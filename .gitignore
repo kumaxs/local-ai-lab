@@ -1,0 +1,71 @@
+# Secrets and credentials
+.env
+.env.*
+*.env
+*token*
+*secret*
+*credential*
+*credentials*
+secrets/
+credentials/
+
+# n8n and worker runtime state
+n8n_data/
+**/n8n_data/
+n8n_inbox/
+**/n8n_inbox/
+n8n_outputs/
+**/n8n_outputs/
+n8n_state/
+**/n8n_state/
+n8n_logs/
+**/n8n_logs/
+
+# Generated extraction outputs
+inputs/
+**/inputs/
+outputs/
+**/outputs/
+data/
+**/data/
+tmp/
+**/tmp/
+batch_outputs/
+**/batch_outputs/
+batch_outputs_ai/
+**/batch_outputs_ai/
+test_pdfs/
+**/test_pdfs/
+
+# Databases and logs
+*.sqlite
+*.sqlite3
+*.db
+*.db-*
+*.log
+
+# Large/private source documents
+*.pdf
+*.epub
+*.docx
+*.pptx
+*.xlsx
+
+# Caches and local environments
+__pycache__/
+**/__pycache__/
+.venv/
+**/.venv/
+venv/
+**/venv/
+node_modules/
+**/node_modules/
+
+# macOS and editor noise
+.DS_Store
+.idea/
+.vscode/
+
+# Future Docling placeholder is not part of this initialization
+future/docling-ready/
+**/future/docling-ready/
