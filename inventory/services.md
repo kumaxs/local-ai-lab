@@ -8,9 +8,10 @@
 - 仓库：`kumaxs/local-ai-lab`
 - remote URL：`git@github.com:kumaxs/local-ai-lab.git`
 - 分支：`main`
-- 最新已确认 remote HEAD：`2df582057132d94f9fc42de1492d9f327aa58e30`
+- 最新已确认 remote HEAD：`d109f7b43efc129d8575c9478a1a4a365cfce520`
 - 当前角色：ChatGPT 新会话首要读取入口，用于读取 canonical docs 和 commit state。
 - 边界：GitHub 不代表本机运行状态；未提交变更、服务状态、ignored runtime outputs 和本机实际运行情况仍必须由 Codex 或用户本地确认。
+- 同步规则：Codex 产生本地 commit 后必须做 GitHub remote readiness 只读检查；文档 / 状态 / 同步记录类 commit 在 readiness 通过且用户授权后应及时 push。运行代码、服务配置、Docker、n8n workflow 或运行逻辑变更需先报告，等待明确授权。
 
 ## Google Drive / Local-Ai-Lab
 

@@ -7,9 +7,10 @@
 - Local engineering canonical repo: `/Users/zeyuan/Projects/local-ai-lab`
 - GitHub canonical remote: `kumaxs/local-ai-lab`
 - GitHub remote URL: `git@github.com:kumaxs/local-ai-lab.git`
-- Latest confirmed remote HEAD: `2df582057132d94f9fc42de1492d9f327aa58e30`
+- Latest confirmed remote HEAD: `d109f7b43efc129d8575c9478a1a4a365cfce520`
 - Google Drive recovery mirror: `Local-Ai-Lab`
 - Local notes/recovery repo: `/Users/zeyuan/Local-AI-Lab`
+- Push closure rule: local commit is not complete synchronization until GitHub remote readiness passes and an authorized `git push origin main` succeeds.
 
 新会话恢复顺序：
 

@@ -140,3 +140,25 @@
 原因：项目采用 GitHub-first 恢复方式后，本地 commit 不等于同步闭环完成。若不及时 push，新会话从 GitHub 读不到最新 canonical state。
 
 失败规则：push 失败时，不得自行 `pull` / `merge` / `rebase` / `reset` / `clean` / force push，只能输出完整错误和最小修复建议。
+
+## 2026-05-22：区分可及时 push 与需先报告的 commit 类型
+
+决策：文档类、状态类、同步记录类、恢复提示词 / 协作规则类、inventory / repo structure / service boundary 类 commit，在 readiness 通过且用户授权后应及时 push。只读审阅任务、没有 commit 的任务，不需要 push。
+
+决策：运行代码、Docker / compose / service 配置、n8n workflow、`local-ai-python-worker` 运行逻辑、`services/n8n-paper-pipeline` 运行逻辑或任何可能影响实际服务运行的变更，commit 后应先报告，不应自动 push，除非用户明确授权。
+
+原因：文档和状态同步必须尽快进入 GitHub-first 恢复入口；运行路径和服务行为变更的风险更高，需要用户在 push 前明确确认。
+
+禁止行为：readiness 不通过时不得 push；behind `origin/main` 时不得 push；发现疑似 secret / token / env / key / credential 文件时不得 push；push 失败时不得自行 `pull` / `merge` / `rebase` / `reset` / `clean` / force push；不得绕过 GitHub push protection；不得把 ignored runtime outputs 加入 git。
+
+报告规则：Codex 完成每次任务后，应尽量输出极简状态报告：
+
+```text
+DONE
+commit: <hash or none>
+pushed: yes/no
+remote: origin/main at <hash or unknown>
+status: clean / not clean
+blocked: none / <reason>
+next: <one-line next step>
+```

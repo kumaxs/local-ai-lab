@@ -48,3 +48,38 @@ commit 后，如满足以下条件，应建议并在用户授权后执行 `git p
 - no untracked non-ignored files。
 
 push 失败时，不得自行 `pull` / `merge` / `rebase` / `reset` / `clean` / force push；只能输出完整错误和最小修复建议。
+
+## Codex commit / push rule
+
+本地 commit 不等于同步闭环完成。GitHub-first 恢复方式下，未 push 的本地 commit 不能作为新会话可靠恢复状态。
+
+只读审阅任务、没有 commit 的任务，不需要 push。
+
+readiness 通过且用户授权后，应及时 push 的范围：
+
+- 文档类 commit。
+- 状态类 commit。
+- 同步记录类 commit。
+- 恢复提示词 / 协作规则类 commit。
+- inventory / repo structure / service boundary 类 commit。
+
+commit 后应先报告、不应自动 push 的范围：
+
+- 运行代码变更。
+- Docker / compose / service 配置变更。
+- n8n workflow 变更。
+- `local-ai-python-worker` 运行逻辑变更。
+- `services/n8n-paper-pipeline` 运行逻辑变更。
+- 任何可能影响实际服务运行的变更。
+
+Codex 完成任务后，默认使用极简状态报告：
+
+```text
+DONE
+commit: <hash or none>
+pushed: yes/no
+remote: origin/main at <hash or unknown>
+status: clean / not clean
+blocked: none / <reason>
+next: <one-line next step>
+```

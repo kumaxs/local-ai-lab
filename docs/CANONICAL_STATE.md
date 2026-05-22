@@ -32,7 +32,7 @@ Local AI Lab 覆盖本地 AI、n8n 自动化、local-ai-python-worker、论文 i
 GitHub remote `kumaxs/local-ai-lab` 已公开，并可作为 ChatGPT 新会话读取 canonical docs 和 commit state 的首要入口。当前已确认 remote `main` 同步到：
 
 ```text
-2df582057132d94f9fc42de1492d9f327aa58e30
+d109f7b43efc129d8575c9478a1a4a365cfce520
 ```
 
 Google Drive / `Local-Ai-Lab` 是 ChatGPT-facing mirror / recovery entry。Drive 曾包含今天最新人工追加内容，因此后续不能再单边手写扩展为新的事实源；应从本地 canonical files 或明确 sync packet 同步。
@@ -52,7 +52,9 @@ Google Drive 仍是 recovery mirror，但不再是首要读取入口。VS Code �
 
 本地实际运行状态、未提交变更、服务状态和 ignored runtime outputs 仍必须由 Codex 或用户在本机确认。
 
-Codex 完成本地 commit 后，必须继续进行 GitHub remote readiness 只读检查。若满足以下条件，应建议并在用户授权后执行：
+本地 commit 不等于同步闭环完成。GitHub-first 恢复方式下，未 push 的本地 commit 不能作为新会话可靠恢复状态，因为新会话可能只能看到 GitHub remote 上的最新 canonical docs。
+
+Codex 产生本地 commit 后，必须继续进行 GitHub remote readiness 只读检查。若 readiness 通过，且用户已授权，应及时执行：
 
 ```bash
 git push origin main
@@ -70,6 +72,46 @@ git push origin main
 - no untracked non-ignored files。
 
 如果 push 失败，不得自行 `pull` / `merge` / `rebase` / `reset` / `clean` / force push；只能输出完整错误和最小修复建议。
+
+自动 push 适用范围：
+
+- 文档类 commit。
+- 状态类 commit。
+- 同步记录类 commit。
+- 恢复提示词 / 协作规则类 commit。
+- inventory / repo structure / service boundary 类 commit。
+
+不应自动 push 的范围：
+
+- 运行代码变更。
+- Docker / compose / service 配置变更。
+- n8n workflow 变更。
+- `local-ai-python-worker` 运行逻辑变更。
+- `services/n8n-paper-pipeline` 运行逻辑变更。
+- 任何可能影响实际服务运行的变更。
+
+这些高风险场景 commit 后应先报告，等待用户明确授权再 push。
+
+禁止行为：
+
+- readiness 不通过时不得 push。
+- behind `origin/main` 时不得 push。
+- 发现疑似 secret / token / env / key / credential 文件时不得 push。
+- push 失败时不得自行 `pull` / `merge` / `rebase` / `reset` / `clean` / force push。
+- 不得绕过 GitHub push protection。
+- 不得把 ignored runtime outputs 加入 git。
+
+Codex 完成每次任务后应尽量使用极简状态报告，避免用户频繁复制长报告：
+
+```text
+DONE
+commit: <hash or none>
+pushed: yes/no
+remote: origin/main at <hash or unknown>
+status: clean / not clean
+blocked: none / <reason>
+next: <one-line next step>
+```
 
 ## 4. 当前主路径
 

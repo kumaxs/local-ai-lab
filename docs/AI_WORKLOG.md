@@ -45,7 +45,7 @@
 
 - GitHub repo `kumaxs/local-ai-lab` 已公开。
 - GitHub remote `origin` 为 `git@github.com:kumaxs/local-ai-lab.git`。
-- 已确认 remote `main` 最新 HEAD：`2df582057132d94f9fc42de1492d9f327aa58e30`，commit message: `record drive final sync`。
+- 已确认 remote `main` 最新 HEAD：`d109f7b43efc129d8575c9478a1a4a365cfce520`，commit message: `document github first recovery workflow`。
 - GitHub 已能被 ChatGPT 读取，后续新会话恢复顺序改为：
   1. GitHub / `kumaxs/local-ai-lab` canonical docs first。
   2. Google Drive / `Local-Ai-Lab` recovery mirror second。
@@ -56,3 +56,15 @@
 - Codex 完成本地 commit 后，必须进行 GitHub remote readiness 只读检查。
 - 如 working tree clean、branch 为 `main`、origin 正确、`main` 跟踪 `origin/main`、本地 ahead 且不 behind、没有 tracked sensitive-risk filenames、没有 untracked non-ignored files，应建议并在用户授权后执行 `git push origin main`。
 - push 失败时，不得自行 `pull` / `merge` / `rebase` / `reset` / `clean` / force push，只能输出完整错误和最小修复建议。
+
+## 2026-05-22：Codex commit / push synchronization rule
+
+- 已固化 Local AI Lab 的 Codex 提交与 GitHub 同步规则。
+- 本地 commit 不等于同步闭环完成；GitHub-first 恢复方式下，未 push 的本地 commit 不能作为新会话可靠恢复状态。
+- Codex 产生本地 commit 后，必须继续执行 GitHub remote readiness 只读检查。
+- readiness 通过且用户已授权时，应及时执行 `git push origin main`。
+- 只读审阅任务、没有 commit 的任务，不需要 push。
+- 文档类、状态类、同步记录类、恢复提示词 / 协作规则类、inventory / repo structure / service boundary 类 commit，在 readiness 通过且用户授权后应及时 push。
+- 运行代码、Docker / compose / service 配置、n8n workflow、`local-ai-python-worker` 运行逻辑、`services/n8n-paper-pipeline` 运行逻辑或其他可能影响实际服务运行的变更，commit 后应先报告，不应自动 push，除非用户明确授权。
+- push 失败时，不得自行 `pull` / `merge` / `rebase` / `reset` / `clean` / force push，不得绕过 GitHub push protection。
+- Codex 完成任务后应优先输出极简状态报告，减少用户复制长报告的负担。
