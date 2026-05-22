@@ -7,10 +7,20 @@
 ```text
 /Users/zeyuan/Projects/local-ai-lab
 ├── README.md
+├── codex-reports/
+│   ├── 2026-05-21-canonical-state-init.md
+│   └── 2026-05-21-sync-protocol-init.md
 ├── docs/
+│   ├── AI_WORKLOG.md
+│   ├── CANONICAL_STATE.md
 │   ├── DECISIONS.md
+│   ├── DOCLING_SERVICE_DESIGN.md
+│   ├── LATEST_STATE.md
 │   ├── NEXT_STEPS.md
-│   └── RUNTIME_STATE.md
+│   ├── RECONCILIATION_REPORT.md
+│   ├── RUNTIME_STATE.md
+│   ├── SYNC_CURSOR.md
+│   └── SYNC_PROTOCOL.md
 ├── infra/
 ├── inventory/
 │   ├── paths.md
@@ -64,9 +74,16 @@ services/n8n-paper-pipeline
 仓库级文档：
 
 - `README.md`
-- `docs/RUNTIME_STATE.md`
+- `docs/AI_WORKLOG.md`
+- `docs/CANONICAL_STATE.md`
 - `docs/DECISIONS.md`
+- `docs/DOCLING_SERVICE_DESIGN.md`
+- `docs/LATEST_STATE.md`
 - `docs/NEXT_STEPS.md`
+- `docs/RECONCILIATION_REPORT.md`
+- `docs/RUNTIME_STATE.md`
+- `docs/SYNC_CURSOR.md`
+- `docs/SYNC_PROTOCOL.md`
 - `inventory/paths.md`
 - `inventory/ports.md`
 - `inventory/repo_structure.md`
@@ -110,8 +127,4 @@ pipeline 内部文档：
 
 ## 7. 当前 Git 状态
 
-截至本次审计前：
-
-- 最新提交：`c7ebebe init local-ai-lab after paper pipeline migration`
-- Git 工作区干净。
-- 只有 ignored 文件未跟踪，主要是运行时目录、PDF 样本、虚拟环境、输出和状态文件。
+当前 Git 状态以执行 `git status --short` 和 `git status --short --ignored` 为准。
