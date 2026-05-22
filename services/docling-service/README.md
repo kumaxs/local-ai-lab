@@ -17,7 +17,7 @@ The current CLI validates contract plumbing and writes placeholder-derived outpu
 ## Example
 
 ```bash
-PYTHONPATH=services/docling-service python -m docling_service.cli \
+PYTHONPATH=services/docling-service python3 -m docling_service.cli \
   --job-uuid 550e8400-e29b-41d4-a716-446655440000 \
   --input-file-path /absolute/local/path/to/file.pdf \
   --display-name file.pdf \
@@ -33,10 +33,19 @@ artifacts/docling-service/<job_uuid>/
 
 Use `--output-root` for local tests or explicit isolated runs.
 
+If using an isolated virtual environment, use:
+
+```bash
+PYTHONPATH=services/docling-service services/docling-service/.venv/bin/python -m docling_service.cli \
+  --job-uuid 550e8400-e29b-41d4-a716-446655440000 \
+  --input-file-path /absolute/local/path/to/file.pdf \
+  --output-root /tmp/docling-service-outputs
+```
+
 ## Tests
 
 ```bash
-python -m unittest discover services/docling-service/tests
+python3 -m unittest discover services/docling-service/tests
 ```
 
-No external dependencies are required for the initial skeleton.
+No external dependencies are required for the placeholder skeleton. `requirements.txt` now includes `docling` for an isolated dependency spike, but the default CLI path remains `--converter placeholder`.
