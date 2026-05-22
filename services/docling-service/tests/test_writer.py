@@ -10,6 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from docling_service.converter import placeholder_convert  # noqa: E402
 from docling_service.contract import REQUIRED_SUCCESS_OUTPUTS, STATUS_SUCCESS  # noqa: E402
+from docling_service.quality import count_tables, measure_gxx_quality  # noqa: E402
 from docling_service.writer import write_docling_outputs  # noqa: E402
 
 
@@ -34,6 +35,13 @@ METADATA_FIELDS = {
     "link_count",
     "table_count",
     "asset_count",
+    "conversion_policy",
+    "ocr_fallback_used",
+    "text_quality_gxx_count",
+    "text_quality_gxx_density",
+    "table_count",
+    "asset_count",
+    "generated_outputs",
 }
 
 STATUS_FIELDS = {
@@ -49,7 +57,26 @@ STATUS_FIELDS = {
     "warnings",
     "error_code",
     "error_message",
+    "conversion_policy",
+    "ocr_fallback_used",
+    "text_quality_gxx_count",
+    "text_quality_gxx_density",
 }
+
+
+class FakeImage:
+    def save(self, path: Path) -> None:
+        path.write_bytes(b"fake png bytes")
+
+
+class FakePage:
+    image = FakeImage()
+
+
+class FakeDocument:
+    pages = {1: FakePage()}
+    pictures: list[object] = []
+    tables: list[object] = []
 
 
 class WriterTests(unittest.TestCase):
@@ -158,11 +185,90 @@ class WriterTests(unittest.TestCase):
             self.assertEqual(metadata["docling_version"], "2.95.0")
             self.assertEqual(metadata["page_count"], 1)
             self.assertEqual(status["status"], STATUS_SUCCESS)
-            self.assertEqual(status["warnings"], ["text_export_failed"])
+            self.assertIn("text_export_failed", status["warnings"])
+            self.assertIn("asset_extraction_unavailable_no_docling_image_candidates", status["warnings"])
             self.assertEqual(metadata["generated_outputs"], status["outputs_written"])
             self.assertIn("text.txt", metadata["generated_outputs"])
             self.assertIn("doctags.txt", metadata["generated_outputs"])
             self.assertFalse((output_dir / input_pdf.name).exists())
+
+    def test_high_gxx_density_fails_quality(self) -> None:
+        text = " ".join(["/G21"] * 25)
+        quality = measure_gxx_quality(text)
+        self.assertTrue(quality.failed)
+        self.assertEqual(quality.gxx_count, 25)
+
+    def test_low_gxx_density_passes_quality(self) -> None:
+        text = "/G21 " + ("readable text " * 1000)
+        quality = measure_gxx_quality(text)
+        self.assertFalse(quality.failed)
+        self.assertEqual(quality.gxx_count, 1)
+
+    def test_table_count_from_document_dict(self) -> None:
+        self.assertEqual(
+            count_tables(
+                {
+                    "tables": [
+                        {"label": "table", "data": {"num_rows": 2, "num_cols": 2}},
+                        {"label": "table", "data": {"num_rows": 1, "num_cols": 3}},
+                    ]
+                }
+            ),
+            2,
+        )
+        self.assertEqual(
+            count_tables({"body": {"children": [{"label": "table", "self_ref": "#/tables/0"}]}}),
+            1,
+        )
+
+    def test_table_json_and_asset_outputs_are_registered(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            input_pdf = self.make_pdf(tmpdir)
+            output_root = Path(tmpdir) / "outputs"
+            result = write_docling_outputs(
+                job_uuid=UUID_ONE,
+                input_file_path=input_pdf,
+                output_root=output_root,
+                conversion={
+                    "markdown": "# Converted\n",
+                    "html": "<html><body><h1>Converted</h1></body></html>\n",
+                    "document_dict": {
+                        "pages": [{"page_no": 1}],
+                        "tables": [
+                            {
+                                "label": "table",
+                                "data": {
+                                    "num_rows": 1,
+                                    "num_cols": 1,
+                                    "table_cells": [{"text": "cell", "row_span": 1, "col_span": 1}],
+                                },
+                            }
+                        ],
+                    },
+                    "document": FakeDocument(),
+                    "text": "Converted\n",
+                    "warnings": [],
+                    "docling_version": "2.95.0",
+                    "conversion_policy": "quality_first",
+                    "ocr_fallback_used": False,
+                    "text_quality_gxx_count": 0,
+                    "text_quality_gxx_density": 0.0,
+                },
+            )
+
+            output_dir = Path(result["output_dir"])
+            self.assertTrue((output_dir / "tables" / "table_1.json").exists())
+            self.assertTrue((output_dir / "assets" / "page_1.png").exists())
+            metadata = json.loads((output_dir / "metadata.json").read_text(encoding="utf-8"))
+            status = json.loads((output_dir / "status.json").read_text(encoding="utf-8"))
+            self.assertEqual(metadata["conversion_policy"], "quality_first")
+            self.assertEqual(metadata["table_count"], 1)
+            self.assertEqual(metadata["asset_count"], 1)
+            self.assertEqual(status["table_count"], 1)
+            self.assertEqual(status["asset_count"], 1)
+            self.assertEqual(status["generated_outputs"], status["outputs_written"])
+            self.assertIn("tables/table_1.json", metadata["generated_outputs"])
+            self.assertIn("assets/page_1.png", status["outputs_written"])
 
 
 if __name__ == "__main__":
