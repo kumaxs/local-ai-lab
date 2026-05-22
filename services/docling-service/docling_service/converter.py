@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 from typing import Any
 
 from .docling_adapter import DoclingAdapterError, convert_with_docling
-from .writer import write_docling_outputs, write_placeholder_outputs
+from .writer import utc_now_iso, write_docling_outputs, write_placeholder_outputs
 
 
 def placeholder_convert(
@@ -24,6 +25,8 @@ def placeholder_convert(
     duration_seconds: float = 0.0,
 ) -> dict[str, Any]:
     """Write placeholder outputs without invoking Docling or fetching links."""
+    actual_started_at = started_at or utc_now_iso()
+    started_monotonic = time.monotonic()
     return write_placeholder_outputs(
         job_uuid=job_uuid,
         input_file_path=input_file_path,
@@ -33,9 +36,9 @@ def placeholder_convert(
         source_name=source_name,
         image_export_mode=image_export_mode,
         requested_outputs=requested_outputs,
-        started_at=started_at,
-        finished_at=finished_at,
-        duration_seconds=duration_seconds,
+        started_at=actual_started_at,
+        finished_at=finished_at or utc_now_iso(),
+        duration_seconds=round(time.monotonic() - started_monotonic, 6),
     )
 
 
@@ -54,6 +57,8 @@ def docling_convert(
     duration_seconds: float = 0.0,
 ) -> dict[str, Any]:
     """Run Docling and write the local CLI output contract."""
+    actual_started_at = started_at or utc_now_iso()
+    started_monotonic = time.monotonic()
     try:
         conversion = convert_with_docling(
             job_uuid=job_uuid,
@@ -64,10 +69,11 @@ def docling_convert(
             source_name=source_name,
             image_export_mode=image_export_mode,
             requested_outputs=requested_outputs,
-            started_at=started_at,
+            started_at=actual_started_at,
             finished_at=finished_at,
             duration_seconds=duration_seconds,
         )
+        actual_finished_at = utc_now_iso()
         return write_docling_outputs(
             job_uuid=job_uuid,
             input_file_path=input_file_path,
@@ -78,9 +84,9 @@ def docling_convert(
             source_name=source_name,
             image_export_mode=image_export_mode,
             requested_outputs=requested_outputs,
-            started_at=started_at,
-            finished_at=finished_at,
-            duration_seconds=duration_seconds,
+            started_at=actual_started_at,
+            finished_at=actual_finished_at,
+            duration_seconds=round(time.monotonic() - started_monotonic, 6),
         )
     except DoclingAdapterError:
         raise

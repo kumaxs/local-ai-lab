@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import shutil
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 from .contract import REQUIRED_SUCCESS_OUTPUTS, STATUS_SUCCESS
+from .quality import CONVERSION_POLICY, count_tables, extract_table_dicts, relative_output
 
 
 def utc_now_iso() -> str:
@@ -56,6 +58,10 @@ def build_metadata(
     link_count: int | None = 0,
     table_count: int | None = 0,
     asset_count: int | None = 0,
+    conversion_policy: str | None = None,
+    ocr_fallback_used: bool | None = None,
+    text_quality_gxx_count: int | None = None,
+    text_quality_gxx_density: float | None = None,
 ) -> dict[str, Any]:
     path = Path(input_file_path)
     stat = path.stat()
@@ -77,6 +83,10 @@ def build_metadata(
         "link_count": link_count,
         "table_count": table_count,
         "asset_count": asset_count,
+        "conversion_policy": conversion_policy,
+        "ocr_fallback_used": ocr_fallback_used,
+        "text_quality_gxx_count": text_quality_gxx_count,
+        "text_quality_gxx_density": text_quality_gxx_density,
     }
 
 
@@ -94,6 +104,13 @@ def build_status(
     warnings: list[str] | None = None,
     error_code: str | None = None,
     error_message: str | None = None,
+    conversion_policy: str | None = None,
+    ocr_fallback_used: bool | None = None,
+    text_quality_gxx_count: int | None = None,
+    text_quality_gxx_density: float | None = None,
+    table_count: int | None = None,
+    asset_count: int | None = None,
+    generated_outputs: list[str] | None = None,
 ) -> dict[str, Any]:
     return {
         "job_uuid": job_uuid,
@@ -108,6 +125,13 @@ def build_status(
         "warnings": warnings or [],
         "error_code": error_code,
         "error_message": error_message,
+        "conversion_policy": conversion_policy,
+        "ocr_fallback_used": ocr_fallback_used,
+        "text_quality_gxx_count": text_quality_gxx_count,
+        "text_quality_gxx_density": text_quality_gxx_density,
+        "table_count": table_count,
+        "asset_count": asset_count,
+        "generated_outputs": generated_outputs or outputs_written or [],
     }
 
 
@@ -129,6 +153,122 @@ def _safe_page_count(document_dict: dict[str, Any] | None, result: Any | None = 
             if isinstance(value, int):
                 return value
     return None
+
+
+def _table_objects(document: Any | None) -> list[Any]:
+    tables = getattr(document, "tables", None)
+    if isinstance(tables, list):
+        return tables
+    return []
+
+
+def _write_table_artifacts(
+    *,
+    output_dir: Path,
+    document_dict: dict[str, Any],
+    document: Any | None,
+) -> tuple[list[str], list[str]]:
+    tables = extract_table_dicts(document_dict)
+    table_objects = _table_objects(document)
+    warnings: list[str] = []
+    written: list[str] = []
+    if not tables:
+        if count_tables(document_dict):
+            warnings.append("table_extraction_limited_no_cell_data_exported")
+        return written, warnings
+
+    tables_dir = output_dir / "tables"
+    for index, table in enumerate(tables, start=1):
+        json_path = tables_dir / f"table_{index}.json"
+        write_json(json_path, table)
+        written.append(relative_output(json_path, output_dir))
+
+        table_object = table_objects[index - 1] if index - 1 < len(table_objects) else None
+        for method_name, suffix in (
+            ("export_to_markdown", "md"),
+            ("export_to_html", "html"),
+        ):
+            method = getattr(table_object, method_name, None)
+            if method is None:
+                continue
+            try:
+                exported = method()
+            except Exception:
+                warnings.append(f"table_{index}_{suffix}_export_failed")
+                continue
+            if exported:
+                export_path = tables_dir / f"table_{index}.{suffix}"
+                export_path.write_text(str(exported), encoding="utf-8")
+                written.append(relative_output(export_path, output_dir))
+
+    return written, warnings
+
+
+def _iter_asset_candidates(document: Any | None) -> list[tuple[str, Any]]:
+    if document is None:
+        return []
+    candidates: list[tuple[str, Any]] = []
+    pages = getattr(document, "pages", None)
+    if isinstance(pages, dict):
+        for page_no, page in sorted(pages.items(), key=lambda item: str(item[0])):
+            candidates.append((f"page_{page_no}", getattr(page, "image", None)))
+    for label, items in (
+        ("picture", getattr(document, "pictures", None)),
+        ("table", getattr(document, "tables", None)),
+    ):
+        if isinstance(items, list):
+            for index, item in enumerate(items, start=1):
+                candidates.append((f"{label}_{index}", getattr(item, "image", None)))
+    return candidates
+
+
+def _write_image_candidate(path: Path, image: Any) -> bool:
+    if image is None:
+        return False
+    pil_image = getattr(image, "pil_image", None)
+    if pil_image is not None:
+        pil_image.save(path, format="PNG")
+        return path.exists() and path.stat().st_size > 0
+    save = getattr(image, "save", None)
+    if callable(save):
+        save(path)
+        return path.exists() and path.stat().st_size > 0
+    uri = getattr(image, "uri", None)
+    if uri:
+        source = Path(str(uri))
+        if source.exists() and source.is_file():
+            shutil.copyfile(source, path)
+            return path.exists() and path.stat().st_size > 0
+    return False
+
+
+def _write_asset_artifacts(*, output_dir: Path, document: Any | None) -> tuple[list[str], list[str]]:
+    warnings: list[str] = []
+    written: list[str] = []
+    candidates = _iter_asset_candidates(document)
+    if not candidates:
+        warnings.append("asset_extraction_unavailable_no_docling_image_candidates")
+        return written, warnings
+
+    assets_dir = output_dir / "assets"
+    assets_dir.mkdir(parents=True, exist_ok=True)
+    for label, image in candidates:
+        if image is None:
+            continue
+        path = assets_dir / f"{label}.png"
+        try:
+            if _write_image_candidate(path, image):
+                written.append(relative_output(path, output_dir))
+        except Exception:
+            warnings.append(f"{label}_asset_export_failed")
+
+    if not written:
+        warnings.append("asset_extraction_limited_no_image_files_written")
+        try:
+            assets_dir.rmdir()
+        except OSError:
+            pass
+    return written, warnings
 
 
 def write_docling_outputs(
@@ -173,8 +313,25 @@ def write_docling_outputs(
         (job_output_dir / "doctags.txt").write_text(str(doctags), encoding="utf-8")
         written.append("doctags.txt")
 
-    generated_outputs = written + ["metadata.json", "status.json"]
     warnings = list(conversion.get("warnings") or [])
+    table_outputs, table_warnings = _write_table_artifacts(
+        output_dir=job_output_dir,
+        document_dict=document_dict,
+        document=conversion.get("document"),
+    )
+    written.extend(table_outputs)
+    warnings.extend(table_warnings)
+
+    asset_outputs, asset_warnings = _write_asset_artifacts(
+        output_dir=job_output_dir,
+        document=conversion.get("document"),
+    )
+    written.extend(asset_outputs)
+    warnings.extend(asset_warnings)
+
+    generated_outputs = written + ["metadata.json", "status.json"]
+    table_count = count_tables(document_dict)
+    asset_count = len(asset_outputs)
 
     metadata = build_metadata(
         job_uuid=job_uuid,
@@ -190,8 +347,12 @@ def write_docling_outputs(
         page_count=_safe_page_count(document_dict, conversion.get("result")),
         docling_version=conversion.get("docling_version"),
         link_count=None,
-        table_count=None,
-        asset_count=0,
+        table_count=table_count,
+        asset_count=asset_count,
+        conversion_policy=conversion.get("conversion_policy", CONVERSION_POLICY),
+        ocr_fallback_used=bool(conversion.get("ocr_fallback_used")),
+        text_quality_gxx_count=conversion.get("text_quality_gxx_count"),
+        text_quality_gxx_density=conversion.get("text_quality_gxx_density"),
     )
     write_json(job_output_dir / "metadata.json", metadata)
 
@@ -210,6 +371,13 @@ def write_docling_outputs(
         warnings=warnings,
         error_code=None,
         error_message=None,
+        conversion_policy=conversion.get("conversion_policy", CONVERSION_POLICY),
+        ocr_fallback_used=bool(conversion.get("ocr_fallback_used")),
+        text_quality_gxx_count=conversion.get("text_quality_gxx_count"),
+        text_quality_gxx_density=conversion.get("text_quality_gxx_density"),
+        table_count=table_count,
+        asset_count=asset_count,
+        generated_outputs=generated_outputs,
     )
     write_json(job_output_dir / "status.json", status)
 
@@ -281,6 +449,10 @@ def write_placeholder_outputs(
         link_count=0,
         table_count=0,
         asset_count=0,
+        conversion_policy=None,
+        ocr_fallback_used=None,
+        text_quality_gxx_count=None,
+        text_quality_gxx_density=None,
     )
     write_json(job_output_dir / "metadata.json", metadata)
 
