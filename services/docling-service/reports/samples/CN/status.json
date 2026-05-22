@@ -1,0 +1,22 @@
+{
+  "duration_seconds": 0.000108,
+  "error_code": null,
+  "error_message": null,
+  "finished_at": "2026-05-22T09:32:50.052554+00:00",
+  "input_file_path": "/Users/zeyuan/Projects/n8n-paper-pipeline/test_pdfs/CN.pdf",
+  "input_sha256": "f55df935c50bb6d9a2d0e8194983b999d3e55fd1822ed145ff65d07fcbec906e",
+  "job_uuid": "5fba5ca2-f3b3-4285-9b9a-c55f04c59d2d",
+  "output_dir": "/private/var/folders/kf/2mr9760j70l3tqkf57030k6r0000gn/T/tmp.VwbhEvIsSX/CN/outputs/5fba5ca2-f3b3-4285-9b9a-c55f04c59d2d",
+  "outputs_written": [
+    "document.md",
+    "document.html",
+    "document.json",
+    "text.txt",
+    "doctags.txt",
+    "metadata.json",
+    "status.json"
+  ],
+  "started_at": "2026-05-22T09:32:50.052451+00:00",
+  "status": "success",
+  "warnings": []
+}

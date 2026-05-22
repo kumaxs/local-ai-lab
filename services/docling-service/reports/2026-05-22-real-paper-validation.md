@@ -70,13 +70,17 @@ No sample failed.
 
 No status warnings were recorded in the generated `status.json` files. During conversion, Docling printed repeated formula parsing messages for at least one paper, but the CLI contract still returned `ok: true` and all required outputs were produced.
 
-## Manual review sample path
+## Manual review sample paths
 
-Review sample output was copied to:
+Review sample outputs were copied to:
 
 `services/docling-service/reports/samples/two-col-arxiv-ai-transformers-gnn/`
+`services/docling-service/reports/samples/two-col-arxiv-ai-bert/`
+`services/docling-service/reports/samples/table-heavy-ai-complex-tables-gtr/`
+`services/docling-service/reports/samples/layout-doc-ai-layoutlm/`
+`services/docling-service/reports/samples/CN/`
 
-Included derived files:
+Each sample directory includes derived files:
 
 - `README.md`
 - `document.md`
