@@ -1,0 +1,5537 @@
+{
+  "body": {
+    "children": [
+      {
+        "$ref": "#/texts/0"
+      },
+      {
+        "$ref": "#/texts/1"
+      },
+      {
+        "$ref": "#/texts/2"
+      },
+      {
+        "$ref": "#/texts/3"
+      },
+      {
+        "$ref": "#/texts/4"
+      },
+      {
+        "$ref": "#/texts/5"
+      },
+      {
+        "$ref": "#/texts/6"
+      },
+      {
+        "$ref": "#/texts/7"
+      },
+      {
+        "$ref": "#/texts/8"
+      },
+      {
+        "$ref": "#/texts/9"
+      },
+      {
+        "$ref": "#/texts/10"
+      },
+      {
+        "$ref": "#/texts/11"
+      },
+      {
+        "$ref": "#/texts/12"
+      },
+      {
+        "$ref": "#/texts/13"
+      },
+      {
+        "$ref": "#/texts/14"
+      },
+      {
+        "$ref": "#/pictures/0"
+      },
+      {
+        "$ref": "#/texts/30"
+      },
+      {
+        "$ref": "#/texts/31"
+      },
+      {
+        "$ref": "#/texts/32"
+      },
+      {
+        "$ref": "#/texts/33"
+      },
+      {
+        "$ref": "#/texts/34"
+      },
+      {
+        "$ref": "#/texts/35"
+      },
+      {
+        "$ref": "#/texts/36"
+      },
+      {
+        "$ref": "#/texts/37"
+      },
+      {
+        "$ref": "#/texts/38"
+      },
+      {
+        "$ref": "#/texts/39"
+      },
+      {
+        "$ref": "#/texts/40"
+      },
+      {
+        "$ref": "#/texts/41"
+      },
+      {
+        "$ref": "#/pictures/1"
+      },
+      {
+        "$ref": "#/texts/47"
+      },
+      {
+        "$ref": "#/texts/48"
+      },
+      {
+        "$ref": "#/texts/49"
+      },
+      {
+        "$ref": "#/texts/50"
+      },
+      {
+        "$ref": "#/texts/51"
+      },
+      {
+        "$ref": "#/texts/52"
+      },
+      {
+        "$ref": "#/texts/53"
+      },
+      {
+        "$ref": "#/texts/54"
+      },
+      {
+        "$ref": "#/texts/55"
+      },
+      {
+        "$ref": "#/texts/56"
+      },
+      {
+        "$ref": "#/texts/57"
+      },
+      {
+        "$ref": "#/texts/58"
+      },
+      {
+        "$ref": "#/pictures/2"
+      },
+      {
+        "$ref": "#/texts/72"
+      },
+      {
+        "$ref": "#/texts/73"
+      },
+      {
+        "$ref": "#/texts/74"
+      },
+      {
+        "$ref": "#/texts/75"
+      },
+      {
+        "$ref": "#/texts/76"
+      },
+      {
+        "$ref": "#/texts/77"
+      },
+      {
+        "$ref": "#/texts/78"
+      },
+      {
+        "$ref": "#/texts/79"
+      },
+      {
+        "$ref": "#/texts/80"
+      },
+      {
+        "$ref": "#/texts/81"
+      },
+      {
+        "$ref": "#/texts/82"
+      },
+      {
+        "$ref": "#/texts/83"
+      },
+      {
+        "$ref": "#/texts/84"
+      },
+      {
+        "$ref": "#/groups/0"
+      },
+      {
+        "$ref": "#/texts/86"
+      },
+      {
+        "$ref": "#/texts/87"
+      },
+      {
+        "$ref": "#/groups/1"
+      },
+      {
+        "$ref": "#/texts/89"
+      },
+      {
+        "$ref": "#/texts/90"
+      },
+      {
+        "$ref": "#/groups/2"
+      },
+      {
+        "$ref": "#/texts/92"
+      },
+      {
+        "$ref": "#/texts/93"
+      },
+      {
+        "$ref": "#/texts/94"
+      },
+      {
+        "$ref": "#/texts/95"
+      },
+      {
+        "$ref": "#/pictures/3"
+      },
+      {
+        "$ref": "#/texts/97"
+      },
+      {
+        "$ref": "#/texts/98"
+      },
+      {
+        "$ref": "#/texts/99"
+      },
+      {
+        "$ref": "#/texts/100"
+      },
+      {
+        "$ref": "#/texts/101"
+      },
+      {
+        "$ref": "#/texts/102"
+      },
+      {
+        "$ref": "#/texts/103"
+      },
+      {
+        "$ref": "#/texts/104"
+      },
+      {
+        "$ref": "#/texts/105"
+      },
+      {
+        "$ref": "#/texts/106"
+      },
+      {
+        "$ref": "#/texts/107"
+      },
+      {
+        "$ref": "#/texts/108"
+      },
+      {
+        "$ref": "#/texts/109"
+      },
+      {
+        "$ref": "#/texts/110"
+      },
+      {
+        "$ref": "#/texts/111"
+      },
+      {
+        "$ref": "#/texts/112"
+      },
+      {
+        "$ref": "#/texts/113"
+      },
+      {
+        "$ref": "#/texts/114"
+      },
+      {
+        "$ref": "#/texts/115"
+      },
+      {
+        "$ref": "#/texts/116"
+      },
+      {
+        "$ref": "#/texts/117"
+      },
+      {
+        "$ref": "#/texts/118"
+      },
+      {
+        "$ref": "#/texts/119"
+      },
+      {
+        "$ref": "#/texts/120"
+      },
+      {
+        "$ref": "#/texts/121"
+      },
+      {
+        "$ref": "#/texts/122"
+      },
+      {
+        "$ref": "#/texts/123"
+      },
+      {
+        "$ref": "#/texts/124"
+      },
+      {
+        "$ref": "#/texts/125"
+      },
+      {
+        "$ref": "#/texts/126"
+      },
+      {
+        "$ref": "#/texts/127"
+      },
+      {
+        "$ref": "#/texts/128"
+      },
+      {
+        "$ref": "#/groups/3"
+      },
+      {
+        "$ref": "#/texts/148"
+      },
+      {
+        "$ref": "#/groups/4"
+      },
+      {
+        "$ref": "#/texts/169"
+      }
+    ],
+    "content_layer": "body",
+    "label": "unspecified",
+    "name": "_root_",
+    "self_ref": "#/body"
+  },
+  "form_items": [],
+  "furniture": {
+    "children": [],
+    "content_layer": "furniture",
+    "label": "unspecified",
+    "name": "_root_",
+    "self_ref": "#/furniture"
+  },
+  "groups": [
+    {
+      "children": [
+        {
+          "$ref": "#/texts/85"
+        }
+      ],
+      "content_layer": "body",
+      "label": "list",
+      "name": "list",
+      "parent": {
+        "$ref": "#/body"
+      },
+      "self_ref": "#/groups/0"
+    },
+    {
+      "children": [
+        {
+          "$ref": "#/texts/88"
+        }
+      ],
+      "content_layer": "body",
+      "label": "list",
+      "name": "list",
+      "parent": {
+        "$ref": "#/body"
+      },
+      "self_ref": "#/groups/1"
+    },
+    {
+      "children": [
+        {
+          "$ref": "#/texts/91"
+        }
+      ],
+      "content_layer": "body",
+      "label": "list",
+      "name": "list",
+      "parent": {
+        "$ref": "#/body"
+      },
+      "self_ref": "#/groups/2"
+    },
+    {
+      "children": [
+        {
+          "$ref": "#/texts/129"
+        },
+        {
+          "$ref": "#/texts/130"
+        },
+        {
+          "$ref": "#/texts/131"
+        },
+        {
+          "$ref": "#/texts/132"
+        },
+        {
+          "$ref": "#/texts/133"
+        },
+        {
+          "$ref": "#/texts/134"
+        },
+        {
+          "$ref": "#/texts/135"
+        },
+        {
+          "$ref": "#/texts/136"
+        },
+        {
+          "$ref": "#/texts/137"
+        },
+        {
+          "$ref": "#/texts/138"
+        },
+        {
+          "$ref": "#/texts/139"
+        },
+        {
+          "$ref": "#/texts/140"
+        },
+        {
+          "$ref": "#/texts/141"
+        },
+        {
+          "$ref": "#/texts/142"
+        },
+        {
+          "$ref": "#/texts/143"
+        },
+        {
+          "$ref": "#/texts/144"
+        },
+        {
+          "$ref": "#/texts/145"
+        },
+        {
+          "$ref": "#/texts/146"
+        },
+        {
+          "$ref": "#/texts/147"
+        }
+      ],
+      "content_layer": "body",
+      "label": "list",
+      "name": "list",
+      "parent": {
+        "$ref": "#/body"
+      },
+      "self_ref": "#/groups/3"
+    },
+    {
+      "children": [
+        {
+          "$ref": "#/texts/149"
+        },
+        {
+          "$ref": "#/texts/150"
+        },
+        {
+          "$ref": "#/texts/151"
+        },
+        {
+          "$ref": "#/texts/152"
+        },
+        {
+          "$ref": "#/texts/153"
+        },
+        {
+          "$ref": "#/texts/154"
+        },
+        {
+          "$ref": "#/texts/155"
+        },
+        {
+          "$ref": "#/texts/156"
+        },
+        {
+          "$ref": "#/texts/157"
+        },
+        {
+          "$ref": "#/texts/158"
+        },
+        {
+          "$ref": "#/texts/159"
+        },
+        {
+          "$ref": "#/texts/160"
+        },
+        {
+          "$ref": "#/texts/161"
+        },
+        {
+          "$ref": "#/texts/162"
+        },
+        {
+          "$ref": "#/texts/163"
+        },
+        {
+          "$ref": "#/texts/164"
+        },
+        {
+          "$ref": "#/texts/165"
+        },
+        {
+          "$ref": "#/texts/166"
+        },
+        {
+          "$ref": "#/texts/167"
+        },
+        {
+          "$ref": "#/texts/168"
+        }
+      ],
+      "content_layer": "body",
+      "label": "list",
+      "name": "list",
+      "parent": {
+        "$ref": "#/body"
+      },
+      "self_ref": "#/groups/4"
+    }
+  ],
+  "key_value_items": [],
+  "name": "two-col-arxiv-ai-transformers-gnn",
+  "origin": {
+    "binary_hash": 14044023996992308689,
+    "filename": "two-col-arxiv-ai-transformers-gnn.pdf",
+    "mimetype": "application/pdf"
+  },
+  "pages": {
+    "1": {
+      "page_no": 1,
+      "size": {
+        "height": 792.0,
+        "width": 612.0
+      }
+    },
+    "2": {
+      "page_no": 2,
+      "size": {
+        "height": 792.0,
+        "width": 612.0
+      }
+    },
+    "3": {
+      "page_no": 3,
+      "size": {
+        "height": 792.0,
+        "width": 612.0
+      }
+    },
+    "4": {
+      "page_no": 4,
+      "size": {
+        "height": 792.0,
+        "width": 612.0
+      }
+    },
+    "5": {
+      "page_no": 5,
+      "size": {
+        "height": 792.0,
+        "width": 612.0
+      }
+    },
+    "6": {
+      "page_no": 6,
+      "size": {
+        "height": 792.0,
+        "width": 612.0
+      }
+    },
+    "7": {
+      "page_no": 7,
+      "size": {
+        "height": 792.0,
+        "width": 612.0
+      }
+    },
+    "8": {
+      "page_no": 8,
+      "size": {
+        "height": 792.0,
+        "width": 612.0
+      }
+    },
+    "9": {
+      "page_no": 9,
+      "size": {
+        "height": 792.0,
+        "width": 612.0
+      }
+    }
+  },
+  "pictures": [
+    {
+      "annotations": [],
+      "captions": [
+        {
+          "$ref": "#/texts/15"
+        }
+      ],
+      "children": [
+        {
+          "$ref": "#/texts/15"
+        },
+        {
+          "$ref": "#/texts/16"
+        },
+        {
+          "$ref": "#/texts/17"
+        },
+        {
+          "$ref": "#/texts/18"
+        },
+        {
+          "$ref": "#/texts/19"
+        },
+        {
+          "$ref": "#/texts/20"
+        },
+        {
+          "$ref": "#/texts/21"
+        },
+        {
+          "$ref": "#/texts/22"
+        },
+        {
+          "$ref": "#/texts/23"
+        },
+        {
+          "$ref": "#/texts/24"
+        },
+        {
+          "$ref": "#/texts/25"
+        },
+        {
+          "$ref": "#/texts/26"
+        },
+        {
+          "$ref": "#/texts/27"
+        },
+        {
+          "$ref": "#/texts/28"
+        },
+        {
+          "$ref": "#/texts/29"
+        }
+      ],
+      "content_layer": "body",
+      "footnotes": [],
+      "label": "picture",
+      "parent": {
+        "$ref": "#/body"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 602.2083740234375,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 145.9780731201172,
+            "r": 459.6961364746094,
+            "t": 718.9317779541016
+          },
+          "charspan": [
+            0,
+            0
+          ],
+          "page_no": 2
+        }
+      ],
+      "references": [],
+      "self_ref": "#/pictures/0"
+    },
+    {
+      "annotations": [],
+      "captions": [
+        {
+          "$ref": "#/texts/42"
+        }
+      ],
+      "children": [
+        {
+          "$ref": "#/texts/42"
+        },
+        {
+          "$ref": "#/texts/43"
+        },
+        {
+          "$ref": "#/texts/44"
+        },
+        {
+          "$ref": "#/texts/45"
+        },
+        {
+          "$ref": "#/texts/46"
+        }
+      ],
+      "content_layer": "body",
+      "footnotes": [],
+      "label": "picture",
+      "parent": {
+        "$ref": "#/body"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 535.5704650878906,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 183.08143615722656,
+            "r": 427.59356689453125,
+            "t": 717.9844436645508
+          },
+          "charspan": [
+            0,
+            0
+          ],
+          "page_no": 3
+        }
+      ],
+      "references": [],
+      "self_ref": "#/pictures/1"
+    },
+    {
+      "annotations": [],
+      "captions": [
+        {
+          "$ref": "#/texts/59"
+        }
+      ],
+      "children": [
+        {
+          "$ref": "#/texts/59"
+        },
+        {
+          "$ref": "#/texts/60"
+        },
+        {
+          "$ref": "#/texts/61"
+        },
+        {
+          "$ref": "#/texts/62"
+        },
+        {
+          "$ref": "#/texts/63"
+        },
+        {
+          "$ref": "#/texts/64"
+        },
+        {
+          "$ref": "#/texts/65"
+        },
+        {
+          "$ref": "#/texts/66"
+        },
+        {
+          "$ref": "#/texts/67"
+        },
+        {
+          "$ref": "#/texts/68"
+        },
+        {
+          "$ref": "#/texts/69"
+        },
+        {
+          "$ref": "#/texts/70"
+        },
+        {
+          "$ref": "#/texts/71"
+        }
+      ],
+      "content_layer": "body",
+      "footnotes": [],
+      "label": "picture",
+      "parent": {
+        "$ref": "#/body"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 359.1959228515625,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 141.81619262695312,
+            "r": 471.4356689453125,
+            "t": 717.9114608764648
+          },
+          "charspan": [
+            0,
+            0
+          ],
+          "page_no": 4
+        }
+      ],
+      "references": [],
+      "self_ref": "#/pictures/2"
+    },
+    {
+      "annotations": [],
+      "captions": [
+        {
+          "$ref": "#/texts/96"
+        }
+      ],
+      "children": [
+        {
+          "$ref": "#/texts/96"
+        }
+      ],
+      "content_layer": "body",
+      "footnotes": [],
+      "label": "picture",
+      "parent": {
+        "$ref": "#/body"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 637.3567047119141,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 106.73108673095703,
+            "r": 488.3780212402344,
+            "t": 718.4737548828125
+          },
+          "charspan": [
+            0,
+            0
+          ],
+          "page_no": 6
+        }
+      ],
+      "references": [],
+      "self_ref": "#/pictures/3"
+    }
+  ],
+  "schema_name": "DoclingDocument",
+  "tables": [],
+  "texts": [
+    {
+      "children": [],
+      "content_layer": "furniture",
+      "label": "page_header",
+      "orig": "arXiv:2506.22084v1  [cs.LG]  27 Jun 2025",
+      "parent": {
+        "$ref": "#/body"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 223.24,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 18.759999999999998,
+            "r": 36.206559297218156,
+            "t": 568.76
+          },
+          "charspan": [
+            0,
+            40
+          ],
+          "page_no": 1
+        }
+      ],
+      "self_ref": "#/texts/0",
+      "text": "arXiv:2506.22084v1  [cs.LG]  27 Jun 2025"
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "label": "section_header",
+      "level": 1,
+      "orig": "Transformers are Graph Neural Networks",
+      "parent": {
+        "$ref": "#/body"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 691.8609813999999,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 149.987,
+            "r": 461.4480168,
+            "t": 707.337626
+          },
+          "charspan": [
+            0,
+            38
+          ],
+          "page_no": 1
+        }
+      ],
+      "self_ref": "#/texts/1",
+      "text": "Transformers are Graph Neural Networks"
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "label": "text",
+      "orig": "Chaitanya K. Joshi",
+      "parent": {
+        "$ref": "#/body"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 659.4958166,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 265.248,
+            "r": 346.75203059999984,
+            "t": 668.452194
+          },
+          "charspan": [
+            0,
+            18
+          ],
+          "page_no": 1
+        }
+      ],
+      "self_ref": "#/texts/2",
+      "text": "Chaitanya K. Joshi"
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "label": "text",
+      "orig": "Department of Computer Science and Technology University of Cambridge, UK",
+      "parent": {
+        "$ref": "#/body"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 637.6937743929203,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 206.051,
+            "r": 405.95056899999975,
+            "t": 657.1546526
+          },
+          "charspan": [
+            0,
+            73
+          ],
+          "page_no": 1
+        }
+      ],
+      "self_ref": "#/texts/3",
+      "text": "Department of Computer Science and Technology University of Cambridge, UK"
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "hyperlink": "mailto:chaitanya.joshi@cl.cam.ac.uk",
+      "label": "text",
+      "orig": "chaitanya.joshi@cl.cam.ac.uk",
+      "parent": {
+        "$ref": "#/body"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 626.6393028,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 232.79199999999997,
+            "r": 379.20436211999964,
+            "t": 634.9381486
+          },
+          "charspan": [
+            0,
+            28
+          ],
+          "page_no": 1
+        }
+      ],
+      "self_ref": "#/texts/4",
+      "text": "chaitanya.joshi@cl.cam.ac.uk"
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "label": "section_header",
+      "level": 1,
+      "orig": "Abstract",
+      "parent": {
+        "$ref": "#/body"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 585.1703632,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 283.758,
+            "r": 328.24329919999997,
+            "t": 595.918088
+          },
+          "charspan": [
+            0,
+            8
+          ],
+          "page_no": 1
+        }
+      ],
+      "self_ref": "#/texts/5",
+      "text": "Abstract"
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "label": "text",
+      "orig": "We establish connections between the Transformer architecture, originally introduced for natural language processing, and Graph Neural Networks (GNNs) for representation learning on graphs. We show how Transformers can be viewed as message passing GNNs operating on fully connected graphs of tokens, where the self-attention mechanism capture the relative importance of all tokens w.r.t. each-other, and positional encodings provide hints about sequential ordering or structure. Thus, Transformers are expressive set processing networks that learn relationships among input elements without being constrained by apriori graphs. Despite this mathematical connection to GNNs, Transformers are implemented via dense matrix operations that are significantly more efficient on modern hardware than sparse message passing. This leads to the perspective that Transformers are GNNs currently winning the hardware lottery.",
+      "parent": {
+        "$ref": "#/body"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 440.4227743929203,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 143.397,
+            "r": 469.87853586399916,
+            "t": 568.9746526
+          },
+          "charspan": [
+            0,
+            913
+          ],
+          "page_no": 1
+        }
+      ],
+      "self_ref": "#/texts/6",
+      "text": "We establish connections between the Transformer architecture, originally introduced for natural language processing, and Graph Neural Networks (GNNs) for representation learning on graphs. We show how Transformers can be viewed as message passing GNNs operating on fully connected graphs of tokens, where the self-attention mechanism capture the relative importance of all tokens w.r.t. each-other, and positional encodings provide hints about sequential ordering or structure. Thus, Transformers are expressive set processing networks that learn relationships among input elements without being constrained by apriori graphs. Despite this mathematical connection to GNNs, Transformers are implemented via dense matrix operations that are significantly more efficient on modern hardware than sparse message passing. This leads to the perspective that Transformers are GNNs currently winning the hardware lottery."
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "label": "section_header",
+      "level": 1,
+      "orig": "1 Transformers for Natural Language Processing",
+      "parent": {
+        "$ref": "#/body"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 402.6943632,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 108.00000000000001,
+            "r": 367.2963328000002,
+            "t": 413.44208799999996
+          },
+          "charspan": [
+            0,
+            46
+          ],
+          "page_no": 1
+        }
+      ],
+      "self_ref": "#/texts/7",
+      "text": "1 Transformers for Natural Language Processing"
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "label": "text",
+      "orig": "Our discussion focuses on representation learning , which is the foundation for any machine learning task, be it predictive or generative modelling [Olah, 2014].",
+      "parent": {
+        "$ref": "#/body"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 367.69277439292034,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 108.0,
+            "r": 503.99942329299995,
+            "t": 387.3329794
+          },
+          "charspan": [
+            0,
+            161
+          ],
+          "page_no": 1
+        }
+      ],
+      "self_ref": "#/texts/8",
+      "text": "Our discussion focuses on representation learning , which is the foundation for any machine learning task, be it predictive or generative modelling [Olah, 2014]."
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "label": "text",
+      "orig": "At a high level, deep neural networks compress statistical and semantic information about data into a list of numbers, called a latent representation or embedding. Models are trained by optimizing a loss function that measures how well the model's representations perform on a task of interest, such as predicting some properties of the input data. For example, if we give a model a dataset of sentences and train it to predict the next word in each sentence, it will learn to build representations of each word that capture its meaning and context in the sentence [Graves, 2013].",
+      "parent": {
+        "$ref": "#/body"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 296.7587743929203,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 107.641,
+            "r": 504.00438595099945,
+            "t": 359.85665259999996
+          },
+          "charspan": [
+            0,
+            580
+          ],
+          "page_no": 1
+        }
+      ],
+      "self_ref": "#/texts/9",
+      "text": "At a high level, deep neural networks compress statistical and semantic information about data into a list of numbers, called a latent representation or embedding. Models are trained by optimizing a loss function that measures how well the model's representations perform on a task of interest, such as predicting some properties of the input data. For example, if we give a model a dataset of sentences and train it to predict the next word in each sentence, it will learn to build representations of each word that capture its meaning and context in the sentence [Graves, 2013]."
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "label": "text",
+      "orig": "When trained on diverse but interconnected data sources, models learn to build general-purpose representations that capture the underlying structure of the data. Good representations enable generalization to new tasks via knowledge transfer across related domains [Radford et al., 2019, Raffel et al., 2020]. For instance, training a model on mathematical tasks may also improve it for programming related tasks, as both domains require abstract problem-solving.",
+      "parent": {
+        "$ref": "#/body"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 236.7337743929204,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 107.532,
+            "r": 505.2471183839992,
+            "t": 288.9226526
+          },
+          "charspan": [
+            0,
+            462
+          ],
+          "page_no": 1
+        }
+      ],
+      "self_ref": "#/texts/10",
+      "text": "When trained on diverse but interconnected data sources, models learn to build general-purpose representations that capture the underlying structure of the data. Good representations enable generalization to new tasks via knowledge transfer across related domains [Radford et al., 2019, Raffel et al., 2020]. For instance, training a model on mathematical tasks may also improve it for programming related tasks, as both domains require abstract problem-solving."
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "label": "text",
+      "orig": "A key ingredient for building good representations is a highly expressive and scalable model architecture. This can be understood by studying at the transformation of architectures in the context of Natural Language Processing (NLP).",
+      "parent": {
+        "$ref": "#/body"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 198.52777439292038,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 107.641,
+            "r": 505.6536047176005,
+            "t": 228.89765260000001
+          },
+          "charspan": [
+            0,
+            233
+          ],
+          "page_no": 1
+        }
+      ],
+      "self_ref": "#/texts/11",
+      "text": "A key ingredient for building good representations is a highly expressive and scalable model architecture. This can be understood by studying at the transformation of architectures in the context of Natural Language Processing (NLP)."
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "label": "text",
+      "orig": "From RNNs to Transformers Recurrent Neural Networks (RNNs) were a class of widely used deep learning architectures for NLP [Hochreiter and Schmidhuber, 1997, Sutskever et al., 2014]. RNNs build representations of each word in a sentence in a sequential manner, i.e. one word at a time. Intuitively, we can imagine an RNN layer as a conveyor belt, with the words being processed on it autoregressively from left to right. At the end, we get a latent embedding for each word in the sentence, which we pass to the next RNN layer or use for our tasks of choice.",
+      "parent": {
+        "$ref": "#/body"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 118.51577439292032,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 108.0,
+            "r": 505.7450491319992,
+            "t": 182.00219399999992
+          },
+          "charspan": [
+            0,
+            557
+          ],
+          "page_no": 1
+        }
+      ],
+      "self_ref": "#/texts/12",
+      "text": "From RNNs to Transformers Recurrent Neural Networks (RNNs) were a class of widely used deep learning architectures for NLP [Hochreiter and Schmidhuber, 1997, Sutskever et al., 2014]. RNNs build representations of each word in a sentence in a sequential manner, i.e. one word at a time. Intuitively, we can imagine an RNN layer as a conveyor belt, with the words being processed on it autoregressively from left to right. At the end, we get a latent embedding for each word in the sentence, which we pass to the next RNN layer or use for our tasks of choice."
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "label": "text",
+      "orig": "However, the sequential nature of RNNs means they struggle with long input contexts, as they compress the entire sentence into a single fixed-length representation at the end of the conveyor belt. This lead to the design of the attention mechanism [Bahdanau et al., 2015], which allows RNNs to focus on different parts of the input sentence when building representations at each step, rather than just the representation of the last word processed.",
+      "parent": {
+        "$ref": "#/body"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 80.30877439292033,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 107.691,
+            "r": 505.7425086689998,
+            "t": 110.67965260000005
+          },
+          "charspan": [
+            0,
+            293
+          ],
+          "page_no": 1
+        },
+        {
+          "bbox": {
+            "b": 520.9547743929203,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 108.0,
+            "r": 503.99685193440024,
+            "t": 540.4156525999999
+          },
+          "charspan": [
+            294,
+            448
+          ],
+          "page_no": 2
+        }
+      ],
+      "self_ref": "#/texts/13",
+      "text": "However, the sequential nature of RNNs means they struggle with long input contexts, as they compress the entire sentence into a single fixed-length representation at the end of the conveyor belt. This lead to the design of the attention mechanism [Bahdanau et al., 2015], which allows RNNs to focus on different parts of the input sentence when building representations at each step, rather than just the representation of the last word processed."
+    },
+    {
+      "children": [],
+      "content_layer": "furniture",
+      "label": "page_footer",
+      "orig": "This paper is a technical version of an article in The Gradient [Joshi, 2020].",
+      "parent": {
+        "$ref": "#/body"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 50.263384509734465,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 107.722,
+            "r": 378.7673056000001,
+            "t": 57.960126400000036
+          },
+          "charspan": [
+            0,
+            78
+          ],
+          "page_no": 1
+        }
+      ],
+      "self_ref": "#/texts/14",
+      "text": "This paper is a technical version of an article in The Gradient [Joshi, 2020]."
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "label": "caption",
+      "orig": "Figure 1: Representation Learning for NLP. RNNs build representations one token at a time, which captures the sequential nature of language. Transformers build representations in parallel via attention mechanisms, which capture relative importance of words w.r.t. each-other.",
+      "parent": {
+        "$ref": "#/pictures/0"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 562.3327743929203,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 108.0,
+            "r": 504.00139487999974,
+            "t": 593.092194
+          },
+          "charspan": [
+            0,
+            275
+          ],
+          "page_no": 2
+        }
+      ],
+      "self_ref": "#/texts/15",
+      "text": "Figure 1: Representation Learning for NLP. RNNs build representations one token at a time, which captures the sequential nature of language. Transformers build representations in parallel via attention mechanisms, which capture relative importance of words w.r.t. each-other."
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "label": "text",
+      "orig": "This",
+      "parent": {
+        "$ref": "#/pictures/0"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 703.7367231323215,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 157.4630364165093,
+            "r": 168.5572102482848,
+            "t": 706.9585704476484
+          },
+          "charspan": [
+            0,
+            4
+          ],
+          "page_no": 2
+        }
+      ],
+      "self_ref": "#/texts/16",
+      "text": "This"
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "label": "text",
+      "orig": "is",
+      "parent": {
+        "$ref": "#/pictures/0"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 703.7367231323215,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 208.60691825513146,
+            "r": 212.8478804310818,
+            "t": 706.9585704476484
+          },
+          "charspan": [
+            0,
+            2
+          ],
+          "page_no": 2
+        }
+      ],
+      "self_ref": "#/texts/17",
+      "text": "is"
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "label": "text",
+      "orig": "a",
+      "parent": {
+        "$ref": "#/pictures/0"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 703.7367231323215,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 256.8087957186503,
+            "r": 260.07482420954994,
+            "t": 706.9585704476484
+          },
+          "charspan": [
+            0,
+            1
+          ],
+          "page_no": 2
+        }
+      ],
+      "self_ref": "#/texts/18",
+      "text": "a"
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "label": "text",
+      "orig": "sentence",
+      "parent": {
+        "$ref": "#/pictures/0"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 703.7367231323215,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 290.57017899045184,
+            "r": 314.4044445492431,
+            "t": 706.9585704476484
+          },
+          "charspan": [
+            0,
+            8
+          ],
+          "page_no": 2
+        }
+      ],
+      "self_ref": "#/texts/19",
+      "text": "sentence"
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "label": "text",
+      "orig": "RNN",
+      "parent": {
+        "$ref": "#/pictures/0"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 703.2479925920051,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 341.8803749061498,
+            "r": 357.7839835064044,
+            "t": 707.2725563620958
+          },
+          "charspan": [
+            0,
+            3
+          ],
+          "page_no": 2
+        }
+      ],
+      "self_ref": "#/texts/20",
+      "text": "RNN"
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "label": "text",
+      "orig": "This",
+      "parent": {
+        "$ref": "#/pictures/0"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 641.3409578930068,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 157.4630364165093,
+            "r": 168.5572102482848,
+            "t": 644.5628052083337
+          },
+          "charspan": [
+            0,
+            4
+          ],
+          "page_no": 2
+        }
+      ],
+      "self_ref": "#/texts/21",
+      "text": "This"
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "label": "text",
+      "orig": "is",
+      "parent": {
+        "$ref": "#/pictures/0"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 641.3409578930068,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 208.60691825513146,
+            "r": 212.8478804310818,
+            "t": 644.5628052083337
+          },
+          "charspan": [
+            0,
+            2
+          ],
+          "page_no": 2
+        }
+      ],
+      "self_ref": "#/texts/22",
+      "text": "is"
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "label": "text",
+      "orig": "another",
+      "parent": {
+        "$ref": "#/pictures/0"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 641.3409578930068,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 248.48171381355058,
+            "r": 268.3990392567979,
+            "t": 644.5628052083337
+          },
+          "charspan": [
+            0,
+            7
+          ],
+          "page_no": 2
+        }
+      ],
+      "self_ref": "#/texts/23",
+      "text": "another"
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "label": "text",
+      "orig": "sentence",
+      "parent": {
+        "$ref": "#/pictures/0"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 641.3409578930068,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 290.57017899045184,
+            "r": 314.4044445492431,
+            "t": 644.5628052083337
+          },
+          "charspan": [
+            0,
+            8
+          ],
+          "page_no": 2
+        }
+      ],
+      "self_ref": "#/texts/24",
+      "text": "sentence"
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "label": "text",
+      "orig": "Transf.",
+      "parent": {
+        "$ref": "#/pictures/0"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 640.8522273526904,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 337.80285569183025,
+            "r": 361.8715353358169,
+            "t": 644.876791122781
+          },
+          "charspan": [
+            0,
+            7
+          ],
+          "page_no": 2
+        }
+      ],
+      "self_ref": "#/texts/25",
+      "text": "Transf."
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "label": "text",
+      "orig": "Translation?",
+      "parent": {
+        "$ref": "#/pictures/0"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 706.9191708028576,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 391.3095183464999,
+            "r": 433.4703885970799,
+            "t": 710.9464799470162
+          },
+          "charspan": [
+            0,
+            12
+          ],
+          "page_no": 2
+        }
+      ],
+      "self_ref": "#/texts/26",
+      "text": "Translation?"
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "label": "text",
+      "orig": "Sentiment?",
+      "parent": {
+        "$ref": "#/pictures/0"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 684.8971360125112,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 391.3095183464999,
+            "r": 430.48250498283005,
+            "t": 688.9244451566698
+          },
+          "charspan": [
+            0,
+            10
+          ],
+          "page_no": 2
+        }
+      ],
+      "self_ref": "#/texts/27",
+      "text": "Sentiment?"
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "label": "text",
+      "orig": "Next word?",
+      "parent": {
+        "$ref": "#/pictures/0"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 662.8751012221649,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 391.3095183464999,
+            "r": 430.4710351730434,
+            "t": 666.9024103663235
+          },
+          "charspan": [
+            0,
+            10
+          ],
+          "page_no": 2
+        }
+      ],
+      "self_ref": "#/texts/28",
+      "text": "Next word?"
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "label": "text",
+      "orig": "Part-of-speech tags?",
+      "parent": {
+        "$ref": "#/pictures/0"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 640.8530664318184,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 391.3095183464999,
+            "r": 461.48540083611454,
+            "t": 644.880375575977
+          },
+          "charspan": [
+            0,
+            20
+          ],
+          "page_no": 2
+        }
+      ],
+      "self_ref": "#/texts/29",
+      "text": "Part-of-speech tags?"
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "label": "text",
+      "orig": "Transformer networks [Vaswani et al., 2017], which are built on top of the attention mechanism, take this idea further by allowing the model to build representations of each word in parallel, rather than sequentially. This is done by computing the importance of each word in the sentence w.r.t. each other word, and then updating the representation of each word based on this importance. This allows the model to capture long-range dependencies and relationships between words, leading to more expressive representations.",
+      "parent": {
+        "$ref": "#/body"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 450.0207743929203,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 107.691,
+            "r": 503.9995816867998,
+            "t": 513.1176526
+          },
+          "charspan": [
+            0,
+            521
+          ],
+          "page_no": 2
+        }
+      ],
+      "self_ref": "#/texts/30",
+      "text": "Transformer networks [Vaswani et al., 2017], which are built on top of the attention mechanism, take this idea further by allowing the model to build representations of each word in parallel, rather than sequentially. This is done by computing the importance of each word in the sentence w.r.t. each other word, and then updating the representation of each word based on this importance. This allows the model to capture long-range dependencies and relationships between words, leading to more expressive representations."
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "label": "text",
+      "orig": "Initially introduced for machine translation 1 , Transformers have replaced RNNs as the architecture of choice across NLP [Achiam et al., 2023] and wider deep learning applications [Dosovitskiy et al., 2021, Radford et al., 2023] due to their expressivity and scalability.",
+      "parent": {
+        "$ref": "#/body"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 411.8137743929203,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 108.0,
+            "r": 505.24711838399895,
+            "t": 443.8529438
+          },
+          "charspan": [
+            0,
+            272
+          ],
+          "page_no": 2
+        }
+      ],
+      "self_ref": "#/texts/31",
+      "text": "Initially introduced for machine translation 1 , Transformers have replaced RNNs as the architecture of choice across NLP [Achiam et al., 2023] and wider deep learning applications [Dosovitskiy et al., 2021, Radford et al., 2023] due to their expressivity and scalability."
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "label": "text",
+      "orig": "The attention mechanism The central component of the Transformer is the attention mechanism, which allows the representations of words in sentences to capture their relative importance w.r.t. each-other; see Weng [2018] for an intuitive introduction.",
+      "parent": {
+        "$ref": "#/body"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 367.4877743929203,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 107.641,
+            "r": 505.74171395199926,
+            "t": 398.246194
+          },
+          "charspan": [
+            0,
+            250
+          ],
+          "page_no": 2
+        }
+      ],
+      "self_ref": "#/texts/32",
+      "text": "The attention mechanism The central component of the Transformer is the attention mechanism, which allows the representations of words in sentences to capture their relative importance w.r.t. each-other; see Weng [2018] for an intuitive introduction."
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "label": "text",
+      "orig": "Formally, we are given a sentence S consisting of an ordered set of n words (or tokens, more generally). For each token i , we initialize its representation h \u2113 =0 i \u2208 R d as an initial token embedding [Mikolov et al., 2013]. Token representations for each token i are then updated via an attention mechanism from any arbitrary layer \u2113 to layer \u2113 +1 as follows:",
+      "parent": {
+        "$ref": "#/body"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 318.3717743929203,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 108.0,
+            "r": 504.0010016039993,
+            "t": 359.96945580000005
+          },
+          "charspan": [
+            0,
+            361
+          ],
+          "page_no": 2
+        }
+      ],
+      "self_ref": "#/texts/33",
+      "text": "Formally, we are given a sentence S consisting of an ordered set of n words (or tokens, more generally). For each token i , we initialize its representation h \u2113 =0 i \u2208 R d as an initial token embedding [Mikolov et al., 2013]. Token representations for each token i are then updated via an attention mechanism from any arbitrary layer \u2113 to layer \u2113 +1 as follows:"
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "label": "formula",
+      "orig": "h \u2113 +1 i = Attention ( Q = W \u2113 Q h \u2113 i , K = { W \u2113 K h \u2113 j , \u2200 j \u2208 S} , V = { W \u2113 V h \u2113 j , \u2200 j \u2208 S} ) , (1)",
+      "parent": {
+        "$ref": "#/body"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 300.46152673256483,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 134.41199999999998,
+            "r": 504.66739160000014,
+            "t": 313.59510539999997
+          },
+          "charspan": [
+            0,
+            108
+          ],
+          "page_no": 2
+        }
+      ],
+      "self_ref": "#/texts/34",
+      "text": ""
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "label": "formula",
+      "orig": "= \u2211 j \u2208S w ij \u00b7 W \u2113 V h \u2113 j , (2)",
+      "parent": {
+        "$ref": "#/body"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 273.0685267325648,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 156.83900000000017,
+            "r": 504.66739160000014,
+            "t": 296.168504
+          },
+          "charspan": [
+            0,
+            33
+          ],
+          "page_no": 2
+        }
+      ],
+      "self_ref": "#/texts/35",
+      "text": ""
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "label": "text",
+      "orig": "where j \u2208 S denotes the set of all tokens in the sentence (including token i itself), and W \u2113 Q , W \u2113 K , W \u2113 V \u2208 R d \u00d7 d are learnable linear transformations denoting the Q uery, K ey and V alue for the attention computation, respectively. The attention weights w ij \u2208 R , which captures the relative importance between each pair of tokens ( i, j ) , are computed via a dot-product of the linearly transformed representations, followed by a softmax normalization across all tokens j \u2208 S :",
+      "parent": {
+        "$ref": "#/body"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 213.88077439292033,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 107.641,
+            "r": 504.35227417479996,
+            "t": 267.43745579999995
+          },
+          "charspan": [
+            0,
+            489
+          ],
+          "page_no": 2
+        }
+      ],
+      "self_ref": "#/texts/36",
+      "text": "where j \u2208 S denotes the set of all tokens in the sentence (including token i itself), and W \u2113 Q , W \u2113 K , W \u2113 V \u2208 R d \u00d7 d are learnable linear transformations denoting the Q uery, K ey and V alue for the attention computation, respectively. The attention weights w ij \u2208 R , which captures the relative importance between each pair of tokens ( i, j ) , are computed via a dot-product of the linearly transformed representations, followed by a softmax normalization across all tokens j \u2208 S :"
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "label": "formula",
+      "orig": "w ij = softmax j \u2208S ( W \u2113 Q h \u2113 i \u00b7 W \u2113 K h \u2113 j ) , (3)",
+      "parent": {
+        "$ref": "#/body"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 196.43252673256484,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 225.81500000000003,
+            "r": 504.66739160000003,
+            "t": 209.10410539999998
+          },
+          "charspan": [
+            0,
+            55
+          ],
+          "page_no": 2
+        }
+      ],
+      "self_ref": "#/texts/37",
+      "text": ""
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "label": "formula",
+      "orig": "= exp ( W \u2113 Q h \u2113 i \u00b7 W \u2113 K h \u2113 j ) \u2211 j \u2032 \u2208S exp ( W \u2113 Q h \u2113 i \u00b7 W \u2113 K h \u2113 j \u2032 ) . (4)",
+      "parent": {
+        "$ref": "#/body"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 161.28752673256486,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 242.73200000000006,
+            "r": 504.66739160000003,
+            "t": 192.42350399999998
+          },
+          "charspan": [
+            0,
+            86
+          ],
+          "page_no": 2
+        }
+      ],
+      "self_ref": "#/texts/38",
+      "text": ""
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "label": "caption",
+      "orig": "Figure 2 illustrates the described attention mechanism, which is a slightly simplified version of the one used in Transformers. The attention computation in equation 1 is performed in parallel for each token in the sentence to obtain the updated representations in one shot . This is a key advantage of Transformers over RNNs, which update representations token-by-token.",
+      "parent": {
+        "$ref": "#/body"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 107.49877439292038,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 107.691,
+            "r": 503.9993256999997,
+            "t": 148.7776526
+          },
+          "charspan": [
+            0,
+            371
+          ],
+          "page_no": 2
+        }
+      ],
+      "self_ref": "#/texts/39",
+      "text": "Figure 2 illustrates the described attention mechanism, which is a slightly simplified version of the one used in Transformers. The attention computation in equation 1 is performed in parallel for each token in the sentence to obtain the updated representations in one shot . This is a key advantage of Transformers over RNNs, which update representations token-by-token."
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "label": "footnote",
+      "orig": "1 One of the motivations for Transformers was that it was inefficient to train RNNs on the large internal datasets that Google had for language translation. They needed to develop an expressive architecture that could scale better than RNNs.",
+      "parent": {
+        "$ref": "#/body"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 70.14038450973453,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 108.0,
+            "r": 503.9986667519999,
+            "t": 99.62541759999999
+          },
+          "charspan": [
+            0,
+            241
+          ],
+          "page_no": 2
+        }
+      ],
+      "self_ref": "#/texts/40",
+      "text": "1 One of the motivations for Transformers was that it was inefficient to train RNNs on the large internal datasets that Google had for language translation. They needed to develop an expressive architecture that could scale better than RNNs."
+    },
+    {
+      "children": [],
+      "content_layer": "furniture",
+      "label": "page_footer",
+      "orig": "2",
+      "parent": {
+        "$ref": "#/body"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 40.04577439292029,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 303.509,
+            "r": 308.4903,
+            "t": 48.59765259999995
+          },
+          "charspan": [
+            0,
+            1
+          ],
+          "page_no": 2
+        }
+      ],
+      "self_ref": "#/texts/41",
+      "text": "2"
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "label": "caption",
+      "orig": "Figure 2: Asimple attention mechanism. Taking as input the representations of the token h \u2113 i and the set of other tokens in the sentence { h \u2113 j \u2200 j \u2208 S} , we compute the attention weights w ij denoting the relative importance for each pair ( i, j ) through the dot-product followed by a softmax normalization. Finally, we produce the updated token representation h \u2113 +1 i by summing over the representations of tokens { h \u2113 j } weighted by the corresponding w ij . Each token in parallel undergoes the same pipeline to update its representation.",
+      "parent": {
+        "$ref": "#/pictures/1"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 440.32277439292034,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 108.0,
+            "r": 505.7422104464,
+            "t": 510.96510539999997
+          },
+          "charspan": [
+            0,
+            547
+          ],
+          "page_no": 3
+        }
+      ],
+      "self_ref": "#/texts/42",
+      "text": "Figure 2: Asimple attention mechanism. Taking as input the representations of the token h \u2113 i and the set of other tokens in the sentence { h \u2113 j \u2200 j \u2208 S} , we compute the attention weights w ij denoting the relative importance for each pair ( i, j ) through the dot-product followed by a softmax normalization. Finally, we produce the updated token representation h \u2113 +1 i by summing over the representations of tokens { h \u2113 j } weighted by the corresponding w ij . Each token in parallel undergoes the same pipeline to update its representation."
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "label": "text",
+      "orig": "Non-learnt Operations",
+      "parent": {
+        "$ref": "#/pictures/1"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 588.0989717143877,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 357.67166881159085,
+            "r": 427.10460989034175,
+            "t": 591.9803406116841
+          },
+          "charspan": [
+            0,
+            21
+          ],
+          "page_no": 3
+        }
+      ],
+      "self_ref": "#/texts/43",
+      "text": "Non-learnt Operations"
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "label": "text",
+      "orig": "Learnable Weights",
+      "parent": {
+        "$ref": "#/pictures/1"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 575.3259415195755,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 357.67166881159085,
+            "r": 415.72711746889973,
+            "t": 579.2073104168719
+          },
+          "charspan": [
+            0,
+            17
+          ],
+          "page_no": 3
+        }
+      ],
+      "self_ref": "#/texts/44",
+      "text": "Learnable Weights"
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "label": "text",
+      "orig": "Softmax Operation",
+      "parent": {
+        "$ref": "#/pictures/1"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 562.9399728458183,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 357.67166881159085,
+            "r": 416.7930491334005,
+            "t": 566.8213417431145
+          },
+          "charspan": [
+            0,
+            17
+          ],
+          "page_no": 3
+        }
+      ],
+      "self_ref": "#/texts/45",
+      "text": "Softmax Operation"
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "label": "text",
+      "orig": "Legend",
+      "parent": {
+        "$ref": "#/pictures/1"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 603.5814325565844,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 375.60350527702064,
+            "r": 400.11992225834024,
+            "t": 607.4628014538807
+          },
+          "charspan": [
+            0,
+            6
+          ],
+          "page_no": 3
+        }
+      ],
+      "self_ref": "#/texts/46",
+      "text": "Legend"
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "label": "text",
+      "orig": "Multi-head attention In practice, using a single attention head can be limiting, as it forces the model to learn only one set of weights that capture relationships among tokens. However, tokens can interact in multiple ways, and we may want to simultaneously capture different aspects of their relationships, such as syntactic and semantic dependencies as well as contextual connections.",
+      "parent": {
+        "$ref": "#/body"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 375.71177439292035,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 108.0,
+            "r": 504.1644627168006,
+            "t": 417.379194
+          },
+          "charspan": [
+            0,
+            387
+          ],
+          "page_no": 3
+        }
+      ],
+      "self_ref": "#/texts/47",
+      "text": "Multi-head attention In practice, using a single attention head can be limiting, as it forces the model to learn only one set of weights that capture relationships among tokens. However, tokens can interact in multiple ways, and we may want to simultaneously capture different aspects of their relationships, such as syntactic and semantic dependencies as well as contextual connections."
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "label": "text",
+      "orig": "To improve the expressivity of the attention mechanism, Transformers introduced multi-head attention , which computes multiple attention weights in parallel. Each attention head learns its own set of query, key, and value transformations, allowing the model to attend to different types of relationships simultaneously and 'hedge its bets' on the most relevant representations for each token.",
+      "parent": {
+        "$ref": "#/body"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 326.5957743929203,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 107.641,
+            "r": 505.24483699999996,
+            "t": 368.0539794
+          },
+          "charspan": [
+            0,
+            392
+          ],
+          "page_no": 3
+        }
+      ],
+      "self_ref": "#/texts/48",
+      "text": "To improve the expressivity of the attention mechanism, Transformers introduced multi-head attention , which computes multiple attention weights in parallel. Each attention head learns its own set of query, key, and value transformations, allowing the model to attend to different types of relationships simultaneously and 'hedge its bets' on the most relevant representations for each token."
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "label": "text",
+      "orig": "Formally, we can define K attention heads, where each head k computes its own set of query, key, and value transformations when updating the representation of token i at layer \u2113 :",
+      "parent": {
+        "$ref": "#/body"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 299.2977743929203,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 108.0,
+            "r": 505.2443760239997,
+            "t": 319.07845580000003
+          },
+          "charspan": [
+            0,
+            179
+          ],
+          "page_no": 3
+        }
+      ],
+      "self_ref": "#/texts/49",
+      "text": "Formally, we can define K attention heads, where each head k computes its own set of query, key, and value transformations when updating the representation of token i at layer \u2113 :"
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "label": "formula",
+      "orig": "Q k = W \u2113,k Q h \u2113 i , K k = { W \u2113,k K h \u2113 j , \u2200 j \u2208 S} , V k, = { W \u2113,k V h \u2113 j , \u2200 j \u2208 S} , (5)",
+      "parent": {
+        "$ref": "#/body"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 278.9435267325648,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 152.62800000000004,
+            "r": 504.66739160000003,
+            "t": 292.7531054
+          },
+          "charspan": [
+            0,
+            96
+          ],
+          "page_no": 3
+        }
+      ],
+      "self_ref": "#/texts/50",
+      "text": ""
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "label": "text",
+      "orig": "where W \u2113,k Q , W \u2113,k K , W \u2113,k V \u2208 R d \u00d7 d k are learnable linear transformations for the k th attention head at layer \u2113 . The output of each attention head is then computed as:",
+      "parent": {
+        "$ref": "#/body"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 248.52777439292038,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 107.641,
+            "r": 504.00487060799975,
+            "t": 272.4872279000001
+          },
+          "charspan": [
+            0,
+            178
+          ],
+          "page_no": 3
+        }
+      ],
+      "self_ref": "#/texts/51",
+      "text": "where W \u2113,k Q , W \u2113,k K , W \u2113,k V \u2208 R d \u00d7 d k are learnable linear transformations for the k th attention head at layer \u2113 . The output of each attention head is then computed as:"
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "label": "formula",
+      "orig": "head k i = \u2211 j \u2208S w k ij \u00b7 W \u2113,k V h \u2113 j , (6)",
+      "parent": {
+        "$ref": "#/body"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 218.36552673256483,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 222.639,
+            "r": 504.66739160000003,
+            "t": 241.465504
+          },
+          "charspan": [
+            0,
+            46
+          ],
+          "page_no": 3
+        }
+      ],
+      "self_ref": "#/texts/52",
+      "text": ""
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "label": "formula",
+      "orig": "and w k ij = softmax j \u2208S ( W \u2113,k Q h \u2113 i \u00b7 W \u2113,k K h \u2113 j ) , (7)",
+      "parent": {
+        "$ref": "#/body"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 197.64252673256487,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 207.85300000000007,
+            "r": 504.6673915999999,
+            "t": 213.35950400000002
+          },
+          "charspan": [
+            0,
+            65
+          ],
+          "page_no": 3
+        }
+      ],
+      "self_ref": "#/texts/53",
+      "text": ""
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "label": "text",
+      "orig": "where w k ij \u2208 R are the attention weights for the k th head, computed in the same way as before in equation 3, but using the query and key transformations specific to that head. The outputs of all attention heads are concatenated and projected to produce the updated representation for token i as:",
+      "parent": {
+        "$ref": "#/body"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 156.7097743929204,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 107.641,
+            "r": 504.19544859999996,
+            "t": 188.97210540000003
+          },
+          "charspan": [
+            0,
+            298
+          ],
+          "page_no": 3
+        }
+      ],
+      "self_ref": "#/texts/54",
+      "text": "where w k ij \u2208 R are the attention weights for the k th head, computed in the same way as before in equation 3, but using the query and key transformations specific to that head. The outputs of all attention heads are concatenated and projected to produce the updated representation for token i as:"
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "label": "formula",
+      "orig": "\u02dc h \u2113 i = Concat ( head 1 i , . . . , head K i ) O \u2113 , (8)",
+      "parent": {
+        "$ref": "#/body"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 137.16752673256485,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 231.041,
+            "r": 504.6673916,
+            "t": 150.39545580000004
+          },
+          "charspan": [
+            0,
+            58
+          ],
+          "page_no": 3
+        }
+      ],
+      "self_ref": "#/texts/55",
+      "text": ""
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "label": "text",
+      "orig": "where O \u2113 \u2208 R d \u00d7 d is a learnable linear transformation that projects the concatenated outputs to the original representation dimension d . In practice, the computation for all the heads is done in parallel via batched matrix multiplication.",
+      "parent": {
+        "$ref": "#/body"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 98.7577743929204,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 107.641,
+            "r": 503.99917852160036,
+            "t": 131.0211054
+          },
+          "charspan": [
+            0,
+            242
+          ],
+          "page_no": 3
+        }
+      ],
+      "self_ref": "#/texts/56",
+      "text": "where O \u2113 \u2208 R d \u00d7 d is a learnable linear transformation that projects the concatenated outputs to the original representation dimension d . In practice, the computation for all the heads is done in parallel via batched matrix multiplication."
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "label": "text",
+      "orig": "After the multi-head attention operation, each token undergoes an independent token-wise operation. The updated representation \u02dc h \u2113 i for token i is added to the original representation h \u2113 i to form a residual connection [He et al., 2016], followed by a layer normalization [Ba et al., 2016], and further processing by a token-wise multi-layer perceptron (MLP):",
+      "parent": {
+        "$ref": "#/body"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 68.07552673256487,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 107.641,
+            "r": 505.74742252179993,
+            "t": 90.92165260000002
+          },
+          "charspan": [
+            0,
+            202
+          ],
+          "page_no": 3
+        },
+        {
+          "bbox": {
+            "b": 221.50377439292038,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 108.0,
+            "r": 504.1652099118005,
+            "t": 240.96465260000002
+          },
+          "charspan": [
+            203,
+            363
+          ],
+          "page_no": 4
+        }
+      ],
+      "self_ref": "#/texts/57",
+      "text": "After the multi-head attention operation, each token undergoes an independent token-wise operation. The updated representation \u02dc h \u2113 i for token i is added to the original representation h \u2113 i to form a residual connection [He et al., 2016], followed by a layer normalization [Ba et al., 2016], and further processing by a token-wise multi-layer perceptron (MLP):"
+    },
+    {
+      "children": [],
+      "content_layer": "furniture",
+      "label": "page_footer",
+      "orig": "3",
+      "parent": {
+        "$ref": "#/body"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 40.04577439292041,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 303.509,
+            "r": 308.4903,
+            "t": 48.59765259999995
+          },
+          "charspan": [
+            0,
+            1
+          ],
+          "page_no": 3
+        }
+      ],
+      "self_ref": "#/texts/58",
+      "text": "3"
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "label": "caption",
+      "orig": "Figure 3: A Transformer layer. A multi-head attention sub-layer computes the relative importance of each token in a sentence w.r.t. each other token, and updates their representations accordingly. The updated representations are then processed by a token-wise multi-layer perceptron (MLP) sub-layer. Modern variants of the Transformer use SwiGLU [Shazeer, 2020] instead of ReLU [Glorot et al., 2011] as the MLP's activation function, and apply the LayerNorm operations before the multi-head attention and feed-forward sub-layers, rather than after [Xiong et al., 2020].",
+      "parent": {
+        "$ref": "#/pictures/2"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 270.7677743929203,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 108.0,
+            "r": 505.7455273368001,
+            "t": 334.254194
+          },
+          "charspan": [
+            0,
+            569
+          ],
+          "page_no": 4
+        }
+      ],
+      "self_ref": "#/texts/59",
+      "text": "Figure 3: A Transformer layer. A multi-head attention sub-layer computes the relative importance of each token in a sentence w.r.t. each other token, and updates their representations accordingly. The updated representations are then processed by a token-wise multi-layer perceptron (MLP) sub-layer. Modern variants of the Transformer use SwiGLU [Shazeer, 2020] instead of ReLU [Glorot et al., 2011] as the MLP's activation function, and apply the LayerNorm operations before the multi-head attention and feed-forward sub-layers, rather than after [Xiong et al., 2020]."
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "label": "text",
+      "orig": "Non-learnt Operations",
+      "parent": {
+        "$ref": "#/pictures/2"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 437.0742803194423,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 395.42180398475784,
+            "r": 463.11074300316307,
+            "t": 440.85815780634067
+          },
+          "charspan": [
+            0,
+            21
+          ],
+          "page_no": 4
+        }
+      ],
+      "self_ref": "#/texts/60",
+      "text": "Non-learnt Operations"
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "label": "text",
+      "orig": "Learnable Weights",
+      "parent": {
+        "$ref": "#/pictures/2"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 424.6220804197396,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 395.42180398475784,
+            "r": 452.0190280515542,
+            "t": 428.4059579066379
+          },
+          "charspan": [
+            0,
+            17
+          ],
+          "page_no": 4
+        }
+      ],
+      "self_ref": "#/texts/61",
+      "text": "Learnable Weights"
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "label": "text",
+      "orig": "Softmax Operation",
+      "parent": {
+        "$ref": "#/pictures/2"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 412.54721991093686,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 395.42180398475784,
+            "r": 453.05818586793333,
+            "t": 416.3310973978352
+          },
+          "charspan": [
+            0,
+            17
+          ],
+          "page_no": 4
+        }
+      ],
+      "self_ref": "#/texts/62",
+      "text": "Softmax Operation"
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "label": "text",
+      "orig": "Legend",
+      "parent": {
+        "$ref": "#/pictures/2"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 452.1678559554457,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 412.90323234049777,
+            "r": 436.8038510989072,
+            "t": 455.9517334423441
+          },
+          "charspan": [
+            0,
+            6
+          ],
+          "page_no": 4
+        }
+      ],
+      "self_ref": "#/texts/63",
+      "text": "Legend"
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "label": "text",
+      "orig": "Token-wise",
+      "parent": {
+        "$ref": "#/pictures/2"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 647.6296604416896,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 145.05122219456885,
+            "r": 180.15041891063117,
+            "t": 651.413537928588
+          },
+          "charspan": [
+            0,
+            10
+          ],
+          "page_no": 4
+        }
+      ],
+      "self_ref": "#/texts/64",
+      "text": "Token-wise"
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "label": "text",
+      "orig": "Feedforward",
+      "parent": {
+        "$ref": "#/pictures/2"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 638.5735150600875,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 143.3237152956044,
+            "r": 181.87939973499041,
+            "t": 642.3573925469859
+          },
+          "charspan": [
+            0,
+            11
+          ],
+          "page_no": 4
+        }
+      ],
+      "self_ref": "#/texts/65",
+      "text": "Feedforward"
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "label": "text",
+      "orig": "sub-layer",
+      "parent": {
+        "$ref": "#/pictures/2"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 629.5173696784855,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 148.5651952723259,
+            "r": 176.64455247914643,
+            "t": 633.3012471653839
+          },
+          "charspan": [
+            0,
+            9
+          ],
+          "page_no": 4
+        }
+      ],
+      "self_ref": "#/texts/66",
+      "text": "sub-layer"
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "label": "text",
+      "orig": "Multi-head",
+      "parent": {
+        "$ref": "#/pictures/2"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 492.9205101726549,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 147.7220775707835,
+            "r": 181.25516846357834,
+            "t": 496.7043876595532
+          },
+          "charspan": [
+            0,
+            10
+          ],
+          "page_no": 4
+        }
+      ],
+      "self_ref": "#/texts/67",
+      "text": "Multi-head"
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "label": "text",
+      "orig": "Attention",
+      "parent": {
+        "$ref": "#/pictures/2"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 483.8643647910528,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 149.290394414212,
+            "r": 181.57060012011766,
+            "t": 487.6482422779512
+          },
+          "charspan": [
+            0,
+            9
+          ],
+          "page_no": 4
+        }
+      ],
+      "self_ref": "#/texts/68",
+      "text": "Attention"
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "label": "text",
+      "orig": "sub-layer",
+      "parent": {
+        "$ref": "#/pictures/2"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 474.80821940945077,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 150.45189222682632,
+            "r": 178.53124943364685,
+            "t": 478.5920968963492
+          },
+          "charspan": [
+            0,
+            9
+          ],
+          "page_no": 4
+        }
+      ],
+      "self_ref": "#/texts/69",
+      "text": "sub-layer"
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "label": "text",
+      "orig": "Learnable Normalization",
+      "parent": {
+        "$ref": "#/pictures/2"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 400.09502001123406,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 395.42180398475784,
+            "r": 471.0628764925932,
+            "t": 403.8788974981324
+          },
+          "charspan": [
+            0,
+            23
+          ],
+          "page_no": 4
+        }
+      ],
+      "self_ref": "#/texts/70",
+      "text": "Learnable Normalization"
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "label": "text",
+      "orig": "Non-linear Activation",
+      "parent": {
+        "$ref": "#/pictures/2"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 388.02015950243134,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 395.42180398475784,
+            "r": 461.8541734744611,
+            "t": 391.8040369893297
+          },
+          "charspan": [
+            0,
+            21
+          ],
+          "page_no": 4
+        }
+      ],
+      "self_ref": "#/texts/71",
+      "text": "Non-linear Activation"
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "label": "formula",
+      "orig": "h \u2113 +1 i = MLP ( LayerNorm ( h \u2113 i + \u02dc h \u2113 i )) , (9)",
+      "parent": {
+        "$ref": "#/body"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 192.68252673256484,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 224.614,
+            "r": 504.6673916000001,
+            "t": 208.24850400000003
+          },
+          "charspan": [
+            0,
+            53
+          ],
+          "page_no": 4
+        }
+      ],
+      "self_ref": "#/texts/72",
+      "text": ""
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "label": "text",
+      "orig": "where the MLP projects each token's representation to a higher dimension (typically 4 \u00d7 d ), applies a non-linear activation function, and then projects back to the original dimension d . It is worth remarking that this token-wise MLP contains significantly more learnable parameters than the attention mechanism.",
+      "parent": {
+        "$ref": "#/body"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 135.43777439292035,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 107.641,
+            "r": 504.000102716,
+            "t": 177.0364558
+          },
+          "charspan": [
+            0,
+            313
+          ],
+          "page_no": 4
+        }
+      ],
+      "self_ref": "#/texts/73",
+      "text": "where the MLP projects each token's representation to a higher dimension (typically 4 \u00d7 d ), applies a non-linear activation function, and then projects back to the original dimension d . It is worth remarking that this token-wise MLP contains significantly more learnable parameters than the attention mechanism."
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "label": "text",
+      "orig": "All of these operations (MLP sub-networks, residual connections, layer normalization) are now standard components and best practices of deep learning architectures. They enable stacking multiple Transformer layers to build very deep networks, which has been key to the development of foundation models that learn complex relationships from large datasets [Bommasani et al., 2021].",
+      "parent": {
+        "$ref": "#/body"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 86.32277439292034,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 107.641,
+            "r": 504.3597020799993,
+            "t": 127.60165259999997
+          },
+          "charspan": [
+            0,
+            380
+          ],
+          "page_no": 4
+        }
+      ],
+      "self_ref": "#/texts/74",
+      "text": "All of these operations (MLP sub-networks, residual connections, layer normalization) are now standard components and best practices of deep learning architectures. They enable stacking multiple Transformer layers to build very deep networks, which has been key to the development of foundation models that learn complex relationships from large datasets [Bommasani et al., 2021]."
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "label": "text",
+      "orig": "The final picture of a Transformer layer is illustrated in Figure 3.",
+      "parent": {
+        "$ref": "#/body"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 69.93377439292033,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 107.691,
+            "r": 365.7721529999998,
+            "t": 78.48565259999998
+          },
+          "charspan": [
+            0,
+            68
+          ],
+          "page_no": 4
+        }
+      ],
+      "self_ref": "#/texts/75",
+      "text": "The final picture of a Transformer layer is illustrated in Figure 3."
+    },
+    {
+      "children": [],
+      "content_layer": "furniture",
+      "label": "page_footer",
+      "orig": "4",
+      "parent": {
+        "$ref": "#/body"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 40.04577439292029,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 303.509,
+            "r": 308.4903,
+            "t": 48.59765259999995
+          },
+          "charspan": [
+            0,
+            1
+          ],
+          "page_no": 4
+        }
+      ],
+      "self_ref": "#/texts/76",
+      "text": "4"
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "label": "section_header",
+      "level": 1,
+      "orig": "2 Graph Neural Networks for Representation Learning on Graphs",
+      "parent": {
+        "$ref": "#/body"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 707.5383632,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 108.0,
+            "r": 455.537664,
+            "t": 718.2860880000001
+          },
+          "charspan": [
+            0,
+            61
+          ],
+          "page_no": 5
+        }
+      ],
+      "self_ref": "#/texts/77",
+      "text": "2 Graph Neural Networks for Representation Learning on Graphs"
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "label": "text",
+      "orig": "Let us now turn our attention to sets with relational structure, i.e. graphs.",
+      "parent": {
+        "$ref": "#/body"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 685.1347743929203,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 108.0,
+            "r": 398.34005179999974,
+            "t": 693.6866526
+          },
+          "charspan": [
+            0,
+            77
+          ],
+          "page_no": 5
+        }
+      ],
+      "self_ref": "#/texts/78",
+      "text": "Let us now turn our attention to sets with relational structure, i.e. graphs."
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "label": "text",
+      "orig": "Graphs are used to model complex and interconnected systems in the real-world, ranging from knowledge graphs to social networks and molecular structures. Formally, an attributed graph G = ( A , H ) is a set V of n nodes connected by edges. A denotes an n \u00d7 n adjacency matrix where each entry a ij \u2208 { 0 , 1 } indicates the presence or absence of an edge connecting nodes i and j . Additionally, we can define N i as the set of neighbors of node i , which are the nodes connected to i by an edge, i.e. N i = { j \u2208 V | a ij = 1 } . The matrix of initial representations H \u2208 R n \u00d7 d stores attributes h i \u2208 R d associated with each node i . For example, in molecular graphs, each node contains information about the atom type and edges can represent interactions among atoms.",
+      "parent": {
+        "$ref": "#/body"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 590.9867743929203,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 106.834,
+            "r": 505.74346299999996,
+            "t": 677.2976526
+          },
+          "charspan": [
+            0,
+            773
+          ],
+          "page_no": 5
+        }
+      ],
+      "self_ref": "#/texts/79",
+      "text": "Graphs are used to model complex and interconnected systems in the real-world, ranging from knowledge graphs to social networks and molecular structures. Formally, an attributed graph G = ( A , H ) is a set V of n nodes connected by edges. A denotes an n \u00d7 n adjacency matrix where each entry a ij \u2208 { 0 , 1 } indicates the presence or absence of an edge connecting nodes i and j . Additionally, we can define N i as the set of neighbors of node i , which are the nodes connected to i by an edge, i.e. N i = { j \u2208 V | a ij = 1 } . The matrix of initial representations H \u2208 R n \u00d7 d stores attributes h i \u2208 R d associated with each node i . For example, in molecular graphs, each node contains information about the atom type and edges can represent interactions among atoms."
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "label": "text",
+      "orig": "Typically, the nodes in a graph have no canonical or fixed ordering and can be shuffled arbitrarily, resulting in an equivalent shuffling of the rows and columns of the adjacency matrix A . Thus, accounting for permutation symmetry is a critical consideration when designing machine learning models for graphs [Bronstein et al., 2021]. Formally, a permutation \u03c3 of the nodes acts on the graph G by permuting the rows and columns of the adjacency matrix A and the representations H :",
+      "parent": {
+        "$ref": "#/body"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 530.9617743929203,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 107.691,
+            "r": 505.24574119999994,
+            "t": 583.1496526
+          },
+          "charspan": [
+            0,
+            482
+          ],
+          "page_no": 5
+        }
+      ],
+      "self_ref": "#/texts/80",
+      "text": "Typically, the nodes in a graph have no canonical or fixed ordering and can be shuffled arbitrarily, resulting in an equivalent shuffling of the rows and columns of the adjacency matrix A . Thus, accounting for permutation symmetry is a critical consideration when designing machine learning models for graphs [Bronstein et al., 2021]. Formally, a permutation \u03c3 of the nodes acts on the graph G by permuting the rows and columns of the adjacency matrix A and the representations H :"
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "label": "formula",
+      "orig": "P \u03c3 G = ( P \u03c3 AP \u22a4 \u03c3 , P \u03c3 H ) , (10)",
+      "parent": {
+        "$ref": "#/body"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 511.6855267325649,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 252.38,
+            "r": 504.6676916,
+            "t": 524.3571054
+          },
+          "charspan": [
+            0,
+            37
+          ],
+          "page_no": 5
+        }
+      ],
+      "self_ref": "#/texts/81",
+      "text": ""
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "label": "text",
+      "orig": "where P \u03c3 is a permutation matrix corresponding to \u03c3 , and P \u03c3 \u2208 R n \u00d7 n has exactly one 1 in every row and column, and 0 elsewhere.",
+      "parent": {
+        "$ref": "#/body"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 484.86577439292034,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 107.641,
+            "r": 504.3473185759995,
+            "t": 506.2191054
+          },
+          "charspan": [
+            0,
+            132
+          ],
+          "page_no": 5
+        }
+      ],
+      "self_ref": "#/texts/82",
+      "text": "where P \u03c3 is a permutation matrix corresponding to \u03c3 , and P \u03c3 \u2208 R n \u00d7 n has exactly one 1 in every row and column, and 0 elsewhere."
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "label": "text",
+      "orig": "Message Passing Graph Neural Networks Graph Neural Networks (GNNs) are a class of deep learning architectures designed to operate on graph-structured data. GNNs leverage graph topology to propagate and aggregate information between connected nodes. They have emerged as the architecture of choice for representation learning on graph data across domains ranging from molecular modelling [Stokes et al., 2020, Batzner et al., 2022] to recommendation systems [Ying et al., 2018] and transportation networks [Derrow-Pinion et al., 2021].",
+      "parent": {
+        "$ref": "#/body"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 407.48377439292034,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 108.0,
+            "r": 504.0035395723999,
+            "t": 470.969194
+          },
+          "charspan": [
+            0,
+            534
+          ],
+          "page_no": 5
+        }
+      ],
+      "self_ref": "#/texts/83",
+      "text": "Message Passing Graph Neural Networks Graph Neural Networks (GNNs) are a class of deep learning architectures designed to operate on graph-structured data. GNNs leverage graph topology to propagate and aggregate information between connected nodes. They have emerged as the architecture of choice for representation learning on graph data across domains ranging from molecular modelling [Stokes et al., 2020, Batzner et al., 2022] to recommendation systems [Ying et al., 2018] and transportation networks [Derrow-Pinion et al., 2021]."
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "label": "text",
+      "orig": "GNNs are based on the principle of message passing , where each node iteratively updates its representations by aggregating from its local neighbors [Battaglia et al., 2018]. Formally, node representations h i for each node i \u2208 V are updated from layer \u2113 to \u2113 +1 through a three-step process:",
+      "parent": {
+        "$ref": "#/body"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 368.5175267325648,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 108.0,
+            "r": 505.38295221999994,
+            "t": 399.8259794
+          },
+          "charspan": [
+            0,
+            292
+          ],
+          "page_no": 5
+        }
+      ],
+      "self_ref": "#/texts/84",
+      "text": "GNNs are based on the principle of message passing , where each node iteratively updates its representations by aggregating from its local neighbors [Battaglia et al., 2018]. Formally, node representations h i for each node i \u2208 V are updated from layer \u2113 to \u2113 +1 through a three-step process:"
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "enumerated": true,
+      "label": "list_item",
+      "marker": "1.",
+      "orig": "1. Message construction : For each node i and its neighbors j \u2208 N i , construct a message m \u2113 ij that captures the relationship between the representations of nodes i and j .",
+      "parent": {
+        "$ref": "#/groups/0"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 338.60877439292034,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 131.412,
+            "r": 503.09832522,
+            "t": 359.96210540000004
+          },
+          "charspan": [
+            0,
+            174
+          ],
+          "page_no": 5
+        }
+      ],
+      "self_ref": "#/texts/85",
+      "text": "Message construction : For each node i and its neighbors j \u2208 N i , construct a message m \u2113 ij that captures the relationship between the representations of nodes i and j ."
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "label": "formula",
+      "orig": "m \u2113 ij = \u03c8 ( h \u2113 i , h \u2113 j ) , \u2200 j \u2208 N i , (11)",
+      "parent": {
+        "$ref": "#/body"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 319.3335267325648,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 260.59299999999996,
+            "r": 504.66769159999996,
+            "t": 332.00410539999996
+          },
+          "charspan": [
+            0,
+            47
+          ],
+          "page_no": 5
+        }
+      ],
+      "self_ref": "#/texts/86",
+      "text": ""
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "label": "text",
+      "orig": "where \u03c8 : R 2 \u00d7 d \u2192 R d is an MLP that learns to construct the message based on the representations of nodes i and j .",
+      "parent": {
+        "$ref": "#/body"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 291.44077439292033,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 143.507,
+            "r": 503.9980285319991,
+            "t": 312.7951054
+          },
+          "charspan": [
+            0,
+            118
+          ],
+          "page_no": 5
+        }
+      ],
+      "self_ref": "#/texts/87",
+      "text": "where \u03c8 : R 2 \u00d7 d \u2192 R d is an MLP that learns to construct the message based on the representations of nodes i and j ."
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "enumerated": true,
+      "label": "list_item",
+      "marker": "2.",
+      "orig": "2. Aggregation : Combine all messages from the neighbors of node i to produce a single aggregated message m \u2113 i .",
+      "parent": {
+        "$ref": "#/groups/1"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 264.08652673256483,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 131.41200000000003,
+            "r": 504.0019545039996,
+            "t": 285.72445580000004
+          },
+          "charspan": [
+            0,
+            113
+          ],
+          "page_no": 5
+        }
+      ],
+      "self_ref": "#/texts/88",
+      "text": "Aggregation : Combine all messages from the neighbors of node i to produce a single aggregated message m \u2113 i ."
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "label": "formula",
+      "orig": "m \u2113 i = \u2295 j \u2208N i m \u2113 ij , (12)",
+      "parent": {
+        "$ref": "#/body"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 234.67094493861669,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 289.992,
+            "r": 504.66769160000007,
+            "t": 258.38650400000006
+          },
+          "charspan": [
+            0,
+            30
+          ],
+          "page_no": 5
+        }
+      ],
+      "self_ref": "#/texts/89",
+      "text": ""
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "label": "text",
+      "orig": "where \u2295 is a permutation-invariant operator (e.g. sum, mean, max) that aggregates messages from all neighbors j \u2208 N i . Thus, a change in the order of neighbors does not affect the aggregated message, preserving the graph's symmetry (equation 10).",
+      "parent": {
+        "$ref": "#/body"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 196.47477439292038,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 143.507,
+            "r": 504.00444646799957,
+            "t": 228.230504
+          },
+          "charspan": [
+            0,
+            247
+          ],
+          "page_no": 5
+        }
+      ],
+      "self_ref": "#/texts/90",
+      "text": "where \u2295 is a permutation-invariant operator (e.g. sum, mean, max) that aggregates messages from all neighbors j \u2208 N i . Thus, a change in the order of neighbors does not affect the aggregated message, preserving the graph's symmetry (equation 10)."
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "enumerated": true,
+      "label": "list_item",
+      "marker": "3.",
+      "orig": "3. Update : Update the representations of node i using the aggregated message m \u2113 i and its previous representations h \u2113 i .",
+      "parent": {
+        "$ref": "#/groups/2"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 167.98152673256482,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 131.412,
+            "r": 504.0027055839999,
+            "t": 192.33310540000002
+          },
+          "charspan": [
+            0,
+            124
+          ],
+          "page_no": 5
+        }
+      ],
+      "self_ref": "#/texts/91",
+      "text": "Update : Update the representations of node i using the aggregated message m \u2113 i and its previous representations h \u2113 i ."
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "label": "formula",
+      "orig": "h \u2113 +1 i = \u03d5 ( h \u2113 i , m \u2113 i ) , (13)",
+      "parent": {
+        "$ref": "#/body"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 149.66652673256488,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 281.91200000000003,
+            "r": 504.66769160000007,
+            "t": 162.8001054
+          },
+          "charspan": [
+            0,
+            37
+          ],
+          "page_no": 5
+        }
+      ],
+      "self_ref": "#/texts/92",
+      "text": ""
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "label": "text",
+      "orig": "where \u03d5 : R d \u2192 R d is another MLP.",
+      "parent": {
+        "$ref": "#/body"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 133.3297743929204,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 143.50700000000012,
+            "r": 289.61609860000016,
+            "t": 143.77410540000005
+          },
+          "charspan": [
+            0,
+            35
+          ],
+          "page_no": 5
+        }
+      ],
+      "self_ref": "#/texts/93",
+      "text": "where \u03d5 : R d \u2192 R d is another MLP."
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "label": "text",
+      "orig": "This general formulation encompasses most commonly used GNN architectures including Graph Convolutional Networks [Kipf and Welling, 2017], Graph Isomorphism Networks [Xu et al., 2019], and Message Passing Neural Networks [Gilmer et al., 2017]. By stacking multiple message passing layers, GNNs can propagate information beyond immediate neighbors and capture complex multi-hop relationships in the graph structure (Figure 4).",
+      "parent": {
+        "$ref": "#/body"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 69.93377439292033,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 107.691,
+            "r": 505.2487123999996,
+            "t": 122.12165259999995
+          },
+          "charspan": [
+            0,
+            425
+          ],
+          "page_no": 5
+        }
+      ],
+      "self_ref": "#/texts/94",
+      "text": "This general formulation encompasses most commonly used GNN architectures including Graph Convolutional Networks [Kipf and Welling, 2017], Graph Isomorphism Networks [Xu et al., 2019], and Message Passing Neural Networks [Gilmer et al., 2017]. By stacking multiple message passing layers, GNNs can propagate information beyond immediate neighbors and capture complex multi-hop relationships in the graph structure (Figure 4)."
+    },
+    {
+      "children": [],
+      "content_layer": "furniture",
+      "label": "page_footer",
+      "orig": "5",
+      "parent": {
+        "$ref": "#/body"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 40.04577439292029,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 303.509,
+            "r": 308.4903,
+            "t": 48.59765259999995
+          },
+          "charspan": [
+            0,
+            1
+          ],
+          "page_no": 5
+        }
+      ],
+      "self_ref": "#/texts/95",
+      "text": "5"
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "label": "caption",
+      "orig": "Figure 4: Representation learning on graphs with message passing. (left) Graphs model complex systems via a set of nodes connected by edges. (middle) GNNs build latent representations of graph data via message passing , where each node learns to aggregate representations from its local neighbourhood. (right) Stacking L message passing layers enables GNNs to send and aggregate information from L -hop subgraphs around each node.",
+      "parent": {
+        "$ref": "#/pictures/3"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 567.3067743929204,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 108.0,
+            "r": 504.24406107600004,
+            "t": 619.883194
+          },
+          "charspan": [
+            0,
+            430
+          ],
+          "page_no": 6
+        }
+      ],
+      "self_ref": "#/texts/96",
+      "text": "Figure 4: Representation learning on graphs with message passing. (left) Graphs model complex systems via a set of nodes connected by edges. (middle) GNNs build latent representations of graph data via message passing , where each node learns to aggregate representations from its local neighbourhood. (right) Stacking L message passing layers enables GNNs to send and aggregate information from L -hop subgraphs around each node."
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "label": "text",
+      "orig": "Graph Attention Networks A particularly interesting class of GNNs uses attention mechanisms to weight the importance of different neighbors during aggregation [Veli\u02c7 ckovi\u00b4 c et al., 2018]. In Graph Attention Networks (GATs), the message from neighbor j to node i is computed as:",
+      "parent": {
+        "$ref": "#/body"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 512.8457743929204,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 107.641,
+            "r": 504.0004914879996,
+            "t": 543.605194
+          },
+          "charspan": [
+            0,
+            279
+          ],
+          "page_no": 6
+        }
+      ],
+      "self_ref": "#/texts/97",
+      "text": "Graph Attention Networks A particularly interesting class of GNNs uses attention mechanisms to weight the importance of different neighbors during aggregation [Veli\u02c7 ckovi\u00b4 c et al., 2018]. In Graph Attention Networks (GATs), the message from neighbor j to node i is computed as:"
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "label": "formula",
+      "orig": "\u03c8 ( h \u2113 i , h \u2113 j ) = LocalAttention ( W \u2113 Q h \u2113 i , { W \u2113 K h \u2113 j , \u2200 j \u2208 N i } , { W \u2113 V h \u2113 j , \u2200 j \u2208 N i } ) , (14)",
+      "parent": {
+        "$ref": "#/body"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 492.68252673256484,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 127.29400000000007,
+            "r": 504.6676916,
+            "t": 505.3541054
+          },
+          "charspan": [
+            0,
+            119
+          ],
+          "page_no": 6
+        }
+      ],
+      "self_ref": "#/texts/98",
+      "text": ""
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "label": "formula",
+      "orig": "= exp( W \u2113 Q h \u2113 i \u00b7 W \u2113 K h \u2113 j ) \u2211 j \u2032 \u2208N i exp( W \u2113 Q h \u2113 i \u00b7 W \u2113 K h \u2113 j \u2032 ) \u00b7 W \u2113 V h \u2113 j , (15)",
+      "parent": {
+        "$ref": "#/body"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 460.11494493861676,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 173.46100000000007,
+            "r": 504.6676915999999,
+            "t": 488.5931054000001
+          },
+          "charspan": [
+            0,
+            101
+          ],
+          "page_no": 6
+        }
+      ],
+      "self_ref": "#/texts/99",
+      "text": ""
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "label": "text",
+      "orig": "where W \u2113 Q , W \u2113 K , W \u2113 V \u2208 R d \u00d7 d . The local attention mechanism allows allows GATs to learn which neighbors are more important for each node during the aggregation step. The updated representation for node i is computed by aggregating the messages from all its neighbors:",
+      "parent": {
+        "$ref": "#/body"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 421.04177439292033,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 107.641,
+            "r": 504.0023811774001,
+            "t": 453.30410540000014
+          },
+          "charspan": [
+            0,
+            277
+          ],
+          "page_no": 6
+        }
+      ],
+      "self_ref": "#/texts/100",
+      "text": "where W \u2113 Q , W \u2113 K , W \u2113 V \u2208 R d \u00d7 d . The local attention mechanism allows allows GATs to learn which neighbors are more important for each node during the aggregation step. The updated representation for node i is computed by aggregating the messages from all its neighbors:"
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "label": "formula",
+      "orig": "h \u2113 +1 i = h \u2113 i + \u2211 j \u2208N i \u03c8 ( h \u2113 i , h \u2113 j ) , (16)",
+      "parent": {
+        "$ref": "#/body"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 389.31494493861675,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 241.133,
+            "r": 504.66769159999996,
+            "t": 413.030504
+          },
+          "charspan": [
+            0,
+            54
+          ],
+          "page_no": 6
+        }
+      ],
+      "self_ref": "#/texts/101",
+      "text": ""
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "label": "text",
+      "orig": "In practice, GATs also use multi-head attention to compute multiple sets of attention weights in parallel, allowing the model to learn different aspects of the relationships between nodes.",
+      "parent": {
+        "$ref": "#/body"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 361.8577743929203,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 108.0,
+            "r": 503.9972105879993,
+            "t": 381.3196526
+          },
+          "charspan": [
+            0,
+            188
+          ],
+          "page_no": 6
+        }
+      ],
+      "self_ref": "#/texts/102",
+      "text": "In practice, GATs also use multi-head attention to compute multiple sets of attention weights in parallel, allowing the model to learn different aspects of the relationships between nodes."
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "label": "text",
+      "orig": "These equations should look very familiar!",
+      "parent": {
+        "$ref": "#/body"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 345.4697743929203,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 107.691,
+            "r": 278.7189542,
+            "t": 354.0216526
+          },
+          "charspan": [
+            0,
+            42
+          ],
+          "page_no": 6
+        }
+      ],
+      "self_ref": "#/texts/103",
+      "text": "These equations should look very familiar!"
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "label": "text",
+      "orig": "In fact, they are almost identical to the Transformer's attention mechanism for computing the relative importance of words in a sentence.",
+      "parent": {
+        "$ref": "#/body"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 318.1717743929203,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 108.0,
+            "r": 503.99754931640024,
+            "t": 337.6326526
+          },
+          "charspan": [
+            0,
+            137
+          ],
+          "page_no": 6
+        }
+      ],
+      "self_ref": "#/texts/104",
+      "text": "In fact, they are almost identical to the Transformer's attention mechanism for computing the relative importance of words in a sentence."
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "label": "section_header",
+      "level": 1,
+      "orig": "3 Transformers are GNNs over Fully Connected Graphs",
+      "parent": {
+        "$ref": "#/body"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 289.4623632,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 108.0,
+            "r": 403.2217088000001,
+            "t": 300.210088
+          },
+          "charspan": [
+            0,
+            51
+          ],
+          "page_no": 6
+        }
+      ],
+      "self_ref": "#/texts/105",
+      "text": "3 Transformers are GNNs over Fully Connected Graphs"
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "label": "text",
+      "orig": "At this point, let us establish a formal equivalence between multi-head attention in Transformers and message passing in Graph Attention Networks (GATs).",
+      "parent": {
+        "$ref": "#/body"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 255.98977439292037,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 107.641,
+            "r": 504.00088907840006,
+            "t": 275.4506526
+          },
+          "charspan": [
+            0,
+            153
+          ],
+          "page_no": 6
+        }
+      ],
+      "self_ref": "#/texts/106",
+      "text": "At this point, let us establish a formal equivalence between multi-head attention in Transformers and message passing in Graph Attention Networks (GATs)."
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "label": "text",
+      "orig": "Transformers can be viewed as GNNs operating on complete graphs, where self-attention models relationships between all input tokens in a sentence S . The multi-head attention in equation 8 can be directly instantiated in the message passing framework as follows (for each head):",
+      "parent": {
+        "$ref": "#/body"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 217.78277439292037,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 107.691,
+            "r": 504.00322799999924,
+            "t": 248.1526526
+          },
+          "charspan": [
+            0,
+            278
+          ],
+          "page_no": 6
+        }
+      ],
+      "self_ref": "#/texts/107",
+      "text": "Transformers can be viewed as GNNs operating on complete graphs, where self-attention models relationships between all input tokens in a sentence S . The multi-head attention in equation 8 can be directly instantiated in the message passing framework as follows (for each head):"
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "label": "formula",
+      "orig": "\u03c8 ( h \u2113 i , h \u2113 j ) = GlobalAttention ( W \u2113 Q h \u2113 i , { W \u2113 K h \u2113 j , \u2200 j \u2208 S} , { W \u2113 V h \u2113 j , \u2200 j \u2208 S} ) , (17)",
+      "parent": {
+        "$ref": "#/body"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 197.61952673256485,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 129.788,
+            "r": 504.66769159999996,
+            "t": 210.29010540000002
+          },
+          "charspan": [
+            0,
+            114
+          ],
+          "page_no": 6
+        }
+      ],
+      "self_ref": "#/texts/108",
+      "text": ""
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "label": "formula",
+      "orig": "= exp( W \u2113 Q h \u2113 i \u00b7 W \u2113 K h \u2113 j ) \u2211 j \u2032 \u2208S exp( W \u2113 Q h \u2113 i \u00b7 W \u2113 K h \u2113 j \u2032 ) \u00b7 W \u2113 V h \u2113 j . (18)",
+      "parent": {
+        "$ref": "#/body"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 165.66752673256485,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 175.95600000000002,
+            "r": 504.6676916,
+            "t": 193.53010540000002
+          },
+          "charspan": [
+            0,
+            99
+          ],
+          "page_no": 6
+        }
+      ],
+      "self_ref": "#/texts/109",
+      "text": ""
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "label": "text",
+      "orig": "Here, \u03c8 ( h \u2113 i , h \u2113 j ) computes the message from token j to token i , with the relative importance of each token computed via attention. Next, the weighted messages from all tokens in the sentence are aggregated via a summation, and the representation of token i is updated as in equation 9 using a token-wise feedforward network \u03d5 :",
+      "parent": {
+        "$ref": "#/body"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 115.05877439292033,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 108.0,
+            "r": 503.9987293439996,
+            "t": 158.32050400000003
+          },
+          "charspan": [
+            0,
+            336
+          ],
+          "page_no": 6
+        }
+      ],
+      "self_ref": "#/texts/110",
+      "text": "Here, \u03c8 ( h \u2113 i , h \u2113 j ) computes the message from token j to token i , with the relative importance of each token computed via attention. Next, the weighted messages from all tokens in the sentence are aggregated via a summation, and the representation of token i is updated as in equation 9 using a token-wise feedforward network \u03d5 :"
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "label": "formula",
+      "orig": "h \u2113 +1 i = \u03d5 ( h \u2113 i , m \u2113 i ) = MLP \uf8eb \uf8ed LayerNorm \uf8eb \uf8ed h \u2113 i + \u2211 j \u2208S \u03c8 ( h \u2113 i , h \u2113 j ) \uf8f6 \uf8f8 \uf8f6 \uf8f8 . (19)",
+      "parent": {
+        "$ref": "#/body"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 74.20552673256486,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 156.652,
+            "r": 504.6676916,
+            "t": 107.8655040000001
+          },
+          "charspan": [
+            0,
+            104
+          ],
+          "page_no": 6
+        }
+      ],
+      "self_ref": "#/texts/111",
+      "text": ""
+    },
+    {
+      "children": [],
+      "content_layer": "furniture",
+      "label": "page_footer",
+      "orig": "6",
+      "parent": {
+        "$ref": "#/body"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 40.04577439292041,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 303.509,
+            "r": 308.4903,
+            "t": 48.59765260000006
+          },
+          "charspan": [
+            0,
+            1
+          ],
+          "page_no": 6
+        }
+      ],
+      "self_ref": "#/texts/112",
+      "text": "6"
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "label": "text",
+      "orig": "We have arrived at exactly the same set of update equations as in Section 1.",
+      "parent": {
+        "$ref": "#/body"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 707.9707743929204,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 107.532,
+            "r": 407.6951753999997,
+            "t": 716.5226526
+          },
+          "charspan": [
+            0,
+            76
+          ],
+          "page_no": 7
+        }
+      ],
+      "self_ref": "#/texts/113",
+      "text": "We have arrived at exactly the same set of update equations as in Section 1."
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "label": "text",
+      "orig": "Thus, Transformers are highly expressive set processing networks. They can learn to capture both local and global context in the data via multi-head attention, without being constrained by the pathologies of pre-defined sparse graph structure as in GNNs [Di Giovanni et al., 2023]. This is especially useful for tasks where we do not have an apriori graph structure, such as in modelling molecular structures. For instance, proteins fold into stable 3D structures through interactions between distant residues, so capturing global relationships is important for ensuring physical validity when predicting protein structures [Jumper et al., 2021].",
+      "parent": {
+        "$ref": "#/body"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 626.1277743929203,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 107.691,
+            "r": 504.0032279999991,
+            "t": 700.1346526
+          },
+          "charspan": [
+            0,
+            646
+          ],
+          "page_no": 7
+        }
+      ],
+      "self_ref": "#/texts/114",
+      "text": "Thus, Transformers are highly expressive set processing networks. They can learn to capture both local and global context in the data via multi-head attention, without being constrained by the pathologies of pre-defined sparse graph structure as in GNNs [Di Giovanni et al., 2023]. This is especially useful for tasks where we do not have an apriori graph structure, such as in modelling molecular structures. For instance, proteins fold into stable 3D structures through interactions between distant residues, so capturing global relationships is important for ensuring physical validity when predicting protein structures [Jumper et al., 2021]."
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "label": "text",
+      "orig": "Conversely, GATs can be viewed as Transformers with attention restricted to local neighbourhoods, where the graph structure is used to implement sparse or masked attention [Dong et al., 2024].",
+      "parent": {
+        "$ref": "#/body"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 598.8307743929204,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 107.641,
+            "r": 505.2446078088005,
+            "t": 618.2916526
+          },
+          "charspan": [
+            0,
+            192
+          ],
+          "page_no": 7
+        }
+      ],
+      "self_ref": "#/texts/115",
+      "text": "Conversely, GATs can be viewed as Transformers with attention restricted to local neighbourhoods, where the graph structure is used to implement sparse or masked attention [Dong et al., 2024]."
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "label": "text",
+      "orig": "This connection has inspired a new development in graph representation learning. Transformers use positional encodings as an initial feature to add information about the sequential ordering of tokens in a sentence, without strictly enforcing a sequential structure. This idea can be extended to graphs, where positional encodings can be used to softly inject information about the graph structure into Transformer blocks [Dwivedi and Bresson, 2020]. This has led to a new class of Graph Transformers [Ramp\u00e1\u0161ek et al., 2022] that aim to combine both local message passing and global multi-head attention. These architectures overcome the expressivity limitations of message passing GNNs while preserving the inductive bias of graph structure.",
+      "parent": {
+        "$ref": "#/body"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 506.0787743929203,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 107.641,
+            "r": 505.242485775,
+            "t": 590.9936526
+          },
+          "charspan": [
+            0,
+            741
+          ],
+          "page_no": 7
+        }
+      ],
+      "self_ref": "#/texts/116",
+      "text": "This connection has inspired a new development in graph representation learning. Transformers use positional encodings as an initial feature to add information about the sequential ordering of tokens in a sentence, without strictly enforcing a sequential structure. This idea can be extended to graphs, where positional encodings can be used to softly inject information about the graph structure into Transformer blocks [Dwivedi and Bresson, 2020]. This has led to a new class of Graph Transformers [Ramp\u00e1\u0161ek et al., 2022] that aim to combine both local message passing and global multi-head attention. These architectures overcome the expressivity limitations of message passing GNNs while preserving the inductive bias of graph structure."
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "label": "section_header",
+      "level": 1,
+      "orig": "4 Transformers are GNNs Winning the Hardware Lottery",
+      "parent": {
+        "$ref": "#/body"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 477.47936319999997,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 108.0,
+            "r": 412.140288,
+            "t": 488.2270879999999
+          },
+          "charspan": [
+            0,
+            52
+          ],
+          "page_no": 7
+        }
+      ],
+      "self_ref": "#/texts/117",
+      "text": "4 Transformers are GNNs Winning the Hardware Lottery"
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "label": "text",
+      "orig": "We will conclude with a discussion on the hardware lottery [Hooker, 2021], the marriage of architectures and hardware that determines which research ideas rise to prominence, and its connection to the bitter lesson in AI research [Sutton, 2019].",
+      "parent": {
+        "$ref": "#/body"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 433.20677439292035,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 107.532,
+            "r": 505.6489250079999,
+            "t": 463.7569794
+          },
+          "charspan": [
+            0,
+            245
+          ],
+          "page_no": 7
+        }
+      ],
+      "self_ref": "#/texts/118",
+      "text": "We will conclude with a discussion on the hardware lottery [Hooker, 2021], the marriage of architectures and hardware that determines which research ideas rise to prominence, and its connection to the bitter lesson in AI research [Sutton, 2019]."
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "label": "text",
+      "orig": "While we have established that Transformers are GNNs operating over fully connected graphs, there is an important practical difference between the two classes of architectures.",
+      "parent": {
+        "$ref": "#/body"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 405.9097743929203,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 107.532,
+            "r": 504.0038288520002,
+            "t": 425.37065259999997
+          },
+          "charspan": [
+            0,
+            176
+          ],
+          "page_no": 7
+        }
+      ],
+      "self_ref": "#/texts/119",
+      "text": "While we have established that Transformers are GNNs operating over fully connected graphs, there is an important practical difference between the two classes of architectures."
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "label": "text",
+      "orig": "Transformers implement global multi-head attention through highly optimized dense matrix multiplication operations that leverage the parallel processing capabilities of modern GPUs and TPUs. Given a matrix of initial representations H \u2208 R n \u00d7 d , the self-attention mechanism for all tokens in the sentence S can be computed in a parallel manner as follows:",
+      "parent": {
+        "$ref": "#/body"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 356.79377439292034,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 107.691,
+            "r": 505.7450491319991,
+            "t": 398.2519794
+          },
+          "charspan": [
+            0,
+            357
+          ],
+          "page_no": 7
+        }
+      ],
+      "self_ref": "#/texts/120",
+      "text": "Transformers implement global multi-head attention through highly optimized dense matrix multiplication operations that leverage the parallel processing capabilities of modern GPUs and TPUs. Given a matrix of initial representations H \u2208 R n \u00d7 d , the self-attention mechanism for all tokens in the sentence S can be computed in a parallel manner as follows:"
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "label": "formula",
+      "orig": "\u02dc H \u2113 = softmax ( H \u2113 W \u2113 Q ( H \u2113 W \u2113 K ) \u22a4 ) ( H \u2113 W \u2113 V ) , (20)",
+      "parent": {
+        "$ref": "#/body"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 334.74252673256484,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 200.25500000000002,
+            "r": 504.6676915999999,
+            "t": 349.99450400000006
+          },
+          "charspan": [
+            0,
+            66
+          ],
+          "page_no": 7
+        }
+      ],
+      "self_ref": "#/texts/121",
+      "text": ""
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "label": "text",
+      "orig": "The multi-head attention mechanism can also be similarly parallelized by performing a single linear transformation for all heads in parallel, followed by reshaping the queries, keys, and values per head to tensors of dimension n \u00d7 k \u00d7 d/k each. The token-wise operations which follow multi-head attention are independent of other tokens and trivially parallelizable as well.",
+      "parent": {
+        "$ref": "#/body"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 283.80377439292033,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 107.691,
+            "r": 504.17274163900026,
+            "t": 325.08265259999996
+          },
+          "charspan": [
+            0,
+            374
+          ],
+          "page_no": 7
+        }
+      ],
+      "self_ref": "#/texts/122",
+      "text": "The multi-head attention mechanism can also be similarly parallelized by performing a single linear transformation for all heads in parallel, followed by reshaping the queries, keys, and values per head to tensors of dimension n \u00d7 k \u00d7 d/k each. The token-wise operations which follow multi-head attention are independent of other tokens and trivially parallelizable as well."
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "label": "text",
+      "orig": "In contrast, GNNs typically perform sparse message passing over locally connected structures, which is substantially less efficient on current GPUs for typical problem scales (with the exception of very sparse or billion-scale graphs). This involves maintaining an index of neighbours for each node, and performing gather and scatter operations to propogate messages [Fey and Lenssen, 2019]. As a result, GNNs are orders of magnitude slower to train and challenging to scale compared to standard Transformers on current hardware.",
+      "parent": {
+        "$ref": "#/body"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 212.86977439292036,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 107.691,
+            "r": 505.24711838399895,
+            "t": 276.14697939999996
+          },
+          "charspan": [
+            0,
+            529
+          ],
+          "page_no": 7
+        }
+      ],
+      "self_ref": "#/texts/123",
+      "text": "In contrast, GNNs typically perform sparse message passing over locally connected structures, which is substantially less efficient on current GPUs for typical problem scales (with the exception of very sparse or billion-scale graphs). This involves maintaining an index of neighbours for each node, and performing gather and scatter operations to propogate messages [Fey and Lenssen, 2019]. As a result, GNNs are orders of magnitude slower to train and challenging to scale compared to standard Transformers on current hardware."
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "label": "text",
+      "orig": "Additionally, with an increasing emphasis on scaling up models and datasets, there is empirical evidence that Transformers can learn the inductive biases baked in to GNNs, such as locality, when trained at sufficient scale. This is particularly effective when models are given appropriate positional encodings as 'hints' about the underlying structure of their input data, without imposing them as hard constraints in the architecture [Jaegle et al., 2021]. The expressivity and flexibility of Transformers makes them the go-to architecture for representation learning on structured data across diverse application domains, including graphs.",
+      "parent": {
+        "$ref": "#/body"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 131.0267743929203,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 107.641,
+            "r": 504.00403725999917,
+            "t": 205.03365259999998
+          },
+          "charspan": [
+            0,
+            641
+          ],
+          "page_no": 7
+        }
+      ],
+      "self_ref": "#/texts/124",
+      "text": "Additionally, with an increasing emphasis on scaling up models and datasets, there is empirical evidence that Transformers can learn the inductive biases baked in to GNNs, such as locality, when trained at sufficient scale. This is particularly effective when models are given appropriate positional encodings as 'hints' about the underlying structure of their input data, without imposing them as hard constraints in the architecture [Jaegle et al., 2021]. The expressivity and flexibility of Transformers makes them the go-to architecture for representation learning on structured data across diverse application domains, including graphs."
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "label": "text",
+      "orig": "Thus, Transformers are Graph Neural Networks that are currently winning the hardware lottery.",
+      "parent": {
+        "$ref": "#/body"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 114.63877439292037,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 107.691,
+            "r": 488.8401507999996,
+            "t": 123.19065260000002
+          },
+          "charspan": [
+            0,
+            93
+          ],
+          "page_no": 7
+        }
+      ],
+      "self_ref": "#/texts/125",
+      "text": "Thus, Transformers are Graph Neural Networks that are currently winning the hardware lottery."
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "label": "text",
+      "orig": "Acknowledgements I am grateful to numerous colleagues for feedback on this article over the years, which has helped shape my understanding of Transformers and GNNs. I would also like to thank The Gradient for providing a platform to share an initial version of this work.",
+      "parent": {
+        "$ref": "#/body"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 69.93377439292033,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 107.751,
+            "r": 504.00256514399916,
+            "t": 100.69219399999997
+          },
+          "charspan": [
+            0,
+            271
+          ],
+          "page_no": 7
+        }
+      ],
+      "self_ref": "#/texts/126",
+      "text": "Acknowledgements I am grateful to numerous colleagues for feedback on this article over the years, which has helped shape my understanding of Transformers and GNNs. I would also like to thank The Gradient for providing a platform to share an initial version of this work."
+    },
+    {
+      "children": [],
+      "content_layer": "furniture",
+      "label": "page_footer",
+      "orig": "7",
+      "parent": {
+        "$ref": "#/body"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 40.04577439292029,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 303.509,
+            "r": 308.4903,
+            "t": 48.59765259999995
+          },
+          "charspan": [
+            0,
+            1
+          ],
+          "page_no": 7
+        }
+      ],
+      "self_ref": "#/texts/127",
+      "text": "7"
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "label": "section_header",
+      "level": 1,
+      "orig": "References",
+      "parent": {
+        "$ref": "#/body"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 707.5383632,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 108.0,
+            "r": 163.54385920000007,
+            "t": 718.2860880000001
+          },
+          "charspan": [
+            0,
+            10
+          ],
+          "page_no": 8
+        }
+      ],
+      "self_ref": "#/texts/128",
+      "text": "References"
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "enumerated": true,
+      "label": "list_item",
+      "marker": "J.",
+      "orig": "J. Achiam, S. Adler, S. Agarwal, L. Ahmad, I. Akkaya, F. L. Aleman, D. Almeida, J. Altenschmidt, et al. Gpt-4 technical report. arXiv preprint arXiv:2303.08774 , 2023. (Cited on page 2)",
+      "parent": {
+        "$ref": "#/groups/3"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 679.5027743929203,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 108.0,
+            "r": 505.2413600012001,
+            "t": 698.9636525999999
+          },
+          "charspan": [
+            0,
+            185
+          ],
+          "page_no": 8
+        }
+      ],
+      "self_ref": "#/texts/129",
+      "text": "Achiam, S. Adler, S. Agarwal, L. Ahmad, I. Akkaya, F. L. Aleman, D. Almeida, J. Altenschmidt, et al. Gpt-4 technical report. arXiv preprint arXiv:2303.08774 , 2023. (Cited on page 2)"
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "enumerated": true,
+      "label": "list_item",
+      "marker": "J.",
+      "orig": "J. L. Ba, J. R. Kiros, and G. E. Hinton. Layer normalization. arXiv preprint arXiv:1607.06450 , 2016. (Cited on page 4)",
+      "parent": {
+        "$ref": "#/groups/3"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 649.8797743929204,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 108.0,
+            "r": 505.7389176660001,
+            "t": 669.5209794
+          },
+          "charspan": [
+            0,
+            119
+          ],
+          "page_no": 8
+        }
+      ],
+      "self_ref": "#/texts/130",
+      "text": "L. Ba, J. R. Kiros, and G. E. Hinton. Layer normalization. arXiv preprint arXiv:1607.06450 , 2016. (Cited on page 4)"
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "enumerated": true,
+      "label": "list_item",
+      "marker": "D.",
+      "orig": "D. Bahdanau, K. Cho, and Y. Bengio. Neural machine translation by jointly learning to align and translate. In ICLR , 2015. (Cited on page 1)",
+      "parent": {
+        "$ref": "#/groups/3"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 620.2577743929203,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 108.0,
+            "r": 503.997210587999,
+            "t": 639.7186525999999
+          },
+          "charspan": [
+            0,
+            140
+          ],
+          "page_no": 8
+        }
+      ],
+      "self_ref": "#/texts/131",
+      "text": "Bahdanau, K. Cho, and Y. Bengio. Neural machine translation by jointly learning to align and translate. In ICLR , 2015. (Cited on page 1)"
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "enumerated": true,
+      "label": "list_item",
+      "marker": "P.",
+      "orig": "P. W. Battaglia, J. B. Hamrick, V. Bapst, A. Sanchez-Gonzalez, V. Zambaldi, et al. Relational inductive biases, deep learning, and graph networks. arXiv preprint , 2018. (Cited on page 5)",
+      "parent": {
+        "$ref": "#/groups/3"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 590.6347743929203,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 108.0,
+            "r": 503.9972105879991,
+            "t": 610.0966526
+          },
+          "charspan": [
+            0,
+            187
+          ],
+          "page_no": 8
+        }
+      ],
+      "self_ref": "#/texts/132",
+      "text": "W. Battaglia, J. B. Hamrick, V. Bapst, A. Sanchez-Gonzalez, V. Zambaldi, et al. Relational inductive biases, deep learning, and graph networks. arXiv preprint , 2018. (Cited on page 5)"
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "enumerated": true,
+      "label": "list_item",
+      "marker": "S.",
+      "orig": "S. Batzner, A. Musaelian, L. Sun, M. Geiger, J. P. Mailoa, M. Kornbluth, N. Molinari, T. E. Smidt, and B. Kozinsky. E (3)-equivariant graph neural networks for data-efficient and accurate interatomic potentials. Nature communications , 2022. (Cited on page 5)",
+      "parent": {
+        "$ref": "#/groups/3"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 550.1037743929203,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 108.0,
+            "r": 504.0013948799997,
+            "t": 580.4736526
+          },
+          "charspan": [
+            0,
+            259
+          ],
+          "page_no": 8
+        }
+      ],
+      "self_ref": "#/texts/133",
+      "text": "Batzner, A. Musaelian, L. Sun, M. Geiger, J. P. Mailoa, M. Kornbluth, N. Molinari, T. E. Smidt, and B. Kozinsky. E (3)-equivariant graph neural networks for data-efficient and accurate interatomic potentials. Nature communications , 2022. (Cited on page 5)"
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "enumerated": true,
+      "label": "list_item",
+      "marker": "R.",
+      "orig": "R. Bommasani, D. A. Hudson, E. Adeli, R. Altman, S. Arora, S. von Arx, M. S. Bernstein, J. Bohg, A. Bosselut, E. Brunskill, E. Brynjolfsson, et al. On the opportunities and risks of foundation models. ArXiv , 2021. (Cited on page 4)",
+      "parent": {
+        "$ref": "#/groups/3"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 509.5717743929203,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 108.0,
+            "r": 505.24460780880037,
+            "t": 539.9416526
+          },
+          "charspan": [
+            0,
+            232
+          ],
+          "page_no": 8
+        }
+      ],
+      "self_ref": "#/texts/134",
+      "text": "Bommasani, D. A. Hudson, E. Adeli, R. Altman, S. Arora, S. von Arx, M. S. Bernstein, J. Bohg, A. Bosselut, E. Brunskill, E. Brynjolfsson, et al. On the opportunities and risks of foundation models. ArXiv , 2021. (Cited on page 4)"
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "enumerated": true,
+      "label": "list_item",
+      "marker": "M.",
+      "orig": "M. M. Bronstein, J. Bruna, T. Cohen, and P. Veli\u02c7 ckovi\u00b4 c. Geometric deep learning: Grids, groups, graphs, geodesics, and gauges. arXiv preprint , 2021. (Cited on page 5)",
+      "parent": {
+        "$ref": "#/groups/3"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 479.94977439292035,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 108.0,
+            "r": 505.24345590399946,
+            "t": 499.4106526
+          },
+          "charspan": [
+            0,
+            171
+          ],
+          "page_no": 8
+        }
+      ],
+      "self_ref": "#/texts/135",
+      "text": "M. Bronstein, J. Bruna, T. Cohen, and P. Veli\u02c7 ckovi\u00b4 c. Geometric deep learning: Grids, groups, graphs, geodesics, and gauges. arXiv preprint , 2021. (Cited on page 5)"
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "enumerated": true,
+      "label": "list_item",
+      "marker": "A.",
+      "orig": "A. Derrow-Pinion, J. She, D. Wong, O. Lange, T. Hester, L. Perez, M. Nunkesser, S. Lee, X. Guo, B. Wiltshire, et al. Eta prediction with graph neural networks in google maps. In Proceedings of the 30th ACM international conference on information & knowledge management , 2021. (Cited on page 5)",
+      "parent": {
+        "$ref": "#/groups/3"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 428.5087743929203,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 108.0,
+            "r": 505.2471183839996,
+            "t": 469.7876526
+          },
+          "charspan": [
+            0,
+            294
+          ],
+          "page_no": 8
+        }
+      ],
+      "self_ref": "#/texts/136",
+      "text": "Derrow-Pinion, J. She, D. Wong, O. Lange, T. Hester, L. Perez, M. Nunkesser, S. Lee, X. Guo, B. Wiltshire, et al. Eta prediction with graph neural networks in google maps. In Proceedings of the 30th ACM international conference on information & knowledge management , 2021. (Cited on page 5)"
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "enumerated": true,
+      "label": "list_item",
+      "marker": "F.",
+      "orig": "F. Di Giovanni, L. Giusti, F. Barbero, G. Luise, P. Lio, and M. M. Bronstein. On over-squashing in message passing neural networks: The impact of width, depth, and topology. In International Conference on Machine Learning . PMLR, 2023. (Cited on page 7)",
+      "parent": {
+        "$ref": "#/groups/3"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 387.97677439292033,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 108.0,
+            "r": 504.0008462252,
+            "t": 418.3476526
+          },
+          "charspan": [
+            0,
+            253
+          ],
+          "page_no": 8
+        }
+      ],
+      "self_ref": "#/texts/137",
+      "text": "Di Giovanni, L. Giusti, F. Barbero, G. Luise, P. Lio, and M. M. Bronstein. On over-squashing in message passing neural networks: The impact of width, depth, and topology. In International Conference on Machine Learning . PMLR, 2023. (Cited on page 7)"
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "enumerated": true,
+      "label": "list_item",
+      "marker": "J.",
+      "orig": "J. Dong, B. Feng, D. Guessous, Y. Liang, and H. He. Flex attention: A programming model for generating optimized attention kernels. arXiv preprint arXiv:2412.05496 , 2024. (Cited on page 7)",
+      "parent": {
+        "$ref": "#/groups/3"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 358.3547743929203,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 108.0,
+            "r": 504.49254836,
+            "t": 377.81565259999996
+          },
+          "charspan": [
+            0,
+            189
+          ],
+          "page_no": 8
+        }
+      ],
+      "self_ref": "#/texts/138",
+      "text": "Dong, B. Feng, D. Guessous, Y. Liang, and H. He. Flex attention: A programming model for generating optimized attention kernels. arXiv preprint arXiv:2412.05496 , 2024. (Cited on page 7)"
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "enumerated": true,
+      "label": "list_item",
+      "marker": "A.",
+      "orig": "A. Dosovitskiy, L. Beyer, A. Kolesnikov, D. Weissenborn, X. Zhai, T. Unterthiner, M. Dehghani, M. Minderer, G. Heigold, S. Gelly, et al. An image is worth 16x16 words: Transformers for image recognition at scale. In International Conference on Learning Representations, ICLR , 2021. (Cited on page 2)",
+      "parent": {
+        "$ref": "#/groups/3"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 306.91377439292035,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 108.0,
+            "r": 505.2471183839993,
+            "t": 348.1926526
+          },
+          "charspan": [
+            0,
+            300
+          ],
+          "page_no": 8
+        }
+      ],
+      "self_ref": "#/texts/139",
+      "text": "Dosovitskiy, L. Beyer, A. Kolesnikov, D. Weissenborn, X. Zhai, T. Unterthiner, M. Dehghani, M. Minderer, G. Heigold, S. Gelly, et al. An image is worth 16x16 words: Transformers for image recognition at scale. In International Conference on Learning Representations, ICLR , 2021. (Cited on page 2)"
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "enumerated": true,
+      "label": "list_item",
+      "marker": "V.",
+      "orig": "V. P. Dwivedi and X. Bresson. A generalization of transformer networks to graphs. arXiv preprint arXiv:2012.09699 , 2020. (Cited on page 7)",
+      "parent": {
+        "$ref": "#/groups/3"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 277.2917743929204,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 108.0,
+            "r": 504.00085624400003,
+            "t": 296.9319794
+          },
+          "charspan": [
+            0,
+            139
+          ],
+          "page_no": 8
+        }
+      ],
+      "self_ref": "#/texts/140",
+      "text": "P. Dwivedi and X. Bresson. A generalization of transformer networks to graphs. arXiv preprint arXiv:2012.09699 , 2020. (Cited on page 7)"
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "enumerated": true,
+      "label": "list_item",
+      "marker": "M.",
+      "orig": "M. Fey and J. E. Lenssen. Fast graph representation learning with PyTorch Geometric. In ICLR Workshop on Representation Learning on Graphs and Manifolds , 2019. (Cited on page 7)",
+      "parent": {
+        "$ref": "#/groups/3"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 247.66877439292034,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 108.0,
+            "r": 503.999733284,
+            "t": 267.3089794
+          },
+          "charspan": [
+            0,
+            178
+          ],
+          "page_no": 8
+        }
+      ],
+      "self_ref": "#/texts/141",
+      "text": "Fey and J. E. Lenssen. Fast graph representation learning with PyTorch Geometric. In ICLR Workshop on Representation Learning on Graphs and Manifolds , 2019. (Cited on page 7)"
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "enumerated": true,
+      "label": "list_item",
+      "marker": "J.",
+      "orig": "J. Gilmer, S. S. Schoenholz, P. F. Riley, O. Vinyals, and G. E. Dahl. Neural message passing for quantum chemistry. In ICML , 2017. (Cited on page 5)",
+      "parent": {
+        "$ref": "#/groups/3"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 218.04677439292038,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 108.0,
+            "r": 504.16996207199946,
+            "t": 237.50765260000003
+          },
+          "charspan": [
+            0,
+            149
+          ],
+          "page_no": 8
+        }
+      ],
+      "self_ref": "#/texts/142",
+      "text": "Gilmer, S. S. Schoenholz, P. F. Riley, O. Vinyals, and G. E. Dahl. Neural message passing for quantum chemistry. In ICML , 2017. (Cited on page 5)"
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "enumerated": true,
+      "label": "list_item",
+      "marker": "X.",
+      "orig": "X. Glorot, A. Bordes, and Y. Bengio. Deep sparse rectifier neural networks. In Proceedings of the fourteenth international conference on artificial intelligence and statistics , 2011. (Cited on page 4)",
+      "parent": {
+        "$ref": "#/groups/3"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 188.42377439292034,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 108.0,
+            "r": 504.6684944479997,
+            "t": 208.0639794
+          },
+          "charspan": [
+            0,
+            201
+          ],
+          "page_no": 8
+        }
+      ],
+      "self_ref": "#/texts/143",
+      "text": "Glorot, A. Bordes, and Y. Bengio. Deep sparse rectifier neural networks. In Proceedings of the fourteenth international conference on artificial intelligence and statistics , 2011. (Cited on page 4)"
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "enumerated": true,
+      "label": "list_item",
+      "marker": "A.",
+      "orig": "A. Graves. Generating sequences with recurrent neural networks. arXiv preprint arXiv:1308.0850 , 2013. (Cited on page 1)",
+      "parent": {
+        "$ref": "#/groups/3"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 158.80177439292038,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 108.0,
+            "r": 505.24506585,
+            "t": 178.44197940000004
+          },
+          "charspan": [
+            0,
+            120
+          ],
+          "page_no": 8
+        }
+      ],
+      "self_ref": "#/texts/144",
+      "text": "Graves. Generating sequences with recurrent neural networks. arXiv preprint arXiv:1308.0850 , 2013. (Cited on page 1)"
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "enumerated": true,
+      "label": "list_item",
+      "marker": "K.",
+      "orig": "K. He, X. Zhang, S. Ren, and J. Sun. Deep residual learning for image recognition. In Proceedings of the IEEE conference on computer vision and pattern recognition , pages 770-778, 2016. (Cited on page 4)",
+      "parent": {
+        "$ref": "#/groups/3"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 118.26977439292034,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 108.0,
+            "r": 504.00007512039997,
+            "t": 148.8189794
+          },
+          "charspan": [
+            0,
+            204
+          ],
+          "page_no": 8
+        }
+      ],
+      "self_ref": "#/texts/145",
+      "text": "He, X. Zhang, S. Ren, and J. Sun. Deep residual learning for image recognition. In Proceedings of the IEEE conference on computer vision and pattern recognition , pages 770-778, 2016. (Cited on page 4)"
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "enumerated": true,
+      "label": "list_item",
+      "marker": "S.",
+      "orig": "S. Hochreiter and J. Schmidhuber. Long short-term memory. Neural computation , 1997. (Cited on page 1)",
+      "parent": {
+        "$ref": "#/groups/3"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 88.6467743929204,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 108.0,
+            "r": 503.999053876,
+            "t": 108.28797940000004
+          },
+          "charspan": [
+            0,
+            102
+          ],
+          "page_no": 8
+        }
+      ],
+      "self_ref": "#/texts/146",
+      "text": "Hochreiter and J. Schmidhuber. Long short-term memory. Neural computation , 1997. (Cited on page 1)"
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "enumerated": true,
+      "label": "list_item",
+      "marker": "S.",
+      "orig": "S. Hooker. The hardware lottery. Communications of the ACM , 2021. (Cited on page 7)",
+      "parent": {
+        "$ref": "#/groups/3"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 69.93377439292033,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 108.0,
+            "r": 458.7919705999999,
+            "t": 78.66497939999999
+          },
+          "charspan": [
+            0,
+            84
+          ],
+          "page_no": 8
+        }
+      ],
+      "self_ref": "#/texts/147",
+      "text": "Hooker. The hardware lottery. Communications of the ACM , 2021. (Cited on page 7)"
+    },
+    {
+      "children": [],
+      "content_layer": "furniture",
+      "label": "page_footer",
+      "orig": "8",
+      "parent": {
+        "$ref": "#/body"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 40.04577439292029,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 303.509,
+            "r": 308.4903,
+            "t": 48.59765259999995
+          },
+          "charspan": [
+            0,
+            1
+          ],
+          "page_no": 8
+        }
+      ],
+      "self_ref": "#/texts/148",
+      "text": "8"
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "enumerated": true,
+      "label": "list_item",
+      "marker": "A.",
+      "orig": "A. Jaegle, S. Borgeaud, J.-B. Alayrac, C. Doersch, C. Ionescu, D. Ding, S. Koppula, D. Zoran, A. Brock, E. Shelhamer, et al. Perceiver io: A general architecture for structured inputs & outputs. arXiv preprint arXiv:2107.14795 , 2021. (Cited on page 7)",
+      "parent": {
+        "$ref": "#/groups/4"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 686.1527743929204,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 108.0,
+            "r": 505.7449433304002,
+            "t": 716.5226526
+          },
+          "charspan": [
+            0,
+            252
+          ],
+          "page_no": 9
+        }
+      ],
+      "self_ref": "#/texts/149",
+      "text": "Jaegle, S. Borgeaud, J.-B. Alayrac, C. Doersch, C. Ionescu, D. Ding, S. Koppula, D. Zoran, A. Brock, E. Shelhamer, et al. Perceiver io: A general architecture for structured inputs & outputs. arXiv preprint arXiv:2107.14795 , 2021. (Cited on page 7)"
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "enumerated": true,
+      "label": "list_item",
+      "marker": "C.",
+      "orig": "C. Joshi. Transformers are graph neural networks. The Gradient , 2020. URL https://thegradi ent.pub/transformers-are-gaph-neural-networks/ . (Cited on page 1)",
+      "parent": {
+        "$ref": "#/groups/4"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 657.5943028,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 108.0,
+            "r": 504.00389983999975,
+            "t": 677.3799794
+          },
+          "charspan": [
+            0,
+            158
+          ],
+          "page_no": 9
+        }
+      ],
+      "self_ref": "#/texts/150",
+      "text": "Joshi. Transformers are graph neural networks. The Gradient , 2020. URL https://thegradi ent.pub/transformers-are-gaph-neural-networks/ . (Cited on page 1)"
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "enumerated": true,
+      "label": "list_item",
+      "marker": "J.",
+      "orig": "J. Jumper, R. Evans, A. Pritzel, T. Green, M. Figurnov, O. Ronneberger, et al. Highly accurate protein structure prediction with alphafold. Nature , 2021. (Cited on page 7)",
+      "parent": {
+        "$ref": "#/groups/4"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 629.3257743929204,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 108.0,
+            "r": 504.0013948799993,
+            "t": 648.7866526
+          },
+          "charspan": [
+            0,
+            172
+          ],
+          "page_no": 9
+        }
+      ],
+      "self_ref": "#/texts/151",
+      "text": "Jumper, R. Evans, A. Pritzel, T. Green, M. Figurnov, O. Ronneberger, et al. Highly accurate protein structure prediction with alphafold. Nature , 2021. (Cited on page 7)"
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "enumerated": true,
+      "label": "list_item",
+      "marker": "T.",
+      "orig": "T. N. Kipf and M. Welling. Semi-supervised classification with graph convolutional networks. In ICLR , 2017. (Cited on page 5)",
+      "parent": {
+        "$ref": "#/groups/4"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 600.9127743929204,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 108.0,
+            "r": 503.9972105879991,
+            "t": 620.3736526
+          },
+          "charspan": [
+            0,
+            126
+          ],
+          "page_no": 9
+        }
+      ],
+      "self_ref": "#/texts/152",
+      "text": "N. Kipf and M. Welling. Semi-supervised classification with graph convolutional networks. In ICLR , 2017. (Cited on page 5)"
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "enumerated": true,
+      "label": "list_item",
+      "marker": "T.",
+      "orig": "T. Mikolov, I. Sutskever, K. Chen, G. S. Corrado, and J. Dean. Distributed representations of words and phrases and their compositionality. Advances in neural information processing systems , 2013. (Cited on page 2)",
+      "parent": {
+        "$ref": "#/groups/4"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 561.5897743929203,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 108.0,
+            "r": 505.7453215232,
+            "t": 591.9596526
+          },
+          "charspan": [
+            0,
+            215
+          ],
+          "page_no": 9
+        }
+      ],
+      "self_ref": "#/texts/153",
+      "text": "Mikolov, I. Sutskever, K. Chen, G. S. Corrado, and J. Dean. Distributed representations of words and phrases and their compositionality. Advances in neural information processing systems , 2013. (Cited on page 2)"
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "enumerated": true,
+      "label": "list_item",
+      "marker": "C.",
+      "orig": "C. Olah. Deep learning, NLP, and representations. Christopher Olah's Blog , 2014. URL https: //colah.github.io/posts/2014-07-NLP-RNNs-Representations/ . (Cited on page 1)",
+      "parent": {
+        "$ref": "#/groups/4"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 533.0313028,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 108.0,
+            "r": 506.61605304,
+            "t": 552.8169794
+          },
+          "charspan": [
+            0,
+            170
+          ],
+          "page_no": 9
+        }
+      ],
+      "self_ref": "#/texts/154",
+      "text": "Olah. Deep learning, NLP, and representations. Christopher Olah's Blog , 2014. URL https: //colah.github.io/posts/2014-07-NLP-RNNs-Representations/ . (Cited on page 1)"
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "enumerated": true,
+      "label": "list_item",
+      "marker": "A.",
+      "orig": "A. Radford, J. Wu, R. Child, D. Luan, D. Amodei, and I. Sutskever. Language models are unsupervised multitask learners. OpenAI , 2019. (Cited on page 1)",
+      "parent": {
+        "$ref": "#/groups/4"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 504.76277439292033,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 108.0,
+            "r": 504.0013948799993,
+            "t": 524.2236526
+          },
+          "charspan": [
+            0,
+            152
+          ],
+          "page_no": 9
+        }
+      ],
+      "self_ref": "#/texts/155",
+      "text": "Radford, J. Wu, R. Child, D. Luan, D. Amodei, and I. Sutskever. Language models are unsupervised multitask learners. OpenAI , 2019. (Cited on page 1)"
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "enumerated": true,
+      "label": "list_item",
+      "marker": "A.",
+      "orig": "A. Radford, J. W. Kim, T. Xu, G. Brockman, C. Mcleavey, and I. Sutskever. Robust speech recognition via large-scale weak supervision. In International Conference on Machine Learning , 2023. (Cited on page 2)",
+      "parent": {
+        "$ref": "#/groups/4"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 465.44077439292033,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 108.0,
+            "r": 504.00159114200005,
+            "t": 495.81065259999997
+          },
+          "charspan": [
+            0,
+            207
+          ],
+          "page_no": 9
+        }
+      ],
+      "self_ref": "#/texts/156",
+      "text": "Radford, J. W. Kim, T. Xu, G. Brockman, C. Mcleavey, and I. Sutskever. Robust speech recognition via large-scale weak supervision. In International Conference on Machine Learning , 2023. (Cited on page 2)"
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "enumerated": true,
+      "label": "list_item",
+      "marker": "C.",
+      "orig": "C. Raffel, N. Shazeer, A. Roberts, K. Lee, S. Narang, M. Matena, Y. Zhou, W. Li, and P. J. Liu. Exploring the limits of transfer learning with a unified text-to-text transformer. Journal of machine learning research , 2020. (Cited on page 1)",
+      "parent": {
+        "$ref": "#/groups/4"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 426.11777439292035,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 108.0,
+            "r": 505.7450491319994,
+            "t": 456.4876526
+          },
+          "charspan": [
+            0,
+            241
+          ],
+          "page_no": 9
+        }
+      ],
+      "self_ref": "#/texts/157",
+      "text": "Raffel, N. Shazeer, A. Roberts, K. Lee, S. Narang, M. Matena, Y. Zhou, W. Li, and P. J. Liu. Exploring the limits of transfer learning with a unified text-to-text transformer. Journal of machine learning research , 2020. (Cited on page 1)"
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "enumerated": true,
+      "label": "list_item",
+      "marker": "L.",
+      "orig": "L. Ramp\u00e1\u0161ek, M. Galkin, V. P. Dwivedi, A. T. Luu, G. Wolf, and D. Beaini. Recipe for a general, powerful, scalable graph transformer. Advances in Neural Information Processing Systems , 2022. (Cited on page 7)",
+      "parent": {
+        "$ref": "#/groups/4"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 386.79577439292035,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 108.0,
+            "r": 505.7418239743999,
+            "t": 417.1656526
+          },
+          "charspan": [
+            0,
+            209
+          ],
+          "page_no": 9
+        }
+      ],
+      "self_ref": "#/texts/158",
+      "text": "Ramp\u00e1\u0161ek, M. Galkin, V. P. Dwivedi, A. T. Luu, G. Wolf, and D. Beaini. Recipe for a general, powerful, scalable graph transformer. Advances in Neural Information Processing Systems , 2022. (Cited on page 7)"
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "enumerated": true,
+      "label": "list_item",
+      "marker": "N.",
+      "orig": "N. Shazeer. Glu variants improve transformer. arXiv preprint arXiv:2002.05202 , 2020. (Cited on page 4)",
+      "parent": {
+        "$ref": "#/groups/4"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 358.3817743929203,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 108.0,
+            "r": 504.0006573119998,
+            "t": 378.0219794
+          },
+          "charspan": [
+            0,
+            103
+          ],
+          "page_no": 9
+        }
+      ],
+      "self_ref": "#/texts/159",
+      "text": "Shazeer. Glu variants improve transformer. arXiv preprint arXiv:2002.05202 , 2020. (Cited on page 4)"
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "enumerated": true,
+      "label": "list_item",
+      "marker": "J.",
+      "orig": "J. M. Stokes, K. Yang, K. Swanson, W. Jin, A. Cubillos-Ruiz, N. M. Donghia, C. R. MacNair, S. French, L. A. Carfrae, Z. Bloom-Ackermann, et al. A deep learning approach to antibiotic discovery. Cell , 2020. (Cited on page 5)",
+      "parent": {
+        "$ref": "#/groups/4"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 319.0597743929203,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 108.0,
+            "r": 505.2471183839994,
+            "t": 349.4296526
+          },
+          "charspan": [
+            0,
+            224
+          ],
+          "page_no": 9
+        }
+      ],
+      "self_ref": "#/texts/160",
+      "text": "M. Stokes, K. Yang, K. Swanson, W. Jin, A. Cubillos-Ruiz, N. M. Donghia, C. R. MacNair, S. French, L. A. Carfrae, Z. Bloom-Ackermann, et al. A deep learning approach to antibiotic discovery. Cell , 2020. (Cited on page 5)"
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "enumerated": true,
+      "label": "list_item",
+      "marker": "I.",
+      "orig": "I. Sutskever, O. Vinyals, and Q. V. Le. Sequence to sequence learning with neural networks. In Advances in neural information processing systems , 2014. (Cited on page 1)",
+      "parent": {
+        "$ref": "#/groups/4"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 290.6457743929203,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 108.0,
+            "r": 503.997210587999,
+            "t": 310.10665259999996
+          },
+          "charspan": [
+            0,
+            170
+          ],
+          "page_no": 9
+        }
+      ],
+      "self_ref": "#/texts/161",
+      "text": "Sutskever, O. Vinyals, and Q. V. Le. Sequence to sequence learning with neural networks. In Advances in neural information processing systems , 2014. (Cited on page 1)"
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "enumerated": true,
+      "label": "list_item",
+      "marker": "R.",
+      "orig": "R. Sutton. The bitter lesson. Incomplete Ideas (blog) , 2019. (Cited on page 7)",
+      "parent": {
+        "$ref": "#/groups/4"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 273.1417743929203,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 107.99999999999997,
+            "r": 419.7189705999998,
+            "t": 281.87297939999996
+          },
+          "charspan": [
+            0,
+            79
+          ],
+          "page_no": 9
+        }
+      ],
+      "self_ref": "#/texts/162",
+      "text": "Sutton. The bitter lesson. Incomplete Ideas (blog) , 2019. (Cited on page 7)"
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "enumerated": true,
+      "label": "list_item",
+      "marker": "A.",
+      "orig": "A. Vaswani, N. Shazeer, N. Parmar, J. Uszkoreit, L. Jones, A. N. Gomez, L. Kaiser, and I. Polosukhin. Attention is all you need. In Advances in neural information processing systems , 2017. (Cited on page 2)",
+      "parent": {
+        "$ref": "#/groups/4"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 233.81877439292032,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 108.0,
+            "r": 505.73927082399945,
+            "t": 264.18965260000004
+          },
+          "charspan": [
+            0,
+            207
+          ],
+          "page_no": 9
+        }
+      ],
+      "self_ref": "#/texts/163",
+      "text": "Vaswani, N. Shazeer, N. Parmar, J. Uszkoreit, L. Jones, A. N. Gomez, L. Kaiser, and I. Polosukhin. Attention is all you need. In Advances in neural information processing systems , 2017. (Cited on page 2)"
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "enumerated": true,
+      "label": "list_item",
+      "marker": "P.",
+      "orig": "P. Veli\u02c7 ckovi\u00b4 c, G. Cucurull, A. Casanova, A. Romero, P. Li\u00f2, and Y. Bengio. Graph Attention Networks. ICLR , 2018. (Cited on page 6)",
+      "parent": {
+        "$ref": "#/groups/4"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 205.40577439292042,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 108.0,
+            "r": 504.00396245999934,
+            "t": 224.86665259999995
+          },
+          "charspan": [
+            0,
+            135
+          ],
+          "page_no": 9
+        }
+      ],
+      "self_ref": "#/texts/164",
+      "text": "Veli\u02c7 ckovi\u00b4 c, G. Cucurull, A. Casanova, A. Romero, P. Li\u00f2, and Y. Bengio. Graph Attention Networks. ICLR , 2018. (Cited on page 6)"
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "enumerated": true,
+      "label": "list_item",
+      "marker": "L.",
+      "orig": "L. Weng. Attention? attention! Lil'Log , 2018. URL http://lilianweng.github.io/lil-log /2018/06/24/attention-attention.html . (Cited on page 2)",
+      "parent": {
+        "$ref": "#/groups/4"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 176.84730279999997,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 108.0,
+            "r": 503.99907329999945,
+            "t": 196.63297939999995
+          },
+          "charspan": [
+            0,
+            143
+          ],
+          "page_no": 9
+        }
+      ],
+      "self_ref": "#/texts/165",
+      "text": "Weng. Attention? attention! Lil'Log , 2018. URL http://lilianweng.github.io/lil-log /2018/06/24/attention-attention.html . (Cited on page 2)"
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "enumerated": true,
+      "label": "list_item",
+      "marker": "R.",
+      "orig": "R. Xiong, Y. Yang, D. He, K. Zheng, S. Zheng, C. Xing, H. Zhang, Y. Lan, L. Wang, and T. Liu. On layer normalization in the transformer architecture. In International conference on machine learning , 2020. (Cited on page 4)",
+      "parent": {
+        "$ref": "#/groups/4"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 137.66977439292032,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 108.0,
+            "r": 505.7450491319997,
+            "t": 168.03965259999995
+          },
+          "charspan": [
+            0,
+            223
+          ],
+          "page_no": 9
+        }
+      ],
+      "self_ref": "#/texts/166",
+      "text": "Xiong, Y. Yang, D. He, K. Zheng, S. Zheng, C. Xing, H. Zhang, Y. Lan, L. Wang, and T. Liu. On layer normalization in the transformer architecture. In International conference on machine learning , 2020. (Cited on page 4)"
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "enumerated": true,
+      "label": "list_item",
+      "marker": "K.",
+      "orig": "K. Xu, W. Hu, J. Leskovec, and S. Jegelka. How powerful are graph neural networks? In ICLR , 2019. (Cited on page 5)",
+      "parent": {
+        "$ref": "#/groups/4"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 109.2567743929203,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 108.0,
+            "r": 505.7431536079999,
+            "t": 128.89697939999996
+          },
+          "charspan": [
+            0,
+            116
+          ],
+          "page_no": 9
+        }
+      ],
+      "self_ref": "#/texts/167",
+      "text": "Xu, W. Hu, J. Leskovec, and S. Jegelka. How powerful are graph neural networks? In ICLR , 2019. (Cited on page 5)"
+    },
+    {
+      "children": [],
+      "content_layer": "body",
+      "enumerated": true,
+      "label": "list_item",
+      "marker": "R.",
+      "orig": "R. Ying, R. He, K. Chen, P. Eksombatchai, W. L. Hamilton, and J. Leskovec. Graph convolutional neural networks for web-scale recommender systems. In Proceedings of the 24th ACM SIGKDD international conference on knowledge discovery & data mining , 2018. (Cited on page 5)",
+      "parent": {
+        "$ref": "#/groups/4"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 69.93377439292033,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 108.0,
+            "r": 504.35751783759997,
+            "t": 100.30365259999996
+          },
+          "charspan": [
+            0,
+            271
+          ],
+          "page_no": 9
+        }
+      ],
+      "self_ref": "#/texts/168",
+      "text": "Ying, R. He, K. Chen, P. Eksombatchai, W. L. Hamilton, and J. Leskovec. Graph convolutional neural networks for web-scale recommender systems. In Proceedings of the 24th ACM SIGKDD international conference on knowledge discovery & data mining , 2018. (Cited on page 5)"
+    },
+    {
+      "children": [],
+      "content_layer": "furniture",
+      "label": "page_footer",
+      "orig": "9",
+      "parent": {
+        "$ref": "#/body"
+      },
+      "prov": [
+        {
+          "bbox": {
+            "b": 40.04577439292029,
+            "coord_origin": "BOTTOMLEFT",
+            "l": 303.50899999999996,
+            "r": 308.49029999999993,
+            "t": 48.59765259999995
+          },
+          "charspan": [
+            0,
+            1
+          ],
+          "page_no": 9
+        }
+      ],
+      "self_ref": "#/texts/169",
+      "text": "9"
+    }
+  ],
+  "version": "1.10.0"
+}
