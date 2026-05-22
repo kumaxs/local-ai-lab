@@ -1,6 +1,22 @@
 # 服务清单
 
-更新时间：2026-05-21
+更新时间：2026-05-22
+
+## GitHub remote
+
+- 类型：public GitHub repository
+- 仓库：`kumaxs/local-ai-lab`
+- remote URL：`git@github.com:kumaxs/local-ai-lab.git`
+- 分支：`main`
+- 最新已确认 remote HEAD：`2df582057132d94f9fc42de1492d9f327aa58e30`
+- 当前角色：ChatGPT 新会话首要读取入口，用于读取 canonical docs 和 commit state。
+- 边界：GitHub 不代表本机运行状态；未提交变更、服务状态、ignored runtime outputs 和本机实际运行情况仍必须由 Codex 或用户本地确认。
+
+## Google Drive / Local-Ai-Lab
+
+- 类型：Google Drive recovery mirror
+- 当前角色：ChatGPT-facing recovery mirror，作为 GitHub-first 恢复之后的第二读取来源。
+- 边界：不再作为首要读取入口；Drive 更新应来自 canonical files 或明确 sync packet，不应单边手写成为新事实源。
 
 ## n8n
 
