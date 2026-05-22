@@ -8,8 +8,13 @@ import sys
 import time
 from typing import Any
 
-from .contract import DEFAULT_TIMEOUT_SECONDS, STATUS_FAILED_INTERNAL
-from .converter import placeholder_convert
+from .contract import (
+    DEFAULT_TIMEOUT_SECONDS,
+    STATUS_FAILED_CONVERSION,
+    STATUS_FAILED_INTERNAL,
+)
+from .converter import docling_convert, placeholder_convert
+from .docling_adapter import DoclingAdapterError
 from .validate import validate_request
 from .writer import utc_now_iso
 
@@ -24,6 +29,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--image-export-mode", default="referenced")
     parser.add_argument("--timeout-seconds", type=int, default=DEFAULT_TIMEOUT_SECONDS)
     parser.add_argument("--output-root")
+    parser.add_argument("--converter", choices=("placeholder", "docling"), default="placeholder")
     return parser
 
 
@@ -61,7 +67,8 @@ def main(argv: list[str] | None = None) -> int:
     started_monotonic = time.monotonic()
     started_at = utc_now_iso()
     try:
-        result = placeholder_convert(
+        converter = placeholder_convert if args.converter == "placeholder" else docling_convert
+        result = converter(
             job_uuid=args.job_uuid,
             input_file_path=validation.input_file_path,
             output_root=args.output_root,
@@ -73,6 +80,22 @@ def main(argv: list[str] | None = None) -> int:
             finished_at=utc_now_iso(),
             duration_seconds=round(time.monotonic() - started_monotonic, 6),
         )
+    except DoclingAdapterError as exc:
+        emit(
+            {
+                "ok": False,
+                "status": STATUS_FAILED_CONVERSION,
+                "job_uuid": args.job_uuid,
+                "output_dir": None,
+                "metadata_path": None,
+                "status_path": None,
+                "error": {
+                    "code": "docling_conversion_unavailable",
+                    "message": str(exc),
+                },
+            }
+        )
+        return 3
     except Exception:
         emit(
             {
