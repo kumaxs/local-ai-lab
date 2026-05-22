@@ -107,7 +107,7 @@ def main(argv: list[str] | None = None) -> int:
                 "status_path": None,
                 "error": {
                     "code": "internal_error",
-                    "message": "internal error while writing placeholder outputs",
+                    "message": "internal error while writing conversion outputs",
                 },
             }
         )

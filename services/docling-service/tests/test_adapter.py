@@ -12,7 +12,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from docling_service import docling_adapter  # noqa: E402
 from docling_service.cli import build_parser, main  # noqa: E402
-from docling_service.contract import STATUS_FAILED_CONVERSION  # noqa: E402
 
 
 VALID_UUID = "550e8400-e29b-41d4-a716-446655440000"
@@ -42,7 +41,14 @@ class AdapterTests(unittest.TestCase):
     def test_is_docling_available_returns_bool(self) -> None:
         self.assertIsInstance(docling_adapter.is_docling_available(), bool)
 
-    def test_docling_converter_controlled_failure(self) -> None:
+    def test_convert_with_docling_rejects_remote_url(self) -> None:
+        with self.assertRaises(docling_adapter.DoclingAdapterError):
+            docling_adapter.convert_with_docling(
+                job_uuid=VALID_UUID,
+                input_file_path="https://example.com/sample.pdf",
+            )
+
+    def test_cli_default_placeholder_success(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             pdf_path = self.make_pdf(tmpdir)
             output_root = Path(tmpdir) / "outputs"
@@ -56,18 +62,16 @@ class AdapterTests(unittest.TestCase):
                         str(pdf_path),
                         "--output-root",
                         str(output_root),
-                        "--converter",
-                        "docling",
                     ]
                 )
 
             payload = json.loads(stdout.getvalue())
-            self.assertNotEqual(exit_code, 0)
-            self.assertFalse(payload["ok"])
-            self.assertEqual(payload["status"], STATUS_FAILED_CONVERSION)
-            self.assertEqual(payload["error"]["code"], "docling_conversion_unavailable")
+            self.assertEqual(exit_code, 0)
+            self.assertTrue(payload["ok"])
+            self.assertEqual(payload["status"], "success")
+            self.assertIsNone(payload["error"])
             self.assertNotIn("Traceback", stdout.getvalue())
-            self.assertFalse((output_root / VALID_UUID).exists())
+            self.assertTrue((output_root / VALID_UUID / "document.md").exists())
 
 
 if __name__ == "__main__":
