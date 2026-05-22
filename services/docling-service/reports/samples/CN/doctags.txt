@@ -1,0 +1,554 @@
+<doctag><page_header><loc_46><loc_22><loc_96><loc_33>第 /G2C/G26 卷第 /G2B 期 /G21/G22/G21/G2C 年 /G2B 月 /G28</page_header>
+<page_header><loc_195><loc_22><loc_310><loc_33>计 算 机 应 用 研 究 /G35 /G48/G48/G46 /G3A /G30 /G41 /G43 /G3A /G31 /G3E /G51 /G42 /G3D /G42 /G41 /G40 /G30 /G4A /G31 /G49 /G4C /G31 /G32 /G48/G45/G43 /G42 /G40 /G3D</page_header>
+<page_header><loc_413><loc_22><loc_454><loc_33>/G5D /G31 /G46 /G5E /G2C/G26 /G5F /G31 /G5E /G2B /G34 /G41 /G4D /G21/G22/G21/G2C</page_header>
+<section_header_level_1><loc_104><loc_49><loc_396><loc_62>时空相关性融合表征的知识追踪模型 /G21</section_header_level_1>
+<text><loc_165><loc_70><loc_334><loc_86>张 /G28 凯 /G33 /G21 付姿姿 /G21 覃正楚 /G22 长江大学 计算机科学学院 /G25 湖北 荆州 /G2C/G23/G2C/G22/G21/G23 /G23</text>
+<text><loc_62><loc_95><loc_443><loc_171>摘 /G28 要 /G21 知识追踪通过对知识点的表示来描述习题 /G25 以此建模知识状态 /G25 最终预测学习者的未来表现 /G27 然而目 前的研究在知识点的表示方面既没有建模历史知识点对当前知识点产生的时间关系上的影响 /G25 又未能刻画习题 内部各知识点之间产生的空间关系上的作用 /G27 为了解决上述问题 /G25 提出了时空相关性融合表征的知识追踪模 型 /G27 首先 /G25 以知识点之间的时间相关程度为基础 /G25 建模历史知识点对当前知识点的时间作用 /G21 其次 /G25 利用图注意 力网络建模习题所包含的若干知识点之间的空间作用 /G25 得到蕴涵了时空信息的知识点表示 /G21 最后 /G25 利用上述知识 点的表示推导出习题的表示 /G25 通过自注意力机制得到当前的知识状态 /G27 在实验阶段 /G25 与五种相关知识追踪模型 在四个真实数据集上进行性能对比 /G25 结果表明提出的模型在性能方面有更出色的表现 /G27 特别地 /G25 在 /G35 /G5A/G5A/G57 /G5A/G38 /G24 /G32 /G42 /G3E/G43 /G3D /G21/G22/G26/G27 数据集中所提模型比五个对比模型在 /G35 /G6C /G4C /G26 /G35 /G4C /G4C 方面分别提升了 /G26 /G2F /G27 /G68 /G6D /G27 /G2F /G27 /G68 和 /G27 /G2F /G23 /G68 /G6D /G21 /G2F /G26 /G68 /G21 消 融实验证明了建模知识点之间时空相关影响的有效性 /G25 训练过程实验表明了提出的模型在知识点的表示及其相 互作用关系的建模等方面具有一定的优势 /G25 应用实例也可看出该模型优于其他知识追踪模型的实际结果 /G27</text>
+<text><loc_62><loc_174><loc_275><loc_179>关键词 /G21 知识追踪 /G21 知识点表示 /G21 时空相关性 /G21 图注意力网络</text>
+<text><loc_62><loc_182><loc_105><loc_187>中图分类号 /G21</text>
+<text><loc_109><loc_182><loc_153><loc_187>/G38 /G36 /G26/G2A/G23 /G28/G28/G28</text>
+<text><loc_153><loc_182><loc_196><loc_187>文献标志码 /G21</text>
+<text><loc_200><loc_182><loc_208><loc_187>/G35</text>
+<text><loc_206><loc_182><loc_237><loc_187>/G28/G28/G28/G28</text>
+<text><loc_237><loc_182><loc_389><loc_187>文章编号 /G21 /G26/G22/G22/G26 /G24 /G23/G29/G25/G2B /G22 /G21/G22/G21/G2C /G23 /G22/G2B /G24 /G22/G26/G2B /G24 /G26/G23/G2A/G26 /G24 /G22/G27</text>
+<text><loc_62><loc_190><loc_219><loc_195>/G39/G31 /G3A /G21 /G26/G22 /G2F /G26/G25/G27/G23/G2C /G3B /G3C /G2F /G3A /G3D /G3D /G3E/G2F /G26/G22/G22/G26 /G24 /G23/G29/G25/G2B /G2F /G21/G22/G21/G23 /G2F /G22/G25 /G2F /G22/G2C/G26/G2C</text>
+<section_header_level_1><loc_94><loc_206><loc_407><loc_213>/G62 /G3E/G31 /G52 /G46 /G42 /G39/G47 /G42 /G43 /G40 /G41 /G30 /G3A /G3E/G47 /G32 /G31 /G39/G42 /G46 /G31 /G49 /G43 /G42 /G32 /G48/G31 /G40 /G41 /G46 /G41 /G3E/G39 /G3D /G48/G41 /G43 /G3A /G41 /G46 /G30 /G31 /G40 /G40 /G42 /G46 /G41 /G43 /G3A /G31 /G3E /G49 /G45/G3D /G3A /G31 /G3E</section_header_level_1>
+<text><loc_195><loc_220><loc_305><loc_226>/G4B /G4A/G41 /G3E/G47 /G62 /G41 /G3A /G33 /G21 /G5C /G45 /G4B /G3A /G56 /G3A /G21 /G61 /G3A /G3E /G4B /G4A/G42 /G3E/G47 /G30 /G4A/G45</text>
+<text><loc_140><loc_229><loc_359><loc_233>/G22 /G3D/G47 /G39/G22 /G22 /G23 /G22 /G26 /G21 /G22 /G27 /G3A /G4A/G2C /G24 /G2D /G3D/G47 /G2F /G24 /G29/G47 /G24 /G21 /G4D /G28/G29/G25/G2C /G49 /G24 /G32 /G29/G2F /G33 /G24 /G2D /G34 /G2F /G2C /G31 /G21 /G5A /G2F /G29/G25/G49 /G39/G22 /G4A /G3F /G4A/G48 /G24 /G2F /G2C/G23/G2C/G22/G21/G23 /G21 /G21 /G39/G2F /G29/G28 /G23</text>
+<text><loc_62><loc_241><loc_444><loc_352>/G21 /G22 /G23 /G24 /G25 /G26/G27 /G24 /G24 /G62 /G3E/G31 /G52 /G46 /G42 /G39/G47 /G42 /G43 /G40 /G41 /G30 /G3A /G3E/G47 /G41 /G3A /G32 /G3D /G43 /G31 /G32 /G31 /G39/G42 /G46 /G43 /G4A/G42 /G3D /G43 /G41 /G43 /G42 /G31 /G49 /G58/G3E/G31 /G52 /G46 /G42 /G39/G47 /G42 /G41 /G3E/G39 /G45/G46 /G43 /G3A /G32 /G41 /G43 /G42 /G46 /G4D /G48/G40 /G42 /G39/G3A /G30 /G43 /G43 /G4A/G42 /G49 /G45/G43 /G45/G40 /G42 /G48/G42 /G40 /G49 /G31 /G40 /G32 /G41 /G3E/G30 /G42 /G31 /G49 /G46 /G42 /G41 /G40 /G3E/G42 /G40 /G3D /G44/G4D /G39/G42 /G3D /G30 /G40 /G3A /G44/G3A /G3E/G47 /G42 /G55 /G42 /G40 /G30 /G3A /G3D /G42 /G3D /G43 /G4A/G40 /G31 /G45/G47 /G4A /G43 /G4A/G42 /G40 /G42 /G48/G40 /G42 /G3D /G42 /G3E/G43 /G41 /G43 /G3A /G31 /G3E /G31 /G49 /G30 /G31 /G3E/G30 /G42 /G48/G43 /G3D /G2F /G54 /G31 /G52 /G42 /G53 /G42 /G40 /G21 /G3A /G3E /G43 /G42 /G40 /G32 /G3D /G31 /G49 /G43 /G4A/G42 /G40 /G42 /G48/G40 /G42 /G3D /G42 /G3E/G43 /G41 /G43 /G3A /G31 /G3E /G31 /G49 /G30 /G31 /G3E/G30 /G42 /G48/G43 /G3D /G21 /G43 /G4A/G42 /G30 /G45/G40 /G40 /G42 /G3E/G43 /G40 /G42 /G3D /G42 /G41 /G40 /G30 /G4A /G39/G31 /G42 /G3D /G3E /G32 /G43 /G32 /G31 /G39/G42 /G46 /G43 /G4A/G42 /G3A /G3E/G49 /G46 /G45/G42 /G3E/G30 /G42 /G31 /G49 /G4A/G3A /G3D /G43 /G31 /G40 /G3A /G30 /G41 /G46 /G58/G3E/G31 /G52 /G46 /G42 /G39/G47 /G42 /G30 /G31 /G3E/G30 /G42 /G48/G43 /G3D /G31 /G3E /G43 /G4A/G42 /G43 /G42 /G32 /G48/G31 /G40 /G41 /G46 /G40 /G42 /G46 /G41 /G43 /G3A /G31 /G3E/G3D /G4A/G3A /G48 /G31 /G49 /G43 /G4A/G42 /G30 /G45/G40 /G40 /G42 /G3E/G43 /G30 /G31 /G3E/G30 /G42 /G48/G43 /G3D /G21 /G3E/G31 /G40 /G39/G31 /G42 /G3D /G3A /G43 /G39/G42 /G3D /G30 /G40 /G3A /G44/G42 /G43 /G4A/G42 /G40 /G31 /G46 /G42 /G31 /G49 /G43 /G4A/G42 /G3D /G48/G41 /G43 /G3A /G41 /G46 /G40 /G42 /G46 /G41 /G43 /G3A /G31 /G3E/G3D /G4A/G3A /G48 /G44/G42 /G43 /G52 /G42 /G42 /G3E /G53 /G41 /G40 /G3A /G31 /G45/G3D /G30 /G31 /G3E/G30 /G42 /G48/G43 /G3D /G3A /G3E /G43 /G4A/G42 /G42 /G55 /G42 /G40 /G30 /G3A /G3D /G42 /G2F /G57 /G3E /G31 /G40 /G39/G42 /G40 /G43 /G31 /G3D /G31 /G46 /G53 /G42 /G43 /G4A/G42 /G3D /G42 /G48/G40 /G31 /G44/G46 /G42 /G32 /G3D /G21 /G43 /G4A/G3A /G3D /G48/G41 /G48/G42 /G40 /G48/G40 /G31 /G48/G31 /G3D /G42 /G39 /G41 /G58/G3E/G31 /G52 /G46 /G42 /G39/G47 /G42 /G43 /G40 /G41 /G30 /G3A /G3E/G47 /G32 /G31 /G39/G42 /G46 /G30 /G4A/G41 /G40 /G41 /G30 /G43 /G42 /G40 /G3A /G56 /G42 /G39 /G44/G4D /G43 /G42 /G32 /G48/G31 /G40 /G41 /G46 /G41 /G3E/G39 /G3D /G48/G41 /G43 /G3A /G41 /G46 /G30 /G31 /G40 /G40 /G42 /G46 /G41 /G43 /G3A /G31 /G3E /G49 /G45/G3D /G3A /G31 /G3E/G2F /G5C /G3A /G40 /G3D /G43 /G31 /G49 /G41 /G46 /G46 /G21 /G44/G41 /G3D /G42 /G39 /G31 /G3E /G43 /G4A/G42 /G39/G42 /G47 /G40 /G42 /G42 /G31 /G49 /G43 /G42 /G32 /G48/G31 /G40 /G41 /G46 /G30 /G31 /G40 /G40 /G42 /G46 /G41 /G43 /G3A /G31 /G3E /G44/G42 /G43 /G52 /G42 /G42 /G3E /G30 /G31 /G3E/G30 /G42 /G48/G43 /G3D /G21 /G3A /G43 /G32 /G31 /G39/G42 /G46 /G46 /G42 /G39 /G43 /G4A/G42 /G43 /G42 /G32 /G48/G31 /G40 /G41 /G46 /G42 /G49 /G49 /G42 /G30 /G43 /G31 /G49 /G4A/G3A /G3D /G43 /G31 /G40 /G3A /G30 /G41 /G46 /G30 /G31 /G3E/G30 /G42 /G48/G43 /G3D /G49 /G40 /G31 /G32 /G30 /G45/G40 /G40 /G42 /G3E/G43 /G30 /G31 /G3E/G24 /G30 /G42 /G48/G43 /G3D /G2F /G5A/G42 /G30 /G31 /G3E/G39/G46 /G4D /G21 /G3A /G43 /G32 /G31 /G39/G42 /G46 /G46 /G42 /G39 /G43 /G4A/G42 /G3D /G48/G41 /G43 /G3A /G41 /G46 /G3A /G3E/G43 /G42 /G40 /G41 /G30 /G43 /G3A /G31 /G3E /G44/G42 /G43 /G52 /G42 /G42 /G3E /G3D /G42 /G53 /G42 /G40 /G41 /G46 /G30 /G31 /G3E/G30 /G42 /G48/G43 /G3D /G30 /G31 /G3E/G43 /G41 /G3A /G3E/G42 /G39 /G3A /G3E /G43 /G4A/G42 /G42 /G55 /G42 /G40 /G30 /G3A /G3D /G42 /G43 /G31 /G31 /G44/G43 /G41 /G3A /G3E /G43 /G4A/G42 /G40 /G42 /G48/G40 /G42 /G3D /G42 /G3E/G43 /G41 /G24 /G43 /G3A /G31 /G3E /G31 /G49 /G58/G3E/G31 /G52 /G46 /G42 /G39/G47 /G42 /G48/G31 /G3A /G3E/G43 /G3D /G30 /G31 /G3E/G43 /G41 /G3A /G3E/G3A /G3E/G47 /G43 /G42 /G32 /G48/G31 /G40 /G41 /G46 /G41 /G3E/G39 /G3D /G48/G41 /G43 /G3A /G41 /G46 /G3A /G3E/G49 /G31 /G40 /G32 /G41 /G43 /G3A /G31 /G3E /G43 /G4A/G40 /G31 /G45/G47 /G4A /G43 /G4A/G42 /G47 /G40 /G41 /G48/G4A /G41 /G43 /G43 /G42 /G3E/G43 /G3A /G31 /G3E /G3E/G42 /G43 /G52 /G31 /G40 /G58/G2F /G5C /G3A /G3E/G41 /G46 /G46 /G4D /G21 /G3A /G43 /G45/G3D /G42 /G39 /G43 /G4A/G42 /G41 /G44/G31 /G53 /G42 /G40 /G42 /G48/G40 /G42 /G3D /G42 /G3E/G43 /G41 /G43 /G3A /G31 /G3E /G31 /G49 /G30 /G31 /G3E/G30 /G42 /G48/G43 /G3D /G43 /G31 /G39/G42 /G40 /G3A /G53 /G42 /G43 /G4A/G42 /G40 /G42 /G48/G40 /G42 /G3D /G42 /G3E/G43 /G41 /G43 /G3A /G31 /G3E /G31 /G49 /G43 /G4A/G42 /G42 /G55 /G42 /G40 /G30 /G3A /G3D /G42 /G3D /G21 /G41 /G3E/G39 /G47 /G42 /G3E/G42 /G40 /G41 /G43 /G42 /G39 /G43 /G4A/G42 /G30 /G45/G40 /G40 /G42 /G3E/G43 /G3D /G43 /G41 /G43 /G42 /G31 /G49 /G58/G3E/G31 /G52 /G46 /G42 /G39/G47 /G42 /G43 /G4A/G40 /G31 /G45/G47 /G4A /G43 /G4A/G42 /G3D /G42 /G46 /G49 /G24 /G41 /G43 /G43 /G42 /G3E/G43 /G3A /G31 /G3E /G32 /G42 /G30 /G4A/G41 /G3E/G3A /G3D /G32 /G2F /G57 /G3E /G43 /G4A/G42 /G42 /G55 /G48/G42 /G40 /G3A /G32 /G42 /G3E/G43 /G41 /G46 /G3D /G43 /G41 /G47 /G42 /G21 /G43 /G4A/G3A /G3D /G48/G41 /G48/G42 /G40 /G30 /G31 /G32 /G48/G41 /G40 /G42 /G39 /G43 /G4A/G42 /G48/G42 /G40 /G49 /G31 /G40 /G32 /G41 /G3E/G30 /G42 /G31 /G49 /G43 /G4A/G42 /G48/G40 /G31 /G48/G31 /G3D /G42 /G39 /G32 /G31 /G39/G42 /G46 /G52 /G3A /G43 /G4A /G43 /G4A/G42 /G49 /G3A /G53 /G42 /G40 /G42 /G46 /G42 /G53 /G41 /G3E/G43 /G58/G3E/G31 /G52 /G46 /G42 /G39/G47 /G42 /G43 /G40 /G41 /G30 /G3A /G3E/G47 /G32 /G31 /G39/G42 /G46 /G3D /G31 /G3E /G49 /G31 /G45/G40 /G40 /G42 /G41 /G46 /G39/G41 /G43 /G41 /G3D /G42 /G43 /G3D /G2F /G38 /G4A/G42 /G40 /G42 /G3D /G45/G46 /G43 /G3D /G3D /G4A/G31 /G52/G43 /G4A/G41 /G43 /G43 /G4A/G42 /G48/G40 /G31 /G48/G31 /G3D /G42 /G39 /G32 /G31 /G39/G42 /G46 /G4A/G41 /G3D /G44/G42 /G43 /G43 /G42 /G40 /G48/G42 /G40 /G24 /G49 /G31 /G40 /G32 /G41 /G3E/G30 /G42 /G2F /G57 /G3E /G48/G41 /G40 /G43 /G3A /G30 /G45/G46 /G41 /G40 /G21 /G30 /G31 /G32 /G48/G41 /G40 /G42 /G39 /G43 /G31 /G43 /G4A/G42 /G49 /G3A /G53 /G42 /G30 /G31 /G32 /G48/G41 /G40 /G41 /G43 /G3A /G53 /G42 /G32 /G31 /G39/G42 /G46 /G3D /G31 /G3E /G43 /G4A/G42 /G35 /G5A/G5A/G57 /G5A/G38 /G32 /G42 /G3E/G43 /G3D /G21/G22/G26/G27 /G39/G41 /G43 /G41 /G3D /G42 /G43 /G21 /G43 /G4A/G42 /G35 /G6C /G4C /G41 /G3E/G39 /G35 /G4C /G4C /G41 /G40 /G42 /G3A /G32 /G24 /G48/G40 /G31 /G53 /G42 /G39 /G44/G4D /G26 /G2F /G27 /G68 /G6D /G27 /G2F /G27 /G68 /G41 /G3E/G39 /G27 /G2F /G23 /G68 /G6D /G26/G21 /G2F /G26 /G68 /G21 /G40 /G42 /G3D /G48/G42 /G30 /G43 /G3A /G53 /G42 /G46 /G4D /G2F /G35 /G43 /G43 /G4A/G42 /G3D /G41 /G32 /G42 /G43 /G3A /G32 /G42 /G21 /G43 /G4A/G42 /G41 /G44/G46 /G41 /G43 /G3A /G31 /G3E /G42 /G55 /G48/G42 /G40 /G3A /G32 /G42 /G3E/G43 /G48/G40 /G31 /G53 /G42 /G3D /G43 /G4A/G42 /G42 /G49 /G49 /G42 /G30 /G43 /G3A /G53 /G42 /G24 /G3E/G42 /G3D /G3D /G31 /G49 /G32 /G31 /G39/G42 /G46 /G3A /G3E/G47 /G43 /G4A/G42 /G43 /G42 /G32 /G48/G31 /G40 /G41 /G46 /G41 /G3E/G39 /G3D /G48/G41 /G43 /G3A /G41 /G46 /G30 /G31 /G40 /G40 /G42 /G46 /G41 /G43 /G3A /G31 /G3E /G44/G42 /G43 /G52 /G42 /G42 /G3E /G30 /G31 /G3E/G30 /G42 /G48/G43 /G3D /G21 /G41 /G3E/G39 /G43 /G4A/G42 /G43 /G40 /G41 /G3A /G3E/G3A /G3E/G47 /G48/G40 /G31 /G30 /G42 /G3D /G3D /G42 /G55 /G48/G42 /G40 /G3A /G32 /G42 /G3E/G43 /G3D /G4A/G31 /G52 /G3D /G43 /G4A/G41 /G43 /G43 /G4A/G42 /G48/G40 /G31 /G24 /G48/G31 /G3D /G42 /G39 /G32 /G31 /G39/G42 /G46 /G4A/G41 /G3D /G30 /G42 /G40 /G43 /G41 /G3A /G3E /G41 /G39/G53 /G41 /G3E/G43 /G41 /G47 /G42 /G3D /G3A /G3E /G43 /G4A/G42 /G40 /G42 /G48/G40 /G42 /G3D /G42 /G3E/G43 /G41 /G43 /G3A /G31 /G3E /G31 /G49 /G30 /G31 /G3E/G30 /G42 /G48/G43 /G3D /G41 /G3E/G39 /G43 /G4A/G42 /G32 /G31 /G39/G42 /G46 /G3A /G3E/G47 /G31 /G49 /G43 /G4A/G42 /G3A /G40 /G3A /G3E/G43 /G42 /G40 /G41 /G30 /G43 /G3A /G31 /G3E /G40 /G42 /G46 /G41 /G43 /G3A /G31 /G3E/G3D /G4A/G3A /G48/G3D /G2F /G38 /G4A/G42 /G41 /G48/G48/G46 /G3A /G30 /G41 /G43 /G3A /G31 /G3E /G42 /G55 /G41 /G32 /G48/G46 /G42 /G3D /G30 /G41 /G3E /G41 /G46 /G3D /G31 /G3D /G4A/G31 /G52/G43 /G4A/G41 /G43 /G43 /G4A/G42 /G32 /G31 /G39/G42 /G46 /G4A/G41 /G3D /G44/G42 /G43 /G43 /G42 /G40 /G48/G40 /G41 /G30 /G43 /G3A /G30 /G41 /G46 /G40 /G42 /G3D /G45/G46 /G43 /G3D /G43 /G4A/G41 /G3E /G31 /G43 /G4A/G42 /G40 /G58/G3E/G31 /G52 /G46 /G42 /G39/G47 /G42 /G43 /G40 /G41 /G30 /G3A /G3E/G47 /G32 /G31 /G39/G42 /G46 /G3D /G2F /G28 /G29 /G2A /G2B /G2C/G25 /G2D /G23 /G24 /G58/G3E/G31 /G52 /G46 /G42 /G39/G47 /G42 /G43 /G40 /G41 /G30 /G3A /G3E/G47 /G25 /G30 /G31 /G3E/G30 /G42 /G48/G43 /G40 /G42 /G48/G40 /G42 /G3D /G42 /G3E/G43 /G41 /G43 /G3A /G31 /G3E /G25 /G43 /G42 /G32 /G48/G31 /G40 /G41 /G46 /G41 /G3E/G39 /G3D /G48/G41 /G43 /G3A /G41 /G46 /G30 /G31 /G40 /G40 /G42 /G46 /G41 /G43 /G3A /G31 /G3E /G25 /G47 /G40 /G41 /G48/G4A /G41 /G43 /G43 /G42 /G3E/G43 /G3A /G31 /G3E /G3E/G42 /G43 /G52 /G31 /G40 /G58</text>
+<section_header_level_1><loc_41><loc_367><loc_73><loc_372>/G21 /G22 引言</section_header_level_1>
+<text><loc_42><loc_379><loc_242><loc_423>知识追踪是智慧教育领域中一项重要的研究内容 /G21 其主要 任务是分析学习行为数据 /G29 建模学习者知识状态的变化过程 /G29 预测学习者的未来作答表现 /G26 知识追踪模型目前应用于各类 在线教育平台 /G21 如国家高等教育智慧教育平台 /G29 学堂在线 /G29 /G4C /G31 /G45/G40 /G3D /G42 /G40 /G41 等 /G21 为智慧教育平台实现个性化的教与学提供理论依 据和技术支撑 /G27 /G26 /G6D /G23 /G28 /G26</text>
+<text><loc_57><loc_427><loc_242><loc_431>知识点的表示是知识追踪领域的关键科学问题 /G21 目前的研</text>
+<text><loc_258><loc_363><loc_458><loc_399>究主要集中在两个方面 /G24 /G41 /G23 利用历史知识点对当前知识点在 时间上的影响来丰富知识点的表示 /G25 /G44 /G23 通过描述习题中若干 知识点之间在空间上的相互关系 /G21 来增强知识点的表示 /G26 这些 研究试图从时间和空间等多个方面建模知识点之间的相互影 响或作用 /G21 从而更加准确地描述知识点 /G26</text>
+<text><loc_258><loc_402><loc_458><loc_431>尽管当前的研究在刻画知识点方面取得了不错的效果 /G21 但 仍存在一定的局限性 /G26 其中 /G21 对知识点的表示仅通过卷积网络 提取时间窗口内知识点之间的影响 /G21 没有从全局考虑时间窗口 的大小 /G25 仅利用图神经网络聚合习题内部知识点之间空间上的</text>
+<footnote><loc_42><loc_444><loc_458><loc_455>收稿日期 /G21 /G21/G22/G21/G23 /G24 /G22/G25 /G24 /G26/G29 /G21 修回日期 /G21 /G21/G22/G21/G23 /G24 /G26/G26 /G24 /G22/G29 /G28/G28 基金项目 /G21 国家自然科学基金资助项目 /G22 /G29/G21/G22/G27/G27/G22/G26/G2A /G23 /G21 国家科技部高端外国专家引进计划 资助项目 /G22 /G3F /G21/G22/G21/G21/G22/G21/G27/G22/G22/G29 /G4E /G23 /G21 湖北省自然科学基金资助项目 /G22 /G21/G22/G21/G21 /G4C /G5C /G69 /G26/G23/G21 /G23 /G21 湖北本科高校省级教学改革研究资助项目 /G22 /G21/G22/G21/G23/G21/G27/G23 /G23</footnote>
+<footnote><loc_42><loc_458><loc_458><loc_476>作者简介 /G21 张凯 /G22 /G26/G25/G2A/G22 /G24/G23 /G25 男 /G22 通信作者 /G23 /G25 湖北武汉人 /G25 教授 /G25 硕导 /G25 博士 /G25 主要研究方向为图神经网络 /G26 贝叶斯深度学习 /G26 知识追踪 /G26 知识图谱 /G22 /G58/G41 /G3A /G2F /G56 /G4A/G41 /G3E/G47 /G2D/G4D /G41 /G3E/G47 /G43 /G56 /G42 /G45/G2F /G42 /G39/G45/G2F /G30 /G3E /G23 /G21 付姿姿 /G22 /G21/G22/G22/G26 /G24/G23 /G25 女 /G25 湖北孝感人 /G25 硕士研究生 /G25 主要研究方向为知识追踪 /G21 覃正楚 /G22 /G26/G25/G25/G2A /G24/G23 /G25 男 /G22 土家族 /G23 /G25 湖北宜昌 人 /G25 硕士研究生 /G25 主要研究方向为知识追踪 /G2F</footnote>
+<page_break>
+<page_header><loc_46><loc_28><loc_81><loc_34>/G30 /G26/G23/G2A/G21 /G30</page_header>
+<page_header><loc_211><loc_29><loc_290><loc_34>计 算 机 应 用 研 究</page_header>
+<page_header><loc_427><loc_29><loc_458><loc_34>/G28 第 /G2C/G26 卷</page_header>
+<text><loc_42><loc_29><loc_49><loc_34>/G28</text>
+<text><loc_42><loc_42><loc_242><loc_63>作用 /G21 未能注意到知识点之间作用程度的区别 /G26 本文提出了时 空相关性融合表征的知识追踪模型 /G21 在现有研究的基础上进行 了一定的改进 /G21 主要创新如下 /G24</text>
+<text><loc_42><loc_66><loc_242><loc_94>/G41 /G23 针对知识点的表示建模时间影响不充分这一问题 /G21 提 出了一种新的方法 /G26 首先计算知识点之间的时间相关程度 /G21 根 据时间先后信息建模全局历史知识点对当前知识点的影响 /G21 得 到知识点的时间相关表示 /G26</text>
+<text><loc_42><loc_97><loc_242><loc_134>/G44 /G23 在上述知识点时间相关表示的基础上 /G21 针对知识点的 表示建模空间作用不精准这一问题 /G21 提出一种新的方法 /G26 首先 计算习题内部各个知识点之间的空间相关程度 /G21 以此为依据聚 合习题内部知识点之间的空间作用 /G21 得到知识点的时空相关 表示 /G26</text>
+<section_header_level_1><loc_41><loc_142><loc_90><loc_147>/G23 /G22 相关工作</section_header_level_1>
+<section_header_level_1><loc_41><loc_156><loc_122><loc_161>/G23 /G29 /G23 /G22 知识点的传统表示</section_header_level_1>
+<text><loc_42><loc_165><loc_242><loc_273>深度知识追踪 /G22 /G39/G42 /G42 /G48 /G58/G3E/G31 /G52 /G46 /G42 /G39/G47 /G42 /G43 /G40 /G41 /G30 /G3A /G3E/G47 /G21 /G5B /G62 /G38 /G23 /G27 /G2C /G28 首次把深 度模型应用于知识追踪领域 /G21 它把学习者与习题的交互数据输 入递归神经网络来建模知识状态 /G21 没有考虑到知识点的直接表 示 /G21 未显式建模知识点间的相互关系 /G26 在 /G5B /G62 /G38 模型的基础上 /G21 /G62 /G38 /G4C /G51 /G27 /G2B /G28 模型利用矩阵 /G27 将习题映射为知识点 /G21 /G5F /G62 /G38 /G5C /G27 /G29 /G28 模型 则通过专家标注得到习题中的知识点 /G26 刘坤佳等人 /G27 /G27 /G28 通过挖 掘习题上下文信息得到新的习题与知识点表示 /G26 更进一步地 /G21 /G5B /G62 /G5D /G34 /G5F /G27 /G2A /G28 模型用一个静态矩阵来存储知识点表示 /G21 与这种方 法类似的还有李晓光等人 /G27 /G25 /G28 提出的 /G4E /G5C /G62 /G38 模型和宗晓萍等 人 /G27 /G26/G22 /G28 提出的 /G34 /G5A/G62 /G38 模型 /G26 上述模型的知识点表示一般仅包含 了知识点本身的信息 /G21 是知识追踪研究初期常用的方法 /G21 属于 知识点的传统表示 /G26 这些表示方法忽略了以往多个时刻的知 识点对当前知识点的影响 /G21 也没有从空间关系考虑知识点之间 的相互作用 /G26</text>
+<text><loc_42><loc_276><loc_242><loc_312>知识点的表示会受到知识点之间存在的时间或空间上关 系的影响 /G21 例如学习者先作答了考查加法的习题 /G21 后续作答了 考查乘除混合运算的习题 /G21 则后续的知识点会受到先前知识点 在时间上的影响 /G26 另一方面 /G21 后续习题所包含的乘法和除法知 识点也会受到彼此空间上的影响 /G26</text>
+<section_header_level_1><loc_41><loc_317><loc_137><loc_321>/G23 /G29 /G24 /G22 知识点的时间相关表示</section_header_level_1>
+<text><loc_42><loc_326><loc_243><loc_441>/G38 /G4C /G5F /G24 /G62 /G38 /G27 /G26/G26 /G28 模型融合了学习者的先验基础来建模习题的 表示 /G21 并利用卷积模型的缺省功能提取时间窗口内习题的相互 影响 /G26 /G4C /G62 /G38 /G27 /G26/G21 /G28 模型把习题映射为知识点 /G21 使用层次卷积建模 历史知识点对当前知识点的作用 /G26 /G34 /G35 /G5C /G62 /G38 /G27 /G26/G23 /G28 模型使用时间卷 积网络刻画了多尺度的知识点表示 /G21 描述了不同时刻知识点之 间的相互作用 /G21 融合得到了新的知识点表示 /G26 /G34 /G4E /G69 /G24 /G62 /G38 /G27 /G26/G2C /G28 模型 利用多种学习行为数据建模知识点表示 /G21 并通过学习行为间的 协同性和约束性 /G21 构建历史知识点对当前知识点的影响 /G26 李浩 君等人 /G27 /G26/G2B /G28 使用双向 /G3F /G51 /G6C 网络建模知识点表示 /G21 一定程度上描 述了历史知识点对当前知识点间的作用关系 /G26 上述研究都是 用不同的方法建模历史知识点对当前知识点的影响 /G21 融合时间 信息来丰富知识点的表示 /G26 但这种方式在建模知识点间的相 互作用时使用的是片段时间信息 /G21 仅考虑了时间窗口内的知识 点相互作用 /G21 一般也没有注意到空间关系对知识点之间相互作 用的影响 /G26</text>
+<section_header_level_1><loc_41><loc_446><loc_137><loc_451>/G23 /G29 /G2A /G22 知识点的空间相关表示</section_header_level_1>
+<text><loc_42><loc_455><loc_242><loc_476>/G3F /G62 /G38 /G27 /G26/G29 /G28 模型利用图结构表示知识点之间的空间关系 /G21 通 过聚合和更新操作建模知识点的表示 /G26 /G3F /G57 /G62 /G38 /G27 /G26/G27 /G28 模型则在 /G3F /G62 /G38 的基础上把习题映射为图中节点 /G21 但没有建模知识点之</text>
+<text><loc_292><loc_29><loc_300><loc_34>/G28</text>
+<text><loc_258><loc_41><loc_458><loc_103>间的关系 /G26 /G3F /G35 /G62 /G38 /G24 /G57 /G51 /G38 /G27 /G26/G2A /G28 模型将图注意力网络与项目反映理 论相结合 /G21 刻画包含空间信息的知识点表示 /G26 /G38 /G31 /G3E/G47 等人 /G27 /G26/G25 /G28 利 用知识结构中的多种空间关系来模拟知识点之间的影响传播 /G21 以此建模知识点表示 /G26 郑浩东等人 /G27 /G21/G22 /G28 使用知识图来描述知识 点之间的相关性 /G21 融入知识状态的变化过程 /G26 上述模型都是以 不同的方式建模知识点的空间关系 /G21 利用图神经网络的缺省功 能刻画知识点之间的相互作用 /G21 以此来描述知识点 /G21 但是忽略 了历史多个时刻的知识点对当前知识点的影响 /G26</text>
+<text><loc_258><loc_106><loc_458><loc_158>综上所述 /G21 三个方面的知识点表示研究均为通过不同方 式建模知识点之间的相互作用 /G21 刻画知识点的表示 /G26 然而 /G21 当前研究尚未完整地从时间关系的角度建模历史知识点对 当前知识点的作用关系 /G21 未能从空间关系的角度描述习题包 含的若干知识点之间的相互影响 /G26 为了更好地表示知识点 及其相互作用关系 /G21 本文从时间和空间的角度建模了知识点 的表示 /G26</text>
+<section_header_level_1><loc_257><loc_166><loc_412><loc_172>/G24 /G22 时空相关性融合表征的知识追踪模型</section_header_level_1>
+<section_header_level_1><loc_257><loc_181><loc_315><loc_186>/G24 /G29 /G23 /G22 提出的思想</section_header_level_1>
+<text><loc_258><loc_190><loc_464><loc_322>在学习者与习题交互过程中 /G21 历史知识点会影响当前知识 点的表示 /G21 比如对三角函数知识点的学习会影响到后续对正弦 函数知识点的学习 /G26 另一方面 /G21 习题内部的知识点之间也会存 在相互作用 /G21 比如在同时具有正弦函数和余弦函数知识点的习 题中 /G21 这两个知识点也会相互影响 /G26 上述两种知识点之间的影 响方式从时间和空间关系上作用于知识点的表示 /G21 现有研究尚 未完整地建模这两种影响 /G26 本文提出了一种时空相关性融合 表征的知识追踪模型 /G22 /G58/G3E/G31 /G52 /G46 /G42 /G39/G47 /G42 /G43 /G40 /G41 /G30 /G3A /G3E/G47 /G31 /G49 /G43 /G42 /G32 /G48/G31 /G40 /G41 /G46 /G41 /G3E/G39 /G3D /G48/G41 /G43 /G3A /G41 /G46 /G30 /G31 /G40 /G40 /G42 /G46 /G41 /G43 /G3A /G31 /G3E /G49 /G45/G3D /G3A /G31 /G3E /G21 /G38 /G5A/G62 /G38 /G23 /G21 利用历史知识点与当前知识点在时 间上的相关性 /G21 以及习题中各个知识点在空间上的相关性 /G21 从 时空角度来建模知识点之间的相互影响 /G21 增强知识点的表示 /G26 模型共分为三个部分 /G24 /G41 /G23 输入模块 /G21 嵌入表示习题 /G57 /G5B /G29 知识点 /G57 /G5B 和学习行为等输入数据 /G25 /G44 /G23 时空相关性模块 /G21 从时间和空间 上建模知识点之间的相互影响 /G21 得到蕴涵时空信息的知识点表 示 /G21 以此推导出习题表示 /G21 计算当前知识状态 /G25 /G30 /G23 预测更新模 块 /G21 描述学习者知识状态的变化 /G21 预测学习者未来的答题情况 /G26 整体模型的架构如图 /G26 所示 /G26</text>
+<picture><loc_270><loc_326><loc_445><loc_345><caption><loc_295><loc_350><loc_420><loc_354>图 /G26 /G28 时空相关性融合表征的知识追踪模型</caption></picture>
+<text><loc_259><loc_356><loc_457><loc_360>/G5C /G3A /G47 /G2F /G26 /G28/G62 /G3E/G31 /G52 /G46 /G42 /G39/G47 /G42 /G43 /G40 /G41 /G30 /G3A /G3E/G47 /G32 /G31 /G39/G42 /G46 /G31 /G49 /G43 /G42 /G32 /G48/G31 /G40 /G41 /G46 /G41 /G3E/G39 /G3D /G48/G41 /G43 /G3A /G41 /G46 /G30 /G31 /G40 /G40 /G42 /G46 /G41 /G43 /G3A /G31 /G3E /G49 /G45/G3D /G3A /G31 /G3E</text>
+<section_header_level_1><loc_257><loc_365><loc_307><loc_369>/G24 /G29 /G24 /G22 符号定义</section_header_level_1>
+<text><loc_258><loc_374><loc_458><loc_387>为了准确描述 /G38 /G5A/G62 /G38 模型各部分的功能 /G21 表 /G26 给出了模型 的相关符号定义 /G26</text>
+<caption><loc_336><loc_390><loc_380><loc_394>表 /G26 /G28 符号定义</caption>
+<otsl><loc_257><loc_402><loc_459><loc_441><fcel><text><loc_266><loc_407><loc_278><loc_411>符号</text>
+<text><loc_316><loc_407><loc_328><loc_411>含义</text>
+<text><loc_369><loc_407><loc_381><loc_411>符号</text>
+<text><loc_420><loc_407><loc_431><loc_411>含义</text>
+<text><loc_270><loc_416><loc_276><loc_420>/G37</text>
+<text><loc_305><loc_416><loc_340><loc_420>知识点的总数</text>
+<text><loc_373><loc_416><loc_376><loc_420>/G2A</text>
+<text><loc_414><loc_416><loc_437><loc_420>表示维度</text>
+<text><loc_270><loc_426><loc_276><loc_429>/G3C</text>
+<text><loc_307><loc_426><loc_337><loc_429>习题的总数</text>
+<text><loc_373><loc_426><loc_379><loc_429>/G3B</text>
+<text><loc_411><loc_426><loc_440><loc_429>表示总时刻</text>
+<text><loc_271><loc_435><loc_277><loc_439>/G2C</text>
+<text><loc_305><loc_435><loc_340><loc_439>表示当前时刻</text><nl><caption><loc_321><loc_397><loc_399><loc_401>/G38 /G41 /G44/G2F /G26 /G28 /G5A/G4D /G32 /G44/G31 /G46 /G39/G42 /G49 /G3A /G3E/G3A /G43 /G3A /G31 /G3E/G3D</caption></otsl>
+<section_header_level_1><loc_257><loc_446><loc_307><loc_451>/G24 /G29 /G2A /G22 输入模块</section_header_level_1>
+<text><loc_258><loc_455><loc_458><loc_476>知识追踪通过表示知识点 /G29 习题和学习时间等数据来建模 知识状态 /G26 为了准确描述知识状态 /G21 本节对知识点 /G29 习题和学 习行为等输入数据进行嵌入表示 /G26</text>
+<page_break>
+<page_header><loc_46><loc_29><loc_69><loc_34>第 /G2B 期</page_header>
+<page_header><loc_169><loc_29><loc_335><loc_34>张 /G28 凯 /G25 等 /G28 时空相关性融合表征的知识追踪模型</page_header>
+<page_header><loc_419><loc_28><loc_458><loc_34>/G30 /G26/G23/G2A/G23 /G30 /G28/G28/G28</page_header>
+<section_header_level_1><loc_56><loc_42><loc_118><loc_47>/G26 /G23 知识点嵌入表示</section_header_level_1>
+<text><loc_42><loc_49><loc_242><loc_64>将知识点 /G47 /G3A 的 /G57 /G5B 表示为独热编码 /G41 /G22 /G47 /G3A /G23 /G28 /G21 /G26 /G6E /G37 /G21 设置一 个嵌入矩阵 /G25 /G47 /G28 /G21 /G37 /G6E /G2A /G21 将 /G47 /G3A 映射成嵌入向量 /G2C /G52 /G3A /G28 /G21 /G26 /G6E /G2A /G24</text>
+<formula><loc_118><loc_66><loc_242><loc_71></formula>
+<text><loc_42><loc_74><loc_242><loc_87>所有知识点的嵌入向量合并成知识点矩阵 /G2D /G28 /G21 /G37 /G6E /G2A /G26 其 中 /G21 每一个 /G2A 维的行向量表示一个知识点 /G26</text>
+<section_header_level_1><loc_56><loc_90><loc_110><loc_95>/G21 /G23 习题嵌入表示</section_header_level_1>
+<text><loc_42><loc_98><loc_242><loc_112>将习题 /G4C /G2C 的 /G57 /G5B 表示为独热编码 /G41 /G22 /G4C /G2C /G23 /G28 /G21 /G26 /G6E /G37 /G21 设置一个 嵌入矩阵 /G25 /G4C /G28 /G21 /G3C /G6E /G2A /G21 将 /G4C /G2C 映射成嵌入向量 /G2E /G52 /G2C /G28 /G21 /G26 /G6E /G2A /G24</text>
+<formula><loc_118><loc_115><loc_242><loc_120></formula>
+<text><loc_42><loc_122><loc_242><loc_151>使用矩阵 /G27 /G28 /G21 /G3C /G6E /G37 描述习题与知识点之间多对多的考查 关系 /G21 矩阵中的每一行对应一道习题 /G21 矩阵中的每一列对应一 个知识点 /G21 当习题考查了某知识点时 /G21 则矩阵 /G27 中对应位置的 值为 /G26 /G21 否则为 /G22 /G26</text>
+<text><loc_42><loc_155><loc_242><loc_176>习题对每个知识点的考查程度存在差异 /G21 为了量化上述考 查关系 /G21 利用矩阵 /G27 计算出习题 /G4C /G2C 对其所包含知识点的考查 权重 /G2F /G2C /G28 /G21 /G26 /G6E /G37 /G24</text>
+<formula><loc_97><loc_178><loc_242><loc_184></formula>
+<text><loc_42><loc_188><loc_242><loc_201>其中 /G24 /G27 /G2C /G21/G24 表示矩阵的第 /G2C 行 /G21 描述了习题 /G4C /G2C 所考查的知识点 /G25 考查权重 /G2F /G2C 表示知识点在习题中被考查的程度 /G26</text>
+<section_header_level_1><loc_56><loc_203><loc_126><loc_208>/G23 /G23 学习时间嵌入表示</section_header_level_1>
+<text><loc_42><loc_211><loc_242><loc_234>将习题 /G4C /G2F 的作答结束时间 /G23 /G4C /G2F 表示为独热编码 /G41 /G22 /G23 /G4C /G2F /G23 /G28 /G21 /G26 /G6E /G3B /G21 设置一个嵌入矩阵 /G25 /G23 /G28 /G21 /G3B /G6E /G2A /G21 将 /G23 /G4C /G2F 映射为嵌入向量 /G30 /G4C /G2F /G28 /G21 /G26 /G6E /G2A /G24</text>
+<formula><loc_119><loc_237><loc_242><loc_243></formula>
+<text><loc_42><loc_246><loc_242><loc_261>综上所述 /G21 可以得到知识点的嵌入表示 /G2C /G52 /G3A /G29 习题的嵌入表 示 /G2E /G52 /G2C /G21 以及学习时间的嵌入表示 /G30 /G4C /G2F /G26</text>
+<section_header_level_1><loc_41><loc_264><loc_114><loc_269>/G24 /G29 /G2B /G22 时空相关性模块</section_header_level_1>
+<text><loc_42><loc_273><loc_242><loc_318>在学习者与习题交互的过程中 /G21 知识点之间会存在时间和 空间上的相互影响 /G21 这两种影响会作用到知识点的表示 /G26 为了 更准确地描述知识点 /G21 利用历史知识点与当前知识点时间上的 相关性建模知识点之间的时间相关影响 /G25 通过习题中若干知识 点空间上的相关性建模知识点之间的空间影响 /G21 最终得到蕴涵 了时间信息和空间信息的知识点表示 /G26</text>
+<section_header_level_1><loc_41><loc_321><loc_145><loc_326>/G24 /G2F /G2B /G2F /G23 /G22 知识点的时间相关表示</section_header_level_1>
+<text><loc_42><loc_329><loc_242><loc_365>知识点的时间相关表示蕴涵了历史知识点对当前知识点 的影响 /G26 具体地 /G21 根据知识点之间的时间相关程度描述历史知 识点对当前知识点的相关影响 /G25 融入时间位置信息来建模历史 知识点对当前知识点的时间相关影响 /G25 最后刻画知识点的时间 相关表示 /G21 如图 /G21 所示 /G26</text>
+<picture><loc_46><loc_367><loc_237><loc_414><caption><loc_99><loc_416><loc_184><loc_420>图 /G21 /G28 知识点的时间相关表示</caption></picture>
+<caption><loc_88><loc_423><loc_200><loc_427>/G5C /G3A /G47 /G2F /G21 /G28/G38 /G42 /G32 /G48/G31 /G40 /G41 /G46 /G30 /G31 /G40 /G40 /G42 /G46 /G41 /G43 /G3A /G31 /G3E /G49 /G31 /G40 /G30 /G31 /G3E/G30 /G42 /G48/G43 /G3D</caption>
+<text><loc_42><loc_430><loc_242><loc_450>/G41 /G23 知识点之间的时间相关程度 /G26 皮尔森相关系数是变量 的协方差与标准差之商 /G21 本节用来度量两个知识点之间的时间 相关程度 /G21 具体如下 /G24</text>
+<formula><loc_70><loc_453><loc_242><loc_479></formula>
+<text><loc_258><loc_42><loc_458><loc_61>其中 /G24 /G2C /G52 /G39 和 /G2C /G52 /G3A 分别表示历史知识点和当前知识点的嵌入向 量 /G25 /G2A 为 /G2C /G52 /G39 和 /G2C /G52 /G3A 的维度 /G25 /G2C /G52 /G3A /G60 /G26 /G2A /G22 /G2A /G44 /G2C /G52 /G3A /G22 /G44 /G23 /G21 /G2C /G52 /G39 /G60 /G26 /G2A /G22 /G2A /G44 /G47 /G52 /G39 /G22 /G44 /G23 /G21</text>
+<text><loc_258><loc_65><loc_458><loc_85>/G2C /G52 /G3A 和 /G2C /G52 /G39 为向量中所有元素的平均值 /G26 皮尔森相关系数 /G2D /G39 /G29 /G3A 越 大 /G21 说明知识点 /G47 /G3A 与 /G47 /G39 之间的时间相关程度越强 /G21 /G47 /G39 对 /G47 /G3A 的 相关影响就会越强 /G26</text>
+<text><loc_258><loc_88><loc_458><loc_116>/G44 /G23 相关影响 /G26 历史知识点会对当前知识点产生影响 /G21 从 而增强当前知识点的表示 /G26 为了建模这一过程 /G21 首先利用知识 点之间的时间相关程度计算历史知识点对当前知识点的相关 影响 /G24</text>
+<formula><loc_308><loc_119><loc_458><loc_125></formula>
+<text><loc_258><loc_127><loc_458><loc_140>其中 /G24 /G25 /G26 为权重矩阵 /G25 /G31 /G39 /G29 /G3A /G28 /G21 /G26 /G6E /G2A 表示 /G47 /G3A 受到来自 /G47 /G39 的相关 影响 /G26</text>
+<text><loc_258><loc_143><loc_460><loc_156>其次 /G21 考虑到每个习题可能包含多个知识点 /G21 利用矩阵 /G27 聚合历史习题 /G4C /G2F 中所有知识点对 /G47 /G3A 的相关影响 /G24</text>
+<formula><loc_324><loc_158><loc_458><loc_168></formula>
+<text><loc_258><loc_170><loc_458><loc_192>其中 /G24 /G2F 是历史习题的序号 /G21 且 /G2F /G28 /G27 /G26 /G21 /G2C /G23 /G31 /G2F /G28 /G22 /G25 /G39 是习题 /G4C /G2F 中 所包含的知识点编号 /G21 且 /G39 /G28 /G27 /G26 /G21 /G37 /G28 /G31 /G39 /G28 /G22 /G25 /G24 /G4C /G2F /G29 /G47 /G3A /G28 /G21 /G26 /G6E /G2A 描述 了习题 /G4C /G2F 中所有知识点对当前知识点 /G47 /G3A 的相关影响 /G26</text>
+<text><loc_258><loc_194><loc_458><loc_222>/G30 /G23 时间相关影响 /G26 历史习题的相关影响会随着时间产生 变化 /G21 时间间隔越久 /G21 相关影响对当前知识点的作用越弱 /G26 为 了建模这一过程 /G21 首先在相关影响 /G31 /G4C /G2F /G29 /G47 /G3A 中融入时间位置信息 /G24 /G23</text>
+<formula><loc_332><loc_218><loc_454><loc_223></formula>
+<text><loc_258><loc_226><loc_461><loc_240>其中 /G24 /G30 /G4C /G2F 表示习题 /G4C /G2F 的作答时间嵌入向量 /G25 /G31 /G30 /G4C /G2F /G29 /G47 /G3A 包含了习题 /G4C /G2F 对当前知识点 /G47 /G3A 的相关影响以及对应时间信息 /G26</text>
+<text><loc_258><loc_242><loc_458><loc_262>其次 /G21 自注意力机制可以根据时间位置信息获取历史习题 相关影响的权重 /G26 建模相关影响随时间变化的过程 /G21 具体 如下 /G24</text>
+<formula><loc_278><loc_265><loc_458><loc_280></formula>
+<text><loc_258><loc_281><loc_458><loc_296>其中 /G24 /G25 /G24 /G4C /G29 /G25 /G24 /G44 和 /G25 /G24 /G33 均为自注意力机制中的参数矩阵 /G25 /G31 /G33 /G4C /G2F /G29 /G47 /G3A /G28 /G21 /G26 /G6E /G2A 描述了 /G4C /G2F 对 /G47 /G3A 的时间相关影响 /G26</text>
+<text><loc_258><loc_299><loc_458><loc_334>/G39 /G23 知识点的时间相关表示 /G26 所有历史习题的时间相关影 响共同作用到当前知识点 /G21 会增强当前知识点 /G47 /G3A 的表示 /G26 为 了建模上述过程 /G21 把所有历史习题对知识点 /G47 /G3A 的时间相关影 响相加 /G21 再与知识点 /G47 /G3A 的嵌入表示拼接 /G21 经过一个 /G51 /G42 /G4E /G6C 函数 得到 /G47 /G3A 的时间相关表示如下 /G24</text>
+<formula><loc_303><loc_336><loc_458><loc_346></formula>
+<text><loc_258><loc_348><loc_458><loc_361>其中 /G24 /G21 表示拼接操作 /G25 /G25 /G21 是参数矩阵 /G25 /G2C /G3A /G28 /G21 /G26 /G6E /G2A 不仅包含了 知识点本身的信息 /G21 也包含了来自历史知识点的时间相关影响 /G26</text>
+<section_header_level_1><loc_257><loc_364><loc_361><loc_369>/G24 /G2F /G2B /G2F /G24 /G22 知识点的时空相关表示</section_header_level_1>
+<text><loc_258><loc_372><loc_458><loc_408>知识点的时空相关表示是在知识点时间相关表示的基础 上 /G21 增加了习题内部各个知识点之间的空间作用 /G26 具体地 /G21 以 矩阵 /G27 为基础构建知识点关系图 /G25 根据知识点关系图和时间 相关表示得到知识点的时空相关表示 /G21 并推导出习题的时空相 关表示 /G21 与答题结果相结合建模知识状态 /G21 如图 /G23 所示 /G26</text>
+<picture><loc_260><loc_410><loc_456><loc_465><caption><loc_315><loc_465><loc_400><loc_470>图 /G23 /G28 知识点的时空相关表示</caption></picture>
+<caption><loc_288><loc_472><loc_432><loc_476>/G5C /G3A /G47 /G2F /G23 /G28/G38 /G42 /G32 /G48/G31 /G40 /G41 /G46 /G41 /G3E/G39 /G3D /G48/G41 /G43 /G3A /G41 /G46 /G30 /G31 /G40 /G40 /G42 /G46 /G41 /G43 /G3A /G31 /G3E /G49 /G31 /G40 /G30 /G31 /G3E/G30 /G42 /G48/G43 /G3D</caption>
+<page_break>
+<page_header><loc_46><loc_28><loc_81><loc_34>/G30 /G26/G23/G2A/G2C /G30</page_header>
+<page_header><loc_211><loc_29><loc_290><loc_34>计 算 机 应 用 研 究</page_header>
+<page_header><loc_427><loc_29><loc_458><loc_34>/G28 第 /G2C/G26 卷</page_header>
+<text><loc_42><loc_29><loc_49><loc_34>/G28</text>
+<text><loc_42><loc_42><loc_242><loc_79>/G41 /G23 知识点关系图 /G26 以矩阵 /G27 为基础 /G21 为任一习题 /G4C /G2F 构建 知识点关系图 /G21 记作 /G46 /G2F /G21 /G46 /G2F /G60 /G2C /G42 /G2F /G21 /G3D /G2F /G2D /G26 其中 /G21 /G42 /G2F /G60 /G2C /G47 /G33 /G73 /G27 /G2F /G21 /G33 /G60 /G26 /G2D 是节点集 /G21 表示习题 /G4C /G2F 中知识点的集合 /G21 每个知识点的特征向 量是其时间相关表示 /G25 /G3D /G2F /G60 /G2C /G22 /G4A /G21 /G33 /G23 /G73 /G47 /G4A /G21 /G47 /G33 /G28 /G42 /G2F /G2D 是边集 /G21 每条边 的特征向量为对应两个知识点之间的注意力系数 /G26</text>
+<text><loc_42><loc_82><loc_242><loc_118>/G44 /G23 知识点的时空相关表示 /G26 作答习题的过程中 /G21 习题内 部的知识点之间会产生空间上的相互作用 /G21 采用图注意力网络 建模这一过程 /G26 首先 /G21 对于知识点关系图 /G46 /G2F /G21 图注意网络可以 捕获图中每个知识点的邻居信息 /G21 得到知识点之间的注意力系 数 /G21 具体过程如下 /G24</text>
+<formula><loc_74><loc_121><loc_242><loc_137></formula>
+<text><loc_42><loc_140><loc_242><loc_177>其中 /G24 /G23 /G33 /G60 /G2C /G4A /G28 /G42 /G2F /G73 /G22 /G4A /G21 /G33 /G23 /G28 /G3D /G2F /G2D 表示 /G47 /G33 的邻居知识点 /G25 /G34 是权重 向量 /G25 /G25 /G46 是图注意力网络中的权重矩阵 /G25 /G2C /G33 是 /G47 /G33 的时间相关 表示 /G25 /G29 /G4A/G33 是 /G47 /G4A 与 /G47 /G33 间的注意力系数 /G21 注意力系数可以反映知 识点之间的空间相关程度 /G21 /G29 /G4A/G33 越大 /G21 说明 /G47 /G4A 与 /G47 /G33 间的空间相 关程度越强 /G26</text>
+<text><loc_42><loc_180><loc_242><loc_201>为了稳定空间相关程度 /G21 通过多头注意力机制提取多个注 意力层面的平均值 /G21 最后聚合邻居信息得到知识点 /G47 /G33 的时空 相关表示 /G24</text>
+<formula><loc_100><loc_203><loc_242><loc_214></formula>
+<text><loc_42><loc_217><loc_243><loc_238>其中 /G24 /G4B 为多头注意力的个数 /G25 得到的 /G2C /G35 /G33 /G28 /G21 /G26 /G6E /G2A 是包含了时间 信息和空间信息的新知识点表示 /G21 即知识点 /G47 /G33 的时空相关 表示 /G26</text>
+<text><loc_42><loc_241><loc_242><loc_263>/G30 /G23 习题的时空相关表示 /G26 习题 /G4C /G2F 中可能存在多个知识 点 /G21 聚合习题 /G4C /G2F 中所有知识点的时空相关表示 /G21 得到 /G4C /G2F 的时空 相关表示 /G2E/G35 /G2F /G28 /G21 /G26 /G6E /G2A /G24</text>
+<formula><loc_70><loc_266><loc_242><loc_273></formula>
+<text><loc_42><loc_277><loc_190><loc_282>其中 /G24 /G2E/G35 /G2F 蕴涵习题 /G4C /G2F 的时间信息和空间信息 /G26</text>
+<section_header_level_1><loc_41><loc_285><loc_114><loc_290>/G24 /G2F /G2B /G2F /G2A /G22 融合知识状态</section_header_level_1>
+<text><loc_42><loc_293><loc_242><loc_313>在建模知识状态的过程中 /G21 还应考虑学习者的答题结果 /G26 首先 /G21 把习题的时空相关表示 /G2E/G35 /G2F 与对应时刻的答题结果进行 拼接 /G21 具体如下 /G24</text>
+<formula><loc_82><loc_316><loc_242><loc_330></formula>
+<text><loc_42><loc_333><loc_242><loc_348>其中 /G24 /G36 /G2F /G28 /G21 /G26 /G6E /G2A 是与 /G2E/G35 /G2F 同维度的零向量 /G25 /G25 /G23 是参数矩阵 /G25 得到 的 /G2E/G36 /G2F /G28 /G21 /G26 /G6E /G2A 包含了习题 /G4C /G2F 的时空信息与作答结果 /G26</text>
+<text><loc_42><loc_350><loc_242><loc_364>其次 /G21 提出的模型利用自注意力机制 /G21 根据融合了时空信 息和作答结果的 /G2E/G36 /G2F 提取历史时刻的权重 /G21 建模知识状态 /G24</text>
+<formula><loc_82><loc_366><loc_242><loc_379></formula>
+<text><loc_42><loc_381><loc_242><loc_395>其中 /G24 /G25 /G39 /G4C /G29 /G25 /G39 /G44 和 /G25 /G39 /G33 均是自注意力机制中的权重参数 /G25 /G37 /G2F /G28 /G21 /G26 /G6E /G2A 描述了时刻 /G2F 的知识状态 /G26</text>
+<text><loc_42><loc_398><loc_242><loc_411>为了增强当前知识状态 /G21 将历史知识状态进行归一化 /G21 获 取历史时刻知识状态的权重为</text>
+<formula><loc_99><loc_414><loc_242><loc_430></formula>
+<text><loc_42><loc_434><loc_242><loc_454>其中 /G24 /G50 /G2F 表示历史知识状态 /G37 /G2F 的权重 /G21 将其作用于 /G37 /G2F 并与当 前知识状态 /G37 /G2C 拼接 /G21 通过一个全连接层 /G21 最终得到包含历史信 息和当前信息的融合知识状态 /G24</text>
+<formula><loc_92><loc_457><loc_242><loc_467></formula>
+<text><loc_42><loc_469><loc_242><loc_476>其中 /G24 /G25 /G2C 是权重参数 /G25 /G37 /G52 /G2C /G28 /G21 /G26 /G6E /G2A 是融合了历史知识状态的当</text>
+<text><loc_292><loc_29><loc_300><loc_34>/G28</text>
+<text><loc_258><loc_42><loc_299><loc_47>前知识状态 /G26</text>
+<section_header_level_1><loc_257><loc_52><loc_322><loc_56>/G24 /G29 /G32 /G22 预测更新模块</section_header_level_1>
+<text><loc_258><loc_61><loc_458><loc_74>预测更新模块用于预测学习者未来的答题情况 /G21 并更新知 识点状态 /G26 图 /G2C 是预测更新过程的示意图 /G26</text>
+<section_header_level_1><loc_257><loc_77><loc_330><loc_82>/G24 /G2F /G32 /G2F /G23 /G22 预测未来表现</section_header_level_1>
+<text><loc_258><loc_85><loc_458><loc_115>考虑到习题间会存在一定的差异 /G21 因此拼接上述融合知识 状态 /G37 /G52 /G2C 和习题的时空相关表示 /G2E/G35 /G2C /G21 这样得到的拼接向量包含 了学习者的知识状态和习题信息 /G26 将拼接向量输入至 /G43 /G41 /G3E/G4A 函 数激活的全连接层 /G21 得到向量 /G38 /G2C /G24</text>
+<formula><loc_317><loc_117><loc_458><loc_123></formula>
+<text><loc_258><loc_126><loc_458><loc_140>其次 /G21 将 /G38 /G2C 输入全连接层 /G21 用 /G3D /G3A /G47 /G32 /G31 /G3A /G39 函数激活 /G21 得到学习 者对习题 /G4C /G2C 的表现情况的预测 /G24</text>
+<formula><loc_325><loc_142><loc_458><loc_148></formula>
+<section_header_level_1><loc_258><loc_151><loc_330><loc_157>其中 /G24 /G25 /G31 是权重参数 /G26</section_header_level_1>
+<picture><loc_296><loc_158><loc_419><loc_202><caption><loc_329><loc_205><loc_347><loc_209>图 /G2C /G28</caption></picture>
+<caption><loc_347><loc_205><loc_387><loc_209>预测更新过程</caption>
+<caption><loc_302><loc_211><loc_418><loc_216>/G5C /G3A /G47 /G2F /G2C /G28/G36 /G40 /G31 /G30 /G42 /G3D /G3D /G31 /G49 /G48/G40 /G42 /G39/G3A /G30 /G43 /G3A /G31 /G3E/G3D /G41 /G3E/G39 /G45/G48/G39/G41 /G43 /G42 /G3D</caption>
+<section_header_level_1><loc_257><loc_219><loc_338><loc_224>/G24 /G2F /G32 /G2F /G24 /G22 更新知识点状态</section_header_level_1>
+<text><loc_258><loc_227><loc_458><loc_240>在学习者与习题的交互过程中 /G21 对每个知识点的掌握程度 也在发生变化 /G21 因此需要更新每个习题练习前后的知识点状态 /G26</text>
+<text><loc_258><loc_242><loc_458><loc_296>首先初始化一个知识点状态矩阵 /G28 /G28 /G21 /G37 /G6E /G2A /G21 矩阵中每一个 /G2A 维的行向量表示一个知识点状态 /G21 设习题 /G4C /G2C 完成之前的知识 点状态矩阵为 /G28 /G2C /G64 /G26 /G21 习题 /G4C /G2C 完成之后的知识点状态矩阵为 /G28 /G2C /G26 为了描述从 /G28 /G2C /G64 /G26 到 /G28 /G2C 这一更新过程 /G21 首先根据考查权重 /G2F /G2C 将 融合知识状态 /G37 /G52 /G2C 转换为学习者在习题 /G4C /G2C 考查的知识点上新 增的知识点状态 /G21 与上一时刻的知识点状态矩阵相加 /G21 具体 如下 /G24</text>
+<formula><loc_327><loc_299><loc_458><loc_305></formula>
+<text><loc_258><loc_309><loc_395><loc_314>其中 /G24 /G39 /G2C 是学习者遗忘的知识点状态矩阵 /G26</text>
+<text><loc_258><loc_317><loc_464><loc_369>遗忘的知识点状态可以根据知识点在 /G2C 时刻的遗忘数据 计算而来 /G21 /G3A /G2C /G2F /G60 /G2C /G3D/G3B /G21 /G36/G3B /G21 /G3E /G3B /G2D 描述知识点 /G47 /G2F 在 /G2C 时刻的遗忘行 为 /G26 其中 /G21 /G3D/G3B /G60 /G2C /G29 /G77 /G22 /G73 /G29 /G28 /G22 /G2D 表示学习者第 /G2C /G64 /G26 次学习和第 /G2C 次学习之间的时间间隔 /G25 /G36/G3B /G60 /G2C /G29 /G33 /G22 /G73 /G29 /G28 /G22 /G2D 表示重复学习当前 知识点 /G47 /G2F 的次数 /G25 /G3E /G3B /G60 /G2C /G29 /G77 /G22 /G73 /G29 /G28 /G22 /G2D 表示重复学习当前知识 点 /G47 /G2F 的时间间隔 /G26 首先把学习遗忘数据进行嵌入表示 /G21 过程 如下 /G24</text>
+<formula><loc_307><loc_372><loc_458><loc_378></formula>
+<text><loc_258><loc_381><loc_458><loc_411>其中 /G24 /G25 /G22 是学习遗忘数据的嵌入矩阵 /G25 得到的 /G3A /G52 /G2F /G28 /G21 /G26 /G6E /G2A 表示 知识点 /G47 /G2F 的遗忘嵌入向量 /G26 把所有的知识点遗忘数据进行嵌 入 /G21 合并得到 /G3B /G52 /G60 /G2C /G3A/G2B /G26 /G25 /G3A/G2B /G21 /G25/G31/G25 /G3A /G52 /G37 /G2D /G28 /G21 /G37 /G6E /G2A 即为知识点遗忘矩 阵 /G21 其中的每一行表示一个知识点的遗忘嵌入向量 /G26</text>
+<text><loc_258><loc_414><loc_458><loc_428>其次 /G21 使用一个用 /G3D /G3A /G47 /G32 /G31 /G3A /G39 函数激活的全连接层 /G21 将每个知 识点的学习遗忘嵌入向量转换为遗忘权重 /G3C /G2C /G28 /G21 /G37 /G6E /G26 /G24</text>
+<formula><loc_325><loc_430><loc_458><loc_435></formula>
+<text><loc_258><loc_438><loc_391><loc_444>其中 /G24 /G25 /G26 /G28 /G21 /G2A /G6E /G26 是权重矩阵 /G25 /G32 /G26 是偏置项 /G26</text>
+<text><loc_258><loc_447><loc_458><loc_468>最后 /G21 将遗忘权重作用于上一时刻的知识点状态矩阵 /G28 /G2C /G64 /G26 /G21 得到学习者遗忘的知识点状态 /G39 /G2C /G28 /G21 /G37 /G6E /G2A /G26 计算过程 如下 /G24</text>
+<formula><loc_343><loc_471><loc_458><loc_476></formula>
+<page_break>
+<page_header><loc_46><loc_29><loc_69><loc_34>第 /G2B 期</page_header>
+<page_header><loc_169><loc_29><loc_335><loc_34>张 /G28 凯 /G25 等 /G28 时空相关性融合表征的知识追踪模型</page_header>
+<page_header><loc_419><loc_28><loc_458><loc_34>/G30 /G26/G23/G2A/G2B /G30 /G28/G28/G28</page_header>
+<section_header_level_1><loc_41><loc_44><loc_91><loc_48>/G24 /G29 /G43 /G22 损失函数</section_header_level_1>
+<text><loc_42><loc_53><loc_245><loc_74>在训练过程中 /G21 选择用交叉熵损失函数来最小化预测值 /G31 /G2C 和真实标签 /G2D /G2C 之间的差异性 /G26 当交叉熵越小时 /G21 预测值与真 实值就越接近 /G21 表示如下 /G24</text>
+<formula><loc_89><loc_78><loc_242><loc_84></formula>
+<text><loc_42><loc_88><loc_243><loc_101>由于交叉熵损失函数是凸函数 /G21 所以在训练时使用梯度下 降法学习参数 /G21 使得模型能够更准确地预测学习者未来的表现 /G26</text>
+<section_header_level_1><loc_41><loc_109><loc_117><loc_114>/G2A /G22 实验结果与分析</section_header_level_1>
+<text><loc_42><loc_122><loc_246><loc_151>/G38 /G5A/G62 /G38 模型的主要工作集中于 /G24 知识点的时间相关表示 /G29 时 空相关表示 /G29 习题的时空融合表示 /G26 为了全面对比分析 /G38 /G5A/G62 /G38 模型的性能 /G21 本章选取了 /G5B /G62 /G38 /G27 /G2C /G28 /G29 /G5B /G62 /G5D /G34 /G5F /G27 /G2A /G28 /G29 /G38 /G4C /G5F /G24 /G62 /G38 /G27 /G26/G26 /G28 /G29 /G3F /G62 /G38 /G27 /G26/G29 /G28 /G29 /G5A/G62 /G38 /G27 /G26/G25 /G28 五个模型作为对比模型 /G26 具体原因如下 /G24</text>
+<unordered_list><list_item><loc_42><loc_154><loc_242><loc_175>/G41 /G23 /G5B /G62 /G38 是首个将深度学习引入知识追踪的模型 /G21 它使用 独热编码作为习题的表征 /G21 虽然没有蕴涵时空相关信息 /G21 但为 后续的研究开辟了新的方向 /G26</list_item>
+<list_item><loc_42><loc_178><loc_242><loc_199>/G44 /G23 /G5B /G62 /G5D /G34 /G5F 使用静态矩阵来存储知识点表示 /G21 虽然没有考 虑到知识点之间的相互影响 /G21 但由知识点表示的线性组合形成 习题的表示 /G26</list_item>
+<list_item><loc_42><loc_202><loc_242><loc_215>/G30 /G23 /G38 /G4C /G5F /G24 /G62 /G38 建模了习题在时间窗口内的相互影响 /G21 刻画了 习题的时间相关表示 /G26</list_item>
+<list_item><loc_42><loc_218><loc_242><loc_231>/G39 /G23 /G3F /G62 /G38 刻画了知识点在空间上的相互作用 /G21 聚合邻居信 息 /G21 得到了知识点的空间相关表示 /G26</list_item>
+<list_item><loc_42><loc_234><loc_243><loc_246>/G42 /G23 /G5A/G62 /G38 根据知识点空间关系的差异设计了两种不同的传播 机制 /G21 通过融合两种邻居信息来建模知识点的空间相关表示 /G26</list_item>
+</unordered_list>
+<text><loc_42><loc_250><loc_243><loc_270>上述模型的研究开始于对习题的表征 /G21 细化的研究着重于 知识点的时间和空间相关表示 /G21 /G38 /G5A/G62 /G38 将从知识点和习题的时 空融合表示等方面与这五个模型在多个评价指标上进行对比 /G26</text>
+<section_header_level_1><loc_41><loc_275><loc_91><loc_280>/G2A /G29 /G23 /G22 实验方法</section_header_level_1>
+<text><loc_42><loc_284><loc_242><loc_297>/G38 /G5A/G62 /G38 模型以知识点 /G57 /G5B /G29 习题 /G57 /G5B 等为输入 /G21 以学习者的作 答预测值为输出 /G21 具体的实验步骤如下 /G24</text>
+<text><loc_42><loc_300><loc_245><loc_330>/G41 /G23 建模知识点的时间相关表示 /G26 对数据集中知识点的 /G57 /G5B 进行嵌入表示 /G21 计算知识点之间的时间相关程度 /G21 并融入时间 位置信息 /G21 建模知识点之间的时间相关影响 /G21 得到知识点的时 间相关表示 /G2C /G3A /G26</text>
+<text><loc_42><loc_332><loc_242><loc_361>/G44 /G23 建模知识点的时空相关表示 /G26 构建习题蕴涵的知识点 关系图 /G21 计算知识点之间的空间相关程度 /G21 建模知识点的时空 相关表示 /G2C /G35 /G33 /G21 通过聚合同一习题中的知识点时空相关表示 /G21 可 以得到习题的时空相关表示 /G2E/G35 /G2F /G26</text>
+<unordered_list><list_item><loc_42><loc_364><loc_243><loc_393>/G30 /G23 建模融合知识状态 /G26 把不同时刻的学习者作答结果映 射成零向量 /G21 与习题的时空相关表示拼接 /G26 通过自注意力机制 建模不同时刻的知识状态 /G37 /G2F 并计算权重 /G21 得到融合知识状 态 /G37 /G52 /G2F /G26</list_item>
+<list_item><loc_42><loc_396><loc_242><loc_409>/G39 /G23 预测作答结果 /G26 根据学习者当前的知识状态 /G21 结合学 习者作答习题的时空相关表示 /G21 得到预测的作答结果 /G31 /G2C /G26</list_item>
+<list_item><loc_42><loc_412><loc_242><loc_433>/G42 /G23 更新知识状态 /G26 定义一个知识点状态矩阵 /G21 将学习者 的遗忘数据映射成嵌入向量并转换为遗忘权重 /G21 从而计算得到 当前的知识点状态矩阵 /G28 /G2C /G26</list_item>
+</unordered_list>
+<section_header_level_1><loc_41><loc_437><loc_84><loc_442>/G2A /G29 /G24 /G22 数据集</section_header_level_1>
+<text><loc_42><loc_446><loc_247><loc_476>为了验证 /G38 /G5A/G62 /G38 模型的有效性 /G21 分别在 /G35 /G5A/G5A/G57 /G5A/G38 /G32 /G42 /G3E/G43 /G3D /G21 /G22 /G26 /G21 /G27 /G21 /G26 /G28 /G29 /G35 /G5A/G5A/G57 /G5A/G38 /G32 /G42 /G3E/G43 /G3D /G21/G22/G26/G27 /G27 /G21/G21 /G28 /G29 /G5A/G46 /G42 /G48/G42 /G32 /G41 /G48/G4D /G2F /G30 /G56 /G27 /G21/G23 /G28 以及 /G4F /G45/G3E/G4D /G3A /G35 /G30 /G41 /G39/G42 /G32 /G4D /G27 /G21/G2C /G28 四 个真实数据集上进行实验 /G21 以下分别简称为 /G35 /G5A/G5A/G57 /G5A/G38 /G26/G21 /G29 /G35 /G5A/G24 /G5A/G57 /G5A/G38 /G26/G27 /G29 /G5A/G46 /G42 /G48/G42 /G32 /G41 /G48/G4D 和 /G4F /G45/G3E/G4D /G3A /G26 表 /G21 展示了各数据集的基本信息 /G26</text>
+<caption><loc_332><loc_42><loc_384><loc_46>表 /G21 /G28 数据集简介</caption>
+<otsl><loc_257><loc_55><loc_459><loc_93><fcel><text><loc_275><loc_59><loc_293><loc_62>数据集</text>
+<text><loc_322><loc_59><loc_346><loc_62>学习者数</text>
+<text><loc_366><loc_59><loc_395><loc_62>习题交互数</text>
+<text><loc_420><loc_59><loc_443><loc_62>知识点数</text>
+<text><loc_272><loc_67><loc_278><loc_70>/G35</text>
+<text><loc_276><loc_67><loc_288><loc_70>/G5A/G5A/G57</text>
+<text><loc_284><loc_67><loc_292><loc_70>/G5A/G38</text>
+<text><loc_290><loc_67><loc_295><loc_70>/G26/G21</text>
+<text><loc_272><loc_73><loc_278><loc_77>/G35</text>
+<text><loc_276><loc_73><loc_288><loc_77>/G5A/G5A/G57</text>
+<text><loc_284><loc_73><loc_292><loc_77>/G5A/G38</text>
+<text><loc_290><loc_73><loc_295><loc_77>/G26/G27</text>
+<text><loc_272><loc_80><loc_280><loc_84>/G5A/G46</text>
+<text><loc_276><loc_80><loc_282><loc_84>/G42</text>
+<text><loc_279><loc_80><loc_287><loc_84>/G48/G42</text>
+<text><loc_284><loc_80><loc_290><loc_84>/G32</text>
+<text><loc_288><loc_80><loc_294><loc_84>/G41</text>
+<text><loc_291><loc_80><loc_299><loc_84>/G48/G4D</text>
+<text><loc_278><loc_87><loc_284><loc_91>/G4F</text>
+<text><loc_280><loc_87><loc_292><loc_91>/G45/G3E/G4D</text>
+<text><loc_288><loc_87><loc_294><loc_91>/G3A</text>
+<text><loc_325><loc_67><loc_331><loc_70>/G2C/G29</text>
+<text><loc_333><loc_67><loc_342><loc_70>/G29/G27/G2C</text>
+<text><loc_327><loc_73><loc_330><loc_77>/G26</text>
+<text><loc_332><loc_73><loc_340><loc_77>/G27/G22/G25</text>
+<text><loc_325><loc_80><loc_331><loc_84>/G2A/G27</text>
+<text><loc_333><loc_80><loc_342><loc_84>/G25/G2B/G21</text>
+<text><loc_324><loc_87><loc_333><loc_91>/G21/G23/G2A</text>
+<text><loc_335><loc_87><loc_343><loc_91>/G26/G21/G22</text>
+<text><loc_369><loc_67><loc_371><loc_70>/G2B</text>
+<text><loc_373><loc_67><loc_382><loc_70>/G2A/G26/G2A</text>
+<text><loc_384><loc_67><loc_392><loc_70>/G2A/G29/G2A</text>
+<text><loc_371><loc_73><loc_380><loc_77>/G25/G2C/G21</text>
+<text><loc_381><loc_73><loc_390><loc_77>/G2A/G26/G29</text>
+<text><loc_367><loc_80><loc_373><loc_84>/G26/G22</text>
+<text><loc_375><loc_80><loc_383><loc_84>/G22/G2A/G27</text>
+<text><loc_385><loc_80><loc_394><loc_84>/G23/G22/G2B</text>
+<text><loc_367><loc_87><loc_373><loc_91>/G21/G29</text>
+<text><loc_375><loc_87><loc_383><loc_91>/G29/G29/G29</text>
+<text><loc_385><loc_87><loc_394><loc_91>/G26/G26/G27</text>
+<text><loc_427><loc_67><loc_435><loc_70>/G21/G29/G29</text>
+<text><loc_427><loc_73><loc_435><loc_77>/G26/G22/G21</text>
+<text><loc_424><loc_80><loc_427><loc_84>/G26</text>
+<text><loc_429><loc_80><loc_438><loc_84>/G2C/G2B/G2A</text>
+<text><loc_427><loc_87><loc_435><loc_91>/G29/G2A/G2C</text><nl><caption><loc_319><loc_50><loc_397><loc_54>/G38 /G41 /G44/G2F /G21 /G28/G5B /G41 /G43 /G41 /G3D /G42 /G43 /G3D /G3A /G3E/G43 /G40 /G31 /G39/G45/G30 /G43 /G3A /G31 /G3E</caption></otsl>
+<section_header_level_1><loc_257><loc_98><loc_307><loc_103>/G2A /G29 /G2A /G22 实验环境</section_header_level_1>
+<text><loc_258><loc_107><loc_458><loc_128>实验环境如表 /G23 所示 /G26 在每个数据集中 /G21 将 /G2A/G22 /G68 的数据 划分为训练集 /G21 /G21/G22 /G68 的数据划分为测试集 /G25 将训练集中 /G21/G22 /G68 的 数据划分为验证集 /G21 用于选择最佳模型的超参数 /G26</text>
+<text><loc_258><loc_131><loc_460><loc_160>参数的初始化选择均值和标准差为零的正态分布随机初 始化 /G21 初始学习率设置为 /G22 /G2F /G22/G22/G26 /G21 学习率每经过 /G26/G22 轮训练会衰 减 /G22 /G2F /G26 倍 /G25 /G44/G41 /G43 /G30 /G4A/G24 /G3D /G3A /G56 /G42 设置为 /G23/G21 /G25 选择交叉熵损失函数和 /G35 /G39/G41 /G32 优化器 /G26</text>
+<caption><loc_336><loc_163><loc_380><loc_167>表 /G23 /G28 实验环境</caption>
+<otsl><loc_257><loc_176><loc_459><loc_215><fcel><text><loc_259><loc_179><loc_282><loc_183>实验环境</text>
+<text><loc_319><loc_179><loc_331><loc_183>参数</text>
+<text><loc_375><loc_179><loc_398><loc_183>实验环境</text>
+<text><loc_427><loc_179><loc_439><loc_183>参数</text>
+<text><loc_259><loc_187><loc_282><loc_190>操作系统</text>
+<text><loc_311><loc_187><loc_322><loc_190>/G6B /G3A</text>
+<text><loc_317><loc_187><loc_329><loc_190>/G3E/G39/G31</text>
+<text><loc_326><loc_187><loc_332><loc_190>/G52</text>
+<text><loc_329><loc_187><loc_335><loc_190>/G3D</text>
+<text><loc_333><loc_187><loc_339><loc_190>/G26/G26</text>
+<text><loc_379><loc_187><loc_385><loc_190>/G36</text>
+<text><loc_382><loc_187><loc_388><loc_190>/G4D</text>
+<text><loc_385><loc_187><loc_390><loc_190>/G43</text>
+<text><loc_386><loc_187><loc_395><loc_190>/G4A/G31</text>
+<text><loc_392><loc_187><loc_394><loc_190>/G3E</text>
+<text><loc_427><loc_187><loc_436><loc_190>/G23 /G2F</text>
+<text><loc_433><loc_187><loc_438><loc_190>/G26/G22</text>
+<text><loc_265><loc_198><loc_271><loc_202>/G4C</text>
+<text><loc_269><loc_198><loc_275><loc_202>/G36</text>
+<text><loc_272><loc_198><loc_278><loc_202>/G6C</text>
+<text><loc_302><loc_195><loc_307><loc_198>/G57</text>
+<text><loc_303><loc_195><loc_312><loc_198>/G3E/G43</text>
+<text><loc_308><loc_195><loc_314><loc_198>/G42</text>
+<text><loc_310><loc_195><loc_316><loc_198>/G46</text>
+<text><loc_314><loc_195><loc_320><loc_198>/G4C</text>
+<text><loc_318><loc_195><loc_323><loc_198>/G31</text>
+<text><loc_320><loc_195><loc_326><loc_198>/G40</text>
+<text><loc_322><loc_195><loc_332><loc_198>/G42 /G3A</text>
+<text><loc_328><loc_195><loc_337><loc_198>/G25 /G24</text>
+<text><loc_333><loc_195><loc_350><loc_198>/G25/G25/G22/G22 /G62</text>
+<text><loc_305><loc_201><loc_311><loc_205>/G4C</text>
+<text><loc_308><loc_201><loc_314><loc_205>/G36</text>
+<text><loc_312><loc_201><loc_317><loc_205>/G6C</text>
+<text><loc_316><loc_201><loc_330><loc_205>/G2D/G23/G2F</text>
+<text><loc_327><loc_201><loc_333><loc_205>/G29/G22</text>
+<text><loc_335><loc_201><loc_341><loc_205>/G3F</text>
+<text><loc_339><loc_201><loc_344><loc_205>/G54</text>
+<text><loc_343><loc_201><loc_349><loc_205>/G56</text>
+<text><loc_377><loc_198><loc_383><loc_202>/G36</text>
+<text><loc_380><loc_198><loc_386><loc_202>/G4D</text>
+<text><loc_383><loc_198><loc_389><loc_202>/G38</text>
+<text><loc_386><loc_198><loc_392><loc_202>/G31</text>
+<text><loc_389><loc_198><loc_394><loc_202>/G40</text>
+<text><loc_391><loc_198><loc_396><loc_202>/G30</text>
+<text><loc_393><loc_198><loc_396><loc_202>/G4A</text>
+<text><loc_424><loc_198><loc_433><loc_202>/G26 /G2F</text>
+<text><loc_430><loc_198><loc_441><loc_202>/G26/G22 /G2F</text>
+<text><loc_438><loc_198><loc_441><loc_202>/G21</text>
+<text><loc_265><loc_210><loc_271><loc_213>/G3F</text>
+<text><loc_269><loc_210><loc_275><loc_213>/G36</text>
+<text><loc_272><loc_210><loc_278><loc_213>/G6C</text>
+<text><loc_288><loc_210><loc_294><loc_213>/G5F</text>
+<text><loc_292><loc_210><loc_298><loc_213>/G5D</text>
+<text><loc_296><loc_210><loc_302><loc_213>/G57</text>
+<text><loc_298><loc_210><loc_304><loc_213>/G5B</text>
+<text><loc_302><loc_210><loc_307><loc_213>/G57</text>
+<text><loc_304><loc_210><loc_315><loc_213>/G35/G3F</text>
+<text><loc_313><loc_210><loc_319><loc_213>/G42</text>
+<text><loc_316><loc_210><loc_322><loc_213>/G5C</text>
+<text><loc_319><loc_210><loc_325><loc_213>/G31</text>
+<text><loc_322><loc_210><loc_327><loc_213>/G40</text>
+<text><loc_323><loc_210><loc_329><loc_213>/G30</text>
+<text><loc_326><loc_210><loc_336><loc_213>/G42 /G51</text>
+<text><loc_334><loc_210><loc_340><loc_213>/G38</text>
+<text><loc_338><loc_210><loc_355><loc_213>/G50/G23/G22/G2A/G22</text>
+<text><loc_357><loc_210><loc_363><loc_213>/G38</text>
+<text><loc_360><loc_210><loc_366><loc_213>/G3A</text>
+<text><loc_381><loc_210><loc_392><loc_213>内存</text>
+<text><loc_425><loc_210><loc_431><loc_213>/G29/G2C</text>
+<text><loc_433><loc_210><loc_439><loc_213>/G3F</text>
+<text><loc_437><loc_210><loc_442><loc_213>/G69</text><nl><caption><loc_311><loc_170><loc_409><loc_175>/G38 /G41 /G44/G2F /G23 /G28/G59 /G55 /G48/G42 /G40 /G3A /G32 /G42 /G3E/G43 /G41 /G46 /G42 /G3E/G53 /G3A /G40 /G31 /G3E/G32 /G42 /G3E/G43 /G3D</caption></otsl>
+<section_header_level_1><loc_257><loc_220><loc_322><loc_225>/G2A /G29 /G2B /G22 性能对比实验</section_header_level_1>
+<text><loc_257><loc_229><loc_463><loc_274>使用曲线下面积 /G22 /G41 /G40 /G42 /G41 /G45/G3E/G39/G42 /G40 /G30 /G45/G40 /G53 /G42 /G21 /G35 /G6C /G4C /G23 和准确率 /G22 /G41 /G30 /G30 /G45/G24 /G40 /G41 /G30 /G4D /G21 /G35 /G4C /G4C /G23 作为模型的评价指标 /G26 /G35 /G6C /G4C 是 /G51 /G37 /G4C /G22 /G40 /G42 /G30 /G42 /G3A /G53 /G42 /G40 /G31 /G48/G42 /G40 /G41 /G24 /G43 /G3A /G3E/G47 /G30 /G4A/G41 /G40 /G41 /G30 /G43 /G42 /G40 /G3A /G3D /G43 /G3A /G30 /G23 曲线与坐标轴围成图形的面积 /G21 其取值在 /G22/G5E /G2B /G6D /G26 /G21 值越大 /G21 说明模型预测性能越好 /G21 若 /G35 /G6C /G4C 的值为 /G22 /G2F /G2B /G21 说明模型是随机预测模型 /G26 /G35 /G4C /G4C 是正确预测结果占所有预测 结果的百分比 /G21 /G35 /G4C /G4C 的值越大 /G21 说明模型的预测结果越准确 /G26</text>
+<text><loc_258><loc_277><loc_458><loc_290>图 /G2B 展示了 /G38 /G5A/G62 /G38 模型与五个对比模型在四个数据集上 的 /G35 /G6C /G4C 值 /G26 其中 /G21 横坐标为数据集 /G21 纵坐标为 /G35 /G6C /G4C 的取值 /G26</text>
+<text><loc_257><loc_293><loc_458><loc_385>由图 /G2B 可以看出 /G21 /G38 /G5A/G62 /G38 模型在四个真实数据集上的表现 最好 /G21 其 /G35 /G6C /G4C 值分别为 /G22 /G2F /G27/G2A/G2A /G23 /G29 /G22 /G2F /G2A/G22/G26 /G27 /G29 /G22 /G2F /G2A/G2C/G2C /G26 和 /G22 /G2F /G2A/G27/G23 /G25 /G26 在 /G5A/G46 /G42 /G48/G42 /G32 /G41 /G48/G4D 数据集中 /G21 /G38 /G5A/G62 /G38 比第二名的 /G3F /G62 /G38 模型要高出 /G21/G5E /G2C/G26 /G68 /G21 分析其原因可能是 /G3F /G62 /G38 模型只建模了知识点之间的 空间作用 /G21 忽略了历史作答习题中的知识点对当前知识点的时 间相关影响 /G21 导致实验结果略低于 /G38 /G5A/G62 /G38 模型 /G26 在 /G35 /G5A/G5A/G57 /G5A/G38 /G26/G27 数据集中 /G21 /G38 /G5A/G62 /G38 模型的 /G35 /G6C /G4C 值比 /G3F /G62 /G38 模型的 /G22 /G2F /G27/G2A/G2C 高出 /G26/G5E /G27 /G68 /G21 比 /G5B /G62 /G5D /G34 /G5F 模型的 /G22 /G2F /G27/G21/G23 /G25 高出 /G27 /G2F /G27 /G68 /G21 分析其原因可 能是 /G5B /G62 /G5D /G34 /G5F 模型利用知识点来表示习题 /G21 但未能建模知识点 在时空上的相互作用关系 /G21 因此性能表现相较于 /G38 /G5A/G62 /G38 模型有 所欠缺 /G26 实验结果也验证了 /G38 /G5A/G62 /G38 模型从时间和空间两个角 度建模知识点表示的有效性 /G26</text>
+<picture><loc_259><loc_387><loc_355><loc_440><caption><loc_271><loc_443><loc_345><loc_460>图 /G2B /G28 不同模型的 /G35 /G6C /G4C 值 /G5C /G3A /G47 /G2F /G2B /G28/G35 /G6C /G4C/G53 /G41 /G46 /G45/G42 /G31 /G49 /G39/G3A /G49 /G49 /G42 /G40 /G42 /G3E/G43 /G32 /G31 /G39/G42 /G46 /G3D</caption></picture>
+<picture><loc_360><loc_387><loc_456><loc_440><caption><loc_371><loc_443><loc_445><loc_460>图 /G29 /G28 不同模型的 /G35 /G4C /G4C 值 /G5C /G3A /G47 /G2F /G29 /G28/G35 /G4C /G4C/G53 /G41 /G46 /G45/G42 /G31 /G49 /G39/G3A /G49 /G49 /G42 /G40 /G42 /G3E/G43 /G32 /G31 /G39/G42 /G46 /G3D</caption></picture>
+<text><loc_258><loc_463><loc_458><loc_476>图 /G29 展示了 /G38 /G5A/G62 /G38 模型与五个对比模型在四个数据集上 的 /G35 /G4C /G4C 值 /G26 由图 /G29 可以看出 /G21 /G38 /G5A/G62 /G38 模型在四个真实数据集上</text>
+<page_break>
+<page_header><loc_46><loc_28><loc_81><loc_34>/G30 /G26/G23/G2A/G29 /G30</page_header>
+<page_header><loc_211><loc_29><loc_290><loc_34>计 算 机 应 用 研 究</page_header>
+<page_header><loc_427><loc_29><loc_458><loc_34>/G28 第 /G2C/G26 卷</page_header>
+<text><loc_42><loc_29><loc_49><loc_34>/G28</text>
+<text><loc_41><loc_42><loc_242><loc_155>的 /G35 /G4C /G4C 值分别为 /G22 /G2F /G27/G2A/G21 /G21 /G29 /G22 /G2F /G2A/G22/G23 /G22 /G29 /G22 /G2F /G27/G25/G23 /G27 和 /G22 /G2F /G2A/G2C/G2B /G27 /G21 对比其 余模型均取得了一定的优势 /G26 值得注意的是 /G21 在 /G35 /G5A/G5A/G57 /G5A/G38 /G26/G27 数 据集中 /G21 /G38 /G5A/G62 /G38 模型的准确率要比 /G5A/G62 /G38 模型的 /G22 /G2F /G27/G23/G22 高出 /G27/G5E /G23 /G68 /G21 比 /G38 /G4C /G5F /G24 /G62 /G38 模型的 /G22 /G2F /G29/G2A/G21 高出 /G26/G21 /G2F /G26 /G68 /G26 /G5A/G62 /G38 模型根据 知识点间不同的空间关系 /G21 设计了两种不同的传播机制 /G21 以此 建模知识点的空间相关表示 /G21 但没有完整建模知识点之间的时 间相关影响 /G21 因此性能表现略差于 /G38 /G5A/G62 /G38 模型 /G26 /G38 /G4C /G5F /G24 /G62 /G38 模型 利用卷积网络描述时间窗口内历史对当前的影响 /G21 但这种片段 式的时间信息不足以囊括所有历史习题对当前习题的影响 /G21 也 忽略了习题内部知识点之间的空间关系 /G21 所以模型的准确率相 较于 /G38 /G5A/G62 /G38 模型存在一定的差距 /G26 /G38 /G5A/G62 /G38 模型在考虑知识点空 间相关影响的同时还注意到了知识点的时间相关影响 /G21 刻画了 知识点的时空相关表示 /G21 并推导出了习题的时空相关表示 /G26 实 验结果充分表明了 /G38 /G5A/G62 /G38 模型建模知识点时空相关表示 /G21 以及 习题时空相关表示的有效性 /G26</text>
+<section_header_level_1><loc_41><loc_159><loc_91><loc_164>/G2A /G29 /G32 /G22 消融实验</section_header_level_1>
+<text><loc_42><loc_169><loc_242><loc_220>为了进一步对比分析知识点时间和空间上的相互影响对 知识点最终表示的作用 /G21 设计了 /G38 /G5A/G62 /G38 /G24 /G35 模型 /G21 消融 /G38 /G5A/G62 /G38 模型 中历史知识点对当前知识点的时间相关影响 /G21 直接把知识点之 间的相关影响映射到知识点表示中 /G25 设计了 /G38 /G5A/G62 /G38 /G24 /G69 模型 /G21 消 融 /G38 /G5A/G62 /G38 模型中习题内部若干知识点之间空间相关影响 /G21 把图 注意力网络用简单的聚合功能替代 /G26 相关实验结果如表 /G2C /G29 /G2B 所示 /G26</text>
+<caption><loc_105><loc_222><loc_179><loc_226>表 /G2C /G28 不同模型的 /G35 /G6C /G4C 值</caption>
+<otsl><loc_41><loc_234><loc_243><loc_272><fcel><text><loc_59><loc_240><loc_71><loc_244>模型</text>
+<text><loc_157><loc_237><loc_174><loc_240>数据集</text>
+<text><loc_96><loc_244><loc_102><loc_248>/G35</text>
+<text><loc_100><loc_244><loc_111><loc_248>/G5A/G5A/G57</text>
+<text><loc_107><loc_244><loc_116><loc_248>/G5A/G38</text>
+<text><loc_113><loc_244><loc_119><loc_248>/G26/G21</text>
+<text><loc_134><loc_244><loc_140><loc_248>/G35</text>
+<text><loc_138><loc_244><loc_149><loc_248>/G5A/G5A/G57</text>
+<text><loc_146><loc_244><loc_154><loc_248>/G5A/G38</text>
+<text><loc_151><loc_244><loc_157><loc_248>/G26/G27</text>
+<text><loc_172><loc_244><loc_180><loc_248>/G5A/G46</text>
+<text><loc_176><loc_244><loc_182><loc_248>/G42</text>
+<text><loc_179><loc_244><loc_187><loc_248>/G48/G42</text>
+<text><loc_184><loc_244><loc_190><loc_248>/G32</text>
+<text><loc_188><loc_244><loc_194><loc_248>/G41</text>
+<text><loc_191><loc_244><loc_199><loc_248>/G48/G4D</text>
+<text><loc_217><loc_244><loc_222><loc_248>/G4F</text>
+<text><loc_219><loc_244><loc_230><loc_248>/G45/G3E/G4D</text>
+<text><loc_227><loc_244><loc_233><loc_248>/G3A</text>
+<text><loc_56><loc_251><loc_61><loc_255>/G38</text>
+<text><loc_59><loc_251><loc_67><loc_255>/G5A/G62</text>
+<text><loc_65><loc_251><loc_71><loc_255>/G38</text>
+<text><loc_69><loc_251><loc_75><loc_255>/G24</text>
+<text><loc_71><loc_251><loc_76><loc_255>/G35</text>
+<text><loc_98><loc_251><loc_107><loc_255>/G22 /G2F</text>
+<text><loc_104><loc_251><loc_112><loc_255>/G27/G29/G2A</text>
+<text><loc_114><loc_251><loc_117><loc_255>/G21</text>
+<text><loc_136><loc_251><loc_145><loc_255>/G22 /G2F</text>
+<text><loc_142><loc_251><loc_150><loc_255>/G27/G25/G26</text>
+<text><loc_152><loc_251><loc_155><loc_255>/G27</text>
+<text><loc_174><loc_251><loc_183><loc_255>/G22 /G2F</text>
+<text><loc_180><loc_251><loc_188><loc_255>/G2A/G2C/G22</text>
+<text><loc_190><loc_251><loc_193><loc_255>/G2B</text>
+<text><loc_213><loc_251><loc_222><loc_255>/G22 /G2F</text>
+<text><loc_219><loc_251><loc_227><loc_255>/G2A/G29/G25</text>
+<text><loc_229><loc_251><loc_232><loc_255>/G2B</text>
+<text><loc_56><loc_259><loc_61><loc_262>/G38</text>
+<text><loc_59><loc_259><loc_67><loc_262>/G5A/G62</text>
+<text><loc_66><loc_259><loc_71><loc_262>/G38</text>
+<text><loc_69><loc_259><loc_75><loc_262>/G24</text>
+<text><loc_71><loc_259><loc_77><loc_262>/G69</text>
+<text><loc_98><loc_259><loc_107><loc_262>/G22 /G2F</text>
+<text><loc_104><loc_259><loc_112><loc_262>/G27/G23/G2B</text>
+<text><loc_114><loc_259><loc_117><loc_262>/G2A</text>
+<text><loc_136><loc_259><loc_145><loc_262>/G22 /G2F</text>
+<text><loc_142><loc_259><loc_150><loc_262>/G27/G2B/G29</text>
+<text><loc_152><loc_259><loc_155><loc_262>/G22</text>
+<text><loc_174><loc_259><loc_183><loc_262>/G22 /G2F</text>
+<text><loc_180><loc_259><loc_188><loc_262>/G2A/G22/G25</text>
+<text><loc_190><loc_259><loc_193><loc_262>/G26</text>
+<text><loc_213><loc_259><loc_222><loc_262>/G22 /G2F</text>
+<text><loc_219><loc_259><loc_227><loc_262>/G2A/G21/G21</text>
+<text><loc_229><loc_259><loc_232><loc_262>/G2C</text>
+<text><loc_59><loc_266><loc_64><loc_270>/G38</text>
+<text><loc_62><loc_266><loc_70><loc_270>/G5A/G62</text>
+<text><loc_68><loc_266><loc_74><loc_270>/G38</text>
+<text><loc_98><loc_266><loc_107><loc_270>/G22 /G2F</text>
+<text><loc_104><loc_266><loc_112><loc_270>/G27/G2A/G2A</text>
+<text><loc_114><loc_266><loc_117><loc_270>/G23</text>
+<text><loc_136><loc_266><loc_145><loc_270>/G22 /G2F</text>
+<text><loc_142><loc_266><loc_150><loc_270>/G2A/G22/G26</text>
+<text><loc_152><loc_266><loc_155><loc_270>/G27</text>
+<text><loc_174><loc_266><loc_183><loc_270>/G22 /G2F</text>
+<text><loc_180><loc_266><loc_188><loc_270>/G2A/G2C/G2C</text>
+<text><loc_190><loc_266><loc_193><loc_270>/G26</text>
+<text><loc_213><loc_266><loc_222><loc_270>/G22 /G2F</text>
+<text><loc_219><loc_266><loc_227><loc_270>/G2A/G27/G23</text>
+<text><loc_229><loc_266><loc_232><loc_270>/G25</text><nl><caption><loc_91><loc_229><loc_198><loc_233>/G38 /G41 /G44/G2F /G2C /G28/G35 /G6C /G4C/G53 /G41 /G46 /G45/G42 /G31 /G49 /G39/G3A /G49 /G49 /G42 /G40 /G42 /G3E/G43 /G32 /G31 /G39/G42 /G46 /G3D</caption></otsl>
+<otsl><loc_41><loc_286><loc_243><loc_323><fcel><text><loc_59><loc_292><loc_71><loc_296>模型</text>
+<text><loc_157><loc_288><loc_174><loc_292>数据集</text>
+<text><loc_96><loc_296><loc_102><loc_299>/G35</text>
+<text><loc_100><loc_296><loc_111><loc_299>/G5A/G5A/G57</text>
+<text><loc_107><loc_296><loc_116><loc_299>/G5A/G38</text>
+<text><loc_113><loc_296><loc_119><loc_299>/G26/G21</text>
+<text><loc_134><loc_296><loc_140><loc_299>/G35</text>
+<text><loc_138><loc_296><loc_149><loc_299>/G5A/G5A/G57</text>
+<text><loc_146><loc_296><loc_154><loc_299>/G5A/G38</text>
+<text><loc_151><loc_296><loc_157><loc_299>/G26/G27</text>
+<text><loc_172><loc_296><loc_180><loc_299>/G5A/G46</text>
+<text><loc_176><loc_296><loc_182><loc_299>/G42</text>
+<text><loc_179><loc_296><loc_187><loc_299>/G48/G42</text>
+<text><loc_184><loc_296><loc_190><loc_299>/G32</text>
+<text><loc_188><loc_296><loc_194><loc_299>/G41</text>
+<text><loc_191><loc_296><loc_199><loc_299>/G48/G4D</text>
+<text><loc_217><loc_296><loc_222><loc_299>/G4F</text>
+<text><loc_219><loc_296><loc_230><loc_299>/G45/G3E/G4D</text>
+<text><loc_227><loc_296><loc_233><loc_299>/G3A</text>
+<text><loc_56><loc_303><loc_61><loc_307>/G38</text>
+<text><loc_59><loc_303><loc_67><loc_307>/G5A/G62</text>
+<text><loc_65><loc_303><loc_71><loc_307>/G38</text>
+<text><loc_69><loc_303><loc_75><loc_307>/G24</text>
+<text><loc_71><loc_303><loc_76><loc_307>/G35</text>
+<text><loc_98><loc_303><loc_107><loc_307>/G22 /G2F</text>
+<text><loc_104><loc_303><loc_112><loc_307>/G27/G27/G2C</text>
+<text><loc_114><loc_303><loc_117><loc_307>/G26</text>
+<text><loc_136><loc_303><loc_145><loc_307>/G22 /G2F</text>
+<text><loc_142><loc_303><loc_150><loc_307>/G2A/G22/G22</text>
+<text><loc_152><loc_303><loc_155><loc_307>/G26</text>
+<text><loc_174><loc_303><loc_183><loc_307>/G22 /G2F</text>
+<text><loc_180><loc_303><loc_188><loc_307>/G27/G2A/G2A</text>
+<text><loc_190><loc_303><loc_193><loc_307>/G21</text>
+<text><loc_213><loc_303><loc_222><loc_307>/G22 /G2F</text>
+<text><loc_219><loc_303><loc_227><loc_307>/G2A/G23/G22</text>
+<text><loc_229><loc_303><loc_232><loc_307>/G2B</text>
+<text><loc_56><loc_310><loc_61><loc_314>/G38</text>
+<text><loc_59><loc_310><loc_67><loc_314>/G5A/G62</text>
+<text><loc_66><loc_310><loc_71><loc_314>/G38</text>
+<text><loc_69><loc_310><loc_75><loc_314>/G24</text>
+<text><loc_71><loc_310><loc_77><loc_314>/G69</text>
+<text><loc_98><loc_310><loc_107><loc_314>/G22 /G2F</text>
+<text><loc_104><loc_310><loc_112><loc_314>/G27/G21/G21</text>
+<text><loc_114><loc_310><loc_117><loc_314>/G2A</text>
+<text><loc_136><loc_310><loc_145><loc_314>/G22 /G2F</text>
+<text><loc_142><loc_310><loc_150><loc_314>/G27/G2B/G2C</text>
+<text><loc_152><loc_310><loc_155><loc_314>/G2C</text>
+<text><loc_174><loc_310><loc_183><loc_314>/G22 /G2F</text>
+<text><loc_180><loc_310><loc_188><loc_314>/G27/G2B/G23</text>
+<text><loc_190><loc_310><loc_193><loc_314>/G23</text>
+<text><loc_213><loc_310><loc_222><loc_314>/G22 /G2F</text>
+<text><loc_219><loc_310><loc_227><loc_314>/G27/G2A/G27</text>
+<text><loc_229><loc_310><loc_232><loc_314>/G2A</text>
+<text><loc_59><loc_318><loc_64><loc_322>/G38</text>
+<text><loc_62><loc_318><loc_70><loc_322>/G5A/G62</text>
+<text><loc_68><loc_318><loc_74><loc_322>/G38</text>
+<text><loc_98><loc_318><loc_107><loc_322>/G22 /G2F</text>
+<text><loc_104><loc_318><loc_112><loc_322>/G27/G2A/G2A</text>
+<text><loc_114><loc_318><loc_117><loc_322>/G21</text>
+<text><loc_136><loc_318><loc_145><loc_322>/G22 /G2F</text>
+<text><loc_142><loc_318><loc_150><loc_322>/G2A/G22/G23</text>
+<text><loc_152><loc_318><loc_155><loc_322>/G22</text>
+<text><loc_174><loc_318><loc_183><loc_322>/G22 /G2F</text>
+<text><loc_180><loc_318><loc_188><loc_322>/G27/G25/G23</text>
+<text><loc_190><loc_318><loc_193><loc_322>/G27</text>
+<text><loc_213><loc_318><loc_222><loc_322>/G22 /G2F</text>
+<text><loc_219><loc_318><loc_227><loc_322>/G2A/G2C/G2B</text>
+<text><loc_229><loc_318><loc_232><loc_322>/G27</text><nl><caption><loc_91><loc_274><loc_197><loc_285>表 /G2B /G28 不同模型的 /G35 /G4C /G4C 值 /G38 /G41 /G44/G2F /G2B /G28/G35 /G4C /G4C/G53 /G41 /G46 /G45/G42 /G31 /G49 /G39/G3A /G49 /G49 /G42 /G40 /G42 /G3E/G43 /G32 /G31 /G39/G42 /G46 /G3D</caption></otsl>
+<text><loc_42><loc_326><loc_242><loc_370>/G28/G28 从表 /G2C /G29 /G2B 中可以看出 /G21 没有建模知识点空间相关影响的 /G38 /G5A/G62 /G38 /G24 /G69 模型性能表现最差 /G22 表 /G2C 第二行和表 /G2B 第二行 /G23 /G21 其次 是没有建模知识点时间相关影响的 /G38 /G5A/G62 /G38 /G24 /G35 模型 /G21 原本的 /G38 /G5A/G62 /G38 模型表现最好 /G26 这一实验结果验证了知识点之间的相互 影响会作用于知识点的最终表示这一假设 /G21 证明了 /G38 /G5A/G62 /G38 模型 中建模知识点的时间相关表示和时空相关表示的有效性 /G26</text>
+<section_header_level_1><loc_41><loc_374><loc_107><loc_378>/G2A /G29 /G43 /G22 训练过程实验</section_header_level_1>
+<text><loc_42><loc_383><loc_242><loc_426>为了分析 /G38 /G5A/G62 /G38 模型的训练效率 /G21 设计了训练过程对比实 验 /G21 将 /G38 /G5A/G62 /G38 模型在四个真实数据集上与对比模型进行迭代次 数对比 /G21 即比较各个模型在达到最优 /G35 /G6C /G4C 值的情况下所需的 迭代次数 /G26 迭代次数反映了模型的训练效率 /G21 迭代次数越低 /G21 模型达到最优性能所需要的训练时间越少 /G21 模型的训练效率越 高 /G26 相关实验结果如图 /G27 所示 /G26</text>
+<picture><loc_61><loc_427><loc_222><loc_470><caption><loc_79><loc_472><loc_210><loc_476>/G5C /G3A /G47 /G2F /G27 /G28/G4C /G31 /G32 /G48/G41 /G40 /G3A /G3D /G31 /G3E /G31 /G49 /G3A /G43 /G42 /G40 /G41 /G43 /G3A /G31 /G3E/G3D /G49 /G31 /G40 /G42 /G41 /G30 /G4A /G32 /G31 /G39/G42 /G46</caption></picture>
+<text><loc_292><loc_29><loc_300><loc_34>/G28</text>
+<text><loc_258><loc_42><loc_458><loc_79>从图 /G27 的实验结果可以看出 /G21 /G38 /G5A/G62 /G38 模型在四个数据集上 达到最优性能的迭代次数均为最小 /G26 最低值出现在 /G4F /G45/G3E/G4D /G3A 数 据集上 /G21 仅需要小于 /G23/G2B/G22 轮迭代即可达到最优性能 /G25 最高值出 现在 /G35 /G5A/G5A/G57 /G5A/G38 /G26/G27 数据集上 /G21 需要超过 /G2B/G2B/G22 轮迭代达到最优性能 /G26 实验结果说明了 /G38 /G5A/G62 /G38 模型的训练效率最高 /G26</text>
+<section_header_level_1><loc_257><loc_84><loc_315><loc_88>/G2A /G29 /G3D /G22 模型的实例</section_header_level_1>
+<text><loc_257><loc_93><loc_458><loc_161>为了验证 /G38 /G5A/G62 /G38 模型在实际学习中的可用性 /G21 指导学生设 计开发了 /G2A 学习数据与认知模型双驱动的跨模态多尺度自适 应智慧学习环境 /G22 /G4C /G34 /G35 /G24 /G57 /G4E /G59 /G23 /G2B /G26 该环境包括了习题 /G57 /G5B /G29 知识 点 /G57 /G5B 和习题作答时间等信息 /G21 具体地 /G21 包含 /G26/G22/G21 个知识点和 /G26 /G27/G22/G25 名学习者的真实作答数据等信息 /G26 以此为基础建模知识 点之间的时间影响和空间作用 /G21 得到知识点的时空相关表示 /G21 完成对学习者知识状态的判断和预测 /G26 同时 /G21 还集成了若干对 比模型 /G21 以便对比分析各个模型在实际学习环境的性能并进行 评估 /G26 智慧学习环境的部分功能如图 /G2A 所示 /G26</text>
+<picture><loc_258><loc_165><loc_459><loc_228><caption><loc_311><loc_232><loc_405><loc_236>图 /G2A /G28 智慧学习环境 /G24 知识点关系</caption></picture>
+<text><loc_258><loc_238><loc_458><loc_290>/G5C /G3A /G47 /G2F /G2A/G28/G57 /G3E/G43 /G42 /G46 /G46 /G3A /G47 /G42 /G3E/G43 /G46 /G42 /G41 /G40 /G3E/G3A /G3E/G47 /G42 /G3E/G53 /G3A /G40 /G31 /G3E/G32 /G42 /G3E/G43 /G24 /G58/G3E/G31 /G52 /G46 /G42 /G39/G47 /G42 /G30 /G31 /G3E/G30 /G42 /G48/G43 /G3D /G40 /G42 /G46 /G41 /G43 /G3A /G31 /G3E/G3D /G4A/G3A /G48 具体应用实例包括在 /G21/G22/G21/G21 /G33 /G21/G22/G21/G23 年第二学期讲授的 /G34 人 工智能 /G35 课程中 /G27/G29 名学生的学习行为数据 /G21 /G34 机器学习 /G35 课程 中 /G29/G23 名学生的学习行为数据 /G21 对隐私信息进行脱敏处理 /G21 保存 若干次作业的答题记录 /G26 具体实验步骤参见 /G23 /G2F /G26 节 /G21 再将其中 的 /G2A/G22 /G68 用作训练集 /G21 /G21/G22 /G68 用作测试集 /G21 计算五个对比模型和 /G38 /G5A/G62 /G38 模型的平均预测准确率 /G21 结果如表 /G29 所示 /G26</text>
+<section_header_level_1><loc_305><loc_293><loc_410><loc_297>表 /G29 /G28 智慧学习环境中的准确率对比</section_header_level_1>
+<otsl><loc_257><loc_307><loc_459><loc_330><fcel><text><loc_263><loc_313><loc_275><loc_317>指标</text>
+<text><loc_364><loc_310><loc_375><loc_314>模型</text>
+<text><loc_289><loc_317><loc_295><loc_321>/G5B</text>
+<text><loc_293><loc_317><loc_298><loc_321>/G62</text>
+<text><loc_296><loc_317><loc_302><loc_321>/G38</text>
+<text><loc_315><loc_317><loc_321><loc_321>/G38</text>
+<text><loc_318><loc_317><loc_324><loc_321>/G4C</text>
+<text><loc_322><loc_317><loc_328><loc_321>/G5F</text>
+<text><loc_326><loc_317><loc_332><loc_321>/G24</text>
+<text><loc_328><loc_317><loc_334><loc_321>/G62</text>
+<text><loc_332><loc_317><loc_337><loc_321>/G38</text>
+<text><loc_350><loc_317><loc_356><loc_321>/G5B</text>
+<text><loc_354><loc_317><loc_360><loc_321>/G62</text>
+<text><loc_358><loc_317><loc_364><loc_321>/G5D</text>
+<text><loc_362><loc_317><loc_372><loc_321>/G34 /G5F</text>
+<text><loc_386><loc_317><loc_391><loc_321>/G3F</text>
+<text><loc_389><loc_317><loc_395><loc_321>/G62</text>
+<text><loc_393><loc_317><loc_399><loc_321>/G38</text>
+<text><loc_412><loc_317><loc_421><loc_321>/G5A/G62</text>
+<text><loc_419><loc_317><loc_425><loc_321>/G38</text>
+<text><loc_438><loc_317><loc_444><loc_321>/G38</text>
+<text><loc_441><loc_317><loc_450><loc_321>/G5A/G62</text>
+<text><loc_448><loc_317><loc_454><loc_321>/G38</text>
+<text><loc_264><loc_324><loc_270><loc_328>/G35</text>
+<text><loc_268><loc_324><loc_273><loc_328>/G4C</text>
+<text><loc_271><loc_324><loc_277><loc_328>/G4C</text>
+<text><loc_287><loc_324><loc_296><loc_328>/G22 /G2F</text>
+<text><loc_293><loc_324><loc_301><loc_328>/G27/G21/G29</text>
+<text><loc_318><loc_324><loc_327><loc_328>/G22 /G2F</text>
+<text><loc_323><loc_324><loc_332><loc_328>/G27/G29/G2B</text>
+<text><loc_353><loc_324><loc_362><loc_328>/G22 /G2F</text>
+<text><loc_359><loc_324><loc_367><loc_328>/G27/G21/G2C</text>
+<text><loc_384><loc_324><loc_393><loc_328>/G22 /G2F</text>
+<text><loc_389><loc_324><loc_398><loc_328>/G27/G25/G23</text>
+<text><loc_410><loc_324><loc_419><loc_328>/G22 /G2F</text>
+<text><loc_416><loc_324><loc_424><loc_328>/G27/G2A/G21</text>
+<text><loc_437><loc_324><loc_446><loc_328>/G22 /G2F</text>
+<text><loc_443><loc_324><loc_451><loc_328>/G2A/G22/G26</text><nl><caption><loc_269><loc_301><loc_452><loc_305>/G38 /G41 /G44/G2F /G29 /G28/G4C /G31 /G32 /G48/G41 /G40 /G3A /G3D /G31 /G3E /G31 /G49 /G41 /G30 /G30 /G45/G40 /G41 /G30 /G4D /G3A /G3E /G3A /G3E/G43 /G42 /G46 /G46 /G3A /G47 /G42 /G3E/G43 /G46 /G42 /G41 /G40 /G3E/G3A /G3E/G47 /G42 /G3E/G53 /G3A /G40 /G31 /G3E/G32 /G42 /G3E/G43</caption></otsl>
+<text><loc_257><loc_333><loc_458><loc_426>/G28/G28 从表 /G29 可以看出 /G21 相较于只建模时间窗口内历史习题对当 前习题影响的 /G38 /G4C /G5F /G24 /G62 /G38 模型 /G21 /G38 /G5A/G62 /G38 模型不仅扩充建模了上述 局部知识点之间的时间影响 /G21 同时把知识点的空间关系融入知 识点的表示 /G21 实验结果表明 /G21 /G38 /G5A/G62 /G38 模型的准确率提高了 /G23/G5E /G29 /G68 /G21 验证了 /G38 /G5A/G62 /G38 模型建模知识点时空相关表示的有效性 /G21 以及在实际学习环境中的效果 /G26 进一步地 /G21 相较于只建模了知 识点空间关系的 /G3F /G62 /G38 和 /G5A/G62 /G38 模型 /G21 /G38 /G5A/G62 /G38 模型在此基础上还刻 画了历史知识点对当前知识点的影响 /G21 计算出知识点的时空相 关表示 /G26 实验结果表明 /G21 /G38 /G5A/G62 /G38 模型的建模方式在准确率方面 分别提高了 /G22 /G2F /G2A /G68 和 /G26 /G2F /G25 /G68 /G26 上述实际环境中的对比结果能够 证明 /G38 /G5A/G62 /G38 模型对实际学习情况的建模更加准确 /G21 验证了该模 型在实际学习环境中的可用性 /G26</text>
+<section_header_level_1><loc_257><loc_434><loc_297><loc_439>/G2B /G22 结束语</section_header_level_1>
+<text><loc_258><loc_447><loc_458><loc_476>本文提出了一个时空相关性融合表征的知识追踪模型 /G21 用于解决现有研究尚未从时间和空间的角度建模知识点表 示及其相互作用的问题 /G26 /G38 /G5A/G62 /G38 模型首先以知识点之间的时 间相关程度为基础 /G21 描述了历史知识点对当前知识点的影</text>
+<page_break>
+<page_header><loc_46><loc_29><loc_69><loc_34>第 /G2B 期</page_header>
+<page_header><loc_169><loc_29><loc_335><loc_34>张 /G28 凯 /G25 等 /G28 时空相关性融合表征的知识追踪模型</page_header>
+<page_header><loc_419><loc_28><loc_458><loc_34>/G30 /G26/G23/G2A/G27 /G30 /G28/G28/G28</page_header>
+<text><loc_42><loc_42><loc_246><loc_126>响 /G21 提炼出知识点的时间相关表示 /G25 其次使用图神经网络建 模了习题中知识点之间的空间作用 /G21 得到包含时间和空间信 息的知识点表示 /G25 最后聚合习题中的知识点 /G21 与答题结果结 合 /G21 采用自注意力机制建模知识状态 /G21 并把历史知识状态融 合到当前知识状态 /G26 与五个对比模型在四个真实数据集上 的实验结果表明 /G21 /G38 /G5A/G62 /G38 模型的性能较为出色 /G21 同时验证了包 含时间和空间信息的知识点表示的有效性 /G26 综上所述 /G21 /G38 /G5A/G62 /G38 模型达到了更好的效果和效率 /G21 验证了建模知识点之间相互 作用的必要性和可行性 /G26 未来将继续深入研究知识点的表 示及其相互作用关系 /G21 以及知识点间的相互作用对习题表征 带来的影响 /G26</text>
+<section_header_level_1><loc_42><loc_130><loc_76><loc_135>参考文献 /G21</section_header_level_1>
+<unordered_list><list_item><loc_42><loc_139><loc_246><loc_173>/G29 /G26 /G2A 刘恒宇 /G25 张天成 /G25 武培文 /G25 等 /G2F 知识追踪综述 /G29 /G4F /G2A /G2F 华东师范大学 学报 /G28 自然科学版 /G25 /G21/G22/G26/G25 /G22 /G2B /G23 /G28 /G26 /G24 /G26/G2B /G2F /G22 /G4E /G3A /G45 /G54 /G42 /G3E/G47 /G4D /G45 /G25 /G4B /G4A/G41 /G3E/G47 /G38 /G3A /G41 /G3E/G30 /G4A/G42 /G3E/G47 /G25 /G6B /G45 /G36 /G42 /G3A /G52 /G42 /G3E /G25 /G24 /G2C /G28/G23 /G2F/G35 /G40 /G42 /G53 /G3A /G42 /G52 /G31 /G49 /G58/G3E/G31 /G52 /G46 /G42 /G39/G47 /G42 /G43 /G40 /G41 /G30 /G3A /G3E/G47 /G29 /G4F /G2A /G2F /G49/G3A /G2F /G30 /G38 /G2D /G41 /G3A /G4A /G45 /G2D /G3C/G2E /G3E /G4B /G37 /G38 /G2D /G2C /G3A /G30 /G3F /G2D /G41 /G58 /G38 /G37 /G59/G31 /G30 /G3C/G37 /G2E /G47 /G28 /G2C /G2D /G2E /G2F /G30 /G2D /G41 /G35 /G36/G37 /G31 /G38 /G36/G31 /G25 /G21/G22/G26/G25 /G22 /G2B /G23 /G28 /G26 /G24 /G26/G2B /G2F /G23</list_item>
+<list_item><loc_42><loc_176><loc_247><loc_209>/G29 /G21 /G2A 曾凡智 /G25 许露倩 /G25 周燕 /G25 等 /G2F 面向智慧教育的知识追踪模型研究综 述 /G29 /G4F /G2A /G2F 计算机科学与探索 /G25 /G21/G22/G21/G21 /G25 /G23 /G43 /G22 /G2A /G23 /G28 /G26/G27/G2C/G21 /G24 /G26/G27/G29/G23 /G2F /G22 /G4B /G42 /G3E/G47 /G5C /G41 /G3E/G56 /G4A/G3A /G25 /G50 /G45 /G4E /G45/G2E/G3A /G41 /G3E /G25 /G4B /G4A/G31 /G45 /G6A /G41 /G3E /G25 /G24 /G2C /G28/G23 /G2F/G51 /G42 /G53 /G3A /G42 /G52 /G31 /G49 /G58/G3E/G31 /G52 /G46 /G42 /G39/G47 /G42/G43 /G40 /G41 /G30 /G3A /G3E/G47 /G32 /G31 /G39/G42 /G46 /G49 /G31 /G40 /G3A /G3E/G43 /G42 /G46 /G46 /G3A /G47 /G42 /G3E/G43 /G42 /G39/G45/G30 /G41 /G43 /G3A /G31 /G3E /G29 /G4F /G2A /G2F /G49/G3A /G2F /G30 /G38 /G2D /G41 /G3A /G4A /G54 /G30 /G3A /G38 /G2E /G37 /G31 /G30 /G3C /G3A /G4A /G3E /G3A /G3F /G4D /G40 /G2F /G2E /G31 /G30 /G35 /G36/G37 /G31 /G38 /G36/G31 /G2D /G38 /G53 /G46 /G31 /G36/G4B /G38 /G3A /G41 /G3A /G48 /G47 /G25 /G21/G22/G21/G21 /G25 /G23 /G43 /G22 /G2A /G23 /G28 /G26/G27/G2C/G21 /G24 /G26/G27/G29/G23 /G2F /G23</list_item>
+<list_item><loc_42><loc_212><loc_247><loc_238>/G29 /G23 /G2A 张暖 /G25 江波 /G2F 学习者知识追踪研究进展综述 /G29 /G4F /G2A /G2F 计算机科学 /G25 /G21/G22/G21/G26 /G25 /G2B /G34 /G22 /G2C /G23 /G28 /G21/G26/G23 /G24 /G21/G21/G21 /G2F /G22 /G4B /G4A/G41 /G3E/G47 /G5F /G45/G41 /G3E /G25 /G4F /G3A /G41 /G3E/G47 /G69 /G31 /G2F /G51 /G42 /G53 /G3A /G42 /G52/G48/G40 /G31 /G47 /G40 /G42 /G3D /G3D /G31 /G49 /G46 /G42 /G41 /G40 /G3E/G42 /G40 /G58/G3E/G31 /G52 /G46 /G42 /G39/G47 /G42 /G43 /G40 /G41 /G30 /G3A /G3E/G47 /G29 /G4F /G2A /G2F /G3E /G3A /G3F /G40 /G2F /G2E /G31 /G30 /G35 /G36/G37 /G31 /G38 /G36/G31 /G25 /G21/G22/G21/G26 /G25 /G2B /G34 /G22 /G2C /G23 /G28 /G21/G26/G23 /G24 /G21/G21/G21 /G2F /G23</list_item>
+<list_item><loc_42><loc_241><loc_247><loc_259>/G29 /G2C /G2A /G36 /G3A /G42 /G30 /G4A /G4C /G25 /G69 /G41 /G3D /G3D /G42 /G3E /G4F /G25 /G54 /G45/G41 /G3E/G47 /G4F /G25 /G24 /G2C /G28/G23 /G2F/G5B /G42 /G42 /G48 /G58/G3E/G31 /G52 /G46 /G42 /G39/G47 /G42 /G43 /G40 /G41 /G30 /G3A /G3E/G47 /G29 /G4C /G2A /G3B /G3B /G36 /G40 /G31 /G30 /G31 /G49 /G43 /G4A/G42 /G21/G25 /G43 /G4A /G35 /G3E/G3E/G45/G41 /G46 /G4C /G31 /G3E/G49 /G42 /G40 /G42 /G3E/G30 /G42 /G31 /G3E /G5F /G42 /G45/G40 /G41 /G46 /G57 /G3E/G49 /G31 /G40 /G32 /G41 /G43 /G3A /G31 /G3E /G36 /G40 /G31 /G30 /G42 /G3D /G3D /G3A /G3E/G47 /G5A/G4D /G3D /G43 /G42 /G32 /G3D /G2F /G51 /G42 /G39 /G54 /G31 /G31 /G58 /G25 /G5F /G6A /G28 /G4C /G45/G40 /G40 /G41 /G3E /G35 /G3D /G3D /G31 /G30 /G3A /G41 /G43 /G42 /G3D /G57 /G3E/G30 /G2F /G25 /G21/G22/G26/G2B /G28 /G2B/G22/G2B /G24 /G2B/G26/G23 /G2F</list_item>
+<list_item><loc_42><loc_262><loc_247><loc_295>/G29 /G2B /G2A 王文涛 /G25 马慧芳 /G25 舒跃育 /G25 等 /G2F 基于上下文表示的知识追踪方法 /G29 /G4F /G2A /G2F 计算机工程与科学 /G25 /G21/G22/G21/G21 /G25 /G2B /G2B /G22 /G25 /G23 /G28 /G26/G29/G25/G23 /G24 /G26/G27/G22/G26 /G2F /G22 /G6B /G41 /G3E/G47 /G6B /G42 /G3E/G24 /G43 /G41 /G31 /G25 /G34 /G41 /G54 /G45/G3A /G49 /G41 /G3E/G47 /G25 /G5A/G4A/G45 /G6A /G45/G42 /G4D /G45 /G25 /G24 /G2C /G28/G23 /G2F /G62 /G3E/G31 /G52 /G46 /G42 /G39/G47 /G42 /G43 /G40 /G41 /G30 /G3A /G3E/G47 /G44/G41 /G3D /G42 /G39 /G31 /G3E /G30 /G31 /G3E/G24 /G43 /G42 /G55 /G43 /G45/G41 /G46 /G3A /G56 /G42 /G39 /G40 /G42 /G48/G40 /G42 /G3D /G42 /G3E/G43 /G41 /G43 /G3A /G31 /G3E /G29 /G4F /G2A /G2F /G3E /G3A /G3F /G40 /G2F /G2E /G31 /G30 /G45 /G38 /G48 /G37 /G38 /G31 /G31 /G30 /G37 /G38 /G48 /G42/G35 /G36/G37 /G31 /G38 /G36/G31 /G25 /G21/G22/G21/G21 /G25 /G2B /G2B /G22 /G25 /G23 /G28 /G26/G29/G25/G23 /G24 /G26/G27/G22/G26 /G2F /G23</list_item>
+<list_item><loc_42><loc_298><loc_247><loc_331>/G29 /G29 /G2A 魏思 /G25 沈双宏 /G25 黄振亚 /G25 等 /G2F 融合通用题目表征学习的神经知识追 踪方法研究 /G29 /G4F /G2A /G2F 中文信息学报 /G25 /G21/G22/G21/G21 /G25 /G2A /G43 /G22 /G2C /G23 /G28 /G26/G2C/G29 /G24 /G26/G2B/G2B /G2F /G22 /G6B /G42 /G3A /G5A/G3A /G25 /G5A/G4A/G42 /G3E /G5A/G4A/G45/G41 /G3E/G47 /G4A/G31 /G3E/G47 /G25 /G54 /G45/G41 /G3E/G47 /G4B /G4A/G42 /G3E/G4D /G41 /G25 /G24 /G2C /G28/G23 /G2F /G57 /G3E/G43 /G42 /G47 /G40 /G41 /G43 /G3A /G3E/G47 /G47 /G42 /G3E/G42 /G40 /G41 /G46 /G42 /G55 /G42 /G40 /G30 /G3A /G24 /G3D /G42 /G3D /G40 /G42 /G48/G40 /G42 /G3D /G42 /G3E/G43 /G41 /G43 /G3A /G31 /G3E /G46 /G42 /G41 /G40 /G3E/G3A /G3E/G47 /G3A /G3E/G43 /G31 /G3E/G42 /G45/G40 /G41 /G46 /G58/G3E/G31 /G52 /G46 /G42 /G39/G47 /G42 /G43 /G40 /G41 /G30 /G3A /G3E/G47 /G29 /G4F /G2A /G2F /G49/G3A /G2F /G30 /G4D /G38 /G2D /G41 /G3A /G4A /G3E /G4B /G37 /G38 /G3C/G31 /G3C /G44 /G38 /G4A /G3A /G30 /G3F /G2D /G2E /G37 /G3A /G38 /G27 /G30 /G3A /G36/G31 /G3C/G3C/G37 /G38 /G48 /G25 /G21/G22/G21/G21 /G25 /G2A /G43 /G22 /G2C /G23 /G28 /G26/G2C/G29 /G24 /G26/G2B/G2B /G2F /G23</list_item>
+<list_item><loc_42><loc_335><loc_247><loc_368>/G29 /G27 /G2A 刘坤佳 /G25 李欣奕 /G25 唐九阳 /G25 等 /G2F 可解释深度知识追踪模型 /G29 /G4F /G2A /G2F 计 算机研究与发展 /G25 /G21/G22/G21/G26 /G25 /G32 /G34 /G22 /G26/G21 /G23 /G28 /G21/G29/G26/G2A /G24 /G21/G29/G21/G25 /G2F /G22 /G4E /G3A /G45 /G62 /G45/G3E/G3C /G3A /G41 /G25 /G4E /G3A /G50 /G3A /G3E/G4D /G3A /G25 /G38 /G41 /G3E/G47 /G4F /G3A /G45/G4D /G41 /G3E/G47 /G25 /G24 /G2C /G28/G23 /G2F /G57 /G3E/G43 /G42 /G40 /G48/G40 /G42 /G43 /G41 /G44/G46 /G42 /G39/G42 /G42 /G48 /G58/G3E/G31 /G52 /G46 /G42 /G39/G47 /G42 /G43 /G40 /G41 /G30 /G3A /G3E/G47 /G29 /G4F /G2A /G2F /G49/G3A /G2F /G30 /G38 /G2D /G41 /G3A /G4A/G3E /G3A /G3F /G40 /G2F /G2E /G31 /G30/G39 /G31 /G3C/G31 /G2D /G30 /G36/G4B /G2D /G38 /G53 /G50 /G31 /G59/G31 /G41 /G3A /G40 /G3F /G31 /G38 /G2E /G25 /G21/G22/G21/G26 /G25 /G32 /G34 /G22 /G26/G21 /G23 /G28 /G21/G29/G26/G2A /G24 /G21/G29/G21/G25 /G2F /G23</list_item>
+<list_item><loc_42><loc_371><loc_247><loc_396>/G29 /G2A /G2A /G4B /G4A/G41 /G3E/G47 /G4F /G3A /G41 /G3E/G3A /G25 /G5A/G4A/G3A /G50 /G3A /G3E/G47 /G3C /G3A /G41 /G3E /G25 /G62 /G3A /G3E/G47 /G57 /G25 /G24 /G2C /G28/G23 /G2F /G5B /G4D /G3E/G41 /G32 /G3A /G30 /G58/G42 /G4D /G24 /G53 /G41 /G46 /G45/G42 /G32 /G42 /G32 /G31 /G40 /G4D /G3E/G42 /G43 /G52 /G31 /G40 /G58/G3D /G49 /G31 /G40 /G58/G3E/G31 /G52 /G46 /G42 /G39/G47 /G42 /G43 /G40 /G41 /G30 /G3A /G3E/G47 /G29 /G4C /G2A /G3B /G3B /G36 /G40 /G31 /G30 /G31 /G49 /G43 /G4A/G42 /G21/G29 /G43 /G4A /G57 /G3E/G43 /G42 /G40 /G3E/G41 /G43 /G3A /G31 /G3E/G41 /G46 /G4C /G31 /G3E/G49 /G42 /G40 /G42 /G3E/G30 /G42 /G31 /G3E /G6B /G31 /G40 /G46 /G39 /G6B /G3A /G39/G42 /G6B /G42 /G44/G2F /G3F /G42 /G3E/G42 /G53 /G41 /G28 /G57 /G3E/G43 /G42 /G40 /G3E/G41 /G43 /G3A /G31 /G3E/G41 /G46 /G6B /G31 /G40 /G46 /G39 /G6B /G3A /G39/G42 /G6B /G42 /G44 /G4C /G31 /G3E/G49 /G42 /G40 /G42 /G3E/G30 /G42 /G3D /G5A/G43 /G42 /G42 /G40 /G3A /G3E/G47 /G4C /G31 /G32 /G32 /G3A /G43 /G43 /G42 /G42 /G25 /G21/G22/G26/G27 /G28 /G27/G29/G2B /G24 /G27/G27/G2C /G2F</list_item>
+<list_item><loc_42><loc_400><loc_247><loc_433>/G29 /G25 /G2A 李晓光 /G25 魏思齐 /G25 张昕 /G25 等 /G2F /G4E /G5C /G62 /G38 /G28 学习与遗忘融合的深度知识追 踪模型 /G29 /G4F /G2A /G2F 软件学报 /G25 /G21/G22/G21/G26 /G25 /G2A /G24 /G22 /G23 /G23 /G28 /G2A/G26/G2A /G24 /G2A/G23/G22 /G2F /G22 /G4E /G3A /G50 /G3A /G41 /G31 /G47 /G45/G41 /G3E/G47 /G25 /G6B /G42 /G3A /G5A/G3A /G2E/G3A /G25 /G4B /G4A/G41 /G3E/G47/G50 /G3A /G3E /G25 /G24 /G2C /G28/G23 /G2F/G4E /G5C /G62 /G38 /G28 /G39/G42 /G42 /G48 /G58/G3E/G31 /G52 /G46 /G42 /G39/G47 /G42/G43 /G40 /G41 /G30 /G3A /G3E/G47/G32 /G31 /G39/G42 /G46 /G52 /G3A /G43 /G4A /G46 /G42 /G41 /G40 /G3E/G3A /G3E/G47 /G41 /G3E/G39 /G49 /G31 /G40 /G47 /G42 /G43 /G43 /G3A /G3E/G47 /G44/G42 /G4A/G41 /G53 /G3A /G31 /G40 /G32 /G42 /G40 /G47 /G3A /G3E/G47 /G29 /G4F /G2A /G2F /G49/G3A /G2F /G30 /G38 /G2D /G41 /G3A /G4A /G35 /G3A /G4A /G2E /G4D /G52 /G2D /G30 /G31 /G25 /G21/G22/G21/G26 /G25 /G2A /G24 /G22 /G23 /G23 /G28 /G2A/G26/G2A /G24 /G2A/G23/G22 /G2F /G23</list_item>
+<list_item><loc_42><loc_436><loc_247><loc_461>/G29 /G26/G22 /G2A 宗晓萍 /G25 陶泽泽 /G2F 基于掌握速度的知识追踪模型 /G29 /G4F /G2A /G2F 计算机工 程与应用 /G25 /G21/G22/G21/G26 /G25 /G32 /G3D /G22 /G29 /G23 /G28 /G26/G26/G27 /G24 /G26/G21/G23 /G2F /G22 /G4B /G31 /G3E/G47/G50 /G3A /G41 /G31 /G48/G3A /G3E/G47 /G25 /G38 /G41 /G31/G4B /G42 /G56 /G42 /G2F /G62 /G3E/G31 /G52 /G46 /G42 /G39/G47 /G42 /G43 /G40 /G41 /G30 /G3A /G3E/G47 /G32 /G31 /G39/G42 /G46 /G44/G41 /G3D /G42 /G39 /G31 /G3E /G32 /G41 /G3D /G43 /G42 /G40 /G4D/G3D /G48/G42 /G42 /G39 /G29 /G4F /G2A /G2F /G3E /G3A /G3F /G40 /G2F /G2E /G31 /G30 /G45 /G38 /G48 /G37 /G38 /G31 /G31 /G30 /G37 /G38 /G48 /G2D /G38 /G53 /G26 /G40 /G40 /G41 /G37 /G36/G2D /G2E /G37 /G3A /G38 /G25 /G21/G22/G21/G26 /G25 /G32 /G3D /G22 /G29 /G23 /G28 /G26/G26/G27 /G24 /G26/G21/G23 /G2F /G23</list_item>
+<list_item><loc_42><loc_465><loc_247><loc_476>/G29 /G26/G26 /G2A 王璨 /G25 刘朝晖 /G25 王蓓 /G25 等 /G2F /G38 /G4C /G5F /G24 /G62 /G38 /G28 个人基础与遗忘融合的时间卷 积知识追踪模型 /G29 /G4F /G2A /G2F 计算机应用研究 /G25 /G21/G22/G21/G21 /G25 /G2A /G33 /G22 /G2B /G23 /G28 /G26/G2C/G25/G29 /G24</list_item>
+<list_item><loc_274><loc_42><loc_463><loc_68>/G26/G2B/G22/G22 /G2F /G22 /G6B /G41 /G3E/G47 /G4C /G41 /G3E /G25 /G4E /G3A /G45 /G4B /G4A/G41 /G31 /G4A/G45/G3A /G25 /G6B /G41 /G3E/G47 /G69 /G42 /G3A /G25 /G24 /G2C /G28/G23 /G2F /G38 /G4C /G5F /G24 /G62 /G38 /G28 /G43 /G42 /G32 /G48/G31 /G40 /G41 /G46 /G30 /G31 /G3E/G53 /G31 /G46 /G45/G43 /G3A /G31 /G3E/G41 /G46 /G58/G3E/G31 /G52 /G24 /G46 /G42 /G39/G47 /G42 /G43 /G40 /G41 /G30 /G58/G3A /G3E/G47 /G32 /G31 /G39/G42 /G46 /G44/G41 /G3D /G42 /G39 /G31 /G3E /G49 /G45/G3D /G3A /G31 /G3E /G31 /G49 /G48/G42 /G40 /G3D /G31 /G3E/G41 /G46 /G44/G41 /G3D /G3A /G3D /G41 /G3E/G39 /G49 /G31 /G40 /G47 /G42 /G43 /G43 /G3A /G3E/G47 /G29 /G4F /G2A /G2F /G26 /G40 /G40 /G41 /G37 /G36/G2D /G2E /G37 /G3A /G38/G39 /G31 /G3C/G31 /G2D /G30 /G36/G4B /G3A /G4A /G3E /G3A /G3F /G40 /G2F /G2E /G31 /G30 /G3C /G25 /G21/G22/G21/G21 /G25 /G2A /G33 /G22 /G2B /G23 /G28 /G26/G2C/G25/G29 /G24 /G26/G2B/G22/G22 /G2F /G23</list_item>
+<list_item><loc_258><loc_71><loc_463><loc_105>/G29 /G26/G21 /G2A /G5A/G4A/G42 /G3E /G5A/G4A/G45/G41 /G3E/G47 /G4A/G31 /G3E/G47 /G25 /G4E /G3A /G45 /G61 /G3A /G25 /G4C /G4A/G42 /G3E /G59 /G3E/G4A/G31 /G3E/G47 /G25 /G24 /G2C /G28/G23 /G2F/G4C /G31 /G3E/G53 /G31 /G46 /G45/G43 /G3A /G31 /G3E/G41 /G46 /G58/G3E/G31 /G52 /G24 /G46 /G42 /G39/G47 /G42 /G43 /G40 /G41 /G30 /G3A /G3E/G47 /G28 /G32 /G31 /G39/G42 /G46 /G3A /G3E/G47 /G3A /G3E/G39/G3A /G53 /G3A /G39/G45/G41 /G46 /G3A /G56 /G41 /G43 /G3A /G31 /G3E /G3A /G3E /G3D /G43 /G45/G39/G42 /G3E/G43 /G46 /G42 /G41 /G40 /G3E/G3A /G3E/G47 /G48/G40 /G31 /G30 /G42 /G3D /G3D /G29 /G4C /G2A /G3B /G3B /G36 /G40 /G31 /G30 /G31 /G49 /G43 /G4A/G42 /G2C/G23 /G40 /G39 /G57 /G3E/G43 /G42 /G40 /G3E/G41 /G43 /G3A /G31 /G3E/G41 /G46 /G35 /G4C /G34 /G5A/G57 /G3F /G57 /G51/G4C /G31 /G3E/G49 /G42 /G40 /G42 /G3E/G30 /G42 /G31 /G3E /G51 /G42 /G24 /G3D /G42 /G41 /G40 /G30 /G4A /G41 /G3E/G39 /G5B /G42 /G53 /G42 /G46 /G31 /G48/G32 /G42 /G3E/G43 /G3A /G3E /G57 /G3E/G49 /G31 /G40 /G32 /G41 /G43 /G3A /G31 /G3E /G51 /G42 /G43 /G40 /G3A /G42 /G53 /G41 /G46 /G2F/G5F /G42 /G52/G6A /G31 /G40 /G58 /G28 /G35 /G4C /G34 /G36 /G40 /G42 /G3D /G3D /G25 /G21/G22/G21/G22 /G28 /G26/G2A/G2B/G27 /G24 /G26/G2A/G29/G22 /G2F</list_item>
+<list_item><loc_258><loc_108><loc_462><loc_141>/G29 /G26/G23 /G2A 段建设 /G25 崔超然 /G25 宋广乐 /G25 等 /G2F 基于多尺度注意力融合的知识追踪 方法 /G29 /G4F /G2A /G2F 南京大学学报 /G28 自然科学版 /G25 /G21/G22/G21/G26 /G25 /G32 /G3D /G22 /G2C /G23 /G28 /G2B/G25/G26 /G24 /G2B/G25/G2A /G2F /G22 /G5B /G45/G41 /G3E /G4F /G3A /G41 /G3E/G3D /G4A/G42 /G25 /G4C /G45/G3A /G4C /G4A/G41 /G31 /G40 /G41 /G3E /G25 /G5A/G31 /G3E/G47 /G3F /G45/G41 /G3E/G47 /G46 /G42 /G25 /G24 /G2C /G28/G23 /G2F /G62 /G3E/G31 /G52 /G46 /G42 /G39/G47 /G42 /G43 /G40 /G41 /G30 /G3A /G3E/G47 /G44/G41 /G3D /G42 /G39 /G31 /G3E /G32 /G45/G46 /G43 /G3A /G24 /G3D /G30 /G41 /G46 /G42 /G41 /G43 /G43 /G42 /G3E/G43 /G3A /G31 /G3E /G49 /G45/G3D /G3A /G31 /G3E /G29 /G4F /G2A /G2F /G49/G3A /G2F /G30 /G38 /G2D /G41 /G3A /G4A /G2C /G2D /G38 /G5A /G37 /G38 /G48/G58 /G38 /G37 /G4D /G59/G31 /G30 /G3C/G37 /G2E /G47 /G28 /G2C /G2D /G2E /G2F /G30 /G2D /G41 /G35 /G36/G37 /G31 /G38 /G36/G31 /G25 /G21/G22/G21/G26 /G25 /G32 /G3D /G22 /G2C /G23 /G28 /G2B/G25/G26 /G24 /G2B/G25/G2A /G2F /G23</list_item>
+<list_item><loc_258><loc_144><loc_462><loc_177>/G29 /G26/G2C /G2A 张凯 /G25 覃正楚 /G25 刘月 /G25 等 /G2F 多学习行为协同的知识追踪模型 /G29 /G4F /G2A /G2F 计算机应用 /G25 /G21/G22/G21/G23 /G25 /G2B /G2A /G22 /G2B /G23 /G28 /G26/G2C/G21/G21 /G24 /G26/G2C/G21/G25 /G2F /G22 /G4B /G4A/G41 /G3E/G47 /G62 /G41 /G3A /G25 /G61 /G3A /G3E /G4B /G4A/G42 /G3E/G47 /G24 /G30 /G4A/G45 /G25 /G4E /G3A /G45 /G6A /G45/G42 /G25 /G24 /G2C /G28/G23 /G2F/G34 /G45/G46 /G43 /G3A /G24 /G46 /G42 /G41 /G40 /G3E/G3A /G3E/G47 /G44/G42 /G4A/G41 /G53 /G3A /G31 /G40 /G30 /G31 /G46 /G46 /G41 /G44/G31 /G40 /G41 /G43 /G42 /G39 /G58/G3E/G31 /G52 /G46 /G42 /G39/G47 /G42 /G43 /G40 /G41 /G30 /G3A /G3E/G47 /G32 /G31 /G39/G42 /G46 /G29 /G4F /G2A /G2F /G49/G3A /G2F /G30 /G38 /G2D /G41 /G3A /G4A /G3E /G3A /G3F /G40 /G2F /G2E /G31 /G30 /G26 /G40 /G40 /G41 /G37 /G36/G2D /G2E /G37 /G3A /G38 /G3C /G25 /G21/G22/G21/G23 /G25 /G2B /G2A /G22 /G2B /G23 /G28 /G26/G2C/G21/G21 /G24 /G26/G2C/G21/G25 /G2F /G23</list_item>
+<list_item><loc_258><loc_180><loc_463><loc_221>/G29 /G26/G2B /G2A 李浩君 /G25 方璇 /G25 戴海容 /G2F 基于自注意力机制和双向 /G3F /G51 /G6C 神经网络 的深度知识追踪优化模型 /G29 /G4F /G2A /G2F 计算机应用研究 /G25 /G21/G22/G21/G21 /G25 /G2A /G33 /G22 /G23 /G23 /G28 /G27/G23/G21 /G24 /G27/G23/G2A /G2F /G22 /G4E /G3A /G54 /G41 /G31 /G3C /G45/G3E /G25 /G5C /G41 /G3E/G47/G50 /G45/G41 /G3E /G25 /G5B /G41 /G3A /G54 /G41 /G3A /G40 /G31 /G3E/G47 /G2F/G5B /G42 /G42 /G48 /G58/G3E/G31 /G52 /G46 /G42 /G39/G47 /G42 /G43 /G40 /G41 /G30 /G58/G3A /G3E/G47 /G31 /G48/G43 /G3A /G32 /G3A /G56 /G41 /G43 /G3A /G31 /G3E /G32 /G31 /G39/G42 /G46 /G44/G41 /G3D /G42 /G39 /G31 /G3E /G3D /G42 /G46 /G49 /G24 /G41 /G43 /G43 /G42 /G3E/G43 /G3A /G31 /G3E /G32 /G42 /G30 /G4A/G41 /G3E/G3A /G3D /G32/G41 /G3E/G39 /G44/G3A /G24 /G39/G3A /G40 /G42 /G30 /G43 /G3A /G31 /G3E/G41 /G46 /G3F /G51 /G6C /G3E/G42 /G45/G40 /G41 /G46 /G3E/G42 /G43 /G52 /G31 /G40 /G58 /G29 /G4F /G2A /G2F /G26 /G40 /G40 /G41 /G37 /G36/G2D /G2E /G37 /G3A /G38 /G39 /G31 /G3C/G31 /G2D /G30 /G36/G4B /G3A /G4A /G3E /G3A /G3F /G40 /G2F /G2E /G31 /G30 /G3C /G25 /G21/G22/G21/G21 /G25 /G2A /G33 /G22 /G23 /G23 /G28 /G27/G23/G21 /G24 /G27/G23/G2A /G2F /G23</list_item>
+<list_item><loc_258><loc_224><loc_462><loc_250>/G29 /G26/G29 /G2A /G5F /G41 /G58/G41 /G47 /G41 /G52 /G41 /G54 /G25 /G57 /G52 /G41 /G3D /G41 /G52 /G41 /G6A /G25 /G34 /G41 /G43 /G3D /G45/G31 /G6A /G2F /G3F /G40 /G41 /G48/G4A/G24 /G44/G41 /G3D /G42 /G39 /G58/G3E/G31 /G52 /G46 /G42 /G39/G47 /G42 /G43 /G40 /G41 /G30 /G3A /G3E/G47 /G28 /G32 /G31 /G39/G42 /G46 /G3A /G3E/G47 /G3D /G43 /G45/G39/G42 /G3E/G43 /G48/G40 /G31 /G49 /G3A /G30 /G3A /G42 /G3E/G30 /G4D /G45/G3D /G3A /G3E/G47 /G47 /G40 /G41 /G48/G4A /G3E/G42 /G45/G40 /G41 /G46 /G3E/G42 /G43 /G52 /G31 /G40 /G58 /G29 /G4C /G2A /G3B /G3B /G36 /G40 /G31 /G30 /G31 /G49 /G57 /G59 /G59 /G59 /G3B /G6B /G57 /G4C /G3B /G35 /G4C /G34 /G57 /G3E/G43 /G42 /G40 /G3E/G41 /G43 /G3A /G31 /G3E/G41 /G46 /G4C /G31 /G3E/G49 /G42 /G40 /G42 /G3E/G30 /G42/G31 /G3E /G6B /G42 /G44 /G57 /G3E/G43 /G42 /G46 /G46 /G3A /G47 /G42 /G3E/G30 /G42 /G2F /G5F /G42 /G52/G6A /G31 /G40 /G58 /G28 /G35 /G4C /G34 /G36 /G40 /G42 /G3D /G3D /G25 /G21/G22/G26/G25 /G28 /G26/G2B/G29 /G24 /G26/G29/G23 /G2F</list_item>
+<list_item><loc_258><loc_253><loc_462><loc_279>/G29 /G26/G27 /G2A /G6A /G41 /G3E/G47 /G6A /G41 /G3E/G47 /G25 /G5A/G4A/G42 /G3E /G4F /G3A /G41 /G3E /G25 /G61 /G45 /G6A /G41 /G3E/G40 /G45 /G25 /G24 /G2C /G28/G23 /G2F /G3F /G57 /G62 /G38 /G28 /G41 /G47 /G40 /G41 /G48/G4A/G24 /G44/G41 /G3D /G42 /G39 /G3A /G3E/G43 /G42 /G40 /G41 /G30 /G24 /G43 /G3A /G31 /G3E /G32 /G31 /G39/G42 /G46 /G49 /G31 /G40 /G58/G3E/G31 /G52 /G46 /G42 /G39/G47 /G42 /G43 /G40 /G41 /G30 /G3A /G3E/G47 /G29 /G4C /G2A /G3B /G3B /G36 /G40 /G31 /G30 /G31 /G49 /G59 /G45/G40 /G31 /G48/G42 /G41 /G3E /G4C /G31 /G3E/G49 /G42 /G40 /G42 /G3E/G30 /G42 /G31 /G3E /G34 /G41 /G30 /G4A/G3A /G3E/G42 /G4E /G42 /G41 /G40 /G3E/G3A /G3E/G47 /G41 /G3E/G39 /G62 /G3E/G31 /G52 /G46 /G42 /G39/G47 /G42 /G5B /G3A /G3D /G30 /G31 /G53 /G42 /G40 /G4D /G3A /G3E /G5B /G41 /G43 /G41 /G44/G41 /G3D /G42 /G3D /G2F /G4C /G4A/G41 /G32 /G28 /G5A/G48/G40 /G3A /G3E/G47 /G42 /G40 /G25 /G21/G22/G21/G26 /G28 /G21/G25/G25 /G24 /G23/G26/G2B /G2F</list_item>
+<list_item><loc_258><loc_282><loc_462><loc_316>/G29 /G26/G2A /G2A 董永峰 /G25 黄港 /G25 薛婉若 /G25 等 /G2F 融合 /G57 /G51 /G38 的图注意力深度知识追踪模 型 /G29 /G4F /G2A /G2F 计算机科学 /G25 /G21/G22/G21/G23 /G25 /G32 /G21 /G22 /G23 /G23 /G28 /G26/G27/G23 /G24 /G26/G2A/G22 /G2F /G22 /G5B /G31 /G3E/G47 /G6A /G31 /G3E/G47 /G49 /G42 /G3E/G47 /G25 /G54 /G45/G41 /G3E/G47 /G3F /G41 /G3E/G47 /G25 /G50 /G45/G42/G6B /G41 /G3E/G40 /G45/G31 /G25 /G24 /G2C /G28/G23 /G2F/G3F /G40 /G41 /G48/G4A /G41 /G43 /G43 /G42 /G3E/G43 /G3A /G31 /G3E /G39/G42 /G42 /G48 /G58/G3E/G31 /G52 /G46 /G42 /G39/G47 /G42 /G43 /G40 /G41 /G30 /G3A /G3E/G47 /G32 /G31 /G39/G42 /G46 /G3A /G3E/G43 /G42 /G47 /G40 /G41 /G43 /G42 /G39 /G52 /G3A /G43 /G4A /G57 /G51 /G38 /G29 /G4F /G2A /G2F /G3E /G3A /G3F /G40 /G2F /G2E /G31 /G30 /G35 /G36/G37 /G31 /G38 /G36/G31 /G25 /G21/G22/G21/G23 /G25 /G32 /G21 /G22 /G23 /G23 /G28 /G26/G27/G23 /G24 /G26/G2A/G22 /G2F /G23</list_item>
+<list_item><loc_258><loc_319><loc_462><loc_345>/G29 /G26/G25 /G2A /G38 /G31 /G3E/G47 /G5A/G4A/G3A /G52 /G42 /G3A /G25 /G4E /G3A /G45 /G61 /G3A /G25 /G54 /G45/G41 /G3E/G47 /G6B /G42 /G3A /G25 /G24 /G2C /G28/G23 /G2F/G5A/G43 /G40 /G45/G30 /G43 /G45/G40 /G42 /G24 /G44/G41 /G3D /G42 /G39 /G58/G3E/G31 /G52 /G46 /G42 /G39/G47 /G42 /G43 /G40 /G41 /G30 /G3A /G3E/G47 /G28 /G41 /G3E /G3A /G3E/G49 /G46 /G45/G42 /G3E/G30 /G42 /G48/G40 /G31 /G48/G41 /G47 /G41 /G43 /G3A /G31 /G3E /G53 /G3A /G42 /G52 /G29 /G4C /G2A /G3B /G3B /G36 /G40 /G31 /G30 /G31 /G49 /G57 /G59 /G59 /G59/G57 /G3E/G43 /G42 /G40 /G3E/G41 /G24 /G43 /G3A /G31 /G3E/G41 /G46 /G4C /G31 /G3E/G49 /G42 /G40 /G42 /G3E/G30 /G42/G31 /G3E /G5B /G41 /G43 /G41/G34 /G3A /G3E/G3A /G3E/G47 /G2F /G36 /G3A /G3D /G30 /G41 /G43 /G41 /G52 /G41 /G4D /G25 /G5F /G4F /G28 /G57 /G59 /G59 /G59 /G36 /G40 /G42 /G3D /G3D /G25 /G21/G22/G21/G22 /G28 /G2B/G2C/G26 /G24 /G2B/G2B/G22 /G2F</list_item>
+<list_item><loc_258><loc_348><loc_462><loc_388>/G29 /G21/G22 /G2A 郑浩东 /G25 马华 /G25 谢颖超 /G25 等 /G2F 融合遗忘因素与记忆门的图神经网络 知识追踪模型 /G29 /G4F /G2A /G2F 计算机应用 /G25 /G21/G22/G21/G23 /G25 /G2B /G2A /G22 /G25 /G23 /G28 /G21/G27/G2C/G27 /G24 /G21/G27/G2B/G21 /G2F /G22 /G4B /G4A/G42 /G3E/G47 /G54 /G41 /G31 /G39/G31 /G3E/G47 /G25 /G34 /G41/G54 /G45/G41 /G25 /G50 /G3A /G42/G6A /G3A /G3E/G47 /G30 /G4A/G41 /G31 /G25 /G24 /G2C /G28/G23 /G2F/G62 /G3E/G31 /G52 /G46 /G42 /G39/G47 /G42/G43 /G40 /G41 /G30 /G3A /G3E/G47 /G32 /G31 /G39/G42 /G46 /G44/G41 /G3D /G42 /G39 /G31 /G3E /G47 /G40 /G41 /G48/G4A /G3E/G42 /G45/G40 /G41 /G46 /G44/G46 /G42 /G3E/G39/G3A /G3E/G47/G52 /G3A /G43 /G4A /G49 /G31 /G40 /G47 /G42 /G43 /G43 /G3A /G3E/G47/G49 /G41 /G30 /G43 /G31 /G40 /G3D/G41 /G3E/G39 /G32 /G42 /G32 /G31 /G40 /G4D /G47 /G41 /G43 /G42 /G29 /G4F /G2A /G2F /G49/G3A /G2F /G30 /G38 /G2D /G41 /G3A /G4A /G3E /G3A /G3F /G40 /G2F /G2E /G31 /G30 /G26 /G40 /G40 /G41 /G37 /G36/G2D /G2E /G37 /G3A /G38 /G3C /G25 /G21/G22/G21/G23 /G25 /G2B /G2A /G22 /G25 /G23 /G28 /G21/G27/G2C/G27 /G24 /G21/G27/G2B/G21 /G2F /G23</list_item>
+<list_item><loc_258><loc_392><loc_463><loc_410>/G29 /G21/G26 /G2A /G5C /G42 /G3E/G47 /G34 /G3A /G3E/G47 /G4D /G45 /G25 /G54 /G42 /G49 /G49 /G42 /G40 /G3E/G41 /G3E /G5F /G25 /G62 /G31 /G42 /G39/G3A /G3E/G47 /G42 /G40 /G62 /G2F /G35 /G39/G39/G40 /G42 /G3D /G3D /G3A /G3E/G47 /G43 /G4A/G42 /G41 /G3D /G3D /G42 /G3D /G3D /G32 /G42 /G3E/G43 /G30 /G4A/G41 /G46 /G46 /G42 /G3E/G47 /G42 /G52 /G3A /G43 /G4A /G41 /G3E /G31 /G3E/G46 /G3A /G3E/G42 /G3D /G4D /G3D /G43 /G42 /G32 /G43 /G4A/G41 /G43 /G43 /G45/G43 /G31 /G40 /G3D /G41 /G3D /G3A /G43 /G41 /G3D /G3D /G42 /G3D /G3D /G42 /G3D /G29 /G4F /G2A /G2F /G58 /G3C/G31 /G30 /G25 /G3A /G53 /G31 /G41 /G37 /G38 /G48 /G2D /G38 /G53 /G58 /G3C/G31 /G30 /G4D /G26 /G53 /G2D /G40 /G2E /G31 /G53 /G44 /G38 /G2E /G31 /G30 /G2D /G36/G2E /G37 /G3A /G38 /G25 /G21/G22/G22/G25 /G25 /G23 /G33 /G22 /G2A /G23 /G28 /G21/G2C/G23 /G24 /G21/G29/G29 /G2F</list_item>
+<list_item><loc_258><loc_413><loc_462><loc_439>/G29 /G21/G21 /G2A /G6B /G41 /G3E/G47 /G6A /G45/G43 /G41 /G31 /G25 /G54 /G42 /G49 /G49 /G42 /G40 /G3E/G41 /G3E /G5F /G38 /G25 /G54 /G42 /G49 /G49 /G42 /G40 /G3E/G41 /G3E /G4C /G2F /G38 /G31 /G52 /G41 /G40 /G39/G3D /G44/G42 /G43 /G43 /G42 /G40 /G41 /G49 /G49 /G42 /G30 /G43 /G39/G42 /G24 /G43 /G42 /G30 /G43 /G31 /G40 /G3D /G28 /G42 /G49 /G49 /G42 /G30 /G43 /G31 /G49 /G32 /G3A /G3D /G3D /G3A /G3E/G47 /G3D /G58/G3A /G46 /G46 /G3D /G25 /G30 /G46 /G41 /G3D /G3D /G49 /G42 /G41 /G43 /G45/G40 /G42 /G3D /G41 /G3E/G39 /G30 /G31 /G32 /G32 /G31 /G3E /G52 /G40 /G31 /G3E/G47 /G41 /G3E/G24 /G3D /G52 /G42 /G40 /G3D /G29 /G4C /G2A /G3B /G3B /G36 /G40 /G31 /G30/G31 /G49 /G43 /G4A/G42 /G2B /G43 /G4A /G57 /G3E/G43 /G42 /G40 /G3E/G41 /G43 /G3A /G31 /G3E/G41 /G46 /G4C /G31 /G3E/G49 /G42 /G40 /G42 /G3E/G30 /G42/G31 /G3E /G4E /G42 /G41 /G40 /G3E/G3A /G3E/G47 /G35 /G3E/G41 /G46 /G4D /G43 /G3A /G30 /G3D /G41 /G3E/G39 /G62 /G3E/G31 /G52 /G46 /G42 /G39/G47 /G42 /G2F /G5F /G42 /G52/G6A /G31 /G40 /G58 /G28 /G35 /G4C /G34 /G36 /G40 /G42 /G3D /G3D /G25 /G21/G22/G26/G2B /G28 /G23/G26 /G24 /G23/G2B /G2F</list_item>
+<list_item><loc_258><loc_443><loc_462><loc_454>/G29 /G21/G23 /G2A /G36 /G41 /G48/G31 /G45/G78 /G42 /G58 /G4F /G25 /G36 /G42 /G46 /G79/G3E/G42 /G58 /G51 /G25 /G5A/G43 /G41 /G3E/G3A /G3D /G46 /G41 /G53 /G5D /G2F /G35 /G39/G41 /G48/G43 /G3A /G53 /G42 /G47 /G42 /G31 /G47 /G40 /G41 /G48/G4A/G4D /G48/G40 /G41 /G30 /G43 /G3A /G30 /G42 /G39/G41 /G43 /G41 /G3D /G42 /G43 /G29 /G4F /G2A /G2F /G49/G3A /G2F /G30 /G38 /G2D /G41 /G3A /G4A /G4C /G31 /G2D /G30 /G38 /G37 /G38 /G48 /G26 /G38 /G2D /G41 /G47/G2E /G37 /G36/G3C /G25 /G21/G22/G26/G29 /G25 /G2A /G22 /G21 /G23 /G28 /G23/G26/G27 /G24 /G23/G21/G26 /G2F</list_item>
+<list_item><loc_258><loc_457><loc_463><loc_476>/G29 /G21/G2C /G2A /G4C /G4A/G41 /G3E/G47 /G54 /G5A /G25 /G54 /G3D /G45 /G54 /G4F /G25 /G4C /G4A/G42 /G3E /G62 /G38 /G2F /G34 /G31 /G39/G42 /G46 /G3A /G3E/G47 /G42 /G55 /G42 /G40 /G30 /G3A /G3D /G42 /G40 /G42 /G46 /G41 /G43 /G3A /G31 /G3E/G3D /G4A/G3A /G48/G3D /G3A /G3E /G59 /G24 /G46 /G42 /G41 /G40 /G3E/G3A /G3E/G47 /G28 /G41 /G45/G3E/G3A /G49 /G3A /G42 /G39 /G41 /G48/G48/G40 /G31 /G41 /G30 /G4A /G29 /G4C /G2A /G3B /G3B /G36 /G40 /G31 /G30 /G31 /G49 /G43 /G4A/G42 /G2A /G43 /G4A /G57 /G3E/G43 /G42 /G40 /G3E/G41 /G43 /G3A /G31 /G3E/G41 /G46 /G4C /G31 /G3E/G49 /G42 /G40 /G42 /G3E/G30 /G42 /G31 /G3E /G59 /G39/G45/G30 /G41 /G43 /G3A /G31 /G3E/G41 /G46 /G5B /G41 /G43 /G41 /G34 /G3A /G3E/G3A /G3E/G47 /G2F /G21/G22/G26/G2B /G28 /G2B/G23/G21 /G24 /G2B/G23/G2B /G2F</list_item>
+</unordered_list>
+</doctag>
