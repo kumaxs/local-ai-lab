@@ -26,8 +26,8 @@
 - GitHub visibility: public
 - Remote origin: `git@github.com:kumaxs/local-ai-lab.git`
 - Branch: `main`
-- Latest confirmed remote HEAD: `2df582057132d94f9fc42de1492d9f327aa58e30`
-- Latest confirmed remote commit message: `record drive final sync`
+- Latest confirmed remote HEAD: `d109f7b43efc129d8575c9478a1a4a365cfce520`
+- Latest confirmed remote commit message: `document github first recovery workflow`
 - Recovery role: GitHub is the first-read canonical docs and commit-state source for new ChatGPT sessions.
 - Recovery order:
   1. GitHub / `kumaxs/local-ai-lab` canonical docs first
@@ -35,4 +35,8 @@
   3. VS Code current shared files third
   4. Codex / user local runtime confirmation last
 - Post-commit rule: after Codex creates a local commit, run GitHub remote readiness read-only checks. If safe and user authorizes it, run `git push origin main`.
+- Closure rule: a local commit is not a synchronization closure. In the GitHub-first recovery model, an unpushed local commit is not reliable recovery state for new ChatGPT sessions.
+- Auto-push scope after approval: documentation, state, sync-record, recovery-prompt, collaboration-rule, inventory, repo-structure, and service-boundary commits.
+- Report-before-push scope: runtime code, Docker / compose / service configuration, n8n workflow, `local-ai-python-worker` runtime logic, `services/n8n-paper-pipeline` runtime logic, or any change that may affect live service behavior.
 - Push failure rule: do not self-repair with `pull`, `merge`, `rebase`, `reset`, `clean`, or force push. Report the complete error and the smallest safe next step.
+- Forbidden: do not push when readiness fails, when local branch is behind `origin/main`, when tracked sensitive-risk filenames or untracked non-ignored files are present, when GitHub push protection blocks the push, or when ignored runtime outputs would be added to Git.
