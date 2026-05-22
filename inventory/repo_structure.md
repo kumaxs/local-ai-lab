@@ -1,6 +1,22 @@
 # 仓库结构索引
 
-更新时间：2026-05-21
+更新时间：2026-05-22
+
+## 0. 外部仓库与恢复入口
+
+- Local engineering canonical repo: `/Users/zeyuan/Projects/local-ai-lab`
+- GitHub canonical remote: `kumaxs/local-ai-lab`
+- GitHub remote URL: `git@github.com:kumaxs/local-ai-lab.git`
+- Latest confirmed remote HEAD: `2df582057132d94f9fc42de1492d9f327aa58e30`
+- Google Drive recovery mirror: `Local-Ai-Lab`
+- Local notes/recovery repo: `/Users/zeyuan/Local-AI-Lab`
+
+新会话恢复顺序：
+
+1. GitHub / `kumaxs/local-ai-lab` canonical docs first。
+2. Google Drive / `Local-Ai-Lab` recovery mirror second。
+3. VS Code 当前共享文件 third。
+4. Codex / 用户补充本地运行状态 last。
 
 ## 1. 顶层结构
 

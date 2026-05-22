@@ -121,3 +121,22 @@
 决策：旧 handoff 中的旧 P4 自定义 n8n Python image 方案应标记为 superseded 或历史 fallback，不直接删除。
 
 原因：保留历史上下文有助于回溯，但当前主线已经改为 `n8n -> local-ai-python-worker -> services/n8n-paper-pipeline`，不能让旧方案继续作为下一步指令。
+
+## 2026-05-22：新会话恢复顺序改为 GitHub first
+
+决策：2026-05-22 之后，新会话恢复顺序改为：
+
+1. GitHub / `kumaxs/local-ai-lab` canonical docs first。
+2. Google Drive / `Local-Ai-Lab` recovery mirror second。
+3. VS Code 当前共享文件 third。
+4. Codex / 用户补充本地运行状态 last。
+
+原因：GitHub remote `kumaxs/local-ai-lab` 已公开，ChatGPT 已能读取 canonical docs 和 commit state。Google Drive 仍是 recovery mirror，但不再是首要读取入口。
+
+## 2026-05-22：本地 commit 后必须检查并及时 push
+
+决策：Codex 完成本地 commit 后，必须继续进行 GitHub remote readiness 只读检查。若 working tree clean、branch 为 `main`、origin 为 `git@github.com:kumaxs/local-ai-lab.git`、`main` 跟踪 `origin/main`、本地 ahead 且不 behind、没有 tracked sensitive-risk filenames、没有 untracked non-ignored files，则应建议并在用户授权后执行 `git push origin main`。
+
+原因：项目采用 GitHub-first 恢复方式后，本地 commit 不等于同步闭环完成。若不及时 push，新会话从 GitHub 读不到最新 canonical state。
+
+失败规则：push 失败时，不得自行 `pull` / `merge` / `rebase` / `reset` / `clean` / force push，只能输出完整错误和最小修复建议。
