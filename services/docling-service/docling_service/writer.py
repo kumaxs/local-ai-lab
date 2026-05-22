@@ -111,6 +111,118 @@ def build_status(
     }
 
 
+def _safe_page_count(document_dict: dict[str, Any] | None, result: Any | None = None) -> int | None:
+    if document_dict:
+        for key in ("page_count", "num_pages", "number_of_pages"):
+            value = document_dict.get(key)
+            if isinstance(value, int):
+                return value
+        pages = document_dict.get("pages")
+        if isinstance(pages, list):
+            return len(pages)
+        if isinstance(pages, dict):
+            return len(pages)
+
+    if result is not None:
+        for attr in ("page_count", "num_pages", "number_of_pages"):
+            value = getattr(result, attr, None)
+            if isinstance(value, int):
+                return value
+    return None
+
+
+def write_docling_outputs(
+    *,
+    job_uuid: str,
+    input_file_path: str | Path,
+    conversion: dict[str, Any],
+    output_root: str | Path | None = None,
+    display_name: str | None = None,
+    original_name: str | None = None,
+    source_name: str | None = None,
+    image_export_mode: str = "referenced",
+    requested_outputs: list[str] | None = None,
+    started_at: str | None = None,
+    finished_at: str | None = None,
+    duration_seconds: float = 0.0,
+) -> dict[str, Any]:
+    input_path = Path(input_file_path).resolve()
+    job_output_dir = output_dir_for_job(job_uuid, output_root)
+    job_output_dir.mkdir(parents=True, exist_ok=True)
+
+    input_sha256 = sha256_file(input_path)
+    document_dict = conversion["document_dict"]
+    if not isinstance(document_dict, dict):
+        raise ValueError("document_dict must be a dict")
+
+    written: list[str] = []
+    (job_output_dir / "document.md").write_text(str(conversion["markdown"]), encoding="utf-8")
+    written.append("document.md")
+    (job_output_dir / "document.html").write_text(str(conversion["html"]), encoding="utf-8")
+    written.append("document.html")
+    write_json(job_output_dir / "document.json", document_dict)
+    written.append("document.json")
+
+    text = conversion.get("text")
+    if text is not None:
+        (job_output_dir / "text.txt").write_text(str(text), encoding="utf-8")
+        written.append("text.txt")
+
+    doctags = conversion.get("doctags")
+    if doctags is not None:
+        (job_output_dir / "doctags.txt").write_text(str(doctags), encoding="utf-8")
+        written.append("doctags.txt")
+
+    generated_outputs = written + ["metadata.json", "status.json"]
+    warnings = list(conversion.get("warnings") or [])
+
+    metadata = build_metadata(
+        job_uuid=job_uuid,
+        display_name=display_name,
+        original_name=original_name,
+        source_name=source_name,
+        input_file_path=input_path,
+        input_sha256=input_sha256,
+        image_export_mode=image_export_mode,
+        requested_outputs=requested_outputs,
+        generated_outputs=generated_outputs,
+        detected_format="pdf",
+        page_count=_safe_page_count(document_dict, conversion.get("result")),
+        docling_version=conversion.get("docling_version"),
+        link_count=None,
+        table_count=None,
+        asset_count=0,
+    )
+    write_json(job_output_dir / "metadata.json", metadata)
+
+    actual_started_at = started_at or utc_now_iso()
+    actual_finished_at = finished_at or utc_now_iso()
+    status = build_status(
+        job_uuid=job_uuid,
+        status=STATUS_SUCCESS,
+        started_at=actual_started_at,
+        finished_at=actual_finished_at,
+        duration_seconds=duration_seconds,
+        input_file_path=input_path,
+        input_sha256=input_sha256,
+        output_dir=job_output_dir,
+        outputs_written=generated_outputs,
+        warnings=warnings,
+        error_code=None,
+        error_message=None,
+    )
+    write_json(job_output_dir / "status.json", status)
+
+    return {
+        "output_dir": job_output_dir,
+        "metadata_path": job_output_dir / "metadata.json",
+        "status_path": job_output_dir / "status.json",
+        "metadata": metadata,
+        "status": status,
+        "outputs_written": generated_outputs,
+    }
+
+
 def write_placeholder_outputs(
     *,
     job_uuid: str,

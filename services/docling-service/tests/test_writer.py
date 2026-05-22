@@ -10,6 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from docling_service.converter import placeholder_convert  # noqa: E402
 from docling_service.contract import REQUIRED_SUCCESS_OUTPUTS, STATUS_SUCCESS  # noqa: E402
+from docling_service.writer import write_docling_outputs  # noqa: E402
 
 
 UUID_ONE = "550e8400-e29b-41d4-a716-446655440000"
@@ -118,6 +119,50 @@ class WriterTests(unittest.TestCase):
             self.assertEqual(second_metadata["display_name"], "duplicate.pdf")
             self.assertEqual(first_metadata["input_sha256"], second_metadata["input_sha256"])
             self.assertNotEqual(first_metadata["job_uuid"], second_metadata["job_uuid"])
+
+    def test_write_docling_outputs_with_optional_exports(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            input_pdf = self.make_pdf(tmpdir)
+            output_root = Path(tmpdir) / "outputs"
+            result = write_docling_outputs(
+                job_uuid=UUID_ONE,
+                input_file_path=input_pdf,
+                output_root=output_root,
+                display_name="docling.pdf",
+                conversion={
+                    "markdown": "# Converted\n",
+                    "html": "<html><body><h1>Converted</h1></body></html>\n",
+                    "document_dict": {"pages": [{"page_no": 1}], "body": "Converted"},
+                    "text": "Converted\n",
+                    "doctags": "<document>\n",
+                    "warnings": ["text_export_failed"],
+                    "docling_version": "2.95.0",
+                },
+            )
+
+            output_dir = Path(result["output_dir"])
+            for filename in (
+                "document.md",
+                "document.html",
+                "document.json",
+                "metadata.json",
+                "status.json",
+                "text.txt",
+                "doctags.txt",
+            ):
+                self.assertTrue((output_dir / filename).exists(), filename)
+
+            metadata = json.loads((output_dir / "metadata.json").read_text(encoding="utf-8"))
+            status = json.loads((output_dir / "status.json").read_text(encoding="utf-8"))
+
+            self.assertEqual(metadata["docling_version"], "2.95.0")
+            self.assertEqual(metadata["page_count"], 1)
+            self.assertEqual(status["status"], STATUS_SUCCESS)
+            self.assertEqual(status["warnings"], ["text_export_failed"])
+            self.assertEqual(metadata["generated_outputs"], status["outputs_written"])
+            self.assertIn("text.txt", metadata["generated_outputs"])
+            self.assertIn("doctags.txt", metadata["generated_outputs"])
+            self.assertFalse((output_dir / input_pdf.name).exists())
 
 
 if __name__ == "__main__":

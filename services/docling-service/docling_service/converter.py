@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from .docling_adapter import DoclingAdapterError, convert_with_docling
-from .writer import write_placeholder_outputs
+from .writer import write_docling_outputs, write_placeholder_outputs
 
 
 def placeholder_convert(
@@ -53,15 +53,25 @@ def docling_convert(
     finished_at: str | None = None,
     duration_seconds: float = 0.0,
 ) -> dict[str, Any]:
-    """Attempt the real Docling adapter path.
-
-    The adapter currently performs availability probing and returns controlled
-    errors until real Docling output mapping is implemented.
-    """
+    """Run Docling and write the local CLI output contract."""
     try:
-        return convert_with_docling(
+        conversion = convert_with_docling(
             job_uuid=job_uuid,
             input_file_path=input_file_path,
+            output_root=output_root,
+            display_name=display_name,
+            original_name=original_name,
+            source_name=source_name,
+            image_export_mode=image_export_mode,
+            requested_outputs=requested_outputs,
+            started_at=started_at,
+            finished_at=finished_at,
+            duration_seconds=duration_seconds,
+        )
+        return write_docling_outputs(
+            job_uuid=job_uuid,
+            input_file_path=input_file_path,
+            conversion=conversion,
             output_root=output_root,
             display_name=display_name,
             original_name=original_name,
