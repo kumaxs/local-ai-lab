@@ -64,7 +64,9 @@ services/n8n-paper-pipeline/scripts/process_inbox.py
 
 ## 5. 与 n8n-paper-pipeline 的关系
 
-`n8n-paper-pipeline` 是 PDF/论文处理主负责人。它负责业务编排、输入分类、去重、输出目录、状态文件、质量路由和后续材料准备。
+`n8n-paper-pipeline` 是 intake / metadata / status / rough triage pipeline。它不是论文处理总负责人，也不是精读引擎。原 PDF 始终是证据源，pipeline 输出的 Markdown、metadata、JSON 或质量标记都只是派生工作材料。
+
+它负责输入分类、去重、输出目录、状态文件、质量路由和后续材料准备。
 
 建议关系：
 
@@ -108,6 +110,8 @@ n8n -> local-ai-python-worker -> n8n-paper-pipeline -> 可选调用 docling-serv
 
 n8n 当前只应继续调用 `local-ai-python-worker:8765` 的既有 endpoint。
 
+n8n 负责 orchestration 和自动化入库。n8n 不负责论文精读，也不负责最终学术判断。
+
 第一阶段不建议 n8n 直接调用 `docling-service`，原因：
 
 - 会绕过 `n8n-paper-pipeline` 的去重、状态、输出目录和质量路由。
@@ -115,6 +119,14 @@ n8n 当前只应继续调用 `local-ai-python-worker:8765` 的既有 endpoint。
 - 会增加回滚复杂度。
 
 接入 n8n 前，必须先用命令行或脚本验证 `docling-service` 的输入输出稳定，并确认 pipeline 的可选调用路径稳定。
+
+## 7.1 与 AI reading workflow 的关系
+
+未来 AI reading workflow 是论文精读层。
+
+它可以使用 `n8n-paper-pipeline` 输出和 Docling sidecar artifacts 作为工作材料，但必须能回查原 PDF。人类研究笔记仍是最终知识资产。
+
+Docling 输出、pipeline metadata、JSON、Markdown 或预读材料都不能替代原 PDF 证据，也不能替代用户正式研究笔记。
 
 ## 8. 输入输出边界建议
 
@@ -424,4 +436,10 @@ n8n -> local-ai-python-worker -> n8n-paper-pipeline -> legacy extraction
 
 当前阶段只应完成设计、样本计划和最小可逆部署方案。下一步不应直接修改 n8n、worker 或 pipeline 主路径。
 
-推荐下一步是：先写 `docling-service` 的最小接口契约和测试样本清单，再决定是否进入最小部署实验。
+推荐下一步是：
+
+1. 编写 `docs/DOCLING_SERVICE_CONTRACT.md`。
+2. 编写 `docs/DOCLING_SERVICE_TEST_PLAN.md`。
+3. 明确 sample validation plan。
+
+下一步不是 implementation，不是 deployment，不是 n8n workflow change，也不是 `n8n-paper-pipeline` main-path replacement。
