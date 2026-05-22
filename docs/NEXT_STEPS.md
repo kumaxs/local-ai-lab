@@ -4,12 +4,16 @@
 
 ## 当前顺序
 
-1. 审阅 `docs/DOCLING_SERVICE_DESIGN.md`。
-2. 更新 `README.md`、`inventory/services.md`，使其符合当前同步协议和 P3/P4 新边界。
-3. 补 `docs/DOCLING_SERVICE_CONTRACT.md`。
-4. 补 `docs/DOCLING_SERVICE_TEST_PLAN.md`。
-5. 再决定是否实现 `docling-service`。
-6. 同步 `docs/LATEST_STATE.md` 摘要到 Google Drive handoff。
+1. 用户审查本地 canonical files。
+2. 如通过，提交 canonical reconciliation commit。
+3. 生成 Drive sync packet。
+4. 更新 Google Drive / `Local-Ai-Lab`。
+5. 回写 `docs/SYNC_CURSOR.md` 和 `docs/AI_WORKLOG.md`。
+6. 再审阅 `docs/DOCLING_SERVICE_DESIGN.md`。
+7. 再补 `docs/DOCLING_SERVICE_CONTRACT.md`。
+8. 再补 `docs/DOCLING_SERVICE_TEST_PLAN.md`。
+9. 不部署 Docling。
+10. 不改变 `n8n-paper-pipeline` 主路径。
 
 ## 当前边界
 
@@ -23,6 +27,6 @@
 
 ## 当前事实源
 
-- 工程事实源：`/Users/zeyuan/Projects/local-ai-lab`
-- ChatGPT 恢复入口与状态镜像：Google Drive `Local-Ai-Lab`
+- 对账后的 canonical engineering repo：`/Users/zeyuan/Projects/local-ai-lab`
+- ChatGPT-facing recovery mirror：Google Drive `Local-Ai-Lab`
 - 本地笔记 / 恢复提示词仓库：`/Users/zeyuan/Local-AI-Lab`

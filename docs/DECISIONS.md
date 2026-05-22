@@ -85,3 +85,39 @@
 决策：重大变更必须维护项目固定文件，并报告成功或失败。
 
 原因：固定状态文件和同步游标可以降低 Codex、ChatGPT、Google Drive、VS Code、本地 Git 之间的状态漂移。
+
+## 2026-05-21：多源对账后再同步
+
+决策：当前存在工程仓库、Google Drive、本地笔记仓库三源混杂，不能直接把任一单源当作完整事实源。
+
+原因：Google Drive 今天包含多次人工追加内容，本地工程仓库包含 Codex 新增的同步协议和 Docling 设计文件，本地笔记仓库包含恢复提示词和部分最新上下文。直接同步会放大冲突。
+
+## 2026-05-21：接受 canonical state 草案
+
+决策：接受 `docs/RECONCILIATION_REPORT.md` 第 6 节 Proposed Canonical State 作为 canonical 草案，并固化到 `docs/CANONICAL_STATE.md`。
+
+原因：该草案明确了 Local AI Lab 的项目身份、工程仓库、Drive mirror、本地笔记仓库、主路径和各服务边界。
+
+## 2026-05-21：确认 canonical engineering repo
+
+决策：`/Users/zeyuan/Projects/local-ai-lab` 是对账后确认的 canonical engineering repo。
+
+原因：工程代码、服务结构、固定状态文件、同步协议、Docling 设计和后续工程变更应在该仓库中维护。
+
+## 2026-05-21：Drive 不再单边手写成为事实源
+
+决策：Google Drive / `Local-Ai-Lab` 保留为 ChatGPT-facing mirror / recovery entry，但后续不得单边手写扩展为新的事实源。
+
+原因：Drive 今天曾包含最新人工内容，但也保留了旧 handoff 和旧 P4 方案。后续 Drive 更新必须来自 canonical state 或明确的 sync packet。
+
+## 2026-05-21：本地笔记仓库保留恢复材料
+
+决策：`/Users/zeyuan/Local-AI-Lab` 保留为本地笔记、恢复提示词和人工桥接材料仓库。
+
+原因：该仓库对新会话恢复有价值，但不替代 canonical engineering repo，也不直接覆盖工程固定文件。
+
+## 2026-05-21：旧 handoff 和旧 P4 方案标记 superseded
+
+决策：旧 handoff 中的旧 P4 自定义 n8n Python image 方案应标记为 superseded 或历史 fallback，不直接删除。
+
+原因：保留历史上下文有助于回溯，但当前主线已经改为 `n8n -> local-ai-python-worker -> services/n8n-paper-pipeline`，不能让旧方案继续作为下一步指令。
