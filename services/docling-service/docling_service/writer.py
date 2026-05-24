@@ -73,6 +73,7 @@ def build_metadata(
     formula_context_asset_count: int | None = None,
     formula_placeholder_link_count: int | None = None,
     formula_enrichment_enabled: bool | None = None,
+    formula_model: str | None = None,
 ) -> dict[str, Any]:
     path = Path(input_file_path)
     stat = path.stat()
@@ -106,6 +107,7 @@ def build_metadata(
         "formula_context_asset_count": formula_context_asset_count,
         "formula_placeholder_link_count": formula_placeholder_link_count,
         "formula_enrichment_enabled": formula_enrichment_enabled,
+        "formula_model": formula_model,
     }
 
 
@@ -138,6 +140,7 @@ def build_status(
     formula_context_asset_count: int | None = None,
     formula_placeholder_link_count: int | None = None,
     formula_enrichment_enabled: bool | None = None,
+    formula_model: str | None = None,
 ) -> dict[str, Any]:
     return {
         "job_uuid": job_uuid,
@@ -167,6 +170,7 @@ def build_status(
         "formula_context_asset_count": formula_context_asset_count,
         "formula_placeholder_link_count": formula_placeholder_link_count,
         "formula_enrichment_enabled": formula_enrichment_enabled,
+        "formula_model": formula_model,
     }
 
 
@@ -865,6 +869,7 @@ def write_docling_outputs(
         formula_context_asset_count=formula_context_asset_count,
         formula_placeholder_link_count=formula_placeholder_link_count,
         formula_enrichment_enabled=conversion.get("formula_enrichment_enabled"),
+        formula_model=conversion.get("formula_model"),
     )
     write_json(job_output_dir / "metadata.json", metadata)
 
@@ -898,6 +903,7 @@ def write_docling_outputs(
         formula_context_asset_count=formula_context_asset_count,
         formula_placeholder_link_count=formula_placeholder_link_count,
         formula_enrichment_enabled=conversion.get("formula_enrichment_enabled"),
+        formula_model=conversion.get("formula_model"),
     )
     write_json(job_output_dir / "status.json", status)
 

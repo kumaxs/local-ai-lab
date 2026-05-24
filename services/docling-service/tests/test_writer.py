@@ -313,6 +313,7 @@ class WriterTests(unittest.TestCase):
                     "ocr_fallback_used": False,
                     "text_quality_gxx_count": 0,
                     "text_quality_gxx_density": 0.0,
+                    "formula_model": "granite_docling_mlx",
                 },
             )
 
@@ -343,6 +344,7 @@ class WriterTests(unittest.TestCase):
             self.assertEqual(metadata["formula_asset_count"], 1)
             self.assertEqual(metadata["formula_context_asset_count"], 1)
             self.assertEqual(metadata["formula_placeholder_link_count"], 1)
+            self.assertEqual(metadata["formula_model"], "granite_docling_mlx")
             self.assertGreater(metadata["formula_placeholder_count"], 0)
             self.assertEqual(status["table_count"], 1)
             self.assertEqual(status["asset_count"], 4)
@@ -350,6 +352,7 @@ class WriterTests(unittest.TestCase):
             self.assertEqual(status["formula_asset_count"], 1)
             self.assertEqual(status["formula_context_asset_count"], 1)
             self.assertEqual(status["formula_placeholder_link_count"], 1)
+            self.assertEqual(status["formula_model"], "granite_docling_mlx")
             self.assertEqual(status["generated_outputs"], status["outputs_written"])
             self.assertIn("tables/table_1.json", metadata["generated_outputs"])
             self.assertIn("tables/table_1.html", metadata["generated_outputs"])
