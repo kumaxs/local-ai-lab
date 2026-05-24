@@ -1,0 +1,702 @@
+{
+  "annotations": [],
+  "captions": [
+    {
+      "$ref": "#/texts/225"
+    }
+  ],
+  "children": [
+    {
+      "$ref": "#/texts/225"
+    }
+  ],
+  "content_layer": "body",
+  "data": {
+    "grid": [
+      [
+        {
+          "bbox": {
+            "b": 310.8768804413403,
+            "coord_origin": "TOPLEFT",
+            "l": 306.8350449042815,
+            "r": 336.1738535997568,
+            "t": 300.88083926952714
+          },
+          "col_span": 1,
+          "column_header": false,
+          "end_col_offset_idx": 1,
+          "end_row_offset_idx": 1,
+          "fillable": false,
+          "row_header": false,
+          "row_section": false,
+          "row_span": 1,
+          "start_col_offset_idx": 0,
+          "start_row_offset_idx": 0,
+          "text": "\u5b9e\u9a8c\u73af\u5883"
+        },
+        {
+          "bbox": {
+            "b": 308.2848836263979,
+            "coord_origin": "TOPLEFT",
+            "l": 380.18206693406205,
+            "r": 393.629021025452,
+            "t": 302.16812034132255
+          },
+          "col_span": 1,
+          "column_header": false,
+          "end_col_offset_idx": 2,
+          "end_row_offset_idx": 1,
+          "fillable": false,
+          "row_header": false,
+          "row_section": false,
+          "row_span": 1,
+          "start_col_offset_idx": 1,
+          "start_row_offset_idx": 0,
+          "text": "\u53c2\u6570"
+        },
+        {
+          "bbox": {
+            "b": 309.5440749189127,
+            "coord_origin": "TOPLEFT",
+            "l": 443.7494865771344,
+            "r": 474.31074552895734,
+            "t": 300.8808392366746
+          },
+          "col_span": 1,
+          "column_header": false,
+          "end_col_offset_idx": 3,
+          "end_row_offset_idx": 1,
+          "fillable": false,
+          "row_header": false,
+          "row_section": false,
+          "row_span": 1,
+          "start_col_offset_idx": 2,
+          "start_row_offset_idx": 0,
+          "text": "\u5b9e\u9a8c\u73af\u5883"
+        },
+        {
+          "bbox": {
+            "b": 308.28488380426757,
+            "coord_origin": "TOPLEFT",
+            "l": 507.31690613010113,
+            "r": 521.9863104778389,
+            "t": 300.8808393992523
+          },
+          "col_span": 1,
+          "column_header": false,
+          "end_col_offset_idx": 4,
+          "end_row_offset_idx": 1,
+          "fillable": false,
+          "row_header": false,
+          "row_section": false,
+          "row_span": 1,
+          "start_col_offset_idx": 3,
+          "start_row_offset_idx": 0,
+          "text": "\u53c2\u6570"
+        }
+      ],
+      [
+        {
+          "bbox": {
+            "b": 321.8725258292081,
+            "coord_origin": "TOPLEFT",
+            "l": 306.8350449042815,
+            "r": 336.1738535997568,
+            "t": 313.17829465568855
+          },
+          "col_span": 1,
+          "column_header": false,
+          "end_col_offset_idx": 1,
+          "end_row_offset_idx": 2,
+          "fillable": false,
+          "row_header": false,
+          "row_section": false,
+          "row_span": 1,
+          "start_col_offset_idx": 0,
+          "start_row_offset_idx": 1,
+          "text": "\u64cd\u4f5c\u7cfb\u7edf"
+        },
+        {
+          "bbox": {
+            "b": 320.53972011871616,
+            "coord_origin": "TOPLEFT",
+            "l": 369.18001367132615,
+            "r": 403.40862339219206,
+            "t": 314.40164747310547
+          },
+          "col_span": 1,
+          "column_header": false,
+          "end_col_offset_idx": 2,
+          "end_row_offset_idx": 2,
+          "fillable": false,
+          "row_header": false,
+          "row_section": false,
+          "row_span": 1,
+          "start_col_offset_idx": 1,
+          "start_row_offset_idx": 1,
+          "text": "Windows 11"
+        },
+        {
+          "bbox": {
+            "b": 320.5397202048344,
+            "coord_origin": "TOPLEFT",
+            "l": 449.86173910481165,
+            "r": 469.4209444779399,
+            "t": 313.1782945208899
+          },
+          "col_span": 1,
+          "column_header": false,
+          "end_col_offset_idx": 3,
+          "end_row_offset_idx": 2,
+          "fillable": false,
+          "row_header": false,
+          "row_section": false,
+          "row_span": 1,
+          "start_col_offset_idx": 2,
+          "start_row_offset_idx": 1,
+          "text": "Python"
+        },
+        {
+          "bbox": {
+            "b": 320.5397201742506,
+            "coord_origin": "TOPLEFT",
+            "l": 506.0944561957158,
+            "r": 521.9863107998011,
+            "t": 313.17829449030614
+          },
+          "col_span": 1,
+          "column_header": false,
+          "end_col_offset_idx": 4,
+          "end_row_offset_idx": 2,
+          "fillable": false,
+          "row_header": false,
+          "row_section": false,
+          "row_span": 1,
+          "start_col_offset_idx": 3,
+          "start_row_offset_idx": 1,
+          "text": "3.10"
+        }
+      ],
+      [
+        {
+          "bbox": {
+            "b": 338.86870147114723,
+            "coord_origin": "TOPLEFT",
+            "l": 312.947296252395,
+            "r": 328.83915085648033,
+            "t": 332.75193818607187
+          },
+          "col_span": 1,
+          "column_header": false,
+          "end_col_offset_idx": 1,
+          "end_row_offset_idx": 3,
+          "fillable": false,
+          "row_header": false,
+          "row_section": false,
+          "row_span": 1,
+          "start_col_offset_idx": 0,
+          "start_row_offset_idx": 2,
+          "text": "CPU"
+        },
+        {
+          "bbox": {
+            "b": 344.9854649554818,
+            "coord_origin": "TOPLEFT",
+            "l": 356.9555122702465,
+            "r": 414.41067686171783,
+            "t": 326.5373450526476
+          },
+          "col_span": 1,
+          "column_header": false,
+          "end_col_offset_idx": 2,
+          "end_row_offset_idx": 3,
+          "fillable": false,
+          "row_header": false,
+          "row_section": false,
+          "row_span": 1,
+          "start_col_offset_idx": 1,
+          "start_row_offset_idx": 2,
+          "text": "Intel Core i9-9900K CPU@3.60 GHz"
+        },
+        {
+          "bbox": {
+            "b": 340.19860112919076,
+            "coord_origin": "TOPLEFT",
+            "l": 447.4168373043599,
+            "r": 471.86584497444454,
+            "t": 332.75193800310484
+          },
+          "col_span": 1,
+          "column_header": false,
+          "end_col_offset_idx": 3,
+          "end_row_offset_idx": 3,
+          "fillable": false,
+          "row_header": false,
+          "row_section": false,
+          "row_span": 1,
+          "start_col_offset_idx": 2,
+          "start_row_offset_idx": 2,
+          "text": "PyTorch"
+        },
+        {
+          "bbox": {
+            "b": 339.100917473028,
+            "coord_origin": "TOPLEFT",
+            "l": 503.5870780727858,
+            "r": 525.716139453808,
+            "t": 332.5197219817698
+          },
+          "col_span": 1,
+          "column_header": false,
+          "end_col_offset_idx": 4,
+          "end_row_offset_idx": 3,
+          "fillable": false,
+          "row_header": false,
+          "row_section": false,
+          "row_span": 1,
+          "start_col_offset_idx": 3,
+          "start_row_offset_idx": 2,
+          "text": "1.10.2"
+        }
+      ],
+      [
+        {
+          "bbox": {
+            "b": 358.52467658892266,
+            "coord_origin": "TOPLEFT",
+            "l": 311.7248461499227,
+            "r": 328.8391510103557,
+            "t": 352.193850513441
+          },
+          "col_span": 1,
+          "column_header": false,
+          "end_col_offset_idx": 1,
+          "end_row_offset_idx": 4,
+          "fillable": false,
+          "row_header": false,
+          "row_section": false,
+          "row_span": 1,
+          "start_col_offset_idx": 0,
+          "start_row_offset_idx": 3,
+          "text": "GPU"
+        },
+        {
+          "bbox": {
+            "b": 358.52467655324153,
+            "coord_origin": "TOPLEFT",
+            "l": 341.0636584393107,
+            "r": 431.52498249530026,
+            "t": 352.1938504777599
+          },
+          "col_span": 1,
+          "column_header": false,
+          "end_col_offset_idx": 2,
+          "end_row_offset_idx": 4,
+          "fillable": false,
+          "row_header": false,
+          "row_section": false,
+          "row_span": 1,
+          "start_col_offset_idx": 1,
+          "start_row_offset_idx": 3,
+          "text": "NVIDIA GeForce RTX 3080 Ti"
+        },
+        {
+          "bbox": {
+            "b": 359.6656977455225,
+            "coord_origin": "TOPLEFT",
+            "l": 452.30663922632283,
+            "r": 466.9760435740605,
+            "t": 352.1938507430496
+          },
+          "col_span": 1,
+          "column_header": false,
+          "end_col_offset_idx": 3,
+          "end_row_offset_idx": 4,
+          "fillable": false,
+          "row_header": false,
+          "row_section": false,
+          "row_span": 1,
+          "start_col_offset_idx": 2,
+          "start_row_offset_idx": 3,
+          "text": "\u5185\u5b58"
+        },
+        {
+          "bbox": {
+            "b": 358.5246766755768,
+            "coord_origin": "TOPLEFT",
+            "l": 503.6495551380113,
+            "r": 524.4312107674872,
+            "t": 352.1938506000952
+          },
+          "col_span": 1,
+          "column_header": false,
+          "end_col_offset_idx": 4,
+          "end_row_offset_idx": 4,
+          "fillable": false,
+          "row_header": false,
+          "row_section": false,
+          "row_span": 1,
+          "start_col_offset_idx": 3,
+          "start_row_offset_idx": 3,
+          "text": "64 GB"
+        }
+      ]
+    ],
+    "num_cols": 4,
+    "num_rows": 4,
+    "table_cells": [
+      {
+        "bbox": {
+          "b": 310.8768804413403,
+          "coord_origin": "TOPLEFT",
+          "l": 306.8350449042815,
+          "r": 336.1738535997568,
+          "t": 300.88083926952714
+        },
+        "col_span": 1,
+        "column_header": false,
+        "end_col_offset_idx": 1,
+        "end_row_offset_idx": 1,
+        "fillable": false,
+        "row_header": false,
+        "row_section": false,
+        "row_span": 1,
+        "start_col_offset_idx": 0,
+        "start_row_offset_idx": 0,
+        "text": "\u5b9e\u9a8c\u73af\u5883"
+      },
+      {
+        "bbox": {
+          "b": 321.8725258292081,
+          "coord_origin": "TOPLEFT",
+          "l": 306.8350449042815,
+          "r": 336.1738535997568,
+          "t": 313.17829465568855
+        },
+        "col_span": 1,
+        "column_header": false,
+        "end_col_offset_idx": 1,
+        "end_row_offset_idx": 2,
+        "fillable": false,
+        "row_header": false,
+        "row_section": false,
+        "row_span": 1,
+        "start_col_offset_idx": 0,
+        "start_row_offset_idx": 1,
+        "text": "\u64cd\u4f5c\u7cfb\u7edf"
+      },
+      {
+        "bbox": {
+          "b": 338.86870147114723,
+          "coord_origin": "TOPLEFT",
+          "l": 312.947296252395,
+          "r": 328.83915085648033,
+          "t": 332.75193818607187
+        },
+        "col_span": 1,
+        "column_header": false,
+        "end_col_offset_idx": 1,
+        "end_row_offset_idx": 3,
+        "fillable": false,
+        "row_header": false,
+        "row_section": false,
+        "row_span": 1,
+        "start_col_offset_idx": 0,
+        "start_row_offset_idx": 2,
+        "text": "CPU"
+      },
+      {
+        "bbox": {
+          "b": 358.52467658892266,
+          "coord_origin": "TOPLEFT",
+          "l": 311.7248461499227,
+          "r": 328.8391510103557,
+          "t": 352.193850513441
+        },
+        "col_span": 1,
+        "column_header": false,
+        "end_col_offset_idx": 1,
+        "end_row_offset_idx": 4,
+        "fillable": false,
+        "row_header": false,
+        "row_section": false,
+        "row_span": 1,
+        "start_col_offset_idx": 0,
+        "start_row_offset_idx": 3,
+        "text": "GPU"
+      },
+      {
+        "bbox": {
+          "b": 308.2848836263979,
+          "coord_origin": "TOPLEFT",
+          "l": 380.18206693406205,
+          "r": 393.629021025452,
+          "t": 302.16812034132255
+        },
+        "col_span": 1,
+        "column_header": false,
+        "end_col_offset_idx": 2,
+        "end_row_offset_idx": 1,
+        "fillable": false,
+        "row_header": false,
+        "row_section": false,
+        "row_span": 1,
+        "start_col_offset_idx": 1,
+        "start_row_offset_idx": 0,
+        "text": "\u53c2\u6570"
+      },
+      {
+        "bbox": {
+          "b": 309.5440749189127,
+          "coord_origin": "TOPLEFT",
+          "l": 443.7494865771344,
+          "r": 474.31074552895734,
+          "t": 300.8808392366746
+        },
+        "col_span": 1,
+        "column_header": false,
+        "end_col_offset_idx": 3,
+        "end_row_offset_idx": 1,
+        "fillable": false,
+        "row_header": false,
+        "row_section": false,
+        "row_span": 1,
+        "start_col_offset_idx": 2,
+        "start_row_offset_idx": 0,
+        "text": "\u5b9e\u9a8c\u73af\u5883"
+      },
+      {
+        "bbox": {
+          "b": 320.53972011871616,
+          "coord_origin": "TOPLEFT",
+          "l": 369.18001367132615,
+          "r": 403.40862339219206,
+          "t": 314.40164747310547
+        },
+        "col_span": 1,
+        "column_header": false,
+        "end_col_offset_idx": 2,
+        "end_row_offset_idx": 2,
+        "fillable": false,
+        "row_header": false,
+        "row_section": false,
+        "row_span": 1,
+        "start_col_offset_idx": 1,
+        "start_row_offset_idx": 1,
+        "text": "Windows 11"
+      },
+      {
+        "bbox": {
+          "b": 320.5397202048344,
+          "coord_origin": "TOPLEFT",
+          "l": 449.86173910481165,
+          "r": 469.4209444779399,
+          "t": 313.1782945208899
+        },
+        "col_span": 1,
+        "column_header": false,
+        "end_col_offset_idx": 3,
+        "end_row_offset_idx": 2,
+        "fillable": false,
+        "row_header": false,
+        "row_section": false,
+        "row_span": 1,
+        "start_col_offset_idx": 2,
+        "start_row_offset_idx": 1,
+        "text": "Python"
+      },
+      {
+        "bbox": {
+          "b": 344.9854649554818,
+          "coord_origin": "TOPLEFT",
+          "l": 356.9555122702465,
+          "r": 414.41067686171783,
+          "t": 326.5373450526476
+        },
+        "col_span": 1,
+        "column_header": false,
+        "end_col_offset_idx": 2,
+        "end_row_offset_idx": 3,
+        "fillable": false,
+        "row_header": false,
+        "row_section": false,
+        "row_span": 1,
+        "start_col_offset_idx": 1,
+        "start_row_offset_idx": 2,
+        "text": "Intel Core i9-9900K CPU@3.60 GHz"
+      },
+      {
+        "bbox": {
+          "b": 340.19860112919076,
+          "coord_origin": "TOPLEFT",
+          "l": 447.4168373043599,
+          "r": 471.86584497444454,
+          "t": 332.75193800310484
+        },
+        "col_span": 1,
+        "column_header": false,
+        "end_col_offset_idx": 3,
+        "end_row_offset_idx": 3,
+        "fillable": false,
+        "row_header": false,
+        "row_section": false,
+        "row_span": 1,
+        "start_col_offset_idx": 2,
+        "start_row_offset_idx": 2,
+        "text": "PyTorch"
+      },
+      {
+        "bbox": {
+          "b": 358.52467655324153,
+          "coord_origin": "TOPLEFT",
+          "l": 341.0636584393107,
+          "r": 431.52498249530026,
+          "t": 352.1938504777599
+        },
+        "col_span": 1,
+        "column_header": false,
+        "end_col_offset_idx": 2,
+        "end_row_offset_idx": 4,
+        "fillable": false,
+        "row_header": false,
+        "row_section": false,
+        "row_span": 1,
+        "start_col_offset_idx": 1,
+        "start_row_offset_idx": 3,
+        "text": "NVIDIA GeForce RTX 3080 Ti"
+      },
+      {
+        "bbox": {
+          "b": 359.6656977455225,
+          "coord_origin": "TOPLEFT",
+          "l": 452.30663922632283,
+          "r": 466.9760435740605,
+          "t": 352.1938507430496
+        },
+        "col_span": 1,
+        "column_header": false,
+        "end_col_offset_idx": 3,
+        "end_row_offset_idx": 4,
+        "fillable": false,
+        "row_header": false,
+        "row_section": false,
+        "row_span": 1,
+        "start_col_offset_idx": 2,
+        "start_row_offset_idx": 3,
+        "text": "\u5185\u5b58"
+      },
+      {
+        "bbox": {
+          "b": 308.28488380426757,
+          "coord_origin": "TOPLEFT",
+          "l": 507.31690613010113,
+          "r": 521.9863104778389,
+          "t": 300.8808393992523
+        },
+        "col_span": 1,
+        "column_header": false,
+        "end_col_offset_idx": 4,
+        "end_row_offset_idx": 1,
+        "fillable": false,
+        "row_header": false,
+        "row_section": false,
+        "row_span": 1,
+        "start_col_offset_idx": 3,
+        "start_row_offset_idx": 0,
+        "text": "\u53c2\u6570"
+      },
+      {
+        "bbox": {
+          "b": 320.5397201742506,
+          "coord_origin": "TOPLEFT",
+          "l": 506.0944561957158,
+          "r": 521.9863107998011,
+          "t": 313.17829449030614
+        },
+        "col_span": 1,
+        "column_header": false,
+        "end_col_offset_idx": 4,
+        "end_row_offset_idx": 2,
+        "fillable": false,
+        "row_header": false,
+        "row_section": false,
+        "row_span": 1,
+        "start_col_offset_idx": 3,
+        "start_row_offset_idx": 1,
+        "text": "3.10"
+      },
+      {
+        "bbox": {
+          "b": 339.100917473028,
+          "coord_origin": "TOPLEFT",
+          "l": 503.5870780727858,
+          "r": 525.716139453808,
+          "t": 332.5197219817698
+        },
+        "col_span": 1,
+        "column_header": false,
+        "end_col_offset_idx": 4,
+        "end_row_offset_idx": 3,
+        "fillable": false,
+        "row_header": false,
+        "row_section": false,
+        "row_span": 1,
+        "start_col_offset_idx": 3,
+        "start_row_offset_idx": 2,
+        "text": "1.10.2"
+      },
+      {
+        "bbox": {
+          "b": 358.5246766755768,
+          "coord_origin": "TOPLEFT",
+          "l": 503.6495551380113,
+          "r": 524.4312107674872,
+          "t": 352.1938506000952
+        },
+        "col_span": 1,
+        "column_header": false,
+        "end_col_offset_idx": 4,
+        "end_row_offset_idx": 4,
+        "fillable": false,
+        "row_header": false,
+        "row_section": false,
+        "row_span": 1,
+        "start_col_offset_idx": 3,
+        "start_row_offset_idx": 3,
+        "text": "64 GB"
+      }
+    ]
+  },
+  "footnotes": [],
+  "image": {
+    "dpi": 72,
+    "mimetype": "image/png",
+    "size": {
+      "height": 65.0,
+      "width": 240.0
+    },
+    "uri": "data:image/png;base64,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"
+  },
+  "label": "table",
+  "parent": {
+    "$ref": "#/body"
+  },
+  "prov": [
+    {
+      "bbox": {
+        "b": 480.18292236328125,
+        "coord_origin": "BOTTOMLEFT",
+        "l": 305.55499267578125,
+        "r": 546.0582275390625,
+        "t": 544.7878112792969
+      },
+      "charspan": [
+        0,
+        0
+      ],
+      "page_no": 5
+    }
+  ],
+  "references": [],
+  "self_ref": "#/tables/2"
+}

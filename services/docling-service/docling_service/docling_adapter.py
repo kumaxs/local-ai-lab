@@ -41,20 +41,44 @@ def _make_document_converter(profile: str) -> Any:
         base_models = import_module("docling.datamodel.base_models")
         pipeline_options = import_module("docling.datamodel.pipeline_options")
         artifacts_path = Path.home() / ".cache" / "docling" / "models"
+        artifacts_path_value = str(artifacts_path) if artifacts_path.is_dir() else None
+        code_formula_model_dir = artifacts_path / "docling-project--CodeFormulaV2"
+        formula_models_available = code_formula_model_dir.is_dir()
         option_kwargs: dict[str, Any] = {
             "accelerator_options": accelerator_options.AcceleratorOptions(device="cpu"),
             "do_ocr": False,
             "do_table_structure": False,
+            "do_formula_enrichment": False,
             "generate_page_images": False,
             "generate_picture_images": False,
             "generate_table_images": False,
             "images_scale": 1.0,
-            "artifacts_path": str(artifacts_path) if artifacts_path.is_dir() else None,
+            "artifacts_path": artifacts_path_value,
         }
-        if profile == "quality_first":
+        if profile == "text_quality_probe":
+            pass
+        elif profile == "quality_first":
             option_kwargs.update(
                 {
                     "do_table_structure": True,
+                    "table_structure_options": pipeline_options.TableStructureOptions(
+                        do_cell_matching=True,
+                        mode=pipeline_options.TableFormerMode.ACCURATE,
+                    ),
+                    "generate_page_images": True,
+                    "generate_picture_images": True,
+                    "generate_table_images": True,
+                }
+            )
+        elif profile == "article_quality_formula":
+            option_kwargs.update(
+                {
+                    "do_table_structure": True,
+                    "table_structure_options": pipeline_options.TableStructureOptions(
+                        do_cell_matching=True,
+                        mode=pipeline_options.TableFormerMode.ACCURATE,
+                    ),
+                    "do_formula_enrichment": formula_models_available,
                     "generate_page_images": True,
                     "generate_picture_images": True,
                     "generate_table_images": True,
@@ -71,8 +95,14 @@ def _make_document_converter(profile: str) -> Any:
             option_kwargs.update(
                 {
                     "do_ocr": True,
+                    "do_table_structure": True,
+                    "table_structure_options": pipeline_options.TableStructureOptions(
+                        do_cell_matching=True,
+                        mode=pipeline_options.TableFormerMode.ACCURATE,
+                    ),
                     "generate_page_images": True,
                     "generate_picture_images": True,
+                    "generate_table_images": True,
                     "ocr_options": pipeline_options.OcrMacOptions(
                         lang=["zh-Hans", "zh-Hant", "en-US"],
                         force_full_page_ocr=True,
@@ -83,8 +113,14 @@ def _make_document_converter(profile: str) -> Any:
             option_kwargs.update(
                 {
                     "do_ocr": True,
+                    "do_table_structure": True,
+                    "table_structure_options": pipeline_options.TableStructureOptions(
+                        do_cell_matching=True,
+                        mode=pipeline_options.TableFormerMode.ACCURATE,
+                    ),
                     "generate_page_images": True,
                     "generate_picture_images": True,
+                    "generate_table_images": True,
                     "ocr_options": pipeline_options.OcrAutoOptions(
                         lang=["chinese", "english"],
                         force_full_page_ocr=True,
@@ -164,6 +200,16 @@ def _export_document_payload(
         warnings.append(warning)
 
     text_quality = measure_gxx_quality(markdown, html, text)
+    formula_models_available = (Path.home() / ".cache" / "docling" / "models" / "docling-project--CodeFormulaV2").is_dir()
+    feature_warnings = list(warnings)
+    if profile in {"quality_first", "article_quality_formula", "ocr_fallback_mac", "ocr_fallback_auto"}:
+        feature_warnings.append("table_structure_accurate_cell_matching_enabled")
+        if profile == "article_quality_formula" and formula_models_available:
+            feature_warnings.append("formula_enrichment_enabled_codeformula_v2")
+        elif profile == "article_quality_formula":
+            feature_warnings.append("formula_enrichment_unavailable_missing_codeformula_v2_model")
+        elif profile in {"ocr_fallback_mac", "ocr_fallback_auto"} and formula_models_available:
+            feature_warnings.append("formula_enrichment_skipped_for_ocr_runtime; visual_fallback_enabled")
     return {
         "markdown": markdown,
         "html": html,
@@ -171,7 +217,7 @@ def _export_document_payload(
         "document": document,
         "text": text,
         "doctags": doctags,
-        "warnings": warnings,
+        "warnings": feature_warnings,
         "docling_version": docling_version,
         "result": result,
         "conversion_policy": CONVERSION_POLICY,
@@ -180,6 +226,7 @@ def _export_document_payload(
         "text_quality_gxx_count": text_quality.gxx_count,
         "text_quality_gxx_density": text_quality.gxx_density,
         "text_quality_failed": text_quality.failed,
+        "formula_enrichment_enabled": profile == "article_quality_formula" and formula_models_available,
     }
 
 
@@ -201,24 +248,43 @@ def _run_docling_profile(input_path: Path, profile: str, docling_version: str | 
 def _convert_quality_first(input_path: Path, docling_version: str | None) -> dict[str, Any]:
     warnings: list[str] = []
     try:
-        conversion = _run_docling_profile(input_path, "quality_first", docling_version)
+        probe = _run_docling_profile(input_path, "text_quality_probe", docling_version)
     except DoclingAdapterError as exc:
-        warnings.append(f"table_or_asset_quality_profile_unavailable: {exc}")
+        warnings.append(f"text_quality_probe_unavailable: {exc}")
+        probe = None
+
+    if probe and probe.get("text_quality_failed"):
+        conversion = probe
+    else:
         try:
-            conversion = _run_docling_profile(
-                input_path,
-                "quality_without_table_structure",
-                docling_version,
-            )
-        except DoclingAdapterError as fallback_exc:
-            warnings.append(f"asset_generation_profile_unavailable: {fallback_exc}")
-            conversion = _run_docling_profile(input_path, "compatibility", docling_version)
-        conversion["warnings"] = warnings + list(conversion.get("warnings") or [])
+            conversion = _run_docling_profile(input_path, "article_quality_formula", docling_version)
+            if warnings:
+                conversion["warnings"] = warnings + list(conversion.get("warnings") or [])
+        except DoclingAdapterError as exc:
+            warnings.append(f"formula_quality_profile_unavailable: {exc}")
+            try:
+                conversion = _run_docling_profile(input_path, "quality_first", docling_version)
+            except DoclingAdapterError as fallback_exc:
+                warnings.append(f"table_or_asset_quality_profile_unavailable: {fallback_exc}")
+                try:
+                    conversion = _run_docling_profile(
+                        input_path,
+                        "quality_without_table_structure",
+                        docling_version,
+                    )
+                except DoclingAdapterError as asset_exc:
+                    warnings.append(f"asset_generation_profile_unavailable: {asset_exc}")
+                    conversion = _run_docling_profile(input_path, "compatibility", docling_version)
+            conversion["warnings"] = warnings + list(conversion.get("warnings") or [])
 
     if conversion.get("text_quality_failed"):
         conversion.setdefault("warnings", []).append(
             "text_quality_failed_gxx_density; attempting OCR fallback"
         )
+        if probe and conversion is not probe:
+            conversion.setdefault("warnings", []).append(
+                "article_quality_profile_preserved_bad_text_signal_from_probe"
+            )
         for profile in ("ocr_fallback_mac", "ocr_fallback_auto"):
             try:
                 fallback = _run_docling_profile(input_path, profile, docling_version)
