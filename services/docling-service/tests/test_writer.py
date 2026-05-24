@@ -64,13 +64,29 @@ STATUS_FIELDS = {
 }
 
 
+class FakePILImage:
+    size = (600, 800)
+
+    def crop(self, box: tuple[int, int, int, int]) -> "FakePILImage":
+        return self
+
+    def save(self, path: Path, format: str | None = None) -> None:
+        path.write_bytes(b"fake png bytes")
+
+
 class FakeImage:
+    pil_image = FakePILImage()
+
     def save(self, path: Path) -> None:
         path.write_bytes(b"fake png bytes")
 
 
 class FakePage:
     image = FakeImage()
+
+    class size:
+        width = 300
+        height = 400
 
 
 class FakeTable:
@@ -92,6 +108,18 @@ class FakeFormula:
     label = "formula"
     text = "Formula not decoded"
 
+    class prov_item:
+        page_no = 1
+
+        class bbox:
+            l = 50
+            t = 250
+            r = 140
+            b = 230
+            coord_origin = "BOTTOMLEFT"
+
+    prov = [prov_item()]
+
     def get_image(self, doc: object | None = None) -> FakeImage:
         return FakeImage()
 
@@ -105,7 +133,7 @@ class FakeDocument:
     def save_as_html(self, filename: str, artifacts_dir: Path | None = None, image_mode: object = None) -> None:
         Path(filename).write_text(
             "<html><head><title>Converted</title></head><body>"
-            "<h1>Converted</h1><p><!-- image placeholder --></p>"
+            "<h1>Converted</h1><p>Formula not decoded</p><p><!-- image placeholder --></p>"
             "</body></html>\n",
             encoding="utf-8",
         )
@@ -190,7 +218,7 @@ class WriterTests(unittest.TestCase):
                 display_name="docling.pdf",
                 conversion={
                     "markdown": "# Converted\n",
-                    "html": "<html><body><h1>Converted</h1></body></html>\n",
+                    "html": "<html><body><h1>Converted</h1><p>Formula not decoded</p></body></html>\n",
                     "document_dict": {"pages": [{"page_no": 1}], "body": "Converted"},
                     "text": "Converted\n",
                     "doctags": "<document>\n",
@@ -263,7 +291,7 @@ class WriterTests(unittest.TestCase):
                 output_root=output_root,
                 conversion={
                     "markdown": "# Converted\n",
-                    "html": "<html><body><h1>Converted</h1></body></html>\n",
+                    "html": "<html><body><h1>Converted</h1><p>Formula not decoded</p></body></html>\n",
                     "document_dict": {
                         "pages": [{"page_no": 1}],
                         "tables": [
@@ -295,32 +323,41 @@ class WriterTests(unittest.TestCase):
             self.assertTrue((output_dir / "assets" / "page_1.png").exists())
             self.assertTrue((output_dir / "assets" / "table_1.png").exists())
             self.assertTrue((output_dir / "assets" / "formula_1.png").exists())
+            self.assertTrue((output_dir / "assets" / "formula_1_context.png").exists())
             document_html = (output_dir / "document.html").read_text(encoding="utf-8")
             self.assertIn('src="assets/page_1.png"', document_html)
             self.assertIn('src="assets/table_1.png"', document_html)
             self.assertIn('src="assets/formula_1.png"', document_html)
+            self.assertIn('src="assets/formula_1_context.png"', document_html)
+            self.assertIn('href="assets/formula_1_context.png"', document_html)
+            self.assertIn("Formula not decoded (review formula 1)", document_html)
             self.assertIn('href="tables/table_1.html"', document_html)
             self.assertIn("<table><tr><td>cell</td></tr></table>", document_html)
             metadata = json.loads((output_dir / "metadata.json").read_text(encoding="utf-8"))
             status = json.loads((output_dir / "status.json").read_text(encoding="utf-8"))
             self.assertEqual(metadata["conversion_policy"], "quality_first")
             self.assertEqual(metadata["table_count"], 1)
-            self.assertEqual(metadata["asset_count"], 3)
+            self.assertEqual(metadata["asset_count"], 4)
             self.assertEqual(metadata["table_image_count"], 1)
             self.assertEqual(metadata["formula_count"], 1)
             self.assertEqual(metadata["formula_asset_count"], 1)
+            self.assertEqual(metadata["formula_context_asset_count"], 1)
+            self.assertEqual(metadata["formula_placeholder_link_count"], 1)
             self.assertGreater(metadata["formula_placeholder_count"], 0)
             self.assertEqual(status["table_count"], 1)
-            self.assertEqual(status["asset_count"], 3)
+            self.assertEqual(status["asset_count"], 4)
             self.assertEqual(status["table_image_count"], 1)
             self.assertEqual(status["formula_asset_count"], 1)
+            self.assertEqual(status["formula_context_asset_count"], 1)
+            self.assertEqual(status["formula_placeholder_link_count"], 1)
             self.assertEqual(status["generated_outputs"], status["outputs_written"])
             self.assertIn("tables/table_1.json", metadata["generated_outputs"])
             self.assertIn("tables/table_1.html", metadata["generated_outputs"])
             self.assertIn("assets/page_1.png", status["outputs_written"])
             self.assertIn("assets/table_1.png", status["outputs_written"])
             self.assertIn("assets/formula_1.png", status["outputs_written"])
-            self.assertIn("formula_decode_limited_review_crops_written", status["warnings"])
+            self.assertIn("assets/formula_1_context.png", status["outputs_written"])
+            self.assertIn("formula_decode_limited_high_res_review_crops_written", status["warnings"])
 
 
 if __name__ == "__main__":

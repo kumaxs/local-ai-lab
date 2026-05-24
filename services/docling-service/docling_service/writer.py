@@ -6,6 +6,7 @@ import hashlib
 import html
 import json
 import os
+import re
 import shutil
 from datetime import UTC, datetime
 from pathlib import Path
@@ -69,6 +70,8 @@ def build_metadata(
     formula_count: int | None = None,
     formula_placeholder_count: int | None = None,
     formula_asset_count: int | None = None,
+    formula_context_asset_count: int | None = None,
+    formula_placeholder_link_count: int | None = None,
     formula_enrichment_enabled: bool | None = None,
 ) -> dict[str, Any]:
     path = Path(input_file_path)
@@ -100,6 +103,8 @@ def build_metadata(
         "formula_count": formula_count,
         "formula_placeholder_count": formula_placeholder_count,
         "formula_asset_count": formula_asset_count,
+        "formula_context_asset_count": formula_context_asset_count,
+        "formula_placeholder_link_count": formula_placeholder_link_count,
         "formula_enrichment_enabled": formula_enrichment_enabled,
     }
 
@@ -130,6 +135,8 @@ def build_status(
     formula_count: int | None = None,
     formula_placeholder_count: int | None = None,
     formula_asset_count: int | None = None,
+    formula_context_asset_count: int | None = None,
+    formula_placeholder_link_count: int | None = None,
     formula_enrichment_enabled: bool | None = None,
 ) -> dict[str, Any]:
     return {
@@ -157,6 +164,8 @@ def build_status(
         "formula_count": formula_count,
         "formula_placeholder_count": formula_placeholder_count,
         "formula_asset_count": formula_asset_count,
+        "formula_context_asset_count": formula_context_asset_count,
+        "formula_placeholder_link_count": formula_placeholder_link_count,
         "formula_enrichment_enabled": formula_enrichment_enabled,
     }
 
@@ -245,6 +254,99 @@ def _count_formula_object_placeholders(document: Any | None) -> int:
     return sum(1 for item in _formula_objects(document) if "Formula not decoded" in _text_item_text(item))
 
 
+def _formula_item_prov(item: Any) -> Any | None:
+    prov = getattr(item, "prov", None)
+    if isinstance(prov, list) and prov:
+        return prov[0]
+    return None
+
+
+def _page_image_for_formula(document: Any | None, item: Any) -> tuple[Any | None, Any | None]:
+    prov = _formula_item_prov(item)
+    page_no = getattr(prov, "page_no", None)
+    pages = getattr(document, "pages", None)
+    if page_no is None or not isinstance(pages, dict):
+        return None, None
+    page = pages.get(page_no)
+    page_image = getattr(page, "image", None)
+    pil_image = getattr(page_image, "pil_image", None)
+    return page, pil_image
+
+
+def _page_dimension(value: Any, names: tuple[str, ...]) -> float | None:
+    for name in names:
+        found = getattr(value, name, None)
+        if isinstance(found, (int, float)) and found > 0:
+            return float(found)
+    return None
+
+
+def _page_size_points(page: Any, pil_image: Any) -> tuple[float, float] | None:
+    size = getattr(page, "size", None)
+    if size is not None:
+        width = _page_dimension(size, ("width", "w"))
+        height = _page_dimension(size, ("height", "h"))
+        if width and height:
+            return width, height
+    return None
+
+
+def _crop_formula_from_page(
+    *,
+    document: Any | None,
+    item: Any,
+    output_path: Path,
+    padding_px: int,
+    min_height_px: int,
+) -> bool:
+    prov = _formula_item_prov(item)
+    bbox = getattr(prov, "bbox", None)
+    if bbox is None:
+        return False
+    page, page_image = _page_image_for_formula(document, item)
+    if page is None or page_image is None:
+        return False
+    size_points = _page_size_points(page, page_image)
+    if size_points is None:
+        return False
+
+    page_width_pt, page_height_pt = size_points
+    page_width_px, page_height_px = page_image.size
+    scale_x = page_width_px / page_width_pt
+    scale_y = page_height_px / page_height_pt
+    left = float(getattr(bbox, "l"))
+    right = float(getattr(bbox, "r"))
+    top = float(getattr(bbox, "t"))
+    bottom = float(getattr(bbox, "b"))
+    origin = str(getattr(getattr(bbox, "coord_origin", ""), "value", getattr(bbox, "coord_origin", ""))).lower()
+
+    x1 = min(left, right) * scale_x
+    x2 = max(left, right) * scale_x
+    if "bottomleft" in origin:
+        y1 = (page_height_pt - max(top, bottom)) * scale_y
+        y2 = (page_height_pt - min(top, bottom)) * scale_y
+    else:
+        y1 = min(top, bottom) * scale_y
+        y2 = max(top, bottom) * scale_y
+
+    if y2 - y1 < min_height_px:
+        extra = (min_height_px - (y2 - y1)) / 2
+        y1 -= extra
+        y2 += extra
+
+    crop_box = (
+        max(0, int(x1) - padding_px),
+        max(0, int(y1) - padding_px),
+        min(page_width_px, int(x2) + padding_px),
+        min(page_height_px, int(y2) + padding_px),
+    )
+    if crop_box[2] <= crop_box[0] or crop_box[3] <= crop_box[1]:
+        return False
+    cropped = page_image.crop(crop_box)
+    cropped.save(output_path, format="PNG")
+    return output_path.exists() and output_path.stat().st_size > 0
+
+
 def _write_table_artifacts(
     *,
     output_dir: Path,
@@ -310,6 +412,8 @@ def _render_review_appendix(
         if path.lower().endswith((".png", ".jpg", ".jpeg", ".webp"))
         and not path.startswith("assets/docling-html/")
     ]
+    formula_assets = [path for path in visible_assets if re.match(r"assets/formula_\d+(_context)?\.png$", path)]
+    non_formula_assets = [path for path in visible_assets if path not in set(formula_assets)]
 
     if not table_outputs and not visible_assets:
         return ""
@@ -321,14 +425,32 @@ def _render_review_appendix(
         "<p>Derived visual and table artifacts generated by docling-service for manual review.</p>",
     ]
 
-    if visible_assets:
+    if formula_assets:
+        parts.extend(
+            [
+                "<h2>Formula Review</h2>",
+                '<div class="docling-review-formulas">',
+            ]
+        )
+        for path in formula_assets:
+            escaped_path = html.escape(path, quote=True)
+            label = html.escape(_asset_label(path))
+            parts.append(
+                "<figure>"
+                f'<a href="{escaped_path}"><img src="{escaped_path}" alt="{label}" loading="lazy"></a>'
+                f"<figcaption>{label}</figcaption>"
+                "</figure>"
+            )
+        parts.append("</div>")
+
+    if non_formula_assets:
         parts.extend(
             [
                 "<h2>Visual Assets</h2>",
                 '<div class="docling-review-assets">',
             ]
         )
-        for path in visible_assets:
+        for path in non_formula_assets:
             escaped_path = html.escape(path, quote=True)
             label = html.escape(_asset_label(path))
             parts.append(
@@ -370,6 +492,36 @@ def _render_review_appendix(
     return "\n".join(parts)
 
 
+def _link_formula_placeholders(document_html: str, asset_outputs: list[str]) -> str:
+    formula_targets = [
+        path
+        for path in asset_outputs
+        if re.match(r"assets/formula_\d+_context\.png$", path)
+    ]
+    if not formula_targets or "Formula not decoded" not in document_html:
+        return document_html
+
+    def sort_key(path: str) -> int:
+        match = re.search(r"formula_(\d+)_context\.png$", path)
+        return int(match.group(1)) if match else 0
+
+    formula_targets.sort(key=sort_key)
+    index = 0
+
+    def replace(_match: re.Match[str]) -> str:
+        nonlocal index
+        target = formula_targets[min(index, len(formula_targets) - 1)]
+        index += 1
+        escaped_target = html.escape(target, quote=True)
+        return (
+            f'<a class="docling-formula-placeholder" href="{escaped_target}">'
+            f"Formula not decoded (review formula {index})"
+            "</a>"
+        )
+
+    return re.sub(r"Formula not decoded", replace, document_html)
+
+
 def _inject_review_appendix(document_html: str, appendix: str) -> str:
     if not appendix:
         return document_html
@@ -379,6 +531,10 @@ def _inject_review_appendix(document_html: str, appendix: str) -> str:
 .docling-review-assets { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 1rem; }
 .docling-review-assets figure { margin: 0; break-inside: avoid; }
 .docling-review-assets img { max-width: 100%; height: auto; border: 1px solid #ccc; background: #fff; }
+.docling-review-formulas { display: grid; grid-template-columns: 1fr; gap: 1rem; }
+.docling-review-formulas figure { margin: 0; break-inside: avoid; }
+.docling-review-formulas img { max-width: 100%; height: auto; border: 1px solid #555; background: #fff; }
+.docling-formula-placeholder { font-weight: 600; color: #7a1f1f; background: #fff5d6; padding: 0.05rem 0.2rem; }
 .docling-review-table { overflow-x: auto; margin: 1.5rem 0; }
 .docling-review-table table { border-collapse: collapse; width: max-content; max-width: 100%; }
 .docling-review-table th, .docling-review-table td { border: 1px solid #bbb; padding: 0.35rem 0.5rem; vertical-align: top; }
@@ -440,6 +596,7 @@ def _write_document_html(
         html_path.write_text(fallback_html, encoding="utf-8")
 
     document_html = html_path.read_text(encoding="utf-8")
+    document_html = _link_formula_placeholders(document_html, asset_outputs)
     appendix = _render_review_appendix(
         output_dir=output_dir,
         table_outputs=table_outputs,
@@ -467,7 +624,6 @@ def _iter_asset_candidates(document: Any | None) -> list[tuple[str, Any]]:
     for label, items in (
         ("picture", getattr(document, "pictures", None)),
         ("table", getattr(document, "tables", None)),
-        ("formula", _formula_objects(document)),
     ):
         if isinstance(items, list):
             for index, item in enumerate(items, start=1):
@@ -521,6 +677,37 @@ def _write_asset_artifacts(*, output_dir: Path, document: Any | None) -> tuple[l
 
     assets_dir = output_dir / "assets"
     assets_dir.mkdir(parents=True, exist_ok=True)
+
+    for index, formula in enumerate(_formula_objects(document), start=1):
+        formula_path = assets_dir / f"formula_{index}.png"
+        context_path = assets_dir / f"formula_{index}_context.png"
+        try:
+            wrote_formula = _crop_formula_from_page(
+                document=document,
+                item=formula,
+                output_path=formula_path,
+                padding_px=20,
+                min_height_px=96,
+            )
+            if not wrote_formula:
+                image = _image_from_candidate(formula, document)
+                wrote_formula = _write_image_candidate(formula_path, image)
+            if wrote_formula:
+                written.append(relative_output(formula_path, output_dir))
+        except Exception:
+            warnings.append(f"formula_{index}_asset_export_failed")
+        try:
+            if _crop_formula_from_page(
+                document=document,
+                item=formula,
+                output_path=context_path,
+                padding_px=120,
+                min_height_px=220,
+            ):
+                written.append(relative_output(context_path, output_dir))
+        except Exception:
+            warnings.append(f"formula_{index}_context_asset_export_failed")
+
     for label, candidate in candidates:
         if candidate is None:
             continue
@@ -615,7 +802,10 @@ def write_docling_outputs(
         [path for path in asset_outputs if path.startswith("assets/table_") and path.lower().endswith(".png")]
     )
     formula_asset_count = len(
-        [path for path in asset_outputs if path.startswith("assets/formula_") and path.lower().endswith(".png")]
+        [path for path in asset_outputs if re.match(r"assets/formula_\d+\.png$", path)]
+    )
+    formula_context_asset_count = len(
+        [path for path in asset_outputs if re.match(r"assets/formula_\d+_context\.png$", path)]
     )
     formula_count = max(
         len(_formula_objects(conversion.get("document"))),
@@ -629,6 +819,7 @@ def write_docling_outputs(
         _count_formula_placeholders(final_html),
         _count_formula_object_placeholders(conversion.get("document")),
     )
+    formula_placeholder_link_count = final_html.count("Formula not decoded (review formula")
 
     if table_count and table_image_count == 0:
         page_images = [
@@ -639,7 +830,9 @@ def write_docling_outputs(
         else:
             warnings.append("table_visual_review_unavailable_no_table_or_page_images")
     if formula_placeholder_count:
-        if formula_asset_count:
+        if formula_asset_count and formula_context_asset_count:
+            warnings.append("formula_decode_limited_high_res_review_crops_written")
+        elif formula_asset_count:
             warnings.append("formula_decode_limited_review_crops_written")
         else:
             warnings.append("formula_decode_limited_no_formula_review_crops")
@@ -669,6 +862,8 @@ def write_docling_outputs(
         formula_count=formula_count,
         formula_placeholder_count=formula_placeholder_count,
         formula_asset_count=formula_asset_count,
+        formula_context_asset_count=formula_context_asset_count,
+        formula_placeholder_link_count=formula_placeholder_link_count,
         formula_enrichment_enabled=conversion.get("formula_enrichment_enabled"),
     )
     write_json(job_output_dir / "metadata.json", metadata)
@@ -700,6 +895,8 @@ def write_docling_outputs(
         formula_count=formula_count,
         formula_placeholder_count=formula_placeholder_count,
         formula_asset_count=formula_asset_count,
+        formula_context_asset_count=formula_context_asset_count,
+        formula_placeholder_link_count=formula_placeholder_link_count,
         formula_enrichment_enabled=conversion.get("formula_enrichment_enabled"),
     )
     write_json(job_output_dir / "status.json", status)
