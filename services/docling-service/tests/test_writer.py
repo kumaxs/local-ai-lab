@@ -73,10 +73,30 @@ class FakePage:
     image = FakeImage()
 
 
+class FakeTable:
+    def export_to_html(self, doc: object | None = None) -> str:
+        if doc is None:
+            return ""
+        return "<table><tr><td>cell</td></tr></table>"
+
+    def export_to_markdown(self, doc: object | None = None) -> str:
+        if doc is None:
+            return ""
+        return "| value |\n| --- |\n| cell |\n"
+
+
 class FakeDocument:
     pages = {1: FakePage()}
     pictures: list[object] = []
-    tables: list[object] = []
+    tables = [FakeTable()]
+
+    def save_as_html(self, filename: str, artifacts_dir: Path | None = None, image_mode: object = None) -> None:
+        Path(filename).write_text(
+            "<html><head><title>Converted</title></head><body>"
+            "<h1>Converted</h1><p><!-- image placeholder --></p>"
+            "</body></html>\n",
+            encoding="utf-8",
+        )
 
 
 class WriterTests(unittest.TestCase):
@@ -258,7 +278,13 @@ class WriterTests(unittest.TestCase):
 
             output_dir = Path(result["output_dir"])
             self.assertTrue((output_dir / "tables" / "table_1.json").exists())
+            self.assertTrue((output_dir / "tables" / "table_1.html").exists())
+            self.assertTrue((output_dir / "tables" / "table_1.md").exists())
             self.assertTrue((output_dir / "assets" / "page_1.png").exists())
+            document_html = (output_dir / "document.html").read_text(encoding="utf-8")
+            self.assertIn('src="assets/page_1.png"', document_html)
+            self.assertIn('href="tables/table_1.html"', document_html)
+            self.assertIn("<table><tr><td>cell</td></tr></table>", document_html)
             metadata = json.loads((output_dir / "metadata.json").read_text(encoding="utf-8"))
             status = json.loads((output_dir / "status.json").read_text(encoding="utf-8"))
             self.assertEqual(metadata["conversion_policy"], "quality_first")
@@ -268,6 +294,7 @@ class WriterTests(unittest.TestCase):
             self.assertEqual(status["asset_count"], 1)
             self.assertEqual(status["generated_outputs"], status["outputs_written"])
             self.assertIn("tables/table_1.json", metadata["generated_outputs"])
+            self.assertIn("tables/table_1.html", metadata["generated_outputs"])
             self.assertIn("assets/page_1.png", status["outputs_written"])
 
 
