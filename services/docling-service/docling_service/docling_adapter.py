@@ -52,7 +52,7 @@ def _make_document_converter(profile: str) -> Any:
             "generate_page_images": False,
             "generate_picture_images": False,
             "generate_table_images": False,
-            "images_scale": 1.0,
+            "images_scale": 3.0,
             "artifacts_path": artifacts_path_value,
         }
         if profile == "text_quality_probe":
@@ -209,7 +209,9 @@ def _export_document_payload(
         elif profile == "article_quality_formula":
             feature_warnings.append("formula_enrichment_unavailable_missing_codeformula_v2_model")
         elif profile in {"ocr_fallback_mac", "ocr_fallback_auto"} and formula_models_available:
-            feature_warnings.append("formula_enrichment_skipped_for_ocr_runtime; visual_fallback_enabled")
+            feature_warnings.append(
+                "formula_enrichment_deferred_on_ocr_after_bounded_validation; high_res_review_fallback_enabled"
+            )
     return {
         "markdown": markdown,
         "html": html,
