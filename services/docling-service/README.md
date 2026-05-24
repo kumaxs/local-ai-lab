@@ -14,7 +14,7 @@ Current state:
 
 The CLI validates contract plumbing and writes local conversion outputs. The Docling path uses `docling.document_converter.DocumentConverter` and does not shell out to the Docling CLI or fetch remote URLs.
 
-For `--converter docling`, the service now prioritizes reading-quality diagnostics over smoke-test speed. Internally it attempts Docling table structure and page/picture/table image generation, checks generated text/Markdown/HTML for dense `/Gxx` PDF fallback tokens, and tries a full-page OCR fallback when the text layer looks bad. If optional OCR, table, or image support is unavailable, conversion should still write the required contract files and record honest warnings in `status.json`.
+For `--converter docling`, the service now prioritizes reading-quality diagnostics over smoke-test speed. Internally it first probes text-layer quality, then applies the best local article-extraction policy it can use without exposing profiles to callers. Normal text-layer PDFs use accurate TableFormer settings, referenced page/picture/table images, and CodeFormulaV2 formula enrichment when the local model is present. PDFs with dense `/Gxx` fallback tokens, including bad Chinese text layers, automatically use full-page OCR fallback while preserving table/page/picture assets. OCR fallback intentionally skips the formula VLM when it would make the run impractically slow; formulas that cannot be decoded are surfaced through visual review artifacts and warnings instead of being hidden.
 
 ## Example
 
@@ -77,9 +77,11 @@ text.txt
 doctags.txt
 ```
 
-`metadata.json` and `status.json` include the internal policy and quality diagnostics, including `conversion_policy`, `ocr_fallback_used`, `text_quality_gxx_count`, `text_quality_gxx_density`, `table_count`, `asset_count`, and `generated_outputs`. `asset_count` is the count of real files written under `assets/`; `table_count` is counted from Docling document structure when available.
+`tables/table_N.html` and `tables/table_N.md` are written only when Docling can export a real table representation. `assets/table_N.png` and `assets/formula_N.png` are written when Docling can provide table or formula region images, so a table/formula remains human-reviewable even when structural extraction is weak.
 
-Command success is not the same as reading-quality success. In particular, Chinese PDFs with bad embedded text layers may still produce poor text if the local OCR engine or model files are unavailable; check `status.warnings` and the `/Gxx` metrics before treating an output as intake-quality.
+`metadata.json` and `status.json` include the internal policy and quality diagnostics, including `conversion_policy`, `ocr_fallback_used`, `text_quality_gxx_count`, `text_quality_gxx_density`, `table_count`, `asset_count`, `table_artifact_count`, `table_image_count`, `formula_count`, `formula_placeholder_count`, `formula_asset_count`, `formula_enrichment_enabled`, and `generated_outputs`. `asset_count` is the count of real files written under `assets/`; `table_count` is counted from Docling document structure when available.
+
+Command success is not the same as reading-quality success. In particular, Chinese PDFs with bad embedded text layers may still produce poor text if the local OCR engine or model files are unavailable, and tables/formulas can still require visual review even when contract files exist. Check `status.warnings`, `/Gxx` metrics, table/formula counts, and the linked artifacts before treating an output as intake-quality.
 
 ## Tests
 

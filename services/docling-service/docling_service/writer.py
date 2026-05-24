@@ -64,6 +64,12 @@ def build_metadata(
     ocr_fallback_used: bool | None = None,
     text_quality_gxx_count: int | None = None,
     text_quality_gxx_density: float | None = None,
+    table_artifact_count: int | None = None,
+    table_image_count: int | None = None,
+    formula_count: int | None = None,
+    formula_placeholder_count: int | None = None,
+    formula_asset_count: int | None = None,
+    formula_enrichment_enabled: bool | None = None,
 ) -> dict[str, Any]:
     path = Path(input_file_path)
     stat = path.stat()
@@ -89,6 +95,12 @@ def build_metadata(
         "ocr_fallback_used": ocr_fallback_used,
         "text_quality_gxx_count": text_quality_gxx_count,
         "text_quality_gxx_density": text_quality_gxx_density,
+        "table_artifact_count": table_artifact_count,
+        "table_image_count": table_image_count,
+        "formula_count": formula_count,
+        "formula_placeholder_count": formula_placeholder_count,
+        "formula_asset_count": formula_asset_count,
+        "formula_enrichment_enabled": formula_enrichment_enabled,
     }
 
 
@@ -113,6 +125,12 @@ def build_status(
     table_count: int | None = None,
     asset_count: int | None = None,
     generated_outputs: list[str] | None = None,
+    table_artifact_count: int | None = None,
+    table_image_count: int | None = None,
+    formula_count: int | None = None,
+    formula_placeholder_count: int | None = None,
+    formula_asset_count: int | None = None,
+    formula_enrichment_enabled: bool | None = None,
 ) -> dict[str, Any]:
     return {
         "job_uuid": job_uuid,
@@ -134,6 +152,12 @@ def build_status(
         "table_count": table_count,
         "asset_count": asset_count,
         "generated_outputs": generated_outputs or outputs_written or [],
+        "table_artifact_count": table_artifact_count,
+        "table_image_count": table_image_count,
+        "formula_count": formula_count,
+        "formula_placeholder_count": formula_placeholder_count,
+        "formula_asset_count": formula_asset_count,
+        "formula_enrichment_enabled": formula_enrichment_enabled,
     }
 
 
@@ -162,6 +186,63 @@ def _table_objects(document: Any | None) -> list[Any]:
     if isinstance(tables, list):
         return tables
     return []
+
+
+def _text_item_label(item: Any) -> str:
+    label = getattr(item, "label", "")
+    value = getattr(label, "value", label)
+    return str(value).lower()
+
+
+def _text_item_text(item: Any) -> str:
+    for attr in ("text", "orig", "content"):
+        value = getattr(item, attr, None)
+        if value:
+            return str(value)
+    return ""
+
+
+def _formula_objects(document: Any | None) -> list[Any]:
+    if document is None:
+        return []
+    texts = getattr(document, "texts", None)
+    if not isinstance(texts, list):
+        return []
+    formulas: list[Any] = []
+    for item in texts:
+        label = _text_item_label(item)
+        text = _text_item_text(item)
+        if "formula" in label or "Formula not decoded" in text:
+            formulas.append(item)
+    return formulas
+
+
+def _count_document_dict_formulas(document_dict: dict[str, Any]) -> int:
+    count = 0
+
+    def walk(value: Any) -> None:
+        nonlocal count
+        if isinstance(value, dict):
+            label = str(value.get("label", "")).lower()
+            text = str(value.get("text") or value.get("orig") or "")
+            if "formula" in label or "Formula not decoded" in text:
+                count += 1
+            for child in value.values():
+                walk(child)
+        elif isinstance(value, list):
+            for child in value:
+                walk(child)
+
+    walk(document_dict)
+    return count
+
+
+def _count_formula_placeholders(*texts: str | None) -> int:
+    return sum(str(text).count("Formula not decoded") for text in texts if text)
+
+
+def _count_formula_object_placeholders(document: Any | None) -> int:
+    return sum(1 for item in _formula_objects(document) if "Formula not decoded" in _text_item_text(item))
 
 
 def _write_table_artifacts(
@@ -386,11 +467,28 @@ def _iter_asset_candidates(document: Any | None) -> list[tuple[str, Any]]:
     for label, items in (
         ("picture", getattr(document, "pictures", None)),
         ("table", getattr(document, "tables", None)),
+        ("formula", _formula_objects(document)),
     ):
         if isinstance(items, list):
             for index, item in enumerate(items, start=1):
-                candidates.append((f"{label}_{index}", getattr(item, "image", None)))
+                candidates.append((f"{label}_{index}", item))
     return candidates
+
+
+def _image_from_candidate(candidate: Any, document: Any | None) -> Any:
+    image = getattr(candidate, "image", None)
+    if image is not None:
+        return image
+    get_image = getattr(candidate, "get_image", None)
+    if callable(get_image):
+        try:
+            return get_image(doc=document)
+        except TypeError:
+            try:
+                return get_image(document)
+            except TypeError:
+                return get_image()
+    return candidate
 
 
 def _write_image_candidate(path: Path, image: Any) -> bool:
@@ -423,11 +521,12 @@ def _write_asset_artifacts(*, output_dir: Path, document: Any | None) -> tuple[l
 
     assets_dir = output_dir / "assets"
     assets_dir.mkdir(parents=True, exist_ok=True)
-    for label, image in candidates:
-        if image is None:
+    for label, candidate in candidates:
+        if candidate is None:
             continue
         path = assets_dir / f"{label}.png"
         try:
+            image = _image_from_candidate(candidate, document)
             if _write_image_candidate(path, image):
                 written.append(relative_output(path, output_dir))
         except Exception:
@@ -510,7 +609,40 @@ def write_docling_outputs(
 
     generated_outputs = written + ["metadata.json", "status.json"]
     table_count = count_tables(document_dict)
+    table_artifact_count = len(table_outputs)
     asset_count = len(asset_outputs) + len([path for path in html_outputs if path != "document.html"])
+    table_image_count = len(
+        [path for path in asset_outputs if path.startswith("assets/table_") and path.lower().endswith(".png")]
+    )
+    formula_asset_count = len(
+        [path for path in asset_outputs if path.startswith("assets/formula_") and path.lower().endswith(".png")]
+    )
+    formula_count = max(
+        len(_formula_objects(conversion.get("document"))),
+        _count_document_dict_formulas(document_dict),
+    )
+    final_html = (job_output_dir / "document.html").read_text(encoding="utf-8")
+    formula_placeholder_count = max(
+        _count_formula_placeholders(str(conversion.get("markdown") or "")),
+        _count_formula_placeholders(str(conversion.get("html") or "")),
+        _count_formula_placeholders(str(conversion.get("text") or "")),
+        _count_formula_placeholders(final_html),
+        _count_formula_object_placeholders(conversion.get("document")),
+    )
+
+    if table_count and table_image_count == 0:
+        page_images = [
+            path for path in asset_outputs if path.startswith("assets/page_") and path.lower().endswith(".png")
+        ]
+        if page_images:
+            warnings.append("table_crop_unavailable_page_images_available_for_review")
+        else:
+            warnings.append("table_visual_review_unavailable_no_table_or_page_images")
+    if formula_placeholder_count:
+        if formula_asset_count:
+            warnings.append("formula_decode_limited_review_crops_written")
+        else:
+            warnings.append("formula_decode_limited_no_formula_review_crops")
 
     metadata = build_metadata(
         job_uuid=job_uuid,
@@ -532,6 +664,12 @@ def write_docling_outputs(
         ocr_fallback_used=bool(conversion.get("ocr_fallback_used")),
         text_quality_gxx_count=conversion.get("text_quality_gxx_count"),
         text_quality_gxx_density=conversion.get("text_quality_gxx_density"),
+        table_artifact_count=table_artifact_count,
+        table_image_count=table_image_count,
+        formula_count=formula_count,
+        formula_placeholder_count=formula_placeholder_count,
+        formula_asset_count=formula_asset_count,
+        formula_enrichment_enabled=conversion.get("formula_enrichment_enabled"),
     )
     write_json(job_output_dir / "metadata.json", metadata)
 
@@ -557,6 +695,12 @@ def write_docling_outputs(
         table_count=table_count,
         asset_count=asset_count,
         generated_outputs=generated_outputs,
+        table_artifact_count=table_artifact_count,
+        table_image_count=table_image_count,
+        formula_count=formula_count,
+        formula_placeholder_count=formula_placeholder_count,
+        formula_asset_count=formula_asset_count,
+        formula_enrichment_enabled=conversion.get("formula_enrichment_enabled"),
     )
     write_json(job_output_dir / "status.json", status)
 

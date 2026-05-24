@@ -1,0 +1,18 @@
+Table 2: SQuAD 1.1 results. The BERT ensemble is 7x systems which use different pre-training checkpoints and fine-tuning seeds.
+
+| System                                   | Dev                                      | Dev                                      | Test                                     | Test                                     |
+|------------------------------------------|------------------------------------------|------------------------------------------|------------------------------------------|------------------------------------------|
+|                                          | EM                                       | F1                                       | EM                                       | F1                                       |
+| Top Leaderboard Systems (Dec 10th, 2018) | Top Leaderboard Systems (Dec 10th, 2018) | Top Leaderboard Systems (Dec 10th, 2018) | Top Leaderboard Systems (Dec 10th, 2018) | Top Leaderboard Systems (Dec 10th, 2018) |
+| Human                                    | -                                        | -                                        | 82.3                                     | 91.2                                     |
+| #1 Ensemble - nlnet                      | -                                        | -                                        | 86.0                                     | 91.7                                     |
+| #2 Ensemble - QANet                      | -                                        | -                                        | 84.5                                     | 90.5                                     |
+| Published                                | Published                                | Published                                | Published                                | Published                                |
+| BiDAF+ELMo (Single)                      | -                                        | 85.6                                     | -                                        | 85.8                                     |
+| R.M. Reader (Ensemble)                   | 81.2                                     | 87.9                                     | 82.3                                     | 88.5                                     |
+| Ours                                     | Ours                                     | Ours                                     | Ours                                     | Ours                                     |
+| BERT BASE (Single)                       | 80.8                                     | 88.5                                     | -                                        | -                                        |
+| BERT LARGE (Single)                      | 84.1                                     | 90.9                                     | -                                        | -                                        |
+| BERT LARGE (Ensemble)                    | 85.8                                     | 91.8                                     | -                                        | -                                        |
+| BERT LARGE (Sgl.+TriviaQA)               | 84.2                                     | 91.1                                     | 85.1                                     | 91.8                                     |
+| BERT LARGE (Ens.+TriviaQA)               | 86.2                                     | 92.2                                     | 87.4                                     | 93.2                                     |
