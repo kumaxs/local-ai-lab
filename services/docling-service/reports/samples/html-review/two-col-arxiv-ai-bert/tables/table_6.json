@@ -1,0 +1,79 @@
+{
+  "annotations": [],
+  "captions": [
+    {
+      "$ref": "#/texts/476"
+    }
+  ],
+  "children": [
+    {
+      "$ref": "#/texts/476"
+    },
+    {
+      "$ref": "#/groups/6"
+    }
+  ],
+  "content_layer": "body",
+  "data": {
+    "grid": [
+      [
+        {
+          "col_span": 1,
+          "column_header": false,
+          "end_col_offset_idx": 1,
+          "end_row_offset_idx": 1,
+          "fillable": false,
+          "row_header": false,
+          "row_section": false,
+          "row_span": 1,
+          "start_col_offset_idx": 0,
+          "start_row_offset_idx": 0,
+          "text": ""
+        }
+      ]
+    ],
+    "num_cols": 1,
+    "num_rows": 1,
+    "table_cells": [
+      {
+        "col_span": 1,
+        "column_header": false,
+        "end_col_offset_idx": 1,
+        "end_row_offset_idx": 1,
+        "fillable": false,
+        "ref": {
+          "$ref": "#/groups/6"
+        },
+        "row_header": false,
+        "row_section": false,
+        "row_span": 1,
+        "start_col_offset_idx": 0,
+        "start_row_offset_idx": 0,
+        "text": ""
+      }
+    ]
+  },
+  "footnotes": [],
+  "label": "table",
+  "parent": {
+    "$ref": "#/body"
+  },
+  "prov": [
+    {
+      "bbox": {
+        "b": 140.86688232421875,
+        "coord_origin": "BOTTOMLEFT",
+        "l": 84.19664764404297,
+        "r": 277.0420837402344,
+        "t": 239.62799072265625
+      },
+      "charspan": [
+        0,
+        0
+      ],
+      "page_no": 9
+    }
+  ],
+  "references": [],
+  "self_ref": "#/tables/5"
+}
