@@ -72,6 +72,7 @@ def build_metadata(
     formula_asset_count: int | None = None,
     formula_context_asset_count: int | None = None,
     formula_placeholder_link_count: int | None = None,
+    formula_source_link_count: int | None = None,
     formula_enrichment_enabled: bool | None = None,
     formula_model: str | None = None,
 ) -> dict[str, Any]:
@@ -106,6 +107,7 @@ def build_metadata(
         "formula_asset_count": formula_asset_count,
         "formula_context_asset_count": formula_context_asset_count,
         "formula_placeholder_link_count": formula_placeholder_link_count,
+        "formula_source_link_count": formula_source_link_count,
         "formula_enrichment_enabled": formula_enrichment_enabled,
         "formula_model": formula_model,
     }
@@ -139,6 +141,7 @@ def build_status(
     formula_asset_count: int | None = None,
     formula_context_asset_count: int | None = None,
     formula_placeholder_link_count: int | None = None,
+    formula_source_link_count: int | None = None,
     formula_enrichment_enabled: bool | None = None,
     formula_model: str | None = None,
 ) -> dict[str, Any]:
@@ -169,6 +172,7 @@ def build_status(
         "formula_asset_count": formula_asset_count,
         "formula_context_asset_count": formula_context_asset_count,
         "formula_placeholder_link_count": formula_placeholder_link_count,
+        "formula_source_link_count": formula_source_link_count,
         "formula_enrichment_enabled": formula_enrichment_enabled,
         "formula_model": formula_model,
     }
@@ -526,6 +530,90 @@ def _link_formula_placeholders(document_html: str, asset_outputs: list[str]) -> 
     return re.sub(r"Formula not decoded", replace, document_html)
 
 
+def _formula_review_targets(asset_outputs: list[str]) -> dict[int, dict[str, str]]:
+    targets: dict[int, dict[str, str]] = {}
+    for path in asset_outputs:
+        match = re.match(r"assets/formula_(\d+)(_context)?\.png$", path)
+        if not match:
+            continue
+        index = int(match.group(1))
+        key = "context" if match.group(2) else "source"
+        targets.setdefault(index, {})[key] = path
+    return targets
+
+
+def _formula_source_links(index: int, targets: dict[str, str]) -> str:
+    parts: list[str] = []
+    for key, label in (("source", "source image"), ("context", "context crop")):
+        path = targets.get(key)
+        if not path:
+            continue
+        escaped_path = html.escape(path, quote=True)
+        escaped_label = html.escape(label)
+        parts.append(f'<a href="{escaped_path}">{escaped_label}</a>')
+    if not parts:
+        return ""
+    return (
+        f' <span class="docling-formula-source" data-formula-index="{index}">'
+        + " | ".join(parts)
+        + "</span>"
+    )
+
+
+def _inject_formula_source_links(
+    *,
+    document_html: str,
+    document: Any | None,
+    asset_outputs: list[str],
+) -> str:
+    targets_by_index = _formula_review_targets(asset_outputs)
+    if not targets_by_index:
+        return document_html
+
+    formulas = _formula_objects(document)
+    linked_indexes: set[int] = set()
+    updated_html = document_html
+
+    for index, formula in enumerate(formulas, start=1):
+        if index not in targets_by_index:
+            continue
+        formula_text = _text_item_text(formula).strip()
+        if not formula_text or "Formula not decoded" in formula_text:
+            continue
+        source_links = _formula_source_links(index, targets_by_index[index])
+        if not source_links:
+            continue
+        candidates = [formula_text, html.escape(formula_text)]
+        for candidate in candidates:
+            if not candidate or candidate not in updated_html:
+                continue
+            updated_html = updated_html.replace(candidate, candidate + source_links, 1)
+            linked_indexes.add(index)
+            break
+
+    unmatched_indexes = [
+        index
+        for index, formula in enumerate(formulas, start=1)
+        if index not in linked_indexes
+        and index in targets_by_index
+        and "Formula not decoded" not in _text_item_text(formula)
+    ]
+    if not unmatched_indexes:
+        return updated_html
+
+    def replace_math(match: re.Match[str]) -> str:
+        if not unmatched_indexes:
+            return match.group(0)
+        index = unmatched_indexes.pop(0)
+        source_links = _formula_source_links(index, targets_by_index[index])
+        if not source_links:
+            return match.group(0)
+        linked_indexes.add(index)
+        return match.group(0) + source_links
+
+    return re.sub(r"(</math>|</span>)", replace_math, updated_html, count=len(unmatched_indexes))
+
+
 def _inject_review_appendix(document_html: str, appendix: str) -> str:
     if not appendix:
         return document_html
@@ -539,6 +627,8 @@ def _inject_review_appendix(document_html: str, appendix: str) -> str:
 .docling-review-formulas figure { margin: 0; break-inside: avoid; }
 .docling-review-formulas img { max-width: 100%; height: auto; border: 1px solid #555; background: #fff; }
 .docling-formula-placeholder { font-weight: 600; color: #7a1f1f; background: #fff5d6; padding: 0.05rem 0.2rem; }
+.docling-formula-source { display: inline-flex; gap: 0.35rem; margin-left: 0.35rem; font-size: 0.82em; white-space: nowrap; }
+.docling-formula-source a { color: #245b89; text-decoration: underline; }
 .docling-review-table { overflow-x: auto; margin: 1.5rem 0; }
 .docling-review-table table { border-collapse: collapse; width: max-content; max-width: 100%; }
 .docling-review-table th, .docling-review-table td { border: 1px solid #bbb; padding: 0.35rem 0.5rem; vertical-align: top; }
@@ -601,6 +691,11 @@ def _write_document_html(
 
     document_html = html_path.read_text(encoding="utf-8")
     document_html = _link_formula_placeholders(document_html, asset_outputs)
+    document_html = _inject_formula_source_links(
+        document_html=document_html,
+        document=document,
+        asset_outputs=asset_outputs,
+    )
     appendix = _render_review_appendix(
         output_dir=output_dir,
         table_outputs=table_outputs,
@@ -824,6 +919,7 @@ def write_docling_outputs(
         _count_formula_object_placeholders(conversion.get("document")),
     )
     formula_placeholder_link_count = final_html.count("Formula not decoded (review formula")
+    formula_source_link_count = final_html.count('class="docling-formula-source"')
 
     if table_count and table_image_count == 0:
         page_images = [
@@ -868,6 +964,7 @@ def write_docling_outputs(
         formula_asset_count=formula_asset_count,
         formula_context_asset_count=formula_context_asset_count,
         formula_placeholder_link_count=formula_placeholder_link_count,
+        formula_source_link_count=formula_source_link_count,
         formula_enrichment_enabled=conversion.get("formula_enrichment_enabled"),
         formula_model=conversion.get("formula_model"),
     )
@@ -902,6 +999,7 @@ def write_docling_outputs(
         formula_asset_count=formula_asset_count,
         formula_context_asset_count=formula_context_asset_count,
         formula_placeholder_link_count=formula_placeholder_link_count,
+        formula_source_link_count=formula_source_link_count,
         formula_enrichment_enabled=conversion.get("formula_enrichment_enabled"),
         formula_model=conversion.get("formula_model"),
     )
