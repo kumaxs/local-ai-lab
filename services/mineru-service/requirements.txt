@@ -1,0 +1,4 @@
+mineru-vl-utils[mlx]==1.0.0
+pymupdf>=1.27.2
+torch>=2.12
+torchvision>=0.27
