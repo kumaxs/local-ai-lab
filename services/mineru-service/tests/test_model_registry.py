@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from mineru_service.contract import find_broken_local_refs, parse_page_range, render_contract_html
 from mineru_service.evaluation import LAYOUT_IMAGE_SIZE, blocks_to_markdown
 from mineru_service.model_registry import default_models, registry_snapshot
 
@@ -47,6 +48,46 @@ class MinerUServiceTests(unittest.TestCase):
         self.assertIn("$$\nE=mc^2\n$$", markdown)
         self.assertIn("<table>", markdown)
         self.assertIn("[image region]", markdown)
+
+    def test_page_range_parser_bounds_pages(self) -> None:
+        self.assertEqual(parse_page_range("1,3-5,99", 5), [1, 3, 4, 5])
+        self.assertEqual(parse_page_range(None, 3), [1, 2, 3])
+
+    def test_contract_html_uses_valid_relative_asset_refs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            asset = root / "assets" / "formulas" / "formula_1.png"
+            asset.parent.mkdir(parents=True)
+            asset.write_bytes(b"png")
+            html_path = root / "document.html"
+            html_path.write_text(
+                render_contract_html(
+                    title="sample",
+                    metadata={"parser": "mineru", "backend": "local_vlm_mlx", "processed_page_count": 1, "page_count": 1},
+                    content_items=[
+                        {
+                            "page_number": 1,
+                            "type": "equation",
+                            "content": "E=mc^2",
+                            "assets": {"source_image": "assets/formulas/formula_1.png"},
+                        }
+                    ],
+                ),
+                encoding="utf-8",
+            )
+            self.assertEqual(find_broken_local_refs(html_path), [])
+
+    def test_contract_html_detects_broken_relative_asset_refs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            html_path = Path(tmpdir) / "document.html"
+            html_path.write_text('<a href="assets/missing.png">missing</a>', encoding="utf-8")
+            self.assertEqual(find_broken_local_refs(html_path), ["assets/missing.png"])
+
+    def test_registry_never_selects_pipeline_hybrid_or_exo(self) -> None:
+        snapshot = registry_snapshot(Path("/missing"))
+        self.assertIn("mlx", snapshot[0]["expected_runtime"].lower())
+        self.assertNotIn("exo", snapshot[0]["expected_runtime"].lower())
+        self.assertNotIn("pipeline", snapshot[0]["expected_runtime"].lower())
 
 
 if __name__ == "__main__":
