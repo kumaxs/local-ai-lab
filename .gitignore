@@ -54,6 +54,8 @@ test_pdfs/
 # Caches and local environments
 __pycache__/
 **/__pycache__/
+.runtime/
+**/.runtime/
 .venv/
 **/.venv/
 venv/
