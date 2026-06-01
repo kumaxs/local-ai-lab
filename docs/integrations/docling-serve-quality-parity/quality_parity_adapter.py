@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import argparse
 import base64
+import csv
+import html
 import json
 import re
 import time
@@ -20,6 +22,8 @@ from typing import Any
 
 GXX_RE = re.compile(r"/G[0-9A-Fa-f]{2}")
 DATA_IMAGE_RE = re.compile(r"data:image/[^\"')\s]+")
+FORMULA_NUMBER_RE = re.compile(r"\(\s*(\d+)\s*\)")
+CN_CHAR_RE = re.compile(r"[\u3400-\u9fff]")
 CN_OCR_LANG = ["zh-Hans", "zh-Hant", "en-US"]
 
 START_COMMAND = (
@@ -242,6 +246,15 @@ def extract_table_nodes(document_json: Any) -> list[dict[str, Any]]:
     return tables
 
 
+def extract_label_nodes(document_json: Any, label_name: str) -> list[dict[str, Any]]:
+    wanted = label_name.lower()
+    nodes: list[dict[str, Any]] = []
+    for node in iter_nodes(document_json):
+        if isinstance(node, dict) and str(node.get("label", "")).lower() == wanted:
+            nodes.append(node)
+    return nodes
+
+
 def combined_text(document: dict[str, Any]) -> str:
     parts = [
         document.get("md_content") or "",
@@ -399,9 +412,8 @@ def write_contract_outputs(
     (output_dir / "document.md").write_text(
         document.get("md_content") or "", encoding="utf-8"
     )
-    (output_dir / "document.html").write_text(
-        document.get("html_content") or "", encoding="utf-8"
-    )
+    document_html = document.get("html_content") or ""
+    (output_dir / "document.html").write_text(document_html, encoding="utf-8")
     (output_dir / "document.json").write_text(
         json.dumps(document.get("json_content"), indent=2, ensure_ascii=False),
         encoding="utf-8",
@@ -420,6 +432,398 @@ def write_contract_outputs(
         (tables_dir / f"table_{index}.json").write_text(
             json.dumps(table, indent=2, ensure_ascii=False), encoding="utf-8"
         )
+
+
+def first_prov(node: dict[str, Any]) -> dict[str, Any] | None:
+    prov = node.get("prov")
+    if isinstance(prov, list) and prov and isinstance(prov[0], dict):
+        return prov[0]
+    return None
+
+
+def table_grid(table: dict[str, Any]) -> list[list[str]]:
+    cells = ((table.get("data") or {}).get("table_cells") or [])
+    max_row = 0
+    max_col = 0
+    for cell in cells:
+        max_row = max(max_row, int(cell.get("end_row_offset_idx") or 0))
+        max_col = max(max_col, int(cell.get("end_col_offset_idx") or 0))
+    grid = [["" for _ in range(max_col)] for _ in range(max_row)]
+    for cell in cells:
+        row = int(cell.get("start_row_offset_idx") or 0)
+        col = int(cell.get("start_col_offset_idx") or 0)
+        if 0 <= row < max_row and 0 <= col < max_col:
+            grid[row][col] = str(cell.get("text") or "")
+    return grid
+
+
+def write_table_review_artifacts(output_dir: Path, tables: list[dict[str, Any]]) -> list[str]:
+    outputs: list[str] = []
+    tables_dir = output_dir / "tables"
+    for index, table in enumerate(tables, start=1):
+        grid = table_grid(table)
+        if not grid:
+            continue
+        tables_dir.mkdir(exist_ok=True)
+        csv_path = tables_dir / f"table_{index}.csv"
+        with csv_path.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.writer(handle)
+            writer.writerows(grid)
+        html_rows = []
+        for row in grid:
+            html_rows.append(
+                "<tr>"
+                + "".join(f"<td>{html.escape(cell)}</td>" for cell in row)
+                + "</tr>"
+            )
+        html_path = tables_dir / f"table_{index}.html"
+        html_path.write_text(
+            "<!doctype html><html><head><meta charset=\"utf-8\">"
+            "<style>body{font-family:system-ui,sans-serif}"
+            "table{border-collapse:collapse}td{border:1px solid #999;padding:4px 6px}</style>"
+            f"<title>Table {index}</title></head><body><table>"
+            + "\n".join(html_rows)
+            + "</table></body></html>\n",
+            encoding="utf-8",
+        )
+        outputs.extend([str(csv_path.relative_to(output_dir)), str(html_path.relative_to(output_dir))])
+    return outputs
+
+
+def render_page_images_and_crops(
+    input_file: Path,
+    output_dir: Path,
+    tables: list[dict[str, Any]],
+    formulas: list[dict[str, Any]],
+    pictures: list[dict[str, Any]],
+) -> tuple[dict[str, int], list[str]]:
+    warnings: list[str] = []
+    counts = {
+        "page_image_count": 0,
+        "table_image_count": 0,
+        "formula_evidence_count": 0,
+        "picture_artifact_count": 0,
+    }
+    try:
+        import pypdfium2 as pdfium
+    except ImportError as exc:
+        warnings.append(f"review_artifact_pdf_renderer_missing:{exc}")
+        return counts, warnings
+
+    pages_dir = output_dir / "pages"
+    tables_dir = output_dir / "tables"
+    formulas_dir = output_dir / "formulas"
+    pictures_dir = output_dir / "pictures"
+    scale = 2.0
+    padding = 18
+
+    try:
+        pdf = pdfium.PdfDocument(str(input_file))
+    except Exception as exc:
+        warnings.append(f"review_artifact_pdf_open_failed:{exc}")
+        return counts, warnings
+
+    page_sizes: dict[int, tuple[float, float]] = {}
+    page_images: dict[int, Any] = {}
+    try:
+        for page_index in range(len(pdf)):
+            page_no = page_index + 1
+            page = pdf[page_index]
+            width, height = page.get_size()
+            page_sizes[page_no] = (float(width), float(height))
+            bitmap = page.render(scale=scale)
+            image = bitmap.to_pil()
+            pages_dir.mkdir(exist_ok=True)
+            page_path = pages_dir / f"page_{page_no}.png"
+            image.save(page_path)
+            page_images[page_no] = image
+            counts["page_image_count"] += 1
+
+        def crop_node(node: dict[str, Any], dest: Path) -> bool:
+            prov = first_prov(node)
+            if not prov or not isinstance(prov.get("bbox"), dict):
+                return False
+            page_no = int(prov.get("page_no") or 0)
+            image = page_images.get(page_no)
+            page_size = page_sizes.get(page_no)
+            if image is None or page_size is None:
+                return False
+            bbox = prov["bbox"]
+            _, page_height = page_size
+            left = float(bbox.get("l") or 0.0)
+            right = float(bbox.get("r") or 0.0)
+            top = float(bbox.get("t") or 0.0)
+            bottom = float(bbox.get("b") or 0.0)
+            if str(bbox.get("coord_origin", "")).upper() == "BOTTOMLEFT":
+                x0 = left * scale
+                x1 = right * scale
+                y0 = (page_height - top) * scale
+                y1 = (page_height - bottom) * scale
+            else:
+                x0 = left * scale
+                x1 = right * scale
+                y0 = top * scale
+                y1 = bottom * scale
+            box = (
+                max(0, int(min(x0, x1) - padding)),
+                max(0, int(min(y0, y1) - padding)),
+                min(image.width, int(max(x0, x1) + padding)),
+                min(image.height, int(max(y0, y1) + padding)),
+            )
+            if box[2] <= box[0] or box[3] <= box[1]:
+                return False
+            dest.parent.mkdir(exist_ok=True)
+            image.crop(box).save(dest)
+            return True
+
+        for index, table in enumerate(tables, start=1):
+            if crop_node(table, tables_dir / f"table_{index}.png"):
+                counts["table_image_count"] += 1
+        for index, formula in enumerate(formulas, start=1):
+            if crop_node(formula, formulas_dir / f"formula_{index}_context.png"):
+                counts["formula_evidence_count"] += 1
+        for index, picture in enumerate(pictures, start=1):
+            if crop_node(picture, pictures_dir / f"picture_{index}.png"):
+                counts["picture_artifact_count"] += 1
+    finally:
+        pdf.close()
+    return counts, warnings
+
+
+def formula_review_diagnostics(
+    formulas: list[dict[str, Any]],
+    output_dir: Path,
+    document: dict[str, Any],
+    input_file: Path,
+) -> dict[str, Any]:
+    suspicious: list[dict[str, Any]] = []
+    missing: list[dict[str, Any]] = []
+    formula_numbers: dict[str, dict[str, Any]] = {}
+    for index, formula in enumerate(formulas, start=1):
+        text = str(formula.get("text") or "")
+        prov = first_prov(formula) or {}
+        match = FORMULA_NUMBER_RE.search(text)
+        if match:
+            formula_numbers[match.group(1)] = {"index": index, "text": text, "prov": prov}
+        reasons: list[str] = []
+        if CN_CHAR_RE.search(text):
+            reasons.append("contains_cjk_text")
+        if len(text) > 180 and text.count("\\frac") > 6:
+            reasons.append("repeated_fraction_pattern")
+        if FORMULA_NUMBER_RE.fullmatch(text.strip()):
+            reasons.append("formula_number_only")
+            missing.append({"index": index, "text": text, "prov": prov})
+        if reasons:
+            suspicious.append(
+                {
+                    "index": index,
+                    "text": text[:300],
+                    "reasons": reasons,
+                    "page_no": prov.get("page_no"),
+                    "evidence": f"formulas/formula_{index}_context.png",
+                }
+            )
+
+    section_text = combined_text(document)
+    has_section_23 = bool(re.search(r"2\s*\.?\s*3|2\.3", section_text))
+    formula_4 = formula_numbers.get("4")
+    formula_4_status = "missing"
+    if formula_4:
+        formula_4_status = (
+            "present_number_only_missing_body"
+            if FORMULA_NUMBER_RE.fullmatch(str(formula_4["text"]).strip())
+            else "present"
+        )
+    elif "CN" in input_file.name:
+        missing.append(
+            {
+                "index": None,
+                "text": "formula 4 not found in formula labels",
+                "prov": {"page_no": 3},
+            }
+        )
+
+    return {
+        "formula_count": len(formulas),
+        "formula_evidence_count": len(
+            list((output_dir / "formulas").glob("formula_*_context.png"))
+        ),
+        "missing_formula_evidence_count": len(missing),
+        "suspicious_formula_diagnostics": suspicious,
+        "missing_formula_diagnostics": missing,
+        "cn_section_2_3_diagnostic_summary": {
+            "applies": input_file.name == "CN.pdf",
+            "section_2_3_text_seen": has_section_23,
+            "formula_4_status": formula_4_status,
+            "formula_4_evidence": (
+                f"formulas/formula_{formula_4['index']}_context.png"
+                if formula_4
+                else "pages/page_3.png"
+            ),
+            "right_column_text_contamination_indicators": [
+                item
+                for item in suspicious
+                if item["page_no"] == 3 and "contains_cjk_text" in item["reasons"]
+            ],
+        },
+    }
+
+
+def write_review_index(
+    output_dir: Path,
+    metadata: dict[str, Any],
+    status: dict[str, Any],
+) -> None:
+    def links_for(pattern: str) -> list[str]:
+        return [
+            str(path.relative_to(output_dir))
+            for path in sorted(output_dir.glob(pattern))
+            if path.is_file()
+        ]
+
+    sections = [
+        ("Pages", links_for("pages/page_*.png")),
+        ("Tables", links_for("tables/table_*.*")),
+        ("Formulas", links_for("formulas/formula_*_context.png")),
+        ("Pictures", links_for("pictures/picture_*.png")),
+    ]
+    warning_items = "".join(
+        f"<li>{html.escape(str(item))}</li>" for item in status.get("warnings", [])
+    )
+    section_html = []
+    for title, paths in sections:
+        links = "".join(
+            f'<li><a href="{html.escape(path)}">{html.escape(path)}</a></li>'
+            for path in paths
+        )
+        section_html.append(f"<h2>{html.escape(title)} ({len(paths)})</h2><ul>{links}</ul>")
+    diagnostics = html.escape(
+        json.dumps(
+            metadata.get("cn_section_2_3_diagnostic_summary") or {},
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
+    (output_dir / "review_index.html").write_text(
+        (
+            "<!doctype html><html><head><meta charset=\"utf-8\">"
+            "<style>body{font-family:system-ui,sans-serif;max-width:1100px;margin:24px auto;"
+            "line-height:1.45}code,pre{background:#f4f4f4;padding:2px 4px}"
+            "li{margin:3px 0}</style>"
+            f"<title>Review artifacts: {html.escape(str(metadata.get('job_id')))}</title>"
+            "</head><body>"
+            f"<h1>Review artifacts: {html.escape(str(metadata.get('job_id')))}</h1>"
+            '<p><a href="document.html">document.html</a> | '
+            '<a href="document.md">document.md</a> | '
+            '<a href="document.json">document.json</a> | '
+            '<a href="metadata.json">metadata.json</a> | '
+            '<a href="status.json">status.json</a></p>'
+            f"<h2>Warnings</h2><ul>{warning_items}</ul>"
+            + "".join(section_html)
+            + f"<h2>CN section 2.3 diagnostics</h2><pre>{diagnostics}</pre>"
+            "</body></html>\n"
+        ),
+        encoding="utf-8",
+    )
+
+
+def add_document_review_banner(output_dir: Path) -> None:
+    html_path = output_dir / "document.html"
+    content = html_path.read_text(encoding="utf-8")
+    banner = (
+        '<div style="font-family:system-ui,sans-serif;padding:10px 12px;'
+        'border:1px solid #999;margin:12px 0;background:#fffbe8">'
+        '<strong>Review artifacts:</strong> '
+        '<a href="review_index.html">review_index.html</a></div>'
+    )
+    if "<body" in content:
+        content = re.sub(r"(<body[^>]*>)", r"\1" + banner, content, count=1, flags=re.I)
+    else:
+        content = banner + content
+    html_path.write_text(content, encoding="utf-8")
+
+
+def restore_review_artifact_layer(
+    output_dir: Path,
+    response: dict[str, Any],
+    metadata: dict[str, Any],
+    status: dict[str, Any],
+    args: argparse.Namespace,
+) -> None:
+    document = response.get("document") or {}
+    document_json = document.get("json_content")
+    tables = extract_table_nodes(document_json)
+    formulas = extract_label_nodes(document_json, "formula")
+    pictures = extract_label_nodes(document_json, "picture")
+
+    table_outputs = write_table_review_artifacts(output_dir, tables)
+    crop_counts, crop_warnings = render_page_images_and_crops(
+        args.input_file, output_dir, tables, formulas, pictures
+    )
+    diagnostics = formula_review_diagnostics(formulas, output_dir, document, args.input_file)
+    review_warnings: list[str] = []
+    review_warnings.extend(crop_warnings)
+    for item in diagnostics["suspicious_formula_diagnostics"]:
+        review_warnings.append(
+            "suspicious_formula:"
+            f"{item['index']}:{','.join(item['reasons'])}:"
+            f"{item['evidence']}"
+        )
+    for item in diagnostics["missing_formula_diagnostics"]:
+        review_warnings.append(
+            "missing_or_incomplete_formula_evidence:"
+            f"{item.get('index')}:{item.get('text')}:"
+            f"page={((item.get('prov') or {}).get('page_no'))}"
+        )
+    metadata.update(crop_counts)
+    metadata.update(diagnostics)
+    metadata["table_artifact_count"] = len(tables) + len(table_outputs) + crop_counts["table_image_count"]
+    metadata["picture_artifact_count"] = crop_counts["picture_artifact_count"]
+    metadata["asset_count"] = (
+        crop_counts["page_image_count"]
+        + crop_counts["table_image_count"]
+        + crop_counts["formula_evidence_count"]
+        + crop_counts["picture_artifact_count"]
+    )
+    metadata["review_artifact_warnings"] = review_warnings
+    metadata.setdefault("generated_outputs", []).extend(
+        [
+            "review_index.html",
+            *[f"pages/page_{index}.png" for index in range(1, crop_counts["page_image_count"] + 1)],
+            *table_outputs,
+            *[
+                f"formulas/formula_{index}_context.png"
+                for index in range(1, crop_counts["formula_evidence_count"] + 1)
+            ],
+            *[
+                f"pictures/picture_{index}.png"
+                for index in range(1, crop_counts["picture_artifact_count"] + 1)
+            ],
+        ]
+    )
+    status["warnings"].extend(review_warnings)
+    status["quality_signals"].update(
+        {
+            "page_image_count": metadata["page_image_count"],
+            "formula_evidence_count": metadata["formula_evidence_count"],
+            "missing_formula_evidence_count": metadata["missing_formula_evidence_count"],
+            "suspicious_formula_diagnostics": metadata["suspicious_formula_diagnostics"],
+            "table_artifact_count": metadata["table_artifact_count"],
+            "picture_artifact_count": metadata["picture_artifact_count"],
+            "review_artifact_warnings": review_warnings,
+            "cn_section_2_3_diagnostic_summary": metadata[
+                "cn_section_2_3_diagnostic_summary"
+            ],
+        }
+    )
+    write_review_index(output_dir, metadata, status)
+    add_document_review_banner(output_dir)
+    (output_dir / "metadata.json").write_text(
+        json.dumps(metadata, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
+    (output_dir / "status.json").write_text(
+        json.dumps(status, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
 
 
 def page_count_from_document(document_json: Any) -> int | None:
@@ -916,9 +1320,7 @@ def main() -> int:
             )
 
     gaps = [
-        "Serve response does not provide prior custom formula/source crop links.",
-        "Serve response does not write standalone assets/ and tables/ unless post-processed.",
-        "This adapter writes table_N.json from table nodes but does not reconstruct table HTML/Markdown artifacts.",
+        "Review artifacts are adapter-owned post-processing outputs, not native Docling Serve outputs.",
         "This adapter is a minimal n8n-callable boundary, not a product decision to make it the long-term service.",
     ]
     status["warnings"].extend(gaps)
@@ -929,6 +1331,7 @@ def main() -> int:
     metadata["effective_page_range"] = selected_page_range
 
     write_contract_outputs(output_dir, response, metadata, status)
+    restore_review_artifact_layer(output_dir, response, metadata, status, args)
     summary = {
         "ok": status["ok"],
         "output_dir": str(output_dir),
