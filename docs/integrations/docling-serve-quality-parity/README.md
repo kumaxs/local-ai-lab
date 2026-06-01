@@ -183,6 +183,8 @@ The review artifact layer is intentionally post-processing owned by this
 adapter. Docling Server remains the execution backend for Route A.
 
 See `docling_v1_parity_checklist.md` before making further parser improvements.
+For the current `CN.pdf` formula `(3)` and `(5)` investigation, see
+`cn_formula_quality_diagnostics.md`.
 
 Formula sample:
 

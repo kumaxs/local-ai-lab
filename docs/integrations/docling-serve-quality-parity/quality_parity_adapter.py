@@ -27,6 +27,9 @@ CN_CHAR_RE = re.compile(r"[\u3400-\u9fff]")
 CN_OCR_LANG = ["zh-Hans", "zh-Hant", "en-US"]
 V1_GXX_FAILURE_MIN_COUNT = 10
 V1_GXX_FAILURE_MIN_DENSITY = 0.002
+FORMULA_SOURCE_PADDING_PX = 2
+FORMULA_CONTEXT_PADDING_PX = 96
+DEFAULT_REVIEW_PADDING_PX = 18
 UNRESOLVED_V1_PARITY_WARNINGS = [
     "v1_parity_gap_footnotes_not_improved_by_server_adapter",
     "v1_parity_gap_pdf_links_not_preserved_or_exported_as_links_json",
@@ -453,6 +456,27 @@ def first_prov(node: dict[str, Any]) -> dict[str, Any] | None:
     return None
 
 
+def bbox_geometry(prov: dict[str, Any] | None) -> dict[str, float] | None:
+    if not prov or not isinstance(prov.get("bbox"), dict):
+        return None
+    bbox = prov["bbox"]
+    left = float(bbox.get("l") or 0.0)
+    right = float(bbox.get("r") or 0.0)
+    top = float(bbox.get("t") or 0.0)
+    bottom = float(bbox.get("b") or 0.0)
+    width = abs(right - left)
+    height = abs(top - bottom)
+    return {
+        "l": left,
+        "r": right,
+        "t": top,
+        "b": bottom,
+        "width": width,
+        "height": height,
+        "aspect_width_over_height": width / height if height else 0.0,
+    }
+
+
 def table_grid(table: dict[str, Any]) -> list[list[str]]:
     cells = ((table.get("data") or {}).get("table_cells") or [])
     max_row = 0
@@ -508,8 +532,9 @@ def render_page_images_and_crops(
     tables: list[dict[str, Any]],
     formulas: list[dict[str, Any]],
     pictures: list[dict[str, Any]],
-) -> tuple[dict[str, int], list[str]]:
+) -> tuple[dict[str, int], list[str], list[dict[str, Any]]]:
     warnings: list[str] = []
+    crop_metrics: list[dict[str, Any]] = []
     counts = {
         "page_image_count": 0,
         "table_image_count": 0,
@@ -522,20 +547,20 @@ def render_page_images_and_crops(
         import pypdfium2 as pdfium
     except ImportError as exc:
         warnings.append(f"review_artifact_pdf_renderer_missing:{exc}")
-        return counts, warnings
+        return counts, warnings, crop_metrics
 
     pages_dir = output_dir / "pages"
     tables_dir = output_dir / "tables"
     formulas_dir = output_dir / "formulas"
     pictures_dir = output_dir / "pictures"
     scale = 2.0
-    padding = 18
+    padding = DEFAULT_REVIEW_PADDING_PX
 
     try:
         pdf = pdfium.PdfDocument(str(input_file))
     except Exception as exc:
         warnings.append(f"review_artifact_pdf_open_failed:{exc}")
-        return counts, warnings
+        return counts, warnings, crop_metrics
 
     page_sizes: dict[int, tuple[float, float]] = {}
     page_images: dict[int, Any] = {}
@@ -553,15 +578,17 @@ def render_page_images_and_crops(
             page_images[page_no] = image
             counts["page_image_count"] += 1
 
-        def crop_node(node: dict[str, Any], dest: Path, crop_padding: int) -> bool:
+        def crop_node(
+            node: dict[str, Any], dest: Path, crop_padding: int
+        ) -> tuple[bool, dict[str, Any] | None]:
             prov = first_prov(node)
             if not prov or not isinstance(prov.get("bbox"), dict):
-                return False
+                return False, None
             page_no = int(prov.get("page_no") or 0)
             image = page_images.get(page_no)
             page_size = page_sizes.get(page_no)
             if image is None or page_size is None:
-                return False
+                return False, None
             bbox = prov["bbox"]
             _, page_height = page_size
             left = float(bbox.get("l") or 0.0)
@@ -585,28 +612,125 @@ def render_page_images_and_crops(
                 min(image.height, int(max(y0, y1) + crop_padding)),
             )
             if box[2] <= box[0] or box[3] <= box[1]:
-                return False
+                return False, None
             dest.parent.mkdir(exist_ok=True)
             image.crop(box).save(dest)
-            return True
+            metric = {
+                "path": str(dest.relative_to(output_dir)),
+                "page_no": page_no,
+                "padding_px": crop_padding,
+                "pixel_box": box,
+                "pixel_width": box[2] - box[0],
+                "pixel_height": box[3] - box[1],
+                "pixel_aspect_width_over_height": (box[2] - box[0])
+                / max(box[3] - box[1], 1),
+                "page_size": {"width": page_size[0], "height": page_size[1]},
+                "page_image_size": {"width": image.width, "height": image.height},
+            }
+            return True, metric
 
         for index, table in enumerate(tables, start=1):
-            if crop_node(table, tables_dir / f"table_{index}.png", padding):
+            wrote_table, _ = crop_node(table, tables_dir / f"table_{index}.png", padding)
+            if wrote_table:
                 counts["table_image_count"] += 1
         for index, formula in enumerate(formulas, start=1):
-            if crop_node(formula, formulas_dir / f"formula_{index}.png", 2):
+            wrote_source, source_metric = crop_node(
+                formula,
+                formulas_dir / f"formula_{index}.png",
+                FORMULA_SOURCE_PADDING_PX,
+            )
+            wrote_context, context_metric = crop_node(
+                formula,
+                formulas_dir / f"formula_{index}_context.png",
+                FORMULA_CONTEXT_PADDING_PX,
+            )
+            formula_metric: dict[str, Any] = {
+                "index": index,
+                "page_no": (first_prov(formula) or {}).get("page_no"),
+                "bbox": bbox_geometry(first_prov(formula)),
+                "source": source_metric,
+                "context": context_metric,
+            }
+            crop_metrics.append(formula_metric)
+            if wrote_source:
                 counts["formula_asset_count"] += 1
-            if crop_node(formula, formulas_dir / f"formula_{index}_context.png", padding):
+            if wrote_context:
                 counts["formula_context_asset_count"] += 1
         for index, picture in enumerate(pictures, start=1):
-            if crop_node(picture, pictures_dir / f"picture_{index}.png", padding):
+            wrote_picture, _ = crop_node(picture, pictures_dir / f"picture_{index}.png", padding)
+            if wrote_picture:
                 counts["picture_artifact_count"] += 1
     finally:
         pdf.close()
     counts["formula_evidence_count"] = max(
         counts["formula_asset_count"], counts["formula_context_asset_count"]
     )
-    return counts, warnings
+    return counts, warnings, crop_metrics
+
+
+def collect_page_nodes(document_json: Any) -> list[dict[str, Any]]:
+    nodes: list[dict[str, Any]] = []
+    formula_index = 0
+    for node in iter_nodes(document_json):
+        if not isinstance(node, dict):
+            continue
+        prov = first_prov(node)
+        geometry = bbox_geometry(prov)
+        if not prov or not geometry:
+            continue
+        label = str(node.get("label") or "")
+        if label.lower() == "formula":
+            formula_index += 1
+        nodes.append(
+            {
+                "formula_index": formula_index if label.lower() == "formula" else None,
+                "label": label,
+                "text": str(node.get("text") or "")[:220],
+                "page_no": prov.get("page_no"),
+                "bbox": geometry,
+                "center_y": (geometry["t"] + geometry["b"]) / 2.0,
+                "center_x": (geometry["l"] + geometry["r"]) / 2.0,
+            }
+        )
+    return nodes
+
+
+def nearby_nodes_for_formula(
+    nodes: list[dict[str, Any]],
+    formula_index: int,
+    page_no: Any,
+    geometry: dict[str, float] | None,
+) -> list[dict[str, Any]]:
+    if not page_no or not geometry:
+        return []
+    formula_center_y = (geometry["t"] + geometry["b"]) / 2.0
+    nearby: list[dict[str, Any]] = []
+    for node in nodes:
+        if node.get("page_no") != page_no:
+            continue
+        if node.get("formula_index") == formula_index:
+            continue
+        node_bbox = node.get("bbox") or {}
+        vertical_distance = abs(float(node.get("center_y") or 0.0) - formula_center_y)
+        horizontal_overlap = min(geometry["r"], node_bbox.get("r", 0.0)) - max(
+            geometry["l"], node_bbox.get("l", 0.0)
+        )
+        same_column_or_overlap = horizontal_overlap > 0 or (
+            abs(float(node.get("center_x") or 0.0) - ((geometry["l"] + geometry["r"]) / 2.0))
+            < 80
+        )
+        if vertical_distance <= 45 and same_column_or_overlap:
+            nearby.append(
+                {
+                    "label": node.get("label"),
+                    "text": node.get("text"),
+                    "bbox": node_bbox,
+                    "vertical_distance": round(vertical_distance, 2),
+                    "horizontal_overlap": round(horizontal_overlap, 2),
+                }
+            )
+    nearby.sort(key=lambda item: (item["vertical_distance"], item["label"]))
+    return nearby[:6]
 
 
 def formula_review_diagnostics(
@@ -614,21 +738,63 @@ def formula_review_diagnostics(
     output_dir: Path,
     document: dict[str, Any],
     input_file: Path,
+    crop_metrics: list[dict[str, Any]],
 ) -> dict[str, Any]:
     suspicious: list[dict[str, Any]] = []
     missing: list[dict[str, Any]] = []
     formula_numbers: dict[str, dict[str, Any]] = {}
+    metrics_by_index = {
+        int(item["index"]): item
+        for item in crop_metrics
+        if isinstance(item.get("index"), int)
+    }
+    page_width_by_no = {}
+    for item in crop_metrics:
+        crop = item.get("source") or item.get("context") or {}
+        page_size = crop.get("page_size") or {}
+        if item.get("page_no") and page_size.get("width"):
+            page_width_by_no[int(item["page_no"])] = float(page_size["width"])
+
+    page_nodes = collect_page_nodes(document.get("json_content"))
     for index, formula in enumerate(formulas, start=1):
         text = str(formula.get("text") or "")
         prov = first_prov(formula) or {}
+        page_no = prov.get("page_no")
+        geometry = bbox_geometry(prov)
+        crop_metric = metrics_by_index.get(index, {})
+        source_metric = crop_metric.get("source") or {}
+        context_metric = crop_metric.get("context") or {}
         match = FORMULA_NUMBER_RE.search(text)
         if match:
             formula_numbers[match.group(1)] = {"index": index, "text": text, "prov": prov}
         reasons: list[str] = []
         if CN_CHAR_RE.search(text):
             reasons.append("contains_cjk_text")
+        if CN_CHAR_RE.search(text) or re.search(r"\\text\s*\{[^}]*[\u3400-\u9fff]", text):
+            reasons.append("prose_like_fragment_in_formula_text")
         if len(text) > 180 and text.count("\\frac") > 6:
             reasons.append("repeated_fraction_pattern")
+        if len(text) > 260:
+            reasons.append("formula_text_too_long")
+        if geometry:
+            if geometry["height"] < 14 and len(text) > 120:
+                reasons.append("bbox_too_thin_for_complex_formula")
+            if geometry["height"] < 12 and geometry["aspect_width_over_height"] > 12 and len(text) > 180:
+                reasons.append("bbox_likely_line_or_separator")
+            if geometry["b"] < 80:
+                reasons.append("near_page_bottom_context_needed")
+            page_width = page_width_by_no.get(int(page_no or 0))
+            if page_width:
+                midpoint = page_width / 2.0
+                if geometry["l"] < midpoint < geometry["r"]:
+                    reasons.append("bbox_crosses_expected_column_boundary")
+        if source_metric:
+            source_height = int(source_metric.get("pixel_height") or 0)
+            source_width = int(source_metric.get("pixel_width") or 0)
+            if source_width and source_height / source_width < 0.08 and len(text) > 180:
+                reasons.append("source_crop_likely_too_thin")
+            if source_height < 32 and len(text) > 180:
+                reasons.append("source_crop_likely_useless_for_review")
         if FORMULA_NUMBER_RE.fullmatch(text.strip()):
             reasons.append("formula_number_only")
             missing.append({"index": index, "text": text, "prov": prov})
@@ -638,8 +804,15 @@ def formula_review_diagnostics(
                     "index": index,
                     "text": text[:300],
                     "reasons": reasons,
-                    "page_no": prov.get("page_no"),
+                    "page_no": page_no,
+                    "bbox": geometry,
+                    "source_crop": source_metric,
+                    "context_crop": context_metric,
+                    "full_page_evidence": f"pages/page_{page_no}.png" if page_no else None,
                     "evidence": f"formulas/formula_{index}_context.png",
+                    "nearby_nodes": nearby_nodes_for_formula(
+                        page_nodes, index, page_no, geometry
+                    ),
                 }
             )
 
@@ -667,6 +840,7 @@ def formula_review_diagnostics(
         "formula_evidence_count": len(
             list((output_dir / "formulas").glob("formula_*_context.png"))
         ),
+        "formula_crop_diagnostics": crop_metrics,
         "missing_formula_evidence_count": len(missing),
         "suspicious_formula_diagnostics": suspicious,
         "missing_formula_diagnostics": missing,
@@ -716,6 +890,29 @@ def write_review_index(
             for path in paths
         )
         section_html.append(f"<h2>{html.escape(title)} ({len(paths)})</h2><ul>{links}</ul>")
+    suspicious_html = []
+    for item in metadata.get("suspicious_formula_diagnostics") or []:
+        source_path = f"formulas/formula_{item.get('index')}.png"
+        context_path = item.get("evidence")
+        page_path = item.get("full_page_evidence")
+        links = []
+        for label, path in (
+            ("source", source_path),
+            ("context", context_path),
+            ("full page", page_path),
+        ):
+            if path:
+                links.append(
+                    f'<a href="{html.escape(str(path), quote=True)}">'
+                    f"{html.escape(label)}</a>"
+                )
+        suspicious_html.append(
+            "<li>"
+            f"Formula {html.escape(str(item.get('index')))}: "
+            f"{html.escape(', '.join(item.get('reasons') or []))} "
+            f"({' | '.join(links)})"
+            "</li>"
+        )
     diagnostics = html.escape(
         json.dumps(
             metadata.get("cn_section_2_3_diagnostic_summary") or {},
@@ -739,6 +936,9 @@ def write_review_index(
             '<a href="status.json">status.json</a></p>'
             f"<h2>Warnings</h2><ul>{warning_items}</ul>"
             + "".join(section_html)
+            + "<h2>Suspicious Formula Evidence</h2><ul>"
+            + "".join(suspicious_html)
+            + "</ul>"
             + f"<h2>CN section 2.3 diagnostics</h2><pre>{diagnostics}</pre>"
             "</body></html>\n"
         ),
@@ -867,10 +1067,16 @@ def restore_review_artifact_layer(
     pictures = extract_label_nodes(document_json, "picture")
 
     table_outputs = write_table_review_artifacts(output_dir, tables)
-    crop_counts, crop_warnings = render_page_images_and_crops(
+    crop_counts, crop_warnings, formula_crop_diagnostics = render_page_images_and_crops(
         args.input_file, output_dir, tables, formulas, pictures
     )
-    diagnostics = formula_review_diagnostics(formulas, output_dir, document, args.input_file)
+    diagnostics = formula_review_diagnostics(
+        formulas,
+        output_dir,
+        document,
+        args.input_file,
+        formula_crop_diagnostics,
+    )
     review_warnings: list[str] = []
     review_warnings.extend(crop_warnings)
     for item in diagnostics["suspicious_formula_diagnostics"]:
@@ -879,6 +1085,12 @@ def restore_review_artifact_layer(
             f"{item['index']}:{','.join(item['reasons'])}:"
             f"{item['evidence']}"
         )
+        if "source_crop_likely_useless_for_review" in item["reasons"]:
+            review_warnings.append(
+                "formula_source_crop_likely_useless:"
+                f"{item['index']}:use_context_or_full_page:"
+                f"{item.get('evidence')}:{item.get('full_page_evidence')}"
+            )
     for item in diagnostics["missing_formula_diagnostics"]:
         review_warnings.append(
             "missing_or_incomplete_formula_evidence:"
@@ -927,6 +1139,7 @@ def restore_review_artifact_layer(
             "formula_evidence_count": metadata["formula_evidence_count"],
             "missing_formula_evidence_count": metadata["missing_formula_evidence_count"],
             "suspicious_formula_diagnostics": metadata["suspicious_formula_diagnostics"],
+            "formula_crop_diagnostics": metadata["formula_crop_diagnostics"],
             "table_artifact_count": metadata["table_artifact_count"],
             "picture_artifact_count": metadata["picture_artifact_count"],
             "review_artifact_warnings": review_warnings,
