@@ -101,6 +101,10 @@ Success classes:
 If Serve is not reachable, the command exits non-zero and prints JSON containing
 the validated local start command.
 
+The adapter retries transient Serve `503`/`504` responses. This is useful during
+full-document review runs because the single local engine can briefly be
+unavailable while expensive OCR/formula work is draining.
+
 ## Preserved Quality Policy
 
 The adapter preserves:
@@ -156,6 +160,26 @@ python3 docs/integrations/docling-serve-quality-parity/quality_parity_adapter.py
 Use at least 1200 seconds for formula-heavy full documents. Bounded page ranges
 can use lower timeouts, but n8n should avoid treating a timeout as a quality
 failure; it is an operational failure and should be retried or escalated.
+
+## Full Directory Review Helper
+
+`batch_full_dir_review.py` is a manual review helper. It is not a production n8n
+integration. It calls `quality_parity_adapter.py` once per PDF, continues after
+failures, and writes `run_summary.json` plus `run_summary.md`.
+
+Example:
+
+```bash
+python3 docs/integrations/docling-serve-quality-parity/batch_full_dir_review.py \
+  --input-dir /Users/zeyuan/Projects/n8n-paper-pipeline/test_pdfs \
+  --output-root /Users/zeyuan/Projects/local-ai-lab/.runtime/review/docling-serve-full-dir-review-2026-06-01 \
+  --serve-url http://127.0.0.1:5001 \
+  --adapter /Users/zeyuan/Projects/local-ai-lab/docs/integrations/docling-serve-quality-parity/quality_parity_adapter.py \
+  --timeout-seconds 1800
+```
+
+Use an ignored output root. The preferred `services/docling-service/reports/samples/`
+path is not currently ignored for new generated files.
 
 ## Known Gaps
 

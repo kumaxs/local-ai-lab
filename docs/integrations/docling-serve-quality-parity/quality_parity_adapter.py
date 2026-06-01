@@ -112,6 +112,18 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--timeout-seconds", type=int, default=1200)
     parser.add_argument(
+        "--http-retries",
+        type=int,
+        default=3,
+        help="Retry transient Docling Serve HTTP 503/504 responses this many times.",
+    )
+    parser.add_argument(
+        "--http-retry-sleep-seconds",
+        type=float,
+        default=10.0,
+        help="Base sleep between transient HTTP retries; multiplied by attempt.",
+    )
+    parser.add_argument(
         "--image-export-mode",
         choices=["embedded", "referenced", "placeholder"],
         default="embedded",
@@ -142,7 +154,13 @@ def page_range(args: argparse.Namespace) -> list[int] | None:
     return [args.page_start, args.page_end]
 
 
-def post_json(url: str, payload: dict[str, Any], timeout: int) -> dict[str, Any]:
+def post_json(
+    url: str,
+    payload: dict[str, Any],
+    timeout: int,
+    retries: int,
+    retry_sleep_seconds: float,
+) -> dict[str, Any]:
     data = json.dumps(payload).encode("utf-8")
     request = urllib.request.Request(
         url,
@@ -150,8 +168,15 @@ def post_json(url: str, payload: dict[str, Any], timeout: int) -> dict[str, Any]
         headers={"Content-Type": "application/json"},
         method="POST",
     )
-    with urllib.request.urlopen(request, timeout=timeout) as response:
-        return json.loads(response.read())
+    for attempt in range(retries + 1):
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                return json.loads(response.read())
+        except urllib.error.HTTPError as exc:
+            if exc.code not in {503, 504} or attempt >= retries:
+                raise
+            time.sleep(retry_sleep_seconds * (attempt + 1))
+    raise RuntimeError("unreachable retry state")
 
 
 def get_json(url: str, timeout: int = 10) -> dict[str, Any]:
@@ -447,6 +472,8 @@ def run_conversion(
         f"{args.serve_url.rstrip('/')}/v1/convert/source",
         payload,
         timeout=args.timeout_seconds,
+        retries=args.http_retries,
+        retry_sleep_seconds=args.http_retry_sleep_seconds,
     )
     wall_time = time.perf_counter() - start
     warnings: list[str] = []
