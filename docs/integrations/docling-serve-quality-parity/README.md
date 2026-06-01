@@ -1,12 +1,23 @@
-# Docling Serve Quality Parity Adapter Boundary
+# Docling Server Quality Parity Adapter Boundary
 
-This directory documents a minimal parity adapter/spec for using Docling Serve as
-the model execution backend while preserving the quality-first behavior that was
-previously proven in `services/docling-service`.
+This directory documents a minimal parity adapter/spec for using Docling Server
+(`docling-serve`) as the model execution backend while preserving the
+quality-first behavior that was previously proven in Docling V1
+(`services/docling-service`).
+
+Project naming:
+
+- Docling V1: the earlier `services/docling-service` quality-first route.
+- Docling Server: the official `docling-serve` HTTP API backend.
+- Route A: the current Docling Server quality-parity adapter.
+- Route B: the `VlmPipeline` evaluation route only.
 
 It is also the minimal n8n-callable command boundary for the next integration
 phase. It is not a live n8n workflow change and it does not modify
 `docling-mcp`.
+
+Route A is acceptable only after Docling V1 parity is preserved. Do not use a
+naked Docling Server API response as the user-facing contract.
 
 ## Startup Requirement
 
@@ -33,7 +44,7 @@ DOCLING_SERVE_OPTIONS_CACHE_SIZE=2 \
 Apple MPS float64 path. Formula enrichment still uses Granite MLX through the
 request-level `code_formula_custom_config`.
 
-For CN OCR parity, the Docling Serve virtual environment must include
+For CN OCR parity, the Docling Server virtual environment must include
 `ocrmac`. Install it only into the project-local Serve venv, not globally:
 
 ```bash
@@ -43,7 +54,7 @@ For CN OCR parity, the Docling Serve virtual environment must include
 ## n8n-Callable Boundary
 
 `quality_parity_adapter.py` is intentionally small and stdlib-only. n8n can call
-it later through an approved command/worker boundary while Docling Serve remains
+it later through an approved command/worker boundary while Docling Server remains
 the only model execution backend.
 
 The command shape is:
@@ -69,9 +80,11 @@ Optional controls:
 --cn-ocr-chunk-size 1
 ```
 
-Defaults are quality-first:
+Defaults are quality-first and aligned with Docling V1 where the behavior is
+portable:
 
-- `/Gxx` text-layer detection is enabled with OCR fallback policy `gxx`;
+- `/Gxx` text-layer detection is enabled with OCR fallback policy `gxx`,
+  defaulting to the Docling V1 trigger of count >= 10 and density >= 0.002;
 - Granite MLX formula enrichment is requested with `formula-policy=granite_mlx`;
 - accurate table structure options are requested;
 - embedded image mode is used so `document.html` is self-contained where Serve
@@ -160,12 +173,16 @@ The adapter preserves:
 - best-effort `tables/table_N.json`, `tables/table_N.html`, and
   `tables/table_N.csv` extraction from Serve JSON table nodes;
 - adapter-owned review artifacts: rendered page images, table crops, formula
-  context crops, picture crops, and `review_index.html`;
+  source/context crops, picture crops, and `review_index.html`;
 - warnings for missing/incomplete formulas and suspicious formula text such as
   likely column contamination.
+- explicit unresolved-gap warnings for footnotes, PDF links, inline formula HTML
+  rendering, and math symbol rendering.
 
 The review artifact layer is intentionally post-processing owned by this
-adapter. Docling Serve remains the execution backend for Route A.
+adapter. Docling Server remains the execution backend for Route A.
+
+See `docling_v1_parity_checklist.md` before making further parser improvements.
 
 Formula sample:
 
@@ -233,7 +250,14 @@ path is not currently ignored for new generated files.
 `vlm_full_dir_review.py` is a separate evaluation-only route. It explicitly uses
 Docling `VlmPipeline` via `pipeline_cls=VlmPipeline`, writes per-PDF review
 outputs, and records every input PDF in `run_summary.json` and
-`run_summary.md`. It does not replace the Route A Serve adapter.
+`run_summary.md`. It does not replace the Route A Server adapter.
+
+Manual review found that Route B can produce cleaner formulas on `CN.pdf`
+section 2.3, but it fatally drops right-column text on pages 3 and 4, wrongly
+concatenates left-column text, does not meaningfully improve footnotes, emits
+inline formula text without proper HTML rendering, and renders most pictures as
+black blocks. Route B must remain evaluation-only and must not become the
+default route without explicit approval and a separate design.
 
 The helper prefers the local Granite Docling MLX cache:
 
@@ -278,7 +302,7 @@ presence flags, and observed table/formula/image indicators.
 
 ## Known Gaps
 
-Docling Serve can execute the core models, but the project still owns quality
+Docling Server can execute the core models, but the project still owns quality
 policy and review packaging around it:
 
 - no built-in `/Gxx` quality policy;
