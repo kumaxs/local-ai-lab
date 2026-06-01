@@ -16,66 +16,273 @@ Source PDF directory:
 
 ## Summary
 
-The full-directory Docling Serve parity review produced inspectable files, but
-manual review found four issues that are real n8n integration blockers. The
-main pattern is that Docling Serve can execute extraction, but the returned
-document does not yet preserve enough quality semantics for production intake.
+The full-directory Docling Serve parity review produced 10 inspectable HTML
+outputs, 69 formula nodes, 0 formula placeholders, 62 tables, and 119 embedded
+image refs. Manual review found four remaining quality blockers. The most
+important blocker is Chinese parity: the current Serve adapter did not
+reproduce the old known-good local `services/docling-service` OCR fallback path.
+
+Critical correction: `CN.pdf` must be treated as a whole-document bad text
+layer / font mapping / parser problem. The `/Gxx` symbols are distributed across
+every page, not isolated to a bad page. The current Serve 503/504 result proves
+only that the current Serve request/configuration/execution shape failed to
+reproduce the old known-good path. It does not prove that Docling Serve cannot
+produce high-quality Chinese output.
 
 | Issue | Evidence | Classification | Blocks n8n? | Minimal next move |
 | --- | --- | --- | --- | --- |
-| Chinese support poor | `CN/metadata.json`: `/Gxx=42333`, `ocr_fallback_used=false`; `CN/status.json` warns fallback-off diagnostic only | Serve pressure/fallback-policy gap plus bad text-layer quality failure | Yes | Do not accept CN fallback-off output; implement bounded page/chunk OCR fallback and fail closed when fallback fails. |
-| Footnotes broken | `two-col-arxiv-ai-lora/document.json` text nodes 14-17 already split/misordered on page 1 | Docling extraction/reading-order limitation, not HTML-only | Yes | Add diagnostics/warnings and source page evidence links; treat structural footnotes as unreliable until Docling config/upstream fix is found. |
-| PDF links missing | Source PDF contains `/Subtype /Link` annotations; Docling JSON has `hyperlink: None` for all 777 text nodes; HTML has zero `href=` | Docling extraction limitation plus adapter omission for plain URL autolinking | Yes | Add safe URL autolinking for plain URLs; separately evaluate PDF annotation sidecar extraction for internal article links. |
-| Math symbols/equation numbers | LoRA page 6 has inline math in text nodes, no page-6 formula nodes; no literal tofu chars in HTML/JSON; equation numbers `(15)`/`(16)` absent | Mixed HTML font/rendering issue and Docling inline-formula extraction limitation | Yes | Add HTML MathJax/font/CSS and source page links; do not claim equation-number recovery unless JSON/source evidence exists. |
+| Chinese support poor | `CN/metadata.json`: `/Gxx=42333`, `ocr_fallback_used=false`; page text-node `/Gxx` counts are nonzero on pages 1-7 | Adapter/Serve OCR configuration parity gap plus full-document execution-shape failure | Yes | Reproduce old `ocrmac` full-page Chinese OCR config through Serve, then fall back to all-page chunks if full-document forced OCR still 503/504s. |
+| Footnotes broken | `two-col-arxiv-ai-lora/document.json` text nodes 14-17 already split/misordered on page 1 | Docling extraction/reading-order limitation, not HTML-only | Yes | Add diagnostics and page/source evidence links; avoid broad string repair unless provenance makes it reliable. |
+| PDF links missing | Source PDF has `/Subtype /Link`, `/URI`, and `/GoTo`; Serve JSON has `hyperlink: None` for all 777 text nodes; HTML has zero `href=` | Docling extraction/export propagation limitation plus adapter omission for safe plain URL autolinking | Yes | Add URL/autolink diagnostics and side-channel PDF annotation extraction; only insert links when matching is reliable. |
+| Math symbols/equation numbers | LoRA page 6 math is inline text, no page-6 formula nodes; no literal replacement/tofu chars; `(15)`/`(16)` absent | HTML font/rendering risk plus Docling inline-formula/equation-number extraction loss | Yes | Add math font/CSS/MathJax where useful and source page/context evidence for math-heavy pages. |
 
-## Issue 1: Chinese OCR Fallback
+## External Fact-Check Notes
+
+Official Docling documentation and local installed package inspection both
+confirm that full-page OCR is supported. The official full-page OCR example
+shows `OcrMacOptions(force_full_page_ocr=True)` as one supported backend option,
+alongside EasyOCR, Tesseract, and RapidOCR, and notes that full-page OCR
+processes each page purely via OCR and is often slower than hybrid detection.
+
+Official RapidOCR documentation also shows explicit local model path control via
+`RapidOcrOptions(det_model_path=..., rec_model_path=..., cls_model_path=...)`,
+which matters if we later need an offline/local Chinese OCR alternative to
+macOS Vision OCR.
+
+The installed Docling Serve 1.20.0 / Docling 2.95.0 stack exposes runtime knobs
+for local serving, OCR presets, custom OCR configs, page ranges, document
+timeouts, queue/batch sizes, and local model artifacts. Therefore, one
+full-document `503` cannot be treated as a capability conclusion.
+
+Relevant upstream signals:
+
+- Docling issue `#748` reports Chinese PDF garbling and discusses the class of
+  problems around Chinese OCR language settings, OCR forcing, parser/backend
+  behavior, and scanned-vs-programmatic PDF differences.
+- Docling issue `#828` reports hyperlinks not being identified from PDFs. This
+  aligns with our finding that link data may exist in PDF annotations while
+  DoclingDocument/export layers do not propagate usable hyperlinks.
+
+## Chinese Parity Investigation
+
+### Old Known-Good Local Path
 
 Evidence paths:
 
 ```text
+services/docling-service/docling_service/docling_adapter.py
+services/docling-service/reports/2026-05-24-formula-quality-validation.md
+services/docling-service/reports/2026-05-25-docling-fallback-closeout.md
+services/docling-service/reports/samples/formula-quality/CN/metadata.json
+services/docling-service/reports/samples/formula-quality/CN/status.json
+```
+
+The previous local `services/docling-service` implementation used Docling's
+Python API directly. For the Chinese fallback profile, the code built
+`PdfPipelineOptions` with:
+
+```text
+accelerator_options: AcceleratorOptions(device="cpu")
+do_ocr: True
+ocr_options: OcrMacOptions(
+  lang=["zh-Hans", "zh-Hant", "en-US"],
+  force_full_page_ocr=True
+)
+do_table_structure: True
+table_structure_options: TableStructureOptions(
+  do_cell_matching=True,
+  mode=TableFormerMode.ACCURATE
+)
+do_formula_enrichment: formula_model is not None
+generate_page_images: True
+generate_picture_images: True
+generate_table_images: True
+images_scale: 3.0
+artifacts_path: /Users/zeyuan/.cache/docling/models
+```
+
+The adapter tried `ocr_fallback_mac` first, then `ocr_fallback_auto` if needed.
+The known-good CN sample recorded:
+
+```text
+ocr_fallback_used: true
+text_quality_gxx_count: 0
+text_quality_gxx_density: 0.0
+table_count: 6
+asset_count: 77
+warnings include: ocr_fallback_mac_used_after_gxx_quality_failure
+```
+
+The 2026-05-25 closeout reported `CN.pdf` runtime `74.894s`,
+`ocr_fallback_used=true`, `/Gxx=0 / 0.0`, `formula_model=granite_docling_mlx`,
+0 placeholders, 24 formula crops/context crops, 6 table crops, 77 assets, and
+0 broken local refs.
+
+### Current Serve Adapter Path
+
+Evidence paths:
+
+```text
+docs/integrations/docling-serve-quality-parity/quality_parity_adapter.py
+docs/2026-06-01-docling-serve-quality-parity-adapter.md
 .runtime/review/docling-serve-full-dir-review-2026-06-01/CN/metadata.json
 .runtime/review/docling-serve-full-dir-review-2026-06-01/CN/status.json
 .runtime/review/docling-serve-full-dir-review-2026-06-01/CN.adapter_stderr.txt
 .runtime/review/docling-serve-full-dir-review-2026-06-01/CN.retry2_stderr.txt
-.runtime/review/docling-serve-full-dir-review-2026-06-01/CN.fallback_off_stderr.txt
+.runtime/review/docling-serve-full-dir-review-2026-06-01/run_summary.json
 ```
 
-Observed facts:
-
-- Final inspectable `CN/` output was generated with `ocr_fallback_policy=off`.
-- `metadata.json` records `text_quality_gxx_count=42333` and
-  `text_quality_gxx_density=0.0038690473742381383`.
-- `status.json` explicitly warns: full-document OCR fallback failed with
-  Docling Serve HTTP 503 after retries, so the current CN output is diagnostic
-  only and not Chinese quality success.
-- The default full-document path failed in the second request, after the first
-  non-forced conversion detected the bad text layer and attempted
-  `force_ocr=true`.
-- Later adapter code now retries transient 503/504, but the captured CN retry
-  still ended with HTTP 503 in `CN.retry2_stderr.txt`.
-
-Classification:
+The current Serve adapter starts from:
 
 ```text
-Serve pressure/fallback-policy gap plus bad text-layer quality failure.
+UVICORN_WORKERS=1
+DOCLING_DEVICE=cpu
+DOCLING_SERVE_ALLOW_CUSTOM_CODE_FORMULA_CONFIG=true
+DOCLING_SERVE_ENG_KIND=local
+DOCLING_SERVE_ENG_LOC_NUM_WORKERS=1
+DOCLING_SERVE_ENG_LOC_SHARE_MODELS=true
+DOCLING_SERVE_ARTIFACTS_PATH=/Users/zeyuan/.cache/docling/models
+DOCLING_SERVE_LOAD_MODELS_AT_BOOT=true
+DOCLING_SERVE_OPTIONS_CACHE_SIZE=2
 ```
 
-This is not evidence that OCR quality is inherently bad. Earlier bounded page
-validation showed the OCR direction can improve `/Gxx`; the blocker here is
-full-document fallback reliability through Serve. The safe next experiment is
-page-range or chunked OCR fallback, not another unbounded full-document retry.
+The request options are:
 
-Minimal fix options:
+```text
+from_formats: ["pdf"]
+to_formats: ["md", "json", "html"]
+image_export_mode: embedded
+do_ocr: True
+force_ocr: False on first pass, True on fallback
+ocr_preset: "auto"
+ocr_custom_config: not set
+ocr_lang: not set
+do_table_structure: True
+table_mode: accurate
+table_cell_matching: True
+include_images: True
+images_scale: 2.0
+do_formula_enrichment: True
+code_formula_custom_config: Granite MLX custom config
+page_range: only when explicitly requested
+```
 
-1. Fail closed for CN: if `/Gxx` fails and OCR fallback fails, write failure or
-   `degraded_failure`, not `degraded_success`.
-2. Add chunked OCR fallback: after a full-document bad text-layer result,
-   retry pages in bounded ranges with `force_ocr=true`, then aggregate outputs.
-3. Add Serve readiness/backpressure checks between first pass and fallback.
-4. Keep a fallback-off diagnostic output only as a review artifact, never as a
-   successful intake result.
+The final retained CN output was created with `ocr_fallback_policy=off` after
+the full-document forced OCR retry failed. It is diagnostic only:
 
-## Issue 2: Footnotes
+```text
+ok: true
+success_class: degraded_success
+ocr_fallback_used: false
+text_quality_gxx_count: 42333
+text_quality_gxx_density: 0.0038690473742381383
+failure_reason: full-document OCR fallback path failed with Docling Serve HTTP 503 after retries
+```
+
+`CN.adapter_stderr.txt` and `CN.retry2_stderr.txt` show `HTTP Error 503:
+Service Unavailable` on the fallback `force_ocr=true` request.
+
+The bad text layer is whole-document. Counting `/Gxx` tokens in text nodes by
+page gives:
+
+| Page | `/Gxx` count in text nodes | Density in text nodes |
+| ---: | ---: | ---: |
+| 1 | 2377 | 0.188996 |
+| 2 | 479 | 0.106777 |
+| 3 | 573 | 0.091417 |
+| 4 | 574 | 0.038013 |
+| 5 | 778 | 0.140917 |
+| 6 | 658 | 0.127767 |
+| 7 | 4479 | 0.200888 |
+
+The top-level `/Gxx=42333` metric is higher because the adapter measures the
+combined Markdown, HTML, text, and serialized JSON payload; both metrics confirm
+the same whole-document bad text-layer failure.
+
+### Old vs Current Comparison
+
+| Dimension | Old local `services/docling-service` | Current Serve adapter |
+| --- | --- | --- |
+| Execution boundary | Direct Python `DocumentConverter` | HTTP `/v1/convert/source` via Docling Serve |
+| Device | CPU standard pipeline | CPU standard pipeline |
+| Bad text detection | `/Gxx` count/density | `/Gxx` count/density |
+| OCR fallback trigger | `/Gxx` failure | `/Gxx` failure |
+| OCR engine | `ocrmac` first, then `auto` | `ocr_preset="auto"` |
+| OCR language | `["zh-Hans", "zh-Hant", "en-US"]` | Not set |
+| Full-page OCR | `OcrMacOptions(force_full_page_ocr=True)` | Only `force_ocr=true`; no explicit engine config |
+| OCR custom config | Python `OcrMacOptions` object | Not used |
+| Table mode | Accurate, cell matching true | Accurate, cell matching true |
+| Formula model | Granite MLX when available | Granite MLX custom config |
+| Images/crops | Page, picture, table, formula/context crops | Embedded images from Serve; no source crop layer |
+| CN result | `/Gxx=0`, readable | fallback-off diagnostic, `/Gxx=42333` |
+
+### Serve Expressibility
+
+The installed Docling Serve request model exposes the needed OCR fields:
+
+```text
+ocr_preset
+ocr_custom_config
+ocr_lang
+force_ocr
+page_range
+document_timeout
+```
+
+The installed Docling jobkit parser supports `ocr_custom_config` with a required
+`kind` field and passes `force_full_page_ocr=request.force_ocr` into the selected
+OCR engine. The installed OCR factory registers `ocrmac`, `rapidocr`, `auto`,
+`easyocr`, `tesserocr`, and `tesseract`.
+
+Therefore, a Serve request can likely express the old macOS OCR path in one of
+these shapes:
+
+```json
+{
+  "force_ocr": true,
+  "ocr_preset": "ocrmac",
+  "ocr_lang": ["zh-Hans", "zh-Hant", "en-US"]
+}
+```
+
+or, if custom config is enabled for OCR:
+
+```json
+{
+  "force_ocr": true,
+  "ocr_custom_config": {
+    "kind": "ocrmac",
+    "lang": ["zh-Hans", "zh-Hant", "en-US"],
+    "recognition": "accurate",
+    "framework": "vision"
+  }
+}
+```
+
+The second shape requires Serve startup with:
+
+```text
+DOCLING_SERVE_ALLOW_CUSTOM_OCR_CONFIG=true
+```
+
+The first shape may not require custom OCR config because `ocrmac` is a
+registered OCR preset/kind. Both shapes should be validated before changing n8n.
+
+### Future CN Parity Success Criterion
+
+Do not accept fallback-off diagnostic output as success. A future CN parity run
+passes only if:
+
+- all seven CN pages are covered;
+- OCR fallback is recorded as whole-document or per-page/per-chunk equivalent;
+- final merged `/Gxx` is approximately zero and no page remains with material
+  `/Gxx` density;
+- no 503/504 remains unresolved;
+- outputs remain contract-compatible: `document.md`, `document.html`,
+  `document.json`, `metadata.json`, `status.json`, and table assets where
+  available.
+
+## Footnotes
 
 Evidence paths:
 
@@ -85,7 +292,7 @@ Evidence paths:
 .runtime/review/docling-serve-full-dir-review-2026-06-01/two-col-arxiv-ai-lora/document.json
 ```
 
-Observed JSON evidence on page 1:
+Observed page-1 JSON evidence:
 
 ```text
 texts[14] label=footnote text="∗ Equal contribution."
@@ -94,19 +301,11 @@ texts[16] label=footnote text="1 mance significantly as shown in Appendix A."
 texts[17] label=footnote text="Compared to V1, this draft includes better baselines, experiments on GLUE, and more on adapter latency. While GPT-3 175B achieves non-trivial performance with few-shot learning, fine-tuning boosts its perfor-"
 ```
 
-Observed HTML evidence:
-
-```html
-<p>∗ Equal contribution.</p>
-<p>0</p>
-<p>1 mance significantly as shown in Appendix A.</p>
-<p>Compared to V1, this draft includes better baselines, experiments on GLUE, and more on adapter latency. While GPT-3 175B achieves non-trivial performance with few-shot learning, fine-tuning boosts its perfor-</p>
-```
-
-The mismatch already exists in `document.json`; it is not introduced solely by
-Markdown or HTML serialization. The in-body footnote marker is also plain text
-inside the preceding paragraph, not represented as superscript/subscript
-metadata in the returned JSON.
+The matching HTML is a direct paragraph rendering of the same split/misordered
+nodes. The error is already present in Docling JSON, not introduced only by
+Markdown or HTML serialization. In-body footnote markers are plain text inside
+paragraph content; the returned JSON does not preserve reliable
+superscript/subscript marker semantics for this case.
 
 Classification:
 
@@ -114,18 +313,16 @@ Classification:
 Docling extraction/reading-order limitation.
 ```
 
-Minimal fix options:
+Minimal workaround:
 
-1. Add adapter diagnostics for suspicious footnotes: isolated numeric footnote
-   nodes, hyphenated split continuations, and footnote text near page bottom.
-2. For human review, link affected footnote warnings to page images or page
-   evidence once the adapter has a page-image/source-evidence layer.
-3. Do not attempt broad footnote repair by string heuristics yet; it is fragile
-   and can corrupt valid papers.
-4. Re-evaluate if Docling Serve exposes a footnote/link/order option in a later
-   targeted test.
+1. Add diagnostics for isolated numeric footnote nodes, hyphenated split
+   continuations, and bottom-of-page footnote candidates.
+2. Link suspicious footnote warnings to page/source evidence once page images
+   or source crops are restored.
+3. Restore `<sup>` only where a marker can be matched to a body with high
+   confidence; otherwise warn instead of guessing.
 
-## Issue 3: Missing Article Links
+## Links
 
 Evidence paths:
 
@@ -135,44 +332,44 @@ Evidence paths:
 .runtime/review/docling-serve-full-dir-review-2026-06-01/two-col-arxiv-ai-lora/document.html
 ```
 
-Source PDF evidence from raw inspection:
+Raw source PDF inspection found:
 
 ```text
-/Annots [...]
-<< /Type /Annot /Subtype /Link
-/A << /Type /Action /S /URI /URI (https://github.com/microsoft/LoRA) >>
-<< /Type /Annot /Subtype /Link /A << /D (Hfootnote.1) /S /GoTo >>
-<< /Type /Annot /Subtype /Link /A << /D (appendix.A) /S /GoTo >>
+/Subtype /Link: 404
+/URI: 72
+/GoTo: 406
+https://github.com/microsoft/LoRA: 1
+Hfootnote.1: 2
+appendix.A: 3
 ```
 
-Docling output evidence:
+Docling Serve output evidence:
 
 - `document.json` contains `hyperlink` fields, but all 777 text nodes have
   `hyperlink: None`.
 - `document.html` contains zero `href=` attributes.
-- `document.html` still contains plain text URLs such as
-  `https://github.com/microsoft/LoRA`, so some external URL text is present but
-  not clickable.
+- The missing links are not merely a browser rendering issue; link information
+  is not present in the returned DoclingDocument text nodes.
 
 Classification:
 
 ```text
-Docling extraction limitation for PDF annotations, plus adapter omission for
-safe plain-URL autolinking.
+Docling extraction/export propagation limitation plus adapter omission for safe
+plain URL autolinking.
 ```
 
-Minimal fix options:
+Minimal workaround:
 
-1. Low-risk adapter fix: auto-link plain `http://` and `https://` strings in
-   generated HTML text nodes.
-2. Add `link_count`, `plain_url_count`, and `pdf_annotation_link_count` quality
-   signals where possible.
-3. For internal citation/section/footnote links, investigate a PDF annotation
-   sidecar using an existing dependency. Do not fake these links from text.
-4. If Docling Serve later exposes a supported link-preservation option, prefer
-   that over sidecar reconstruction.
+1. Produce link diagnostics: `pdf_annotation_link_count`, `json_link_count`,
+   `html_href_count`, and `plain_url_count`.
+2. Generate a side-channel `links.json` from PDF annotations using an existing
+   local dependency if available.
+3. Regex-link obvious `http(s)`, DOI, arXiv, and ORCID text only when the exact
+   visible string exists in HTML.
+4. Do not reconstruct internal `GoTo` section/citation/footnote links unless
+   text and bounding boxes can be matched reliably.
 
-## Issue 4: Math Symbols And Equation Numbers
+## Math Symbols And Equation Numbers
 
 Evidence paths:
 
@@ -193,78 +390,81 @@ Observed facts:
 | Θ | = 2 × ˆ L LoRA × d model × r
 ```
 
-- No literal replacement/tofu characters were found in JSON or HTML for
-  `□`, `�`, `▯`, `◻`, `☐`, or `■`.
+- No literal replacement/tofu characters were found in HTML, Markdown, or JSON
+  for `□`, `�`, `▯`, `◻`, `☐`, or `■`.
 - The output contains mathematical Unicode characters such as `𝑊`, `𝑟`, `𝑑`,
   `Θ`, `∆`, `Φ`, and `ℝ`, which can render as square boxes if the browser/font
   stack lacks coverage.
-- The strings `(15)` and `(16)` were not found in `document.html`,
-  `document.md`, or `document.json` as equation numbers. The only relevant
-  `15`/`16` occurrences in JSON are table numbers, page footers, reference
-  years/pages, or table text.
+- The parenthesized equation numbers `(15)` and `(16)` are absent from
+  `document.html`, `document.md`, and `document.json`.
 
 Classification:
 
 ```text
-HTML rendering/font/MathJax issue for square boxes, and Docling inline-formula
-extraction limitation for missing equation numbers.
+HTML rendering/font risk for square boxes, plus Docling inline-formula and
+equation-number extraction loss.
 ```
 
-Minimal fix options:
+Minimal workaround:
 
-1. Add HTML-level math rendering support: MathJax for MathML/LaTeX and a CSS
-   font stack with broad math Unicode coverage.
-2. Add warnings when a page has math-heavy Unicode text but no formula nodes.
-3. Restore source evidence links/page images for math-heavy pages so humans can
-   verify lost inline formulas and equation numbers.
-4. Do not claim equation-number recovery unless the number is present in
-   Docling JSON or recovered from a source image/annotation layer.
+1. Add a math-aware CSS font stack and MathJax only where LaTeX/MathML source is
+   present.
+2. Warn when a page has math-heavy Unicode text but no formula nodes.
+3. Add source page/context evidence links for math-heavy pages.
+4. Do not claim equation-number recovery unless the number exists in Docling
+   JSON or can be recovered from a source image/annotation layer.
 
 ## Blocking Assessment
 
-All four issues block n8n integration as a production-quality parser path:
+All four issues block n8n integration:
 
-1. Chinese is a hard blocker because the current CN output is explicitly not a
-   quality success.
-2. Footnotes are a blocker because the structured reading order is wrong in
-   JSON before HTML export.
-3. Links are a blocker because source PDF navigation/reference information is
-   dropped.
-4. Math rendering/inline formula loss is a blocker because HTML is not reliable
-   for human verification or AI reading without source evidence.
+1. Chinese is the first-priority blocker because the current CN output is known
+   bad and the old local path proves better output is possible.
+2. Footnotes are a structural blocker because the JSON reading order is wrong
+   before HTML export.
+3. Links are a review/navigation blocker because PDF article links disappear.
+4. Math rendering and inline formula loss are review blockers because humans and
+   downstream AI cannot verify the missing symbols/numbers without source
+   evidence.
 
 ## Minimal Fix Plan
 
 Priority order:
 
-1. **Fail closed on quality fallback failures.** Change adapter status semantics
-   so a failed required OCR fallback is not reported as `ok=true`; keep
-   fallback-off output only as a diagnostic artifact.
-2. **Implement bounded CN OCR fallback.** Retry forced OCR by page or small page
-   chunks after `/Gxx` failure. Aggregate only if all chunks succeed; otherwise
-   report exact failed pages.
-3. **Add low-risk HTML output polish.** Auto-link plain external URLs and add
-   MathJax/CSS/font support. This improves reviewability without changing
-   extraction data.
-4. **Add quality diagnostics.** Record suspicious footnotes, all-null hyperlink
-   fields, math-heavy pages without formula nodes, and missing source-evidence
-   links in `status.json`.
-5. **Restore source evidence links.** Reintroduce page image/context links for
-   footnotes and math-heavy pages before n8n integration.
-6. **Investigate PDF annotation sidecar.** Use an existing local PDF dependency
-   only if it can extract URI/GoTo annotations reliably without global installs.
+1. **Reproduce old CN OCR config through Serve.** Add a targeted adapter option
+   or request shape for `ocr_preset="ocrmac"` plus
+   `ocr_lang=["zh-Hans", "zh-Hant", "en-US"]`; if needed, start Serve with
+   `DOCLING_SERVE_ALLOW_CUSTOM_OCR_CONFIG=true` and use
+   `ocr_custom_config.kind="ocrmac"`.
+2. **Fail closed on required OCR fallback failure.** If `/Gxx` fails and the
+   required fallback fails, write `failure` or `degraded_failure`, not
+   `degraded_success`.
+3. **Cover all CN pages with bounded fallback.** If full-document forced OCR
+   still returns 503/504, retry all pages serially or in small `page_range`
+   chunks with the same OCRMac full-page semantics, then aggregate outputs.
+4. **Tune Serve execution shape before judging quality.** Try smaller OCR/layout
+   batch sizes, longer request/document timeout, and readiness/backpressure
+   waits between first pass and fallback.
+5. **Add low-risk review HTML improvements.** Add safe external URL autolinking
+   and math font/CSS/MathJax support where it cannot corrupt extraction data.
+6. **Add diagnostics and source evidence.** Record suspicious footnotes,
+   all-null hyperlinks despite source annotations, math-heavy pages without
+   formula nodes, and missing page/source evidence links.
+7. **Investigate PDF annotation sidecar.** Extract `links.json` from source PDF
+   annotations with existing local dependencies only; defer internal link
+   insertion until text/bbox matching is reliable.
 
 ## Recommended Next Codex Task
 
-Implement the low-risk adapter changes only:
+Implement only the low-risk adapter changes needed for targeted validation:
 
-- fail closed when OCR fallback is required but fails;
-- add bounded page/chunk OCR fallback for CN;
-- auto-link plain external URLs in `document.html`;
-- add MathJax/CSS/font support to generated HTML;
-- add diagnostic warning fields for suspicious footnotes, all-null hyperlinks,
-  and math-heavy pages without formula nodes;
-- regenerate a small targeted review set: `CN.pdf` and
+- add a CN parity OCR request path using `ocrmac` with Chinese locale and
+  full-page OCR semantics;
+- fail closed when required OCR fallback fails;
+- add all-page page/chunk fallback for CN if full-document OCR 503/504s;
+- add diagnostics for links, footnotes, and math-heavy pages;
+- add safe external URL autolinking and math CSS/MathJax polish;
+- regenerate a targeted review set for `CN.pdf` and
   `two-col-arxiv-ai-lora.pdf`.
 
-Do not proceed to n8n until this targeted set passes manual inspection.
+Do not proceed to n8n until the targeted set passes manual inspection.
