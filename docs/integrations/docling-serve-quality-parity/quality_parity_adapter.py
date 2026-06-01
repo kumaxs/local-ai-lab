@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Minimal Docling Serve quality parity adapter boundary.
+"""Minimal Docling Server quality parity adapter boundary.
 
 This script is the narrow n8n-callable boundary between Local AI Lab automation
-and Docling Serve. Docling Serve remains the model execution backend; this
+and Docling Server. Docling Server remains the model execution backend; this
 adapter owns only the quality policy and contract-output mapping.
 """
 
@@ -25,6 +25,14 @@ DATA_IMAGE_RE = re.compile(r"data:image/[^\"')\s]+")
 FORMULA_NUMBER_RE = re.compile(r"\(\s*(\d+)\s*\)")
 CN_CHAR_RE = re.compile(r"[\u3400-\u9fff]")
 CN_OCR_LANG = ["zh-Hans", "zh-Hant", "en-US"]
+V1_GXX_FAILURE_MIN_COUNT = 10
+V1_GXX_FAILURE_MIN_DENSITY = 0.002
+UNRESOLVED_V1_PARITY_WARNINGS = [
+    "v1_parity_gap_footnotes_not_improved_by_server_adapter",
+    "v1_parity_gap_pdf_links_not_preserved_or_exported_as_links_json",
+    "v1_parity_gap_inline_formula_html_rendering_requires_review",
+    "v1_parity_gap_math_symbol_rendering_requires_review",
+]
 
 START_COMMAND = (
     "UVICORN_WORKERS=1 DOCLING_DEVICE=cpu "
@@ -93,8 +101,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sample-name", default=None)
     parser.add_argument("--page-start", type=int, default=None)
     parser.add_argument("--page-end", type=int, default=None)
-    parser.add_argument("--gxx-count-threshold", type=int, default=50)
-    parser.add_argument("--gxx-density-threshold", type=float, default=0.001)
+    parser.add_argument("--gxx-count-threshold", type=int, default=V1_GXX_FAILURE_MIN_COUNT)
+    parser.add_argument(
+        "--gxx-density-threshold",
+        type=float,
+        default=V1_GXX_FAILURE_MIN_DENSITY,
+    )
     parser.add_argument(
         "--ocr-fallback-policy",
         choices=["gxx", "off"],
@@ -146,7 +158,7 @@ def parse_args() -> argparse.Namespace:
         "--http-retries",
         type=int,
         default=3,
-        help="Retry transient Docling Serve HTTP 503/504 responses this many times.",
+        help="Retry transient Docling Server HTTP 503/504 responses this many times.",
     )
     parser.add_argument(
         "--http-retry-sleep-seconds",
@@ -501,6 +513,8 @@ def render_page_images_and_crops(
     counts = {
         "page_image_count": 0,
         "table_image_count": 0,
+        "formula_asset_count": 0,
+        "formula_context_asset_count": 0,
         "formula_evidence_count": 0,
         "picture_artifact_count": 0,
     }
@@ -539,7 +553,7 @@ def render_page_images_and_crops(
             page_images[page_no] = image
             counts["page_image_count"] += 1
 
-        def crop_node(node: dict[str, Any], dest: Path) -> bool:
+        def crop_node(node: dict[str, Any], dest: Path, crop_padding: int) -> bool:
             prov = first_prov(node)
             if not prov or not isinstance(prov.get("bbox"), dict):
                 return False
@@ -565,10 +579,10 @@ def render_page_images_and_crops(
                 y0 = top * scale
                 y1 = bottom * scale
             box = (
-                max(0, int(min(x0, x1) - padding)),
-                max(0, int(min(y0, y1) - padding)),
-                min(image.width, int(max(x0, x1) + padding)),
-                min(image.height, int(max(y0, y1) + padding)),
+                max(0, int(min(x0, x1) - crop_padding)),
+                max(0, int(min(y0, y1) - crop_padding)),
+                min(image.width, int(max(x0, x1) + crop_padding)),
+                min(image.height, int(max(y0, y1) + crop_padding)),
             )
             if box[2] <= box[0] or box[3] <= box[1]:
                 return False
@@ -577,16 +591,21 @@ def render_page_images_and_crops(
             return True
 
         for index, table in enumerate(tables, start=1):
-            if crop_node(table, tables_dir / f"table_{index}.png"):
+            if crop_node(table, tables_dir / f"table_{index}.png", padding):
                 counts["table_image_count"] += 1
         for index, formula in enumerate(formulas, start=1):
-            if crop_node(formula, formulas_dir / f"formula_{index}_context.png"):
-                counts["formula_evidence_count"] += 1
+            if crop_node(formula, formulas_dir / f"formula_{index}.png", 2):
+                counts["formula_asset_count"] += 1
+            if crop_node(formula, formulas_dir / f"formula_{index}_context.png", padding):
+                counts["formula_context_asset_count"] += 1
         for index, picture in enumerate(pictures, start=1):
-            if crop_node(picture, pictures_dir / f"picture_{index}.png"):
+            if crop_node(picture, pictures_dir / f"picture_{index}.png", padding):
                 counts["picture_artifact_count"] += 1
     finally:
         pdf.close()
+    counts["formula_evidence_count"] = max(
+        counts["formula_asset_count"], counts["formula_context_asset_count"]
+    )
     return counts, warnings
 
 
@@ -684,7 +703,7 @@ def write_review_index(
     sections = [
         ("Pages", links_for("pages/page_*.png")),
         ("Tables", links_for("tables/table_*.*")),
-        ("Formulas", links_for("formulas/formula_*_context.png")),
+        ("Formulas", links_for("formulas/formula_*.png")),
         ("Pictures", links_for("pictures/picture_*.png")),
     ]
     warning_items = "".join(
@@ -743,6 +762,97 @@ def add_document_review_banner(output_dir: Path) -> None:
     html_path.write_text(content, encoding="utf-8")
 
 
+def formula_review_targets(output_dir: Path) -> dict[int, dict[str, str]]:
+    targets: dict[int, dict[str, str]] = {}
+    for path in sorted((output_dir / "formulas").glob("formula_*.png")):
+        match = re.match(r"formula_(\d+)(_context)?\.png$", path.name)
+        if not match:
+            continue
+        index = int(match.group(1))
+        key = "context" if match.group(2) else "source"
+        targets.setdefault(index, {})[key] = str(path.relative_to(output_dir))
+    return targets
+
+
+def formula_source_links(index: int, targets: dict[str, str]) -> str:
+    parts: list[str] = []
+    for key, label in (("source", "source image"), ("context", "context crop")):
+        path = targets.get(key)
+        if not path:
+            continue
+        parts.append(
+            f'<a href="{html.escape(path, quote=True)}">{html.escape(label)}</a>'
+        )
+    if not parts:
+        return ""
+    return (
+        f' <span class="docling-formula-source" data-formula-index="{index}">'
+        + " | ".join(parts)
+        + "</span>"
+    )
+
+
+def link_formula_placeholders(document_html: str, targets_by_index: dict[int, dict[str, str]]) -> str:
+    if "Formula not decoded" not in document_html:
+        return document_html
+    context_targets = [
+        (index, targets["context"])
+        for index, targets in sorted(targets_by_index.items())
+        if "context" in targets
+    ]
+    if not context_targets:
+        return document_html
+    replacement_index = 0
+
+    def replace(_match: re.Match[str]) -> str:
+        nonlocal replacement_index
+        formula_index, target = context_targets[
+            min(replacement_index, len(context_targets) - 1)
+        ]
+        replacement_index += 1
+        return (
+            f'<a class="docling-formula-placeholder" '
+            f'href="{html.escape(target, quote=True)}">'
+            f"Formula not decoded (review formula {formula_index})"
+            "</a>"
+        )
+
+    return re.sub(r"Formula not decoded", replace, document_html)
+
+
+def inject_formula_source_links(
+    output_dir: Path,
+    formulas: list[dict[str, Any]],
+) -> int:
+    html_path = output_dir / "document.html"
+    document_html = html_path.read_text(encoding="utf-8")
+    targets_by_index = formula_review_targets(output_dir)
+    if not targets_by_index:
+        return 0
+
+    updated_html = link_formula_placeholders(document_html, targets_by_index)
+    linked_indexes: set[int] = set()
+    for index, formula in enumerate(formulas, start=1):
+        targets = targets_by_index.get(index)
+        if not targets:
+            continue
+        formula_text = str(formula.get("text") or "").strip()
+        if not formula_text or "Formula not decoded" in formula_text:
+            continue
+        source_links = formula_source_links(index, targets)
+        if not source_links:
+            continue
+        for candidate in (formula_text, html.escape(formula_text)):
+            if candidate and candidate in updated_html:
+                updated_html = updated_html.replace(candidate, candidate + source_links, 1)
+                linked_indexes.add(index)
+                break
+
+    if updated_html != document_html:
+        html_path.write_text(updated_html, encoding="utf-8")
+    return len(linked_indexes)
+
+
 def restore_review_artifact_layer(
     output_dir: Path,
     response: dict[str, Any],
@@ -782,18 +892,24 @@ def restore_review_artifact_layer(
     metadata["asset_count"] = (
         crop_counts["page_image_count"]
         + crop_counts["table_image_count"]
-        + crop_counts["formula_evidence_count"]
+        + crop_counts["formula_asset_count"]
+        + crop_counts["formula_context_asset_count"]
         + crop_counts["picture_artifact_count"]
     )
     metadata["review_artifact_warnings"] = review_warnings
+    metadata["unresolved_v1_parity_warnings"] = UNRESOLVED_V1_PARITY_WARNINGS
     metadata.setdefault("generated_outputs", []).extend(
         [
             "review_index.html",
             *[f"pages/page_{index}.png" for index in range(1, crop_counts["page_image_count"] + 1)],
             *table_outputs,
             *[
+                f"formulas/formula_{index}.png"
+                for index in range(1, crop_counts["formula_asset_count"] + 1)
+            ],
+            *[
                 f"formulas/formula_{index}_context.png"
-                for index in range(1, crop_counts["formula_evidence_count"] + 1)
+                for index in range(1, crop_counts["formula_context_asset_count"] + 1)
             ],
             *[
                 f"pictures/picture_{index}.png"
@@ -802,15 +918,19 @@ def restore_review_artifact_layer(
         ]
     )
     status["warnings"].extend(review_warnings)
+    status["warnings"].extend(UNRESOLVED_V1_PARITY_WARNINGS)
     status["quality_signals"].update(
         {
             "page_image_count": metadata["page_image_count"],
+            "formula_asset_count": metadata["formula_asset_count"],
+            "formula_context_asset_count": metadata["formula_context_asset_count"],
             "formula_evidence_count": metadata["formula_evidence_count"],
             "missing_formula_evidence_count": metadata["missing_formula_evidence_count"],
             "suspicious_formula_diagnostics": metadata["suspicious_formula_diagnostics"],
             "table_artifact_count": metadata["table_artifact_count"],
             "picture_artifact_count": metadata["picture_artifact_count"],
             "review_artifact_warnings": review_warnings,
+            "unresolved_v1_parity_warnings": UNRESOLVED_V1_PARITY_WARNINGS,
             "cn_section_2_3_diagnostic_summary": metadata[
                 "cn_section_2_3_diagnostic_summary"
             ],
@@ -818,6 +938,9 @@ def restore_review_artifact_layer(
     )
     write_review_index(output_dir, metadata, status)
     add_document_review_banner(output_dir)
+    formula_source_link_count = inject_formula_source_links(output_dir, formulas)
+    metadata["formula_source_link_count"] = formula_source_link_count
+    status["quality_signals"]["formula_source_link_count"] = formula_source_link_count
     (output_dir / "metadata.json").write_text(
         json.dumps(metadata, indent=2, ensure_ascii=False), encoding="utf-8"
     )
@@ -1195,7 +1318,7 @@ def main() -> int:
             json.dumps(
                 {
                     "ok": False,
-                    "blocked": f"Docling Serve is not reachable: {exc}",
+                    "blocked": f"Docling Server is not reachable: {exc}",
                     "start_command": START_COMMAND,
                 },
                 indent=2,
@@ -1292,9 +1415,9 @@ def main() -> int:
                 (
                     "text_quality_failed_gxx; forced OCR fallback via "
                     + (
-                        "Docling Serve OCRMac full-page request"
+                        "Docling Server OCRMac full-page request"
                         if args.cn_ocr_parity
-                        else "Docling Serve force_ocr=true"
+                        else "Docling Server force_ocr=true"
                     )
                 ),
             )
@@ -1320,7 +1443,7 @@ def main() -> int:
             )
 
     gaps = [
-        "Review artifacts are adapter-owned post-processing outputs, not native Docling Serve outputs.",
+        "Review artifacts are adapter-owned post-processing outputs, not native Docling Server outputs.",
         "This adapter is a minimal n8n-callable boundary, not a product decision to make it the long-term service.",
     ]
     status["warnings"].extend(gaps)
