@@ -110,6 +110,13 @@ The adapter writes one job directory under `--output-root`:
   metadata.json
   status.json
   tables/table_N.json
+  review_index.html
+  pages/page_N.png
+  tables/table_N.html
+  tables/table_N.csv
+  tables/table_N.png
+  formulas/formula_N_context.png
+  pictures/picture_N.png
 ```
 
 n8n should read:
@@ -150,8 +157,15 @@ The adapter preserves:
 - embedded/referenced image export options;
 - contract-equivalent output mapping:
   `document.md`, `document.html`, `document.json`, `metadata.json`, `status.json`;
-- best-effort `tables/table_N.json` extraction from Serve JSON table nodes;
-- warnings for gaps that official Serve output does not reproduce by itself.
+- best-effort `tables/table_N.json`, `tables/table_N.html`, and
+  `tables/table_N.csv` extraction from Serve JSON table nodes;
+- adapter-owned review artifacts: rendered page images, table crops, formula
+  context crops, picture crops, and `review_index.html`;
+- warnings for missing/incomplete formulas and suspicious formula text such as
+  likely column contamination.
+
+The review artifact layer is intentionally post-processing owned by this
+adapter. Docling Serve remains the execution backend for Route A.
 
 Formula sample:
 
@@ -214,16 +228,64 @@ python3 docs/integrations/docling-serve-quality-parity/batch_full_dir_review.py 
 Use an ignored output root. The preferred `services/docling-service/reports/samples/`
 path is not currently ignored for new generated files.
 
+## Route B: VLM Pipeline Evaluation Helper
+
+`vlm_full_dir_review.py` is a separate evaluation-only route. It explicitly uses
+Docling `VlmPipeline` via `pipeline_cls=VlmPipeline`, writes per-PDF review
+outputs, and records every input PDF in `run_summary.json` and
+`run_summary.md`. It does not replace the Route A Serve adapter.
+
+The helper prefers the local Granite Docling MLX cache:
+
+```text
+/Users/zeyuan/.cache/docling/models/ibm-granite--granite-docling-258M-mlx
+```
+
+If that cache is missing, the helper records a failure instead of downloading a
+large model. Each PDF runs in a worker subprocess, so a failed or timed-out
+document does not stop the batch.
+
+Example:
+
+```bash
+.runtime/docling-serve/.venv/bin/python \
+  docs/integrations/docling-serve-quality-parity/vlm_full_dir_review.py \
+  --input-dir /Users/zeyuan/Projects/n8n-paper-pipeline/test_pdfs \
+  --output-root /Users/zeyuan/Projects/local-ai-lab/.runtime/review/docling-vlm-full-dir-review-2026-06-01 \
+  --timeout-seconds 900 \
+  --document-timeout 780
+```
+
+Per-PDF outputs, when conversion succeeds:
+
+```text
+<output-root>/<job-id>/
+  document.md
+  document.html
+  document.json
+  metadata.json
+  status.json
+  review_index.html
+  pages/page_N.png
+  tables/table_N.json
+  tables/table_N.html
+  tables/table_N.csv
+```
+
+Summary rows include the input filename, job id, output directory, model,
+processed page count, success class, runtime, warnings/failure reason, output
+presence flags, and observed table/formula/image indicators.
+
 ## Known Gaps
 
-Docling Serve can execute the core models, but it does not by itself reproduce
-all prior project quality behavior:
+Docling Serve can execute the core models, but the project still owns quality
+policy and review packaging around it:
 
 - no built-in `/Gxx` quality policy;
 - no automatic Chinese OCR fallback decision;
 - no project metadata/status contract;
-- no formula/table/page source crop traceability layer;
-- no standalone `assets/` and rich table artifacts unless post-processed.
+- no formula/table/page source crop traceability layer unless post-processed;
+- no standalone review assets and rich table artifacts unless post-processed.
 
 The next n8n phase should treat this as the request/post-processing spec rather
 than use a naked default `/v1/convert/source` request.
