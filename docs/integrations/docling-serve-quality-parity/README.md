@@ -16,6 +16,7 @@ The validated Serve startup policy is:
 UVICORN_WORKERS=1 \
 DOCLING_DEVICE=cpu \
 DOCLING_SERVE_ALLOW_CUSTOM_CODE_FORMULA_CONFIG=true \
+DOCLING_SERVE_ALLOW_CUSTOM_OCR_CONFIG=true \
 DOCLING_SERVE_ENG_KIND=local \
 DOCLING_SERVE_ENG_LOC_NUM_WORKERS=1 \
 DOCLING_SERVE_ENG_LOC_SHARE_MODELS=true \
@@ -31,6 +32,13 @@ DOCLING_SERVE_OPTIONS_CACHE_SIZE=2 \
 `DOCLING_DEVICE=cpu` keeps the standard PDF pipeline off the currently failing
 Apple MPS float64 path. Formula enrichment still uses Granite MLX through the
 request-level `code_formula_custom_config`.
+
+For CN OCR parity, the Docling Serve virtual environment must include
+`ocrmac`. Install it only into the project-local Serve venv, not globally:
+
+```bash
+.runtime/docling-serve/.venv/bin/python -m pip install ocrmac
+```
 
 ## n8n-Callable Boundary
 
@@ -56,6 +64,9 @@ Optional controls:
 --formula-policy granite_mlx
 --timeout-seconds 1200
 --image-export-mode embedded
+--cn-ocr-parity
+--cn-ocr-request-shape preset
+--cn-ocr-chunk-size 1
 ```
 
 Defaults are quality-first:
@@ -65,6 +76,29 @@ Defaults are quality-first:
 - accurate table structure options are requested;
 - embedded image mode is used so `document.html` is self-contained where Serve
   provides images.
+
+For Chinese bad text-layer parity, use `--cn-ocr-parity`. This keeps the normal
+first pass unchanged, then on `/Gxx` failure requests the old known-good OCRMac
+full-page OCR behavior through Serve:
+
+```text
+force_ocr=true
+ocr_preset=ocrmac
+ocr_lang=["zh-Hans", "zh-Hant", "en-US"]
+```
+
+If that full-document fallback receives a transient Serve `503`/`504`, the
+adapter retries all pages through `page_range` chunks using the same OCRMac
+Chinese settings, then merges the chunk outputs into the contract files. A
+failed required OCR fallback is reported as `failure` or `degraded_failure`, not
+as `degraded_success`.
+
+If the deployed Serve requires explicit custom OCR configuration, start it with
+`DOCLING_SERVE_ALLOW_CUSTOM_OCR_CONFIG=true` and run with:
+
+```bash
+--cn-ocr-parity --cn-ocr-request-shape custom
+```
 
 The adapter writes one job directory under `--output-root`:
 
@@ -139,8 +173,7 @@ python3 docs/integrations/docling-serve-quality-parity/quality_parity_adapter.py
   --input-file /Users/zeyuan/Projects/n8n-paper-pipeline/test_pdfs/CN.pdf \
   --output-root /tmp/docling-serve-quality-parity \
   --job-id CN_p1 \
-  --page-start 1 \
-  --page-end 1
+  --cn-ocr-parity
 ```
 
 For a table page:
