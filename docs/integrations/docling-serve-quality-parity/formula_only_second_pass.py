@@ -18,7 +18,9 @@ This is a minimal prototype, not a production n8n integration.
 from __future__ import annotations
 
 import argparse
+import html
 import json
+import os
 import re
 import sys
 from difflib import SequenceMatcher
@@ -143,6 +145,43 @@ def formula_vertical_center(bbox: dict[str, float]) -> float:
 def formula_horizontal_center(bbox: dict[str, float]) -> float:
     """Center x in TOPLEFT space."""
     return (bbox["l"] + bbox["r"]) / 2
+
+
+def _formula_asset_links(output_dir: Path, source_dir: Path, formula_no: int | None, page_no: int | None) -> dict[str, str | None]:
+    """Return output-relative links to available source evidence assets."""
+    links: dict[str, str | None] = {
+        "formula_crop": None,
+        "formula_context": None,
+        "full_page": None,
+        "source_review": None,
+    }
+    if formula_no is not None:
+        crop = source_dir / "formulas" / f"formula_{formula_no}.png"
+        context = source_dir / "formulas" / f"formula_{formula_no}_context.png"
+        if crop.exists():
+            links["formula_crop"] = _relative_link(output_dir, crop)
+        if context.exists():
+            links["formula_context"] = _relative_link(output_dir, context)
+    if page_no is not None:
+        page = source_dir / "pages" / f"page_{page_no}.png"
+        if page.exists():
+            links["full_page"] = _relative_link(output_dir, page)
+    review = source_dir / "review_index.html"
+    if review.exists():
+        links["source_review"] = _relative_link(output_dir, review)
+    return links
+
+
+def _relative_link(from_dir: Path, target: Path) -> str:
+    """Return a POSIX relative path suitable for an HTML href/src."""
+    try:
+        return target.resolve().relative_to(from_dir.resolve()).as_posix()
+    except ValueError:
+        return Path(os.path.relpath(target.resolve(), from_dir.resolve())).as_posix()
+
+
+def _html_text(value: Any) -> str:
+    return html.escape("" if value is None else str(value))
 
 
 def is_suspicious(f: dict[str, Any]) -> list[str]:
@@ -270,6 +309,28 @@ def _extract_eq_numbers_from_text(text: str) -> list[int]:
     return [int(m.group(1)) for m in EQ_NUM_RE.finditer(text)]
 
 
+def _find_markdown_block(md_text: str, formula_text: str, eq_num: int | None) -> str:
+    """Find the most likely $$...$$ markdown block for a formula."""
+    if not md_text:
+        return ""
+    if eq_num is not None:
+        pattern = re.compile(
+            r"\$\$[^$]*?\(\s*" + re.escape(str(eq_num)) + r"\s*\)[^$]*?\$\$",
+            re.DOTALL,
+        )
+        match = pattern.search(md_text)
+        if match:
+            return match.group(0)
+
+    prefix = formula_text[:30]
+    if prefix:
+        pattern = re.compile(r"\$\$" + re.escape(prefix) + r"[^$]*?\$\$", re.DOTALL)
+        match = pattern.search(md_text)
+        if match:
+            return match.group(0)
+    return ""
+
+
 def patch_document_md(
     md_text: str,
     route_a_formulas: list[dict[str, Any]],
@@ -305,9 +366,10 @@ def patch_document_md(
         # Also try blocks WITHOUT explicit equation number (for formulas where
         # Route A had eq_num but we replaced with Route B's cleaner text)
         def replacer(m: re.Match) -> str:
-            old = m.group(0)
             # Preserve the $$ delimiters, replace inner content
             if eq_num is not None:
+                if EQ_NUM_RE.search(route_b_text):
+                    return f"$${route_b_text}$$"
                 return f"$${route_b_text} \\quad ( {eq_num} )$$"
             else:
                 return f"$${route_b_text}$$"
@@ -343,6 +405,10 @@ def patch_document_json(
     Returns (patched_doc, replacement_log).
     """
     route_a_formulas = extract_formulas(route_a_doc)
+    for formula_no, formula in enumerate(route_a_formulas, start=1):
+        formula["formula_no"] = formula_no
+    for formula_no, formula in enumerate(route_b_formulas, start=1):
+        formula["formula_no"] = formula_no
     matches = match_route_b_to_route_a(route_a_formulas, route_b_formulas)
 
     log: list[dict[str, Any]] = []
@@ -355,11 +421,13 @@ def patch_document_json(
         if i not in matches:
             log.append({
                 "index": i,
-                "route_a_text": af["text"][:100],
+                "formula_no": af.get("formula_no"),
+                "route_a_text": af["text"],
                 "page_no": af["page_no"],
                 "eq_number": af["main_eq"],
                 "reasons": reasons,
                 "route_b_candidate": None,
+                "route_b_formula_no": None,
                 "status": "suspicious_no_route_b_match",
             })
             continue
@@ -369,11 +437,13 @@ def patch_document_json(
         if not route_b_text.strip():
             log.append({
                 "index": i,
-                "route_a_text": af["text"][:100],
+                "formula_no": af.get("formula_no"),
+                "route_a_text": af["text"],
                 "page_no": af["page_no"],
                 "eq_number": af["main_eq"],
                 "reasons": reasons,
                 "route_b_candidate": None,
+                "route_b_formula_no": bf.get("formula_no"),
                 "status": "route_b_also_empty",
             })
             continue
@@ -381,15 +451,179 @@ def patch_document_json(
         _patch_node_text(af["node"], route_b_text)
         log.append({
             "index": i,
-            "route_a_text": af["text"][:100],
+            "formula_no": af.get("formula_no"),
+            "route_a_text": af["text"],
             "page_no": af["page_no"],
             "eq_number": af["main_eq"],
             "reasons": reasons,
-            "route_b_candidate": route_b_text[:100],
+            "route_b_candidate": route_b_text,
+            "route_b_formula_no": bf.get("formula_no"),
             "status": "replaced",
         })
 
     return route_a_doc, log
+
+
+def add_review_evidence(
+    replacement_log: list[dict[str, Any]],
+    route_a_dir: Path,
+    route_b_dir: Path,
+    output_dir: Path,
+    before_md: str,
+    after_md: str,
+) -> None:
+    """Attach human-review evidence metadata to each replacement log entry."""
+    for entry in replacement_log:
+        route_a_text = entry.get("route_a_text", "")
+        route_b_text = entry.get("route_b_candidate") or ""
+        eq_num = entry.get("eq_number")
+        page_no = entry.get("page_no")
+        entry["route_a_evidence"] = _formula_asset_links(
+            output_dir, route_a_dir, entry.get("formula_no"), page_no
+        )
+        entry["route_b_evidence"] = _formula_asset_links(
+            output_dir, route_b_dir, entry.get("route_b_formula_no"), page_no
+        )
+        entry["markdown_before"] = _find_markdown_block(before_md, route_a_text, eq_num)
+        after_probe = route_b_text if entry.get("status") == "replaced" else route_a_text
+        entry["markdown_after"] = _find_markdown_block(after_md, after_probe, eq_num)
+
+
+def _render_asset_link(label: str, href: str | None) -> str:
+    if not href:
+        return f"<span class=\"missing\">{html.escape(label)} missing</span>"
+    return f"<a href=\"{html.escape(href)}\">{html.escape(label)}</a>"
+
+
+def _render_image(label: str, href: str | None) -> str:
+    if not href:
+        return f"<div class=\"asset missing\">{html.escape(label)} missing</div>"
+    esc = html.escape(href)
+    return (
+        f"<figure class=\"asset\"><a href=\"{esc}\"><img src=\"{esc}\" "
+        f"alt=\"{html.escape(label)}\"></a><figcaption>{html.escape(label)}</figcaption></figure>"
+    )
+
+
+def write_review_html(output_dir: Path, summary: dict[str, Any]) -> Path:
+    """Write a human-reviewable HTML page for formula replacements."""
+    rows = []
+    for entry in summary.get("replacement_log", []):
+        title = f"Formula {entry.get('formula_no')}"
+        eq = entry.get("eq_number")
+        if eq is not None:
+            title += f" / equation ({eq})"
+        route_a_ev = entry.get("route_a_evidence") or {}
+        route_b_ev = entry.get("route_b_evidence") or {}
+        reasons = ", ".join(entry.get("reasons") or [])
+        rows.append(f"""
+<section class="formula-card" id="formula-{_html_text(entry.get('formula_no'))}">
+  <header>
+    <h2>{_html_text(title)}</h2>
+    <div class="status {html.escape(str(entry.get('status', '')))}">{_html_text(entry.get('status'))}</div>
+  </header>
+  <dl class="meta">
+    <div><dt>Page</dt><dd>{_html_text(entry.get('page_no'))}</dd></div>
+    <div><dt>Reasons</dt><dd>{_html_text(reasons)}</dd></div>
+    <div><dt>Route B formula</dt><dd>{_html_text(entry.get('route_b_formula_no'))}</dd></div>
+  </dl>
+  <div class="compare">
+    <div>
+      <h3>Route A Formula Text</h3>
+      <pre>{_html_text(entry.get('route_a_text'))}</pre>
+    </div>
+    <div>
+      <h3>Replacement Candidate</h3>
+      <pre>{_html_text(entry.get('route_b_candidate') or 'NO ROUTE B MATCH')}</pre>
+    </div>
+  </div>
+  <div class="compare">
+    <div>
+      <h3>Before Markdown Snippet</h3>
+      <pre>{_html_text(entry.get('markdown_before') or 'No markdown block found')}</pre>
+    </div>
+    <div>
+      <h3>After Markdown Snippet</h3>
+      <pre>{_html_text(entry.get('markdown_after') or 'No markdown block found')}</pre>
+    </div>
+  </div>
+  <h3>Evidence</h3>
+  <div class="links">
+    {_render_asset_link('Route A review index', route_a_ev.get('source_review'))}
+    {_render_asset_link('Route A full page', route_a_ev.get('full_page'))}
+    {_render_asset_link('Route A crop', route_a_ev.get('formula_crop'))}
+    {_render_asset_link('Route A context crop', route_a_ev.get('formula_context'))}
+    {_render_asset_link('Route B review index', route_b_ev.get('source_review'))}
+    {_render_asset_link('Route B full page', route_b_ev.get('full_page'))}
+  </div>
+  <div class="assets">
+    {_render_image('Route A formula crop', route_a_ev.get('formula_crop'))}
+    {_render_image('Route A context crop', route_a_ev.get('formula_context'))}
+    {_render_image('Route A full page', route_a_ev.get('full_page'))}
+    {_render_image('Route B full page', route_b_ev.get('full_page'))}
+  </div>
+</section>
+""")
+
+    if not rows:
+        rows.append("""
+<section class="formula-card">
+  <header><h2>No Suspicious Formulas</h2><div class="status clean">clean</div></header>
+  <p>This run made no replacements. Route A document JSON and markdown were preserved.</p>
+</section>
+""")
+
+    html_text = f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Formula Second-Pass Review</title>
+  <style>
+    body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 0; color: #1f2933; background: #f7f8fa; }}
+    main {{ max-width: 1180px; margin: 0 auto; padding: 28px; }}
+    h1 {{ margin: 0 0 8px; font-size: 28px; }}
+    h2 {{ margin: 0; font-size: 20px; }}
+    h3 {{ margin: 18px 0 8px; font-size: 14px; text-transform: uppercase; color: #52606d; }}
+    .summary, .formula-card {{ background: #fff; border: 1px solid #d9e2ec; border-radius: 8px; padding: 18px; margin-bottom: 18px; }}
+    .summary-grid, .meta {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 12px; }}
+    dt {{ color: #52606d; font-size: 12px; text-transform: uppercase; }}
+    dd {{ margin: 4px 0 0; font-weight: 600; }}
+    header {{ display: flex; justify-content: space-between; gap: 16px; align-items: center; }}
+    .status {{ border-radius: 999px; padding: 4px 10px; font-size: 12px; font-weight: 700; background: #e4e7eb; }}
+    .status.replaced {{ background: #d8f3dc; color: #1b4332; }}
+    .status.suspicious_no_route_b_match, .status.route_b_also_empty {{ background: #ffe8cc; color: #7c2d12; }}
+    .status.clean {{ background: #e0f2fe; color: #0c4a6e; }}
+    .compare {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 14px; }}
+    pre {{ white-space: pre-wrap; overflow-wrap: anywhere; background: #f0f4f8; border: 1px solid #d9e2ec; border-radius: 6px; padding: 12px; font: 13px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; }}
+    .links {{ display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; }}
+    .links a, .missing {{ border: 1px solid #bcccdc; border-radius: 999px; padding: 5px 10px; font-size: 12px; text-decoration: none; color: #243b53; background: #fff; }}
+    .missing {{ color: #7b8794; background: #f0f4f8; }}
+    .assets {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; align-items: start; }}
+    figure {{ margin: 0; }}
+    .asset img {{ width: 100%; max-height: 480px; object-fit: contain; background: #fff; border: 1px solid #d9e2ec; border-radius: 6px; }}
+    figcaption, .asset.missing {{ font-size: 12px; color: #52606d; margin-top: 6px; }}
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Formula Second-Pass Review</h1>
+    <section class="summary">
+      <dl class="summary-grid">
+        <div><dt>Route A formulas</dt><dd>{_html_text(summary.get('route_a_formula_count'))}</dd></div>
+        <div><dt>Route B formulas</dt><dd>{_html_text(summary.get('route_b_formula_count'))}</dd></div>
+        <div><dt>Suspicious</dt><dd>{_html_text(summary.get('suspicious_formula_count'))}</dd></div>
+        <div><dt>Replaced</dt><dd>{_html_text(summary.get('replaced_count'))}</dd></div>
+        <div><dt>No match</dt><dd>{_html_text(summary.get('no_match_count'))}</dd></div>
+      </dl>
+    </section>
+    {''.join(rows)}
+  </main>
+</body>
+</html>
+"""
+    path = output_dir / "review_index.html"
+    path.write_text(html_text, encoding="utf-8")
+    return path
 
 
 def run_formula_second_pass(
@@ -432,6 +666,15 @@ def run_formula_second_pass(
     patched_md = patch_document_md(md_text, route_a_formulas, replacement_log)
     (output_dir / "document.md").write_text(patched_md, encoding="utf-8")
 
+    add_review_evidence(
+        replacement_log,
+        route_a_dir,
+        route_b_dir,
+        output_dir,
+        md_text,
+        patched_md,
+    )
+
     summary = {
         "route_a_dir": str(route_a_dir),
         "route_b_dir": str(route_b_dir),
@@ -444,6 +687,8 @@ def run_formula_second_pass(
         "replacement_log": replacement_log,
         "ok": True,
     }
+    review_path = write_review_html(output_dir, summary)
+    summary["review_html_path"] = str(review_path)
     (output_dir / "second_pass_summary.json").write_text(
         json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8"
     )
