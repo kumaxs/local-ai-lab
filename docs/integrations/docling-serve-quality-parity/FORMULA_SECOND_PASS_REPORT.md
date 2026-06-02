@@ -1,13 +1,13 @@
 # Formula Second-Pass Prototype: Final Report
 
 Date: 2026-06-02
-Scope: Minimal formula-only second-pass using Route B (VlmPipeline) as formula-candidate source.
+Scope: Minimal formula-only second-pass using Route B (VlmPipeline) as formula-candidate source, with human-reviewable evidence output.
 
 ---
 
 ## DONE
 
-- `docs/integrations/docling-serve-quality-parity/formula_only_second_pass.py` - prototype script, all py_compile checks pass.
+- `docs/integrations/docling-serve-quality-parity/formula_only_second_pass.py` - prototype script, review HTML writer, and all py_compile checks pass.
 
 ---
 
@@ -25,14 +25,16 @@ Pending final git step.
 
 ## changed
 
-- **New file**: `docs/integrations/docling-serve-quality-parity/formula_only_second_pass.py`
-- All other files: unchanged (no modifications to existing adapter, n8n, worker, or pipeline code).
+- **Updated file**: `docs/integrations/docling-serve-quality-parity/formula_only_second_pass.py`
+- Adds `review_index.html` generation beside each second-pass output.
+- Adds review evidence fields to `second_pass_summary.json`: Route A/Route B evidence links plus before/after markdown snippets.
+- No modifications to existing adapter, n8n, worker, or pipeline code.
 
 ---
 
 ## tests
 
-Validation runs completed on CN.pdf + 4 English formula PDFs. All Python files in `docs/integrations/docling-serve-quality-parity/` pass `python3 -m py_compile`. `git diff --check` is clean.
+Validation runs completed on CN.pdf + 4 English formula PDFs. All Python files in `docs/integrations/docling-serve-quality-parity/` pass `python3 -m py_compile`. `git diff --check` is clean. Generated review HTML links were parsed and all referenced CN evidence assets resolve.
 
 | PDF | Route A formulas | Route B formulas | Suspicious | Replaced | No match | OK |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -64,10 +66,23 @@ All under `.runtime/` (gitignored):
   - `document.json` (patched)
   - `document.md` (patched)
   - `second_pass_summary.json`
+  - `review_index.html`
 - transformers-gnn: `.runtime/review/docling-formula-second-pass-2026-06-02/two-col-arxiv-ai-transformers-gnn/`
 - gat: `.runtime/review/docling-formula-second-pass-2026-06-02/two-col-arxiv-ai-gat/`
 - lora: `.runtime/review/docling-formula-second-pass-2026-06-02/two-col-arxiv-ai-lora/`
 - rag: `.runtime/review/docling-formula-second-pass-2026-06-02/two-col-arxiv-ai-rag/`
+
+---
+
+## review_html_paths
+
+- CN: `.runtime/review/docling-formula-second-pass-cn-2026-06-02/CN/review_index.html`
+- transformers-gnn: `.runtime/review/docling-formula-second-pass-2026-06-02/two-col-arxiv-ai-transformers-gnn/review_index.html`
+- gat: `.runtime/review/docling-formula-second-pass-2026-06-02/two-col-arxiv-ai-gat/review_index.html`
+- lora: `.runtime/review/docling-formula-second-pass-2026-06-02/two-col-arxiv-ai-lora/review_index.html`
+- rag: `.runtime/review/docling-formula-second-pass-2026-06-02/two-col-arxiv-ai-rag/review_index.html`
+
+The CN review page includes all suspicious formulas, especially formula numbers 3, 4, 5, 7, 8, 14/equation-like `(1 4)`, and 16. Each card shows Route A text, replacement candidate or no-match status, Route A crop/context/full-page evidence, Route B full-page evidence, and before/after markdown snippets.
 
 ---
 
