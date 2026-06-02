@@ -1,6 +1,6 @@
 # Formula Second-Pass Prototype: Final Report
 
-Date: 2026-06-02
+Date: 2026-06-03
 Scope: Minimal formula-only second-pass using Route B (VlmPipeline) as formula-candidate source, with human-reviewable evidence output.
 
 ---
@@ -28,13 +28,15 @@ Pending final git step.
 - **Updated file**: `docs/integrations/docling-serve-quality-parity/formula_only_second_pass.py`
 - Adds `review_index.html` generation beside each second-pass output.
 - Adds review evidence fields to `second_pass_summary.json`: Route A/Route B evidence links plus before/after markdown snippets.
+- Adds review-only candidate sources via `--review-candidate-dir LABEL=DIR`; these candidates are shown in review output but are never patched into `document.json` or `document.md`.
+- Adds compact formula diagnostics and review notes for complex replacements and right-column no-match formulas.
 - No modifications to existing adapter, n8n, worker, or pipeline code.
 
 ---
 
 ## tests
 
-Validation runs completed on CN.pdf + 4 English formula PDFs. All Python files in `docs/integrations/docling-serve-quality-parity/` pass `python3 -m py_compile`. `git diff --check` is clean. Generated review HTML links were parsed and all referenced CN evidence assets resolve.
+Validation runs completed on CN.pdf + 4 English formula PDFs. CN used `route-a-full=.runtime/review/docling-serve-full-dir-review-2026-06-01/CN` as a review-only candidate source. All Python files in `docs/integrations/docling-serve-quality-parity/` pass `python3 -m py_compile`. `git diff --check` is clean. Generated review HTML links were parsed and all referenced CN evidence assets resolve.
 
 | PDF | Route A formulas | Route B formulas | Suspicious | Replaced | No match | OK |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -82,7 +84,9 @@ All under `.runtime/` (gitignored):
 - lora: `.runtime/review/docling-formula-second-pass-2026-06-02/two-col-arxiv-ai-lora/review_index.html`
 - rag: `.runtime/review/docling-formula-second-pass-2026-06-02/two-col-arxiv-ai-rag/review_index.html`
 
-The CN review page includes all suspicious formulas, especially formula numbers 3, 4, 5, 7, 8, 14/equation-like `(1 4)`, and 16. Each card shows Route A text, replacement candidate or no-match status, Route A crop/context/full-page evidence, Route B full-page evidence, and before/after markdown snippets.
+The CN review page includes all suspicious formulas, especially formula numbers 3, 4, 5, 7, 8, 14/equation-like `(1 4)`, and 16. Each card shows Route A text, replacement candidate or no-match status, Route A crop/context/full-page evidence, Route B full-page evidence, before/after markdown snippets, formula diagnostics, and review notes.
+
+Formula 5 now includes a review-only comparison candidate from `route-a-full`. Formulas 7 and 8 now include review-only right-column candidate attempts from `route-a-full`; these are visible for human judgement and are not written into the patched outputs.
 
 ---
 
@@ -107,6 +111,23 @@ English PDFs show **zero regressions**: no suspicious formulas detected, no fals
 
 ---
 
+## result_5
+
+Formula 5 remains patched from Route B, but the review now marks it as a complex candidate rather than a simple win. Route A quality output is an obvious hallucination with repeated `\frac{\sqrt{d}}{\sqrt{d}}`; Route B produces a full summation/fraction candidate. The review page also shows a `route-a-full` comparison candidate with similar structure but different variable placement (`c'_p`/`c'_h` vs Route B's repeated `c'_p`), so final correctness still needs visual/manual judgement against the page evidence.
+
+---
+
+## result_7_8
+
+Formulas 7 and 8 are still not patched because Route B has no matching candidates. The review now correctly flags both as right-column markers and shows review-only fallback candidates from `route-a-full`:
+
+- Formula 7 candidate: `e_{q_i -> e_p} = sum_{h=1}^{N} e_{h -> p}, Q_{i,h}=1 (7)`.
+- Formula 8 candidate: `el_{q_i -> c_p} = e_{q_i -> c_p} + l_{q_i} (8)`.
+
+These candidates are useful evidence for a future targeted right-column policy, but they are intentionally not applied in this prototype because they are not Route B candidates.
+
+---
+
 ## english_regression
 
 **None.** All 4 English PDFs (transformers-gnn, gat, lora, rag) show 0 suspicious formulas, 0 replacements. Route A formulas on English documents are clean and are kept intact.
@@ -127,8 +148,8 @@ The approach has three practical constraints to document:
 
 ## next
 
-1. **Test on 2-3 more English formula-heavy PDFs** to confirm zero-regression holds across diverse paper styles (e.g., IEEE, NeurIPS, ACL layouts).
+1. **Decide whether review-only `route-a-full` candidates can become a guarded fallback** for right-column no-match formulas, or whether a fresh targeted right-column VLM/crop pass is required.
 2. **Add equation-number restoration** to the markdown replacer for formulas without `main_eq`; currently formula (16) markdown loses `(16)`.
-3. **Investigate right-column formula candidates**: Route B fails on CN.pdf right-column (formulas 7, 8). Consider a targeted right-column crop pass or improved CN VLM conversion.
-4. **Production integration decision**: if the approach is approved, wire `formula_only_second_pass.py` as a post-processing step after `quality_parity_adapter.py` in the n8n job chain, calling Route B VLM only for formula nodes flagged as suspicious by the adapter.
+3. **Resolve formula 5 manually** by comparing Route B and `route-a-full` candidates against the page crop/full-page evidence.
+4. **Production integration decision**: if approved, keep Route A as the backbone and call candidate sources only for formula nodes flagged as suspicious.
 5. **Do not commit** `.runtime/` outputs, model caches, or batch logs.

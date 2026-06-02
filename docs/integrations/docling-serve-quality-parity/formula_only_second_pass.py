@@ -41,6 +41,7 @@ REPEATED_SINGLE_RE = re.compile(r"(\\ [a-zA-Z]\s*){4,}")
 MIN_BBOX_AREA = 50.0  # PDF points^2
 # Route B uses ~2x pixel scale (1190x1684 for a PDF page 595x842)
 PIXEL_SCALE = 2.0
+RIGHT_COLUMN_X_PX = 650.0
 
 
 def load_json(path: Path) -> dict[str, Any] | None:
@@ -147,6 +148,17 @@ def formula_horizontal_center(bbox: dict[str, float]) -> float:
     return (bbox["l"] + bbox["r"]) / 2
 
 
+def _formula_bbox_summary(bbox: dict[str, float] | None) -> dict[str, float] | None:
+    if bbox is None:
+        return None
+    return {
+        "x_center": round(formula_horizontal_center(bbox), 2),
+        "y_center": round(formula_vertical_center(bbox), 2),
+        "width": round(abs(bbox["r"] - bbox["l"]), 2),
+        "height": round(abs(bbox["b"] - bbox["t"]), 2),
+    }
+
+
 def _formula_asset_links(output_dir: Path, source_dir: Path, formula_no: int | None, page_no: int | None) -> dict[str, str | None]:
     """Return output-relative links to available source evidence assets."""
     links: dict[str, str | None] = {
@@ -184,6 +196,12 @@ def _html_text(value: Any) -> str:
     return html.escape("" if value is None else str(value))
 
 
+def _truncate_review_text(text: str, limit: int = 1200) -> str:
+    if len(text) <= limit:
+        return text
+    return text[:limit] + "\n...[truncated for review]..."
+
+
 def is_suspicious(f: dict[str, Any]) -> list[str]:
     """Return list of suspicion reasons, empty if formula looks OK."""
     reasons: list[str] = []
@@ -213,6 +231,48 @@ def is_suspicious(f: dict[str, Any]) -> list[str]:
 def text_similarity(a: str, b: str) -> float:
     """Return SequenceMatcher ratio between two strings."""
     return SequenceMatcher(None, a, b).ratio()
+
+
+def formula_diagnostics(formula_text: str | None) -> dict[str, Any]:
+    """Return lightweight review diagnostics for formula text."""
+    text = formula_text or ""
+    return {
+        "char_count": len(text),
+        "eq_numbers": _extract_eq_numbers_from_text(text),
+        "frac_count": text.count(chr(92) + "frac"),
+        "sqrt_count": text.count(chr(92) + "sqrt"),
+        "sum_count": text.count(chr(92) + "sum"),
+        "cjk_count": len(CJK_RE.findall(text)),
+        "repeated_and_count": text.count(chr(92) + " \\ a n d"),
+    }
+
+
+def review_notes(entry: dict[str, Any]) -> list[str]:
+    """Human-facing notes for formulas needing careful inspection."""
+    notes: list[str] = []
+    if entry.get("status") != "replaced":
+        notes.append("No Route B replacement was applied; Route A output is preserved.")
+    if entry.get("right_column_likely"):
+        notes.append("Right-column formula marker: inspect full-page evidence and any review-only fallback candidates.")
+    candidate_diag = entry.get("candidate_diagnostics") or {}
+    if candidate_diag.get("char_count", 0) > 400 or candidate_diag.get("frac_count", 0) >= 3:
+        notes.append("Complex candidate: judge against the crop/page evidence before treating it as correct.")
+    if entry.get("eq_number") is None:
+        notes.append("No clean equation number was extracted from Route A text; markdown matching used content prefix/proximity.")
+    if entry.get("review_candidate_attempts"):
+        notes.append("Review-only candidate attempts are not written into document.json or document.md.")
+    return notes
+
+
+def needs_review_candidate_attempts(entry: dict[str, Any]) -> bool:
+    """Limit fallback attempts to unresolved formulas and hard replacements."""
+    if entry.get("status") != "replaced":
+        return True
+    candidate_diag = entry.get("candidate_diagnostics") or {}
+    return bool(
+        candidate_diag.get("char_count", 0) > 400
+        or candidate_diag.get("frac_count", 0) >= 3
+    )
 
 
 def match_route_b_to_route_a(
@@ -295,6 +355,100 @@ def match_route_b_to_route_a(
             used_b_indices.add(id(best_sim_cf))
 
     return matches
+
+
+def parse_review_candidate_arg(value: str) -> tuple[str, Path]:
+    """Parse LABEL=PATH or PATH into a review-candidate source."""
+    if "=" in value:
+        label, path = value.split("=", 1)
+        label = label.strip() or Path(path).name
+        return label, Path(path)
+    path = Path(value)
+    return path.name, path
+
+
+def load_review_candidate_sources(values: list[str]) -> list[dict[str, Any]]:
+    """Load optional review-only formula candidate sources."""
+    sources: list[dict[str, Any]] = []
+    for value in values:
+        label, source_dir = parse_review_candidate_arg(value)
+        doc = load_json(source_dir / "document.json")
+        if doc is None:
+            sources.append({
+                "label": label,
+                "source_dir": source_dir,
+                "formulas": [],
+                "error": f"document.json not found: {source_dir}",
+            })
+            continue
+        formulas = extract_formulas(doc)
+        for formula_no, formula in enumerate(formulas, start=1):
+            formula["formula_no"] = formula_no
+        sources.append({
+            "label": label,
+            "source_dir": source_dir,
+            "formulas": formulas,
+            "error": None,
+        })
+    return sources
+
+
+def find_review_candidate_attempts(
+    entry: dict[str, Any],
+    sources: list[dict[str, Any]],
+    output_dir: Path,
+) -> list[dict[str, Any]]:
+    """Find review-only candidates for unresolved or hard-to-judge formulas."""
+    attempts: list[dict[str, Any]] = []
+    eq_num = entry.get("eq_number")
+    page_no = entry.get("page_no")
+    bbox_summary = entry.get("route_a_bbox") or {}
+    right_column = bool(entry.get("right_column_likely"))
+
+    for source in sources:
+        if source.get("error"):
+            attempts.append({
+                "source": source["label"],
+                "status": "source_error",
+                "message": source["error"],
+            })
+            continue
+
+        candidates = []
+        for formula in source["formulas"]:
+            if formula.get("page_no") != page_no:
+                continue
+            match_reason: str | None = None
+            if eq_num is not None and formula.get("main_eq") == eq_num:
+                match_reason = "same_page_equation_number"
+            elif right_column and formula.get("bbox_norm") and bbox_summary:
+                source_bbox = formula.get("bbox_norm")
+                y_dist = abs(formula_vertical_center(source_bbox) - float(bbox_summary.get("y_center", 0)))
+                x_center = formula_horizontal_center(source_bbox)
+                if x_center >= RIGHT_COLUMN_X_PX and y_dist < 80:
+                    match_reason = "right_column_vertical_proximity"
+            if not match_reason:
+                continue
+            text = formula.get("text", "")
+            candidates.append({
+                "source": source["label"],
+                "source_dir": str(source["source_dir"]),
+                "formula_no": formula.get("formula_no"),
+                "page_no": formula.get("page_no"),
+                "eq_number": formula.get("main_eq"),
+                "match_reason": match_reason,
+                "bbox": _formula_bbox_summary(formula.get("bbox_norm")),
+                "text": text,
+                "diagnostics": formula_diagnostics(text),
+                "evidence": _formula_asset_links(
+                    output_dir,
+                    source["source_dir"],
+                    formula.get("formula_no"),
+                    formula.get("page_no"),
+                ),
+            })
+        attempts.extend(candidates[:3])
+    return attempts
 
 
 def _patch_node_text(node: dict[str, Any], new_text: str) -> None:
@@ -425,9 +579,11 @@ def patch_document_json(
                 "route_a_text": af["text"],
                 "page_no": af["page_no"],
                 "eq_number": af["main_eq"],
+                "route_a_bbox": _formula_bbox_summary(af.get("bbox_norm")),
                 "reasons": reasons,
                 "route_b_candidate": None,
                 "route_b_formula_no": None,
+                "candidate_diagnostics": formula_diagnostics(None),
                 "status": "suspicious_no_route_b_match",
             })
             continue
@@ -441,9 +597,11 @@ def patch_document_json(
                 "route_a_text": af["text"],
                 "page_no": af["page_no"],
                 "eq_number": af["main_eq"],
+                "route_a_bbox": _formula_bbox_summary(af.get("bbox_norm")),
                 "reasons": reasons,
                 "route_b_candidate": None,
                 "route_b_formula_no": bf.get("formula_no"),
+                "candidate_diagnostics": formula_diagnostics(None),
                 "status": "route_b_also_empty",
             })
             continue
@@ -455,9 +613,11 @@ def patch_document_json(
             "route_a_text": af["text"],
             "page_no": af["page_no"],
             "eq_number": af["main_eq"],
+            "route_a_bbox": _formula_bbox_summary(af.get("bbox_norm")),
             "reasons": reasons,
             "route_b_candidate": route_b_text,
             "route_b_formula_no": bf.get("formula_no"),
+            "candidate_diagnostics": formula_diagnostics(route_b_text),
             "status": "replaced",
         })
 
@@ -468,6 +628,7 @@ def add_review_evidence(
     replacement_log: list[dict[str, Any]],
     route_a_dir: Path,
     route_b_dir: Path,
+    review_candidate_sources: list[dict[str, Any]],
     output_dir: Path,
     before_md: str,
     after_md: str,
@@ -484,9 +645,21 @@ def add_review_evidence(
         entry["route_b_evidence"] = _formula_asset_links(
             output_dir, route_b_dir, entry.get("route_b_formula_no"), page_no
         )
+        bbox = entry.get("route_a_bbox") or {}
+        entry["right_column_likely"] = bool(bbox.get("x_center", 0) >= RIGHT_COLUMN_X_PX)
+        entry["route_a_diagnostics"] = formula_diagnostics(route_a_text)
         entry["markdown_before"] = _find_markdown_block(before_md, route_a_text, eq_num)
         after_probe = route_b_text if entry.get("status") == "replaced" else route_a_text
         entry["markdown_after"] = _find_markdown_block(after_md, after_probe, eq_num)
+        if needs_review_candidate_attempts(entry):
+            entry["review_candidate_attempts"] = find_review_candidate_attempts(
+                entry,
+                review_candidate_sources,
+                output_dir,
+            )
+        else:
+            entry["review_candidate_attempts"] = []
+        entry["review_notes"] = review_notes(entry)
 
 
 def _render_asset_link(label: str, href: str | None) -> str:
@@ -505,6 +678,66 @@ def _render_image(label: str, href: str | None) -> str:
     )
 
 
+def _render_diagnostics(diag: dict[str, Any] | None) -> str:
+    if not diag:
+        return "<span class=\"missing\">none</span>"
+    items = [
+        ("chars", diag.get("char_count")),
+        ("eq", ", ".join(str(x) for x in diag.get("eq_numbers") or []) or "none"),
+        ("frac", diag.get("frac_count")),
+        ("sqrt", diag.get("sqrt_count")),
+        ("sum", diag.get("sum_count")),
+        ("cjk", diag.get("cjk_count")),
+    ]
+    return "".join(
+        f"<span class=\"metric\"><strong>{html.escape(label)}</strong> {_html_text(value)}</span>"
+        for label, value in items
+    )
+
+
+def _render_notes(notes: list[str]) -> str:
+    if not notes:
+        return "<p class=\"quiet\">No extra review notes.</p>"
+    return "<ul class=\"notes\">" + "".join(f"<li>{_html_text(note)}</li>" for note in notes) + "</ul>"
+
+
+def _render_candidate_attempts(attempts: list[dict[str, Any]]) -> str:
+    if not attempts:
+        return "<p class=\"quiet\">No review-only fallback candidates found.</p>"
+    rendered = []
+    for attempt in attempts:
+        if attempt.get("status") == "source_error":
+            rendered.append(
+                f"<div class=\"attempt\"><h4>{_html_text(attempt.get('source'))}</h4>"
+                f"<p class=\"missing\">{_html_text(attempt.get('message'))}</p></div>"
+            )
+            continue
+        ev = attempt.get("evidence") or {}
+        rendered.append(f"""
+<div class="attempt">
+  <h4>{_html_text(attempt.get('source'))} formula {_html_text(attempt.get('formula_no'))}</h4>
+  <dl class="meta compact">
+    <div><dt>Match</dt><dd>{_html_text(attempt.get('match_reason'))}</dd></div>
+    <div><dt>Equation</dt><dd>{_html_text(attempt.get('eq_number'))}</dd></div>
+    <div><dt>BBox</dt><dd>{_html_text(attempt.get('bbox'))}</dd></div>
+  </dl>
+  <div class="diagnostics">{_render_diagnostics(attempt.get('diagnostics'))}</div>
+  <pre>{_html_text(_truncate_review_text(attempt.get('text') or ''))}</pre>
+  <div class="links">
+    {_render_asset_link('Candidate review index', ev.get('source_review'))}
+    {_render_asset_link('Candidate full page', ev.get('full_page'))}
+    {_render_asset_link('Candidate crop', ev.get('formula_crop'))}
+    {_render_asset_link('Candidate context crop', ev.get('formula_context'))}
+  </div>
+  <div class="assets">
+    {_render_image('Candidate formula crop', ev.get('formula_crop'))}
+    {_render_image('Candidate context crop', ev.get('formula_context'))}
+  </div>
+</div>
+""")
+    return "".join(rendered)
+
+
 def write_review_html(output_dir: Path, summary: dict[str, Any]) -> Path:
     """Write a human-reviewable HTML page for formula replacements."""
     rows = []
@@ -516,6 +749,7 @@ def write_review_html(output_dir: Path, summary: dict[str, Any]) -> Path:
         route_a_ev = entry.get("route_a_evidence") or {}
         route_b_ev = entry.get("route_b_evidence") or {}
         reasons = ", ".join(entry.get("reasons") or [])
+        right_col = "yes" if entry.get("right_column_likely") else "no"
         rows.append(f"""
 <section class="formula-card" id="formula-{_html_text(entry.get('formula_no'))}">
   <header>
@@ -526,15 +760,21 @@ def write_review_html(output_dir: Path, summary: dict[str, Any]) -> Path:
     <div><dt>Page</dt><dd>{_html_text(entry.get('page_no'))}</dd></div>
     <div><dt>Reasons</dt><dd>{_html_text(reasons)}</dd></div>
     <div><dt>Route B formula</dt><dd>{_html_text(entry.get('route_b_formula_no'))}</dd></div>
+    <div><dt>Right column</dt><dd>{_html_text(right_col)}</dd></div>
+    <div><dt>Route A bbox</dt><dd>{_html_text(entry.get('route_a_bbox'))}</dd></div>
   </dl>
+  <h3>Review Notes</h3>
+  {_render_notes(entry.get('review_notes') or [])}
   <div class="compare">
     <div>
       <h3>Route A Formula Text</h3>
-      <pre>{_html_text(entry.get('route_a_text'))}</pre>
+      <div class="diagnostics">{_render_diagnostics(entry.get('route_a_diagnostics'))}</div>
+      <pre>{_html_text(_truncate_review_text(entry.get('route_a_text') or ''))}</pre>
     </div>
     <div>
       <h3>Replacement Candidate</h3>
-      <pre>{_html_text(entry.get('route_b_candidate') or 'NO ROUTE B MATCH')}</pre>
+      <div class="diagnostics">{_render_diagnostics(entry.get('candidate_diagnostics'))}</div>
+      <pre>{_html_text(_truncate_review_text(entry.get('route_b_candidate') or 'NO ROUTE B MATCH'))}</pre>
     </div>
   </div>
   <div class="compare">
@@ -562,6 +802,8 @@ def write_review_html(output_dir: Path, summary: dict[str, Any]) -> Path:
     {_render_image('Route A full page', route_a_ev.get('full_page'))}
     {_render_image('Route B full page', route_b_ev.get('full_page'))}
   </div>
+  <h3>Review-Only Candidate Attempts</h3>
+  {_render_candidate_attempts(entry.get('review_candidate_attempts') or [])}
 </section>
 """)
 
@@ -586,6 +828,7 @@ def write_review_html(output_dir: Path, summary: dict[str, Any]) -> Path:
     h3 {{ margin: 18px 0 8px; font-size: 14px; text-transform: uppercase; color: #52606d; }}
     .summary, .formula-card {{ background: #fff; border: 1px solid #d9e2ec; border-radius: 8px; padding: 18px; margin-bottom: 18px; }}
     .summary-grid, .meta {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 12px; }}
+    .meta.compact {{ grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); }}
     dt {{ color: #52606d; font-size: 12px; text-transform: uppercase; }}
     dd {{ margin: 4px 0 0; font-weight: 600; }}
     header {{ display: flex; justify-content: space-between; gap: 16px; align-items: center; }}
@@ -602,6 +845,12 @@ def write_review_html(output_dir: Path, summary: dict[str, Any]) -> Path:
     figure {{ margin: 0; }}
     .asset img {{ width: 100%; max-height: 480px; object-fit: contain; background: #fff; border: 1px solid #d9e2ec; border-radius: 6px; }}
     figcaption, .asset.missing {{ font-size: 12px; color: #52606d; margin-top: 6px; }}
+    .diagnostics {{ display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px; }}
+    .metric {{ border: 1px solid #d9e2ec; border-radius: 999px; padding: 4px 8px; font-size: 12px; color: #334e68; background: #fff; }}
+    .notes {{ margin: 0 0 8px 18px; padding: 0; color: #334e68; }}
+    .quiet {{ color: #7b8794; }}
+    .attempt {{ border: 1px dashed #bcccdc; border-radius: 8px; padding: 12px; margin-top: 10px; background: #fbfcfd; }}
+    .attempt h4 {{ margin: 0 0 10px; font-size: 15px; }}
   </style>
 </head>
 <body>
@@ -630,9 +879,11 @@ def run_formula_second_pass(
     route_a_dir: Path,
     route_b_dir: Path,
     output_dir: Path,
+    review_candidate_args: list[str] | None = None,
 ) -> dict[str, Any]:
     """Run the formula-only second pass on a single document."""
     output_dir.mkdir(parents=True, exist_ok=True)
+    review_candidate_sources = load_review_candidate_sources(review_candidate_args or [])
 
     route_a_doc = load_json(route_a_dir / "document.json")
     route_b_doc = load_json(route_b_dir / "document.json")
@@ -670,6 +921,7 @@ def run_formula_second_pass(
         replacement_log,
         route_a_dir,
         route_b_dir,
+        review_candidate_sources,
         output_dir,
         md_text,
         patched_md,
@@ -684,6 +936,15 @@ def run_formula_second_pass(
         "suspicious_formula_count": suspicious_count,
         "replaced_count": replaced_count,
         "no_match_count": no_match_count,
+        "review_candidate_sources": [
+            {
+                "label": source["label"],
+                "source_dir": str(source["source_dir"]),
+                "formula_count": len(source["formulas"]),
+                "error": source.get("error"),
+            }
+            for source in review_candidate_sources
+        ],
         "replacement_log": replacement_log,
         "ok": True,
     }
@@ -716,12 +977,26 @@ def parse_args() -> argparse.Namespace:
         required=True,
         help="Output directory for merged document.",
     )
+    parser.add_argument(
+        "--review-candidate-dir",
+        action="append",
+        default=[],
+        help=(
+            "Optional review-only formula candidate source as LABEL=DIR or DIR. "
+            "Candidates are shown in review HTML but never patched into outputs."
+        ),
+    )
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
-    result = run_formula_second_pass(args.route_a_dir, args.route_b_dir, args.output_dir)
+    result = run_formula_second_pass(
+        args.route_a_dir,
+        args.route_b_dir,
+        args.output_dir,
+        args.review_candidate_dir,
+    )
     print(json.dumps(result, indent=2, ensure_ascii=False))
     return 0 if result.get("ok") else 1
 
