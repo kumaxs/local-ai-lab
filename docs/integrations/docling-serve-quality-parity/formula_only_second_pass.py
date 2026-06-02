@@ -250,6 +250,9 @@ def formula_diagnostics(formula_text: str | None) -> dict[str, Any]:
 def review_notes(entry: dict[str, Any]) -> list[str]:
     """Human-facing notes for formulas needing careful inspection."""
     notes: list[str] = []
+    candidate_source = entry.get("candidate_source")
+    if candidate_source == "guarded_fallback":
+        notes.append("Guarded route-a-full fallback applied from reviewed equation allowlist.")
     if entry.get("status") != "replaced":
         notes.append("No Route B replacement was applied; Route A output is preserved.")
     if entry.get("right_column_likely"):
@@ -391,6 +394,23 @@ def load_review_candidate_sources(values: list[str]) -> list[dict[str, Any]]:
             "error": None,
         })
     return sources
+
+
+def find_source_formula_by_eq(
+    sources: list[dict[str, Any]],
+    page_no: int | None,
+    eq_num: int | None,
+) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    """Find the first source formula with the same page and equation number."""
+    if eq_num is None:
+        return None
+    for source in sources:
+        if source.get("error"):
+            continue
+        for formula in source["formulas"]:
+            if formula.get("page_no") == page_no and formula.get("main_eq") == eq_num:
+                return source, formula
+    return None
 
 
 def find_review_candidate_attempts(
@@ -553,6 +573,8 @@ def patch_document_md(
 def patch_document_json(
     route_a_doc: dict[str, Any],
     route_b_formulas: list[dict[str, Any]],
+    guarded_fallback_sources: list[dict[str, Any]] | None = None,
+    guarded_fallback_eqs: set[int] | None = None,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     """Patch formula text in Route A document.json with Route B candidates.
 
@@ -564,6 +586,8 @@ def patch_document_json(
     for formula_no, formula in enumerate(route_b_formulas, start=1):
         formula["formula_no"] = formula_no
     matches = match_route_b_to_route_a(route_a_formulas, route_b_formulas)
+    guarded_fallback_sources = guarded_fallback_sources or []
+    guarded_fallback_eqs = guarded_fallback_eqs or set()
 
     log: list[dict[str, Any]] = []
 
@@ -571,6 +595,40 @@ def patch_document_json(
         reasons = is_suspicious(af)
         if not reasons:
             continue
+
+        fallback_match = None
+        if af.get("main_eq") in guarded_fallback_eqs:
+            fallback_match = find_source_formula_by_eq(
+                guarded_fallback_sources,
+                af.get("page_no"),
+                af.get("main_eq"),
+            )
+
+        if fallback_match is not None:
+            source, fallback_formula = fallback_match
+            fallback_text = fallback_formula.get("text", "")
+            if not fallback_text.strip():
+                fallback_match = None
+            else:
+                _patch_node_text(af["node"], fallback_text)
+                log.append({
+                    "index": i,
+                    "formula_no": af.get("formula_no"),
+                    "route_a_text": af["text"],
+                    "page_no": af["page_no"],
+                    "eq_number": af["main_eq"],
+                    "route_a_bbox": _formula_bbox_summary(af.get("bbox_norm")),
+                    "reasons": reasons,
+                    "route_b_candidate": fallback_text,
+                    "route_b_formula_no": None,
+                    "candidate_source": "guarded_fallback",
+                    "candidate_source_label": source["label"],
+                    "candidate_source_dir": str(source["source_dir"]),
+                    "candidate_formula_no": fallback_formula.get("formula_no"),
+                    "candidate_diagnostics": formula_diagnostics(fallback_text),
+                    "status": "replaced",
+                })
+                continue
 
         if i not in matches:
             log.append({
@@ -583,6 +641,9 @@ def patch_document_json(
                 "reasons": reasons,
                 "route_b_candidate": None,
                 "route_b_formula_no": None,
+                "candidate_source": None,
+                "candidate_source_label": None,
+                "candidate_formula_no": None,
                 "candidate_diagnostics": formula_diagnostics(None),
                 "status": "suspicious_no_route_b_match",
             })
@@ -601,6 +662,9 @@ def patch_document_json(
                 "reasons": reasons,
                 "route_b_candidate": None,
                 "route_b_formula_no": bf.get("formula_no"),
+                "candidate_source": "route_b",
+                "candidate_source_label": "route_b",
+                "candidate_formula_no": bf.get("formula_no"),
                 "candidate_diagnostics": formula_diagnostics(None),
                 "status": "route_b_also_empty",
             })
@@ -617,6 +681,9 @@ def patch_document_json(
             "reasons": reasons,
             "route_b_candidate": route_b_text,
             "route_b_formula_no": bf.get("formula_no"),
+            "candidate_source": "route_b",
+            "candidate_source_label": "route_b",
+            "candidate_formula_no": bf.get("formula_no"),
             "candidate_diagnostics": formula_diagnostics(route_b_text),
             "status": "replaced",
         })
@@ -645,6 +712,15 @@ def add_review_evidence(
         entry["route_b_evidence"] = _formula_asset_links(
             output_dir, route_b_dir, entry.get("route_b_formula_no"), page_no
         )
+        if entry.get("candidate_source") == "guarded_fallback" and entry.get("candidate_source_dir"):
+            entry["replacement_evidence"] = _formula_asset_links(
+                output_dir,
+                Path(str(entry["candidate_source_dir"])),
+                entry.get("candidate_formula_no"),
+                page_no,
+            )
+        else:
+            entry["replacement_evidence"] = entry["route_b_evidence"]
         bbox = entry.get("route_a_bbox") or {}
         entry["right_column_likely"] = bool(bbox.get("x_center", 0) >= RIGHT_COLUMN_X_PX)
         entry["route_a_diagnostics"] = formula_diagnostics(route_a_text)
@@ -666,6 +742,24 @@ def _render_asset_link(label: str, href: str | None) -> str:
     if not href:
         return f"<span class=\"missing\">{html.escape(label)} missing</span>"
     return f"<a href=\"{html.escape(href)}\">{html.escape(label)}</a>"
+
+
+def _math_body(text: str | None) -> str:
+    """Return a MathJax-friendly body while preserving raw text elsewhere."""
+    body = (text or "").strip()
+    if body.startswith("$$") and body.endswith("$$"):
+        body = body[2:-2].strip()
+    return body
+
+
+def _render_math(label: str, text: str | None) -> str:
+    body = _math_body(text)
+    if not body or body == "NO ROUTE B MATCH" or body == "No markdown block found":
+        return f"<div class=\"math-render missing\">{html.escape(label)} unavailable</div>"
+    return (
+        f"<div class=\"math-render\" aria-label=\"{html.escape(label)}\">"
+        f"\\[{html.escape(body)}\\]</div>"
+    )
 
 
 def _render_image(label: str, href: str | None) -> str:
@@ -722,6 +816,7 @@ def _render_candidate_attempts(attempts: list[dict[str, Any]]) -> str:
     <div><dt>BBox</dt><dd>{_html_text(attempt.get('bbox'))}</dd></div>
   </dl>
   <div class="diagnostics">{_render_diagnostics(attempt.get('diagnostics'))}</div>
+  {_render_math('candidate attempt rendered math', attempt.get('text'))}
   <pre>{_html_text(_truncate_review_text(attempt.get('text') or ''))}</pre>
   <div class="links">
     {_render_asset_link('Candidate review index', ev.get('source_review'))}
@@ -748,8 +843,10 @@ def write_review_html(output_dir: Path, summary: dict[str, Any]) -> Path:
             title += f" / equation ({eq})"
         route_a_ev = entry.get("route_a_evidence") or {}
         route_b_ev = entry.get("route_b_evidence") or {}
+        replacement_ev = entry.get("replacement_evidence") or {}
         reasons = ", ".join(entry.get("reasons") or [])
         right_col = "yes" if entry.get("right_column_likely") else "no"
+        candidate_label = entry.get("candidate_source_label") or entry.get("candidate_source") or "none"
         rows.append(f"""
 <section class="formula-card" id="formula-{_html_text(entry.get('formula_no'))}">
   <header>
@@ -760,6 +857,7 @@ def write_review_html(output_dir: Path, summary: dict[str, Any]) -> Path:
     <div><dt>Page</dt><dd>{_html_text(entry.get('page_no'))}</dd></div>
     <div><dt>Reasons</dt><dd>{_html_text(reasons)}</dd></div>
     <div><dt>Route B formula</dt><dd>{_html_text(entry.get('route_b_formula_no'))}</dd></div>
+    <div><dt>Replacement source</dt><dd>{_html_text(candidate_label)}</dd></div>
     <div><dt>Right column</dt><dd>{_html_text(right_col)}</dd></div>
     <div><dt>Route A bbox</dt><dd>{_html_text(entry.get('route_a_bbox'))}</dd></div>
   </dl>
@@ -769,21 +867,25 @@ def write_review_html(output_dir: Path, summary: dict[str, Any]) -> Path:
     <div>
       <h3>Route A Formula Text</h3>
       <div class="diagnostics">{_render_diagnostics(entry.get('route_a_diagnostics'))}</div>
+      {_render_math('Route A rendered math', entry.get('route_a_text'))}
       <pre>{_html_text(_truncate_review_text(entry.get('route_a_text') or ''))}</pre>
     </div>
     <div>
       <h3>Replacement Candidate</h3>
       <div class="diagnostics">{_render_diagnostics(entry.get('candidate_diagnostics'))}</div>
+      {_render_math('Replacement candidate rendered math', entry.get('route_b_candidate') or 'NO ROUTE B MATCH')}
       <pre>{_html_text(_truncate_review_text(entry.get('route_b_candidate') or 'NO ROUTE B MATCH'))}</pre>
     </div>
   </div>
   <div class="compare">
     <div>
       <h3>Before Markdown Snippet</h3>
+      {_render_math('Before markdown rendered math', entry.get('markdown_before'))}
       <pre>{_html_text(entry.get('markdown_before') or 'No markdown block found')}</pre>
     </div>
     <div>
       <h3>After Markdown Snippet</h3>
+      {_render_math('After markdown rendered math', entry.get('markdown_after'))}
       <pre>{_html_text(entry.get('markdown_after') or 'No markdown block found')}</pre>
     </div>
   </div>
@@ -795,6 +897,8 @@ def write_review_html(output_dir: Path, summary: dict[str, Any]) -> Path:
     {_render_asset_link('Route A context crop', route_a_ev.get('formula_context'))}
     {_render_asset_link('Route B review index', route_b_ev.get('source_review'))}
     {_render_asset_link('Route B full page', route_b_ev.get('full_page'))}
+    {_render_asset_link('Replacement source review index', replacement_ev.get('source_review'))}
+    {_render_asset_link('Replacement source full page', replacement_ev.get('full_page'))}
   </div>
   <div class="assets">
     {_render_image('Route A formula crop', route_a_ev.get('formula_crop'))}
@@ -820,6 +924,13 @@ def write_review_html(output_dir: Path, summary: dict[str, Any]) -> Path:
 <head>
   <meta charset="utf-8">
   <title>Formula Second-Pass Review</title>
+  <script>
+    window.MathJax = {{
+      tex: {{ inlineMath: [['\\\\(', '\\\\)']], displayMath: [['\\\\[', '\\\\]']] }},
+      svg: {{ fontCache: 'global' }}
+    }};
+  </script>
+  <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-svg.js"></script>
   <style>
     body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 0; color: #1f2933; background: #f7f8fa; }}
     main {{ max-width: 1180px; margin: 0 auto; padding: 28px; }}
@@ -838,6 +949,8 @@ def write_review_html(output_dir: Path, summary: dict[str, Any]) -> Path:
     .status.clean {{ background: #e0f2fe; color: #0c4a6e; }}
     .compare {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 14px; }}
     pre {{ white-space: pre-wrap; overflow-wrap: anywhere; background: #f0f4f8; border: 1px solid #d9e2ec; border-radius: 6px; padding: 12px; font: 13px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; }}
+    .math-render {{ overflow-x: auto; background: #ffffff; border: 1px solid #d9e2ec; border-radius: 6px; padding: 10px 12px; margin: 8px 0; min-height: 24px; }}
+    .math-render.missing {{ color: #7b8794; background: #f0f4f8; font-size: 12px; }}
     .links {{ display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; }}
     .links a, .missing {{ border: 1px solid #bcccdc; border-radius: 999px; padding: 5px 10px; font-size: 12px; text-decoration: none; color: #243b53; background: #fff; }}
     .missing {{ color: #7b8794; background: #f0f4f8; }}
@@ -880,10 +993,14 @@ def run_formula_second_pass(
     route_b_dir: Path,
     output_dir: Path,
     review_candidate_args: list[str] | None = None,
+    guarded_fallback_args: list[str] | None = None,
+    guarded_fallback_eqs: set[int] | None = None,
 ) -> dict[str, Any]:
     """Run the formula-only second pass on a single document."""
     output_dir.mkdir(parents=True, exist_ok=True)
     review_candidate_sources = load_review_candidate_sources(review_candidate_args or [])
+    guarded_fallback_sources = load_review_candidate_sources(guarded_fallback_args or [])
+    combined_review_sources = review_candidate_sources + guarded_fallback_sources
 
     route_a_doc = load_json(route_a_dir / "document.json")
     route_b_doc = load_json(route_b_dir / "document.json")
@@ -898,7 +1015,12 @@ def run_formula_second_pass(
 
     suspicious_count = sum(1 for f in route_a_formulas if is_suspicious(f))
 
-    patched_doc, replacement_log = patch_document_json(route_a_doc, route_b_formulas)
+    patched_doc, replacement_log = patch_document_json(
+        route_a_doc,
+        route_b_formulas,
+        guarded_fallback_sources,
+        guarded_fallback_eqs or set(),
+    )
 
     replaced_count = sum(1 for e in replacement_log if e["status"] == "replaced")
     no_match_count = sum(
@@ -921,7 +1043,7 @@ def run_formula_second_pass(
         replacement_log,
         route_a_dir,
         route_b_dir,
-        review_candidate_sources,
+        combined_review_sources,
         output_dir,
         md_text,
         patched_md,
@@ -945,6 +1067,16 @@ def run_formula_second_pass(
             }
             for source in review_candidate_sources
         ],
+        "guarded_fallback_sources": [
+            {
+                "label": source["label"],
+                "source_dir": str(source["source_dir"]),
+                "formula_count": len(source["formulas"]),
+                "error": source.get("error"),
+            }
+            for source in guarded_fallback_sources
+        ],
+        "guarded_fallback_eqs": sorted(guarded_fallback_eqs or set()),
         "replacement_log": replacement_log,
         "ok": True,
     }
@@ -986,6 +1118,22 @@ def parse_args() -> argparse.Namespace:
             "Candidates are shown in review HTML but never patched into outputs."
         ),
     )
+    parser.add_argument(
+        "--guarded-fallback-dir",
+        action="append",
+        default=[],
+        help=(
+            "Optional guarded replacement source as LABEL=DIR or DIR. "
+            "Only equations listed with --guarded-fallback-eq may use it."
+        ),
+    )
+    parser.add_argument(
+        "--guarded-fallback-eq",
+        action="append",
+        type=int,
+        default=[],
+        help="Reviewed equation number allowed to use guarded fallback replacement.",
+    )
     return parser.parse_args()
 
 
@@ -996,6 +1144,8 @@ def main() -> int:
         args.route_b_dir,
         args.output_dir,
         args.review_candidate_dir,
+        args.guarded_fallback_dir,
+        set(args.guarded_fallback_eq),
     )
     print(json.dumps(result, indent=2, ensure_ascii=False))
     return 0 if result.get("ok") else 1
