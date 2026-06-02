@@ -28,19 +28,21 @@ Pending final git step.
 - **Updated file**: `docs/integrations/docling-serve-quality-parity/formula_only_second_pass.py`
 - Adds `review_index.html` generation beside each second-pass output.
 - Adds review evidence fields to `second_pass_summary.json`: Route A/Route B evidence links plus before/after markdown snippets.
+- Adds guarded fallback sources via `--guarded-fallback-dir LABEL=DIR` plus reviewed `--guarded-fallback-eq` allowlist.
 - Adds review-only candidate sources via `--review-candidate-dir LABEL=DIR`; these candidates are shown in review output but are never patched into `document.json` or `document.md`.
 - Adds compact formula diagnostics and review notes for complex replacements and right-column no-match formulas.
+- Adds MathJax rendering blocks for Route A text, replacement candidates, fallback candidates, and before/after markdown snippets while preserving raw LaTeX text.
 - No modifications to existing adapter, n8n, worker, or pipeline code.
 
 ---
 
 ## tests
 
-Validation runs completed on CN.pdf + 4 English formula PDFs. CN used `route-a-full=.runtime/review/docling-serve-full-dir-review-2026-06-01/CN` as a review-only candidate source. All Python files in `docs/integrations/docling-serve-quality-parity/` pass `python3 -m py_compile`. `git diff --check` is clean. Generated review HTML links were parsed and all referenced CN evidence assets resolve.
+Validation runs completed on CN.pdf + 4 English formula PDFs. CN used `route-a-full=.runtime/review/docling-serve-full-dir-review-2026-06-01/CN` as a guarded fallback source for equations 5, 7, and 8. All Python files in `docs/integrations/docling-serve-quality-parity/` pass `python3 -m py_compile`. `git diff --check` is clean. Generated review HTML links were parsed and all referenced local CN evidence assets resolve.
 
 | PDF | Route A formulas | Route B formulas | Suspicious | Replaced | No match | OK |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| CN.pdf | 24 | 16 | 7 | 5 | 2 | OK |
+| CN.pdf | 24 | 16 | 7 | 7 | 0 | OK |
 | two-col-arxiv-ai-transformers-gnn | 20 | 20 | 0 | 0 | 0 | OK |
 | two-col-arxiv-ai-gat | 6 | 6 | 0 | 0 | 0 | OK |
 | two-col-arxiv-ai-lora | 6 | 6 | 0 | 0 | 0 | OK |
@@ -52,9 +54,9 @@ CN.pdf suspicious/replaced details:
 | --- | --- | --- | --- | --- |
 | (3) | CJK `\text{...}` tail | `contains_cjk` | `w_t = softmax([...])` | **Replaced** |
 | (4) | Only `( 4 )`, no body | `number_only_missing_body` | `l_i = O(l_i) * W_l` | **Replaced** |
-| (5) | repeated `\frac{\sqrt{d}}{\sqrt{d}}` hallucination | `repeated_frac_hallucination` | `r_{h->p} = sum(...)` | **Replaced** |
-| (7) | Number-only `( 7 )` | `number_only_missing_body` | none | No match |
-| (8) | Number-only `( 8 )` | `number_only_missing_body` | none | No match |
+| (5) | repeated `\frac{\sqrt{d}}{\sqrt{d}}` hallucination | `repeated_frac_hallucination` | route-a-full guarded fallback | **Replaced** |
+| (7) | Number-only `( 7 )` | `number_only_missing_body` | route-a-full guarded fallback | **Replaced** |
+| (8) | Number-only `( 8 )` | `number_only_missing_body` | route-a-full guarded fallback | **Replaced** |
 | (13) | CJK contamination in formula text | `contains_cjk` | `qr_i = ReLU([...])` | **Replaced** |
 | (16) | `\and\and\and...` hallucination (many repeats) | `repeated_and_hallucination` | `w_i = h_i / sum_k` | **Replaced** |
 
@@ -84,15 +86,15 @@ All under `.runtime/` (gitignored):
 - lora: `.runtime/review/docling-formula-second-pass-2026-06-02/two-col-arxiv-ai-lora/review_index.html`
 - rag: `.runtime/review/docling-formula-second-pass-2026-06-02/two-col-arxiv-ai-rag/review_index.html`
 
-The CN review page includes all suspicious formulas, especially formula numbers 3, 4, 5, 7, 8, 14/equation-like `(1 4)`, and 16. Each card shows Route A text, replacement candidate or no-match status, Route A crop/context/full-page evidence, Route B full-page evidence, before/after markdown snippets, formula diagnostics, and review notes.
+The CN review page includes all suspicious formulas, especially formula numbers 3, 4, 5, 7, 8, 14/equation-like `(1 4)`, and 16. Each card shows Route A text, replacement candidate/source, Route A crop/context/full-page evidence, Route B full-page evidence, before/after markdown snippets, formula diagnostics, review notes, rendered MathJax math, and raw LaTeX text.
 
-Formula 5 now includes a review-only comparison candidate from `route-a-full`. Formulas 7 and 8 now include review-only right-column candidate attempts from `route-a-full`; these are visible for human judgement and are not written into the patched outputs.
+Formula 5 now uses the guarded `route-a-full` fallback. Formulas 7 and 8 now use guarded right-column fallback candidates from `route-a-full`; these are written into the patched JSON/markdown only because they are explicitly allowlisted.
 
 ---
 
 ## best_result
 
-CN.pdf: 5 of 7 suspicious formulas replaced when using the quality Route A output as the document backbone and Route B only as the formula-candidate source. The 2 unresolved cases (formulas 7 and 8) are right-column number-only placeholders that Route B also fails to detect. All 4 key target formulas from the feasibility report - (3), (4), (5), (16) - are resolved.
+CN.pdf: 7 of 7 suspicious formulas replaced when using the quality Route A output as the document backbone. Route B remains the formula source for formulas 3, 4, 14, and 16. Guarded `route-a-full` fallback is used only for reviewed equations 5, 7, and 8.
 
 Key detection patterns that work:
 
@@ -103,9 +105,10 @@ Key detection patterns that work:
 
 Key matching strategies:
 
-1. **Equation number match** (primary): `(page, eq_number)` match from Route A formula text to Route B formula text. Works for formulas (3), (4), (5).
+1. **Equation number match** (primary): `(page, eq_number)` match from Route A formula text to Route B formula text. Works for formulas (3), (4).
 2. **Vertical-center proximity** (fallback): Convert Route A BOTTOMLEFT PDF coords to Route B TOPLEFT pixel space, match by vertical center within 100px threshold. Critical for formulas (13) and (16) where Route B omits equation numbers.
-3. **Content-prefix fallback** (markdown only): for formulas without eq_numbers in Route A text, match the markdown `$$...$$` block by the formula's first 30 characters.
+3. **Guarded route-a-full fallback**: explicit reviewed equation allowlist for CN formulas 5, 7, and 8.
+4. **Content-prefix fallback** (markdown only): for formulas without eq_numbers in Route A text, match the markdown `$$...$$` block by the formula's first 30 characters.
 
 English PDFs show **zero regressions**: no suspicious formulas detected, no false replacements, document structure preserved.
 
@@ -113,18 +116,24 @@ English PDFs show **zero regressions**: no suspicious formulas detected, no fals
 
 ## result_5
 
-Formula 5 remains patched from Route B, but the review now marks it as a complex candidate rather than a simple win. Route A quality output is an obvious hallucination with repeated `\frac{\sqrt{d}}{\sqrt{d}}`; Route B produces a full summation/fraction candidate. The review page also shows a `route-a-full` comparison candidate with similar structure but different variable placement (`c'_p`/`c'_h` vs Route B's repeated `c'_p`), so final correctness still needs visual/manual judgement against the page evidence.
+Formula 5 is now patched from guarded `route-a-full`, not Route B. Route A quality output is an obvious hallucination with repeated `\frac{\sqrt{d}}{\sqrt{d}}`; Route B produced a plausible but wrong candidate that repeated the `p` subscript where manual review confirmed `h` was needed. The guarded fallback now uses the reviewed `route-a-full` candidate.
 
 ---
 
 ## result_7_8
 
-Formulas 7 and 8 are still not patched because Route B has no matching candidates. The review now correctly flags both as right-column markers and shows review-only fallback candidates from `route-a-full`:
+Formulas 7 and 8 are now patched from guarded `route-a-full` because Route B has no matching candidates and manual review confirmed the right-column fallback candidates:
 
 - Formula 7 candidate: `e_{q_i -> e_p} = sum_{h=1}^{N} e_{h -> p}, Q_{i,h}=1 (7)`.
 - Formula 8 candidate: `el_{q_i -> c_p} = e_{q_i -> c_p} + l_{q_i} (8)`.
 
-These candidates are useful evidence for a future targeted right-column policy, but they are intentionally not applied in this prototype because they are not Route B candidates.
+These candidates are now applied only under the explicit reviewed allowlist; this keeps the document backbone as Route A and avoids using route-a-full as a general replacement source.
+
+---
+
+## latex_rendering
+
+`review_index.html` now loads MathJax v3 from CDN and renders Route A formula text, replacement candidates, review-only candidate attempts, and before/after markdown snippets in display math blocks. Raw LaTeX remains visible below every rendered block as the inspection fallback.
 
 ---
 
@@ -136,11 +145,11 @@ These candidates are useful evidence for a future targeted right-column policy, 
 
 ## conclusion
 
-The formula-only second-pass prototype is **viable** for the CN.pdf use case. Route B (VlmPipeline) provides materially better formula candidates than Route A for all 4 target formulas, and the matching pipeline correctly pairs them using equation numbers and vertical-center proximity. English PDFs are unaffected (no regressions).
+The formula-only second-pass prototype is **viable** for the CN.pdf use case. Route B (VlmPipeline) provides materially better formula candidates for several targets, while guarded route-a-full fallback handles reviewed CN formulas 5, 7, and 8. English PDFs are unaffected (no regressions).
 
 The approach has three practical constraints to document:
 
-1. **Right-column formulas not recovered**: formulas (7) and (8) are right-column equation numbers where Route B's VLM pipeline also failed to detect a body. No replacement is possible without a separate right-column-specific VLM pass or improving the CN.pdf VLM conversion.
+1. **Right-column formulas require guarded fallback**: formulas (7) and (8) are right-column equation numbers where Route B's VLM pipeline failed to detect a body. The current fallback is explicitly allowlisted and should not become broad replacement logic without more validation.
 2. **Route B as formula-only source**: Route B (VlmPipeline) is not safe as full-document output; it drops right-column text on CN.pdf pages 3-4 and renders pictures unreliably. The second-pass uses Route B **only** for formula text replacement, never for layout or text.
 3. **Markdown patching limitations**: formulas without embedded equation numbers (like formula 16) are patched via content-prefix matching. The patched markdown loses the equation number tag when `eq_num is None`, which is acceptable for the prototype but should be addressed in a production version.
 
@@ -148,8 +157,8 @@ The approach has three practical constraints to document:
 
 ## next
 
-1. **Decide whether review-only `route-a-full` candidates can become a guarded fallback** for right-column no-match formulas, or whether a fresh targeted right-column VLM/crop pass is required.
+1. **Generalize guarded fallback carefully** with more CN/right-column examples before production use.
 2. **Add equation-number restoration** to the markdown replacer for formulas without `main_eq`; currently formula (16) markdown loses `(16)`.
-3. **Resolve formula 5 manually** by comparing Route B and `route-a-full` candidates against the page crop/full-page evidence.
+3. **Consider bundling local MathJax assets** if offline review is required; current review uses CDN MathJax with raw LaTeX always visible.
 4. **Production integration decision**: if approved, keep Route A as the backbone and call candidate sources only for formula nodes flagged as suspicious.
 5. **Do not commit** `.runtime/` outputs, model caches, or batch logs.
