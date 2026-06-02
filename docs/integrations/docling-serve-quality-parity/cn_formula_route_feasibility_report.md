@@ -108,6 +108,8 @@ Results:
 - Runtime: about 2 seconds.
 - Failure: HTTP 404 with Docling Serve detail
   `Task result not found. Please wait for a completion status.`
+- Server worker log: `Worker 0 failed to process job ...:
+  'str' object has no attribute 'value'`.
 
 Assessment: not a practical Route A fix through the current Docling Server
 execution path. The model files exist in the local mirror-style cache, but this
