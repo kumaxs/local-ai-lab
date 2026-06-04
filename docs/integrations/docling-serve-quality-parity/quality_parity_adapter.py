@@ -57,6 +57,9 @@ MATH_TEXT_RE = re.compile(
     r"(?:\\(?:frac|sum|int|alpha|beta|gamma|theta|mathcal|mathbf|mathrm|sqrt|infty|cdot|left|right)|"
     r"[Θ∆Φℝ𝑊𝑟𝑑𝒩×≪ˆ=|])"
 )
+ALIGNMENT_ENV_RE = re.compile(
+    r"\\begin\s*\{\s*(?:aligned|align|array|matrix|pmatrix|bmatrix|cases|split|gathered)\s*\}"
+)
 
 START_COMMAND = (
     "UVICORN_WORKERS=1 DOCLING_DEVICE=cpu "
@@ -1398,45 +1401,149 @@ def formula_number_qc_diagnostics(
     return diagnostics
 
 
+def sanitize_formula_display_text(formula_text: str) -> tuple[str, list[str]]:
+    """Return a MathJax-display-safe formula body plus evidence-backed reasons."""
+    reasons: list[str] = []
+    display_text = formula_text
+    if "&" in display_text and not ALIGNMENT_ENV_RE.search(display_text):
+        sanitized = re.sub(r"\s*&\s*", " ", display_text)
+        sanitized = re.sub(r"\s+", " ", sanitized).strip()
+        if sanitized and sanitized != display_text:
+            display_text = sanitized
+            reasons.append("bare_alignment_marker_without_alignment_environment")
+    return display_text, reasons
+
+
+def formula_tex_qc_diagnostics(formulas: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    diagnostics: list[dict[str, Any]] = []
+    for index, formula in enumerate(formulas, start=1):
+        text = str(formula.get("text") or "")
+        prov = first_prov(formula) or {}
+        display_text, reasons = sanitize_formula_display_text(text)
+        if not reasons:
+            continue
+        diagnostics.append(
+            {
+                "index": index,
+                "text": text[:400],
+                "display_text": display_text[:400],
+                "reasons": reasons,
+                "page_no": prov.get("page_no"),
+                "bbox": bbox_geometry(prov),
+                "evidence": f"formulas/formula_{index}_context.png",
+                "action": "sanitize_display_tex_preserve_raw_tex",
+                "safe_to_apply": True,
+            }
+        )
+    return diagnostics
+
+
+def formula_second_pass_apply_all_review(
+    formulas: list[dict[str, Any]],
+    formula_number_diag: list[dict[str, Any]],
+    formula_tex_diag: list[dict[str, Any]],
+    formula_number_recovered: list[int],
+) -> dict[str, Any]:
+    number_by_index = {int(item["index"]): item for item in formula_number_diag}
+    tex_by_index = {int(item["index"]): item for item in formula_tex_diag}
+    reviewed: list[dict[str, Any]] = []
+    for index, formula in enumerate(formulas, start=1):
+        text = str(formula.get("text") or "")
+        prov = first_prov(formula) or {}
+        number_item = number_by_index.get(index)
+        tex_item = tex_by_index.get(index)
+        actions: list[str] = []
+        quality_gate = "preserve_route_a"
+        if index in formula_number_recovered:
+            actions.append("html_number_recovered_from_formula_text")
+            quality_gate = "enhance_html"
+        if tex_item and tex_item.get("safe_to_apply"):
+            actions.append("html_display_tex_sanitized")
+            quality_gate = "enhance_html"
+        if number_item and not number_item.get("safe_to_recover"):
+            actions.append("diagnostic_evidence_only")
+            if quality_gate != "enhance_html":
+                quality_gate = "evidence_only"
+        reviewed.append(
+            {
+                "index": index,
+                "page_no": prov.get("page_no"),
+                "eq_numbers": _compact_formula_numbers(text),
+                "quality_gate": quality_gate,
+                "actions": actions or ["reviewed_no_change"],
+                "number_recovery": number_item,
+                "tex_safety": tex_item,
+                "evidence": f"formulas/formula_{index}_context.png",
+            }
+        )
+    return {
+        "policy": "apply_all_review_gate",
+        "formula_count": len(formulas),
+        "reviewed_count": len(reviewed),
+        "enhanced_count": sum(1 for item in reviewed if item["quality_gate"] == "enhance_html"),
+        "evidence_only_count": sum(1 for item in reviewed if item["quality_gate"] == "evidence_only"),
+        "preserved_count": sum(1 for item in reviewed if item["quality_gate"] == "preserve_route_a"),
+        "reviewed_formulas": reviewed,
+    }
+
+
 def recover_formula_numbers_in_html(
     output_dir: Path,
     document_html: str,
     formulas: list[dict[str, Any]],
     diagnostics: list[dict[str, Any]],
+    tex_diagnostics: list[dict[str, Any]] | None = None,
 ) -> tuple[str, list[int]]:
     recoverable = {
         int(item["index"]): int(item["recovered_number"])
         for item in diagnostics
         if item.get("safe_to_recover") and item.get("recovered_number")
     }
-    if not recoverable:
+    tex_fixable = {
+        int(item["index"]): item
+        for item in tex_diagnostics or []
+        if item.get("safe_to_apply")
+    }
+    target_indexes = sorted(set(recoverable) | set(tex_fixable))
+    if not target_indexes:
         return document_html, []
 
     blocks = list(FORMULA_MATH_BLOCK_RE.finditer(document_html))
     replacements: list[tuple[int, re.Match[str], str]] = []
     sidecar_dir = output_dir
-    for formula_index, recovered_number in sorted(recoverable.items()):
+    for formula_index in target_indexes:
         if not (0 < formula_index <= len(blocks)):
             continue
+        recovered_number = recoverable.get(formula_index)
         formula_text = str(formulas[formula_index - 1].get("text") or "").strip()
         if not formula_text:
             continue
+        display_text, _sanitize_reasons = sanitize_formula_display_text(formula_text)
+        status_value = (
+            "qc_formula_number_recovery"
+            if recovered_number is not None
+            else "qc_formula_tex_safety"
+        )
         replacement = _render_second_pass_formula_html(
             {
                 "formula_no": formula_index,
-                "status": "qc_formula_number_recovery",
+                "status": status_value,
                 "markdown_after": f"$${formula_text}$$",
+                "display_override": display_text,
+                "raw_tex": formula_text,
             },
             output_dir,
             sidecar_dir,
-        ).replace(
-            'data-formula-status="qc_formula_number_recovery"',
-            (
-                'data-formula-status="qc_formula_number_recovery" '
-                f'data-equation-number="{html.escape(str(recovered_number), quote=True)}"'
-            ),
-            1,
         )
+        if recovered_number is not None:
+            replacement = replacement.replace(
+                f'data-formula-status="{status_value}"',
+                (
+                    f'data-formula-status="{status_value}" '
+                    f'data-equation-number="{html.escape(str(recovered_number), quote=True)}"'
+                ),
+                1,
+            )
         replacements.append((formula_index, blocks[formula_index - 1], replacement))
 
     if not replacements:
@@ -1547,12 +1654,25 @@ def run_unified_review_qc(
     document_html, autolink_count = _autolink_plain_urls(document_html)
     document_html, footnote_sup_count = _polish_footnote_superscripts(document_html)
     document_html, math_text_count = _mark_math_heavy_text(document_html)
+    formula_second_pass_start = time.monotonic()
     formula_number_diag = formula_number_qc_diagnostics(formulas, document_html)
+    formula_tex_diag = formula_tex_qc_diagnostics(formulas)
     document_html, formula_number_recovered = recover_formula_numbers_in_html(
         output_dir,
         document_html,
         formulas,
         formula_number_diag,
+        formula_tex_diag,
+    )
+    formula_second_pass_review = formula_second_pass_apply_all_review(
+        formulas,
+        formula_number_diag,
+        formula_tex_diag,
+        formula_number_recovered,
+    )
+    formula_second_pass_review["elapsed_seconds"] = round(
+        time.monotonic() - formula_second_pass_start,
+        6,
     )
     html_path.write_text(document_html, encoding="utf-8")
 
@@ -1580,6 +1700,8 @@ def run_unified_review_qc(
             "math_review_diagnostics": math_diag,
             "formula_number_qc_diagnostics": formula_number_diag,
             "formula_number_recovered_html_indexes": formula_number_recovered,
+            "formula_tex_qc_diagnostics": formula_tex_diag,
+            "formula_second_pass_apply_all_review": formula_second_pass_review,
             "header_footer_qc_diagnostics": header_footer_diag,
         }
     )
@@ -1596,6 +1718,8 @@ def run_unified_review_qc(
             "math_review_diagnostics": math_diag,
             "formula_number_qc_diagnostics": formula_number_diag,
             "formula_number_recovered_html_indexes": formula_number_recovered,
+            "formula_tex_qc_diagnostics": formula_tex_diag,
+            "formula_second_pass_apply_all_review": formula_second_pass_review,
             "header_footer_qc_diagnostics": header_footer_diag,
         }
     )
@@ -1625,6 +1749,20 @@ def run_unified_review_qc(
         status["warnings"].append(
             "formula_numbers_recovered_in_html:"
             + ",".join(str(index) for index in formula_number_recovered)
+        )
+    for item in formula_tex_diag:
+        status["warnings"].append(
+            "formula_tex_qc:"
+            f"{item['index']}:{','.join(item.get('reasons') or [])}:"
+            f"{item.get('action')}:{item.get('evidence')}"
+        )
+    if formula_second_pass_review.get("reviewed_count"):
+        status["warnings"].append(
+            "formula_second_pass_apply_all_review:"
+            f"reviewed={formula_second_pass_review.get('reviewed_count')}:"
+            f"enhanced={formula_second_pass_review.get('enhanced_count')}:"
+            f"evidence_only={formula_second_pass_review.get('evidence_only_count')}:"
+            f"elapsed={formula_second_pass_review.get('elapsed_seconds')}"
         )
     for item in header_footer_diag:
         status["warnings"].append(
@@ -1770,6 +1908,19 @@ def _strip_display_math_wrapper(text: str) -> str:
 
 
 def _second_pass_formula_display_text(entry: dict[str, Any]) -> str:
+    display_override = str(entry.get("display_override") or "").strip()
+    if display_override:
+        return display_override
+    markdown_after = _strip_display_math_wrapper(str(entry.get("markdown_after") or ""))
+    if markdown_after:
+        return markdown_after
+    return str(entry.get("route_b_candidate") or "").strip()
+
+
+def _second_pass_formula_raw_text(entry: dict[str, Any]) -> str:
+    raw_tex = str(entry.get("raw_tex") or "").strip()
+    if raw_tex:
+        return raw_tex
     markdown_after = _strip_display_math_wrapper(str(entry.get("markdown_after") or ""))
     if markdown_after:
         return markdown_after
@@ -1783,6 +1934,7 @@ def _render_second_pass_formula_html(
 ) -> str:
     formula_no = entry.get("formula_no")
     display_text = _second_pass_formula_display_text(entry)
+    raw_text = _second_pass_formula_raw_text(entry)
     source_link = f"formulas/formula_{formula_no}.png" if formula_no else None
     context_link = f"formulas/formula_{formula_no}_context.png" if formula_no else None
     review_link = _relative_output_link(output_dir, sidecar_dir / "review_index.html")
@@ -1805,8 +1957,16 @@ def _render_second_pass_formula_html(
         f'\\[{html.escape(display_text)}\\]'
         '</div>'
         '<pre class="docling-formula-tex">'
-        f'{html.escape(display_text)}'
+        f'{html.escape(raw_text)}'
         '</pre>'
+        + (
+            '<pre class="docling-formula-tex docling-formula-display-tex">'
+            f'{html.escape(display_text)}'
+            '</pre>'
+            if display_text != raw_text
+            else ""
+        )
+        +
         '<div class="docling-formula-source">'
         + " | ".join(links)
         + "</div>"
