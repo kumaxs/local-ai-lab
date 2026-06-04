@@ -8,6 +8,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import quality_parity_adapter as adapter  # noqa: E402
+import formula_only_second_pass as formula_second_pass  # noqa: E402
 
 
 class EnglishReviewPolishTests(unittest.TestCase):
@@ -92,13 +93,13 @@ class EnglishReviewPolishTests(unittest.TestCase):
         }
 
         diagnostics = adapter.first_page_footnote_recovery_diagnostics(document)
-        recoverable = [item for item in diagnostics if item.get("safe_to_apply")]
+        recoverable = [item for item in diagnostics if item.get("action") == "diagnostic_only_generic_quarantine_preferred"]
         evidence_only = [item for item in diagnostics if not item.get("safe_to_apply")]
 
         self.assertEqual(len(recoverable), 1)
         self.assertIn("performance significantly", recoverable[0]["recovered_text"])
-        self.assertEqual(recoverable[0]["action"], "html_recovery_preserve_original_fragments")
-        self.assertEqual(evidence_only[0]["footnote_number"], "0")
+        self.assertFalse(recoverable[0]["safe_to_apply"])
+        self.assertEqual(evidence_only[-1]["footnote_number"], "0")
 
     def test_first_page_footnote_html_recovery_preserves_trace(self) -> None:
         diagnostics = [
@@ -206,6 +207,64 @@ class EnglishReviewPolishTests(unittest.TestCase):
         self.assertEqual(review["enhanced_count"], 1)
         self.assertEqual(review["evidence_only_count"], 1)
 
+    def test_formula_second_pass_apply_all_replaces_clean_formula(self) -> None:
+        route_a = {
+            "texts": [
+                {
+                    "label": "formula",
+                    "text": r"x = y \quad (1)",
+                    "prov": [{"page_no": 1, "bbox": {"l": 10, "r": 100, "t": 700, "b": 680}}],
+                }
+            ]
+        }
+        route_b = [
+            {
+                "text": r"x = y + z \quad (1)",
+                "page_no": 1,
+                "main_eq": 1,
+                "bbox_norm": {"l": 20, "r": 200, "t": 100, "b": 120},
+                "node": {},
+            }
+        ]
+
+        patched, log = formula_second_pass.patch_document_json(
+            route_a,
+            route_b,
+            apply_all=True,
+        )
+
+        self.assertEqual(log[0]["status"], "replaced")
+        self.assertEqual(patched["texts"][0]["text"], r"x = y + z \quad (1)")
+
+    def test_formula_second_pass_apply_all_fallbacks_bad_candidate(self) -> None:
+        route_a = {
+            "texts": [
+                {
+                    "label": "formula",
+                    "text": r"x = y \quad (1)",
+                    "prov": [{"page_no": 1, "bbox": {"l": 10, "r": 100, "t": 700, "b": 680}}],
+                }
+            ]
+        }
+        route_b = [
+            {
+                "text": "(1)",
+                "page_no": 1,
+                "main_eq": 1,
+                "bbox_norm": {"l": 20, "r": 200, "t": 100, "b": 120},
+                "node": {},
+            }
+        ]
+
+        patched, log = formula_second_pass.patch_document_json(
+            route_a,
+            route_b,
+            apply_all=True,
+        )
+
+        self.assertEqual(log[0]["status"], "route_b_candidate_failed_quality_gate")
+        self.assertEqual(patched["texts"][0]["text"], r"x = y \quad (1)")
+
     def test_write_formula_latex_sources_outputs_raw_and_display_tex(self) -> None:
         formulas = [
             {
@@ -269,6 +328,29 @@ class EnglishReviewPolishTests(unittest.TestCase):
         self.assertIn("page_number", footer["reasons"])
         self.assertIn("template_or_publication_noise", header["reasons"])
         self.assertIn("rotated_margin_header", header["reasons"])
+
+    def test_structural_quarantine_marks_edge_and_footnote_nodes(self) -> None:
+        document = {
+            "texts": [
+                {
+                    "label": "page_footer",
+                    "text": "2",
+                    "prov": [{"page_no": 2, "bbox": {"l": 303, "r": 308, "t": 48, "b": 40}}],
+                },
+                {
+                    "label": "footnote",
+                    "text": "0",
+                    "prov": [{"page_no": 1, "bbox": {"l": 120, "r": 124, "t": 90, "b": 85}}],
+                },
+            ]
+        }
+
+        qc = adapter.structural_noise_qc(document)
+
+        self.assertEqual(qc["candidate_count"], 2)
+        self.assertEqual(qc["unresolved_footnote_count"], 1)
+        self.assertEqual(document["texts"][0]["label"], "quarantined_page_footer")
+        self.assertEqual(document["texts"][1]["label"], "quarantined_footnote")
 
 
 if __name__ == "__main__":

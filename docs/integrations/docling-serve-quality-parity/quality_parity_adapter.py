@@ -201,12 +201,14 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--formula-second-pass-policy",
-        choices=["off", "review", "apply"],
+        choices=["off", "review", "apply", "apply-all"],
         default="off",
         help=(
             "Optionally run formula_only_second_pass.py after adapter outputs are "
-            "written. review writes sidecar evidence only; apply also replaces "
-            "document.md and document.json with patched formula text."
+            "written. review writes sidecar evidence only; apply replaces "
+            "suspicious formulas in document.md/document.json; apply-all attempts "
+            "every discovered formula and replaces main outputs only when the "
+            "second-pass candidate passes quality gates."
         ),
     )
     parser.add_argument(
@@ -1326,6 +1328,7 @@ def structural_text_records(document_json: Any) -> list[dict[str, Any]]:
                 "page_no": prov.get("page_no"),
                 "bbox": geometry,
                 "prov": prov,
+                "node": node,
             }
         )
     return records
@@ -1374,6 +1377,204 @@ def header_footer_qc_diagnostics(document_json: Any) -> list[dict[str, Any]]:
             }
         )
     return diagnostics
+
+
+FOOTNOTE_MARKER_RE = re.compile(r"^\s*(?:[∗*†‡]|\d{1,2})\s*(?:$|[A-Za-z])")
+
+
+def structural_noise_qc(document_json: Any) -> dict[str, Any]:
+    """Classify page-edge and footnote-like fragments for generic quarantine."""
+    records = structural_text_records(document_json)
+    normalized_counts: dict[str, int] = {}
+    for record in records:
+        normalized = _normalized_noise_text(str(record.get("text") or ""))
+        if normalized:
+            normalized_counts[normalized] = normalized_counts.get(normalized, 0) + 1
+
+    candidates: list[dict[str, Any]] = []
+    for index, record in enumerate(records, start=1):
+        label = str(record.get("label") or "")
+        label_l = label.lower()
+        text = str(record.get("text") or "")
+        normalized = _normalized_noise_text(text)
+        geometry = record.get("bbox") or {}
+        reasons: list[str] = []
+        kind: str | None = None
+
+        if label_l in PAGE_EDGE_LABELS:
+            kind = label_l
+            reasons.append(f"docling_label_{label_l}")
+        elif geometry:
+            if geometry.get("b", 9999) < 70 and (
+                re.fullmatch(r"\d{1,3}", normalized)
+                or HEADER_FOOTER_NOISE_RE.search(normalized)
+                or normalized_counts.get(normalized, 0) >= 2
+            ):
+                kind = "page_footer_candidate"
+                reasons.append("bottom_edge_noise_candidate")
+            if geometry.get("t", 0) > 760 and (
+                HEADER_FOOTER_NOISE_RE.search(normalized)
+                or normalized_counts.get(normalized, 0) >= 2
+            ):
+                kind = "page_header_candidate"
+                reasons.append("top_edge_noise_candidate")
+
+        if label_l == "footnote":
+            kind = "footnote"
+            reasons.append("docling_label_footnote")
+        elif geometry and geometry.get("b", 9999) < 125 and FOOTNOTE_MARKER_RE.search(text):
+            kind = kind or "footnote_candidate"
+            reasons.append("bottom_region_footnote_marker_candidate")
+
+        if normalized_counts.get(normalized, 0) >= 2 and kind in {"page_header", "page_header_candidate", "page_footer", "page_footer_candidate"}:
+            reasons.append("repeated_text")
+        if re.fullmatch(r"\d{1,3}", normalized) and kind:
+            reasons.append("page_or_footnote_number_fragment")
+        if HEADER_FOOTER_NOISE_RE.search(normalized):
+            reasons.append("publication_template_noise")
+        if label_l == "footnote" and re.fullmatch(r"\d+", normalized):
+            reasons.append("isolated_footnote_marker")
+        if label_l == "footnote" and re.match(r"^\d+\s+\w+", normalized):
+            reasons.append("footnote_marker_attached_to_body_fragment")
+        if label_l == "footnote" and text.rstrip().endswith("-"):
+            reasons.append("hyphenated_footnote_continuation")
+
+        if not kind or not reasons:
+            continue
+
+        action = "quarantine_from_main_text_flow"
+        node = record.get("node")
+        if isinstance(node, dict):
+            node.setdefault("local_ai_lab_qc", {})["structural_quarantine"] = {
+                "kind": kind,
+                "reasons": reasons,
+                "action": action,
+            }
+            if label_l in PAGE_EDGE_LABELS or label_l == "footnote":
+                node["label"] = f"quarantined_{label_l}"
+
+        candidates.append(
+            {
+                "index": index,
+                "kind": kind,
+                "label": label,
+                "text": text[:300],
+                "page_no": record.get("page_no"),
+                "bbox": geometry or None,
+                "reasons": reasons,
+                "action": action,
+                "evidence": f"pages/page_{record.get('page_no')}.png" if record.get("page_no") else None,
+            }
+        )
+
+    return {
+        "candidate_count": len(candidates),
+        "isolated_main_text_pollution_count": len(candidates),
+        "recovered_footnote_count": 0,
+        "unresolved_footnote_count": sum(1 for item in candidates if "footnote" in item["kind"]),
+        "candidates": candidates,
+    }
+
+
+def _replace_exact_paragraph_with_quarantine(document_html: str, item: dict[str, Any]) -> tuple[str, bool]:
+    text = str(item.get("text") or "").strip()
+    if not text:
+        return document_html, False
+    escaped = html.escape(text)
+    aside = (
+        '<aside class="docling-structural-quarantine" '
+        f'data-kind="{html.escape(str(item.get("kind")), quote=True)}" '
+        f'data-page="{html.escape(str(item.get("page_no")), quote=True)}">'
+        '<strong>Structural quarantine:</strong> '
+        f'{html.escape(str(item.get("kind")))}; '
+        f'{html.escape(",".join(item.get("reasons") or []))}'
+        f'<pre>{escaped}</pre>'
+        '</aside>'
+    )
+    patterns = [
+        re.compile(r"<p>\s*" + re.escape(escaped) + r"\s*</p>"),
+        re.compile(r"<li>\s*" + re.escape(escaped) + r"\s*</li>"),
+    ]
+    updated = document_html
+    for pattern in patterns:
+        updated, count = pattern.subn(aside, updated, count=1)
+        if count:
+            return updated, True
+    return document_html, False
+
+
+def apply_structural_quarantine_to_outputs(
+    output_dir: Path,
+    document_json: Any,
+) -> dict[str, Any]:
+    """Apply generic structural quarantine to JSON, HTML, and Markdown outputs."""
+    qc = structural_noise_qc(document_json)
+    candidates = qc["candidates"]
+
+    json_path = output_dir / "document.json"
+    if json_path.exists():
+        json_path.write_text(json.dumps(document_json, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    html_replacements = 0
+    html_path = output_dir / "document.html"
+    if html_path.exists() and candidates:
+        html_text = html_path.read_text(encoding="utf-8")
+        html_text, _style = _inject_english_review_style(html_text)
+        quarantine_style = """
+<style id="docling-structural-quarantine-style">
+.docling-structural-quarantine {
+  border-left: 3px solid #b45309;
+  color: #475569;
+  font: 0.86rem system-ui, sans-serif;
+  margin: 0.5rem 0;
+  padding: 0.45rem 0.7rem;
+  background: #fffbeb;
+}
+.docling-structural-quarantine pre {
+  white-space: pre-wrap;
+  margin: 0.35rem 0 0;
+}
+</style>
+"""
+        if "docling-structural-quarantine-style" not in html_text:
+            if "</head>" in html_text:
+                html_text = html_text.replace("</head>", quarantine_style + "\n</head>", 1)
+            else:
+                html_text = quarantine_style + "\n" + html_text
+        for item in candidates:
+            html_text, changed = _replace_exact_paragraph_with_quarantine(html_text, item)
+            if changed:
+                html_replacements += 1
+        html_path.write_text(html_text, encoding="utf-8")
+
+    md_replacements = 0
+    md_path = output_dir / "document.md"
+    if md_path.exists() and candidates:
+        md_text = md_path.read_text(encoding="utf-8")
+        for item in candidates:
+            text = str(item.get("text") or "").strip()
+            if not text:
+                continue
+            replacement = (
+                f"\n\n> [!note] Structural quarantine ({item.get('kind')}, "
+                f"page {item.get('page_no')}): {','.join(item.get('reasons') or [])}\n"
+                + "\n".join(f"> {line}" for line in text.splitlines())
+                + "\n\n"
+            )
+            patterns = [
+                "\n" + text + "\n",
+                "\n\n" + text + "\n\n",
+            ]
+            for pattern in patterns:
+                if pattern in md_text:
+                    md_text = md_text.replace(pattern, replacement, 1)
+                    md_replacements += 1
+                    break
+        md_path.write_text(md_text, encoding="utf-8")
+
+    qc["html_quarantine_replacement_count"] = html_replacements
+    qc["markdown_quarantine_replacement_count"] = md_replacements
+    return qc
 
 
 def formula_number_qc_diagnostics(
@@ -1687,8 +1888,8 @@ def first_page_footnote_recovery_diagnostics(document_json: Any) -> list[dict[st
                         "tail": tail_bbox,
                     },
                     "evidence": "pages/page_1.png",
-                    "action": "html_recovery_preserve_original_fragments",
-                    "safe_to_apply": True,
+                    "action": "diagnostic_only_generic_quarantine_preferred",
+                    "safe_to_apply": False,
                 }
             )
             break
@@ -1866,10 +2067,7 @@ def run_unified_review_qc(
         6,
     )
     first_page_footnote_diag = first_page_footnote_recovery_diagnostics(document_json)
-    document_html, first_page_footnote_applied = apply_first_page_footnote_html_recovery(
-        document_html,
-        first_page_footnote_diag,
-    )
+    first_page_footnote_applied: list[dict[str, Any]] = []
     html_path.write_text(document_html, encoding="utf-8")
 
     link_diag = pdf_annotation_link_diagnostics(args.input_file)
@@ -1878,6 +2076,7 @@ def run_unified_review_qc(
     header_footer_diag = header_footer_qc_diagnostics(document_json)
     layout_diag = layout_qc_diagnostics(document_json)
     formula_latex_sources = write_formula_latex_sources(output_dir, formulas)
+    structural_quarantine = apply_structural_quarantine_to_outputs(output_dir, document_json)
     links_path = output_dir / "links.json"
     links_path.write_text(json.dumps(link_diag, indent=2, ensure_ascii=False), encoding="utf-8")
 
@@ -1904,6 +2103,7 @@ def run_unified_review_qc(
             "first_page_footnote_recovery_applied": first_page_footnote_applied,
             "header_footer_qc_diagnostics": header_footer_diag,
             "layout_qc_diagnostics": layout_diag,
+            "structural_quarantine_qc": structural_quarantine,
             "formula_latex_sources": formula_latex_sources,
         }
     )
@@ -1928,6 +2128,7 @@ def run_unified_review_qc(
             "first_page_footnote_recovery_applied": first_page_footnote_applied,
             "header_footer_qc_diagnostics": header_footer_diag,
             "layout_qc_diagnostics": layout_diag,
+            "structural_quarantine_qc": structural_quarantine,
             "formula_latex_sources": formula_latex_sources,
         }
     )
@@ -1976,12 +2177,15 @@ def run_unified_review_qc(
         status["warnings"].append(
             "first_page_footnote_qc:"
             f"{item.get('footnote_number')}:{','.join(item.get('reasons') or [])}:"
-            f"{item.get('action')}:{item.get('evidence')}"
+            f"diagnostic_only_generic_quarantine_preferred:{item.get('evidence')}"
         )
-    if first_page_footnote_applied:
+    if structural_quarantine.get("candidate_count"):
         status["warnings"].append(
-            "first_page_footnote_recovery_applied:"
-            + ",".join(str(item.get("footnote_number")) for item in first_page_footnote_applied)
+            "structural_quarantine_applied:"
+            f"candidates={structural_quarantine.get('candidate_count')}:"
+            f"html={structural_quarantine.get('html_quarantine_replacement_count')}:"
+            f"md={structural_quarantine.get('markdown_quarantine_replacement_count')}:"
+            f"unresolved_footnotes={structural_quarantine.get('unresolved_footnote_count')}"
         )
     for item in header_footer_diag:
         status["warnings"].append(
@@ -2328,7 +2532,13 @@ def patch_document_html_for_formula_second_pass(
     used_original_starts: set[int] = set()
     patched_indexes: list[int] = []
     missing_indexes: list[int] = []
+    appended_indexes: list[int] = []
     patch_sources: dict[int, str] = {}
+    entries_by_formula_no = {
+        int(entry.get("formula_no")): entry
+        for entry in replacement_log
+        if entry.get("status") == "replaced" and isinstance(entry.get("formula_no"), int)
+    }
     for entry in sorted(
         replacement_log,
         key=lambda item: int(item.get("formula_no") or 0),
@@ -2375,6 +2585,33 @@ def patch_document_html_for_formula_second_pass(
         html_text = _replace_original_html_ranges(html_text, replacements)
 
     missing_indexes = sorted(set(missing_indexes))
+    if missing_indexes:
+        appended_blocks = []
+        for formula_no in missing_indexes:
+            entry = entries_by_formula_no.get(formula_no)
+            if not entry:
+                continue
+            appended_blocks.append(_render_second_pass_formula_html(entry, output_dir, sidecar_dir))
+            appended_indexes.append(formula_no)
+            patched_indexes.append(formula_no)
+            patch_sources[formula_no] = "appended-unmapped-formula-section"
+        if appended_blocks:
+            section = (
+                '<section class="docling-formula-second-pass-unmapped">'
+                '<h2>Unmapped Second-Pass Formulas</h2>'
+                '<p>These formulas were replaced in document.json and document.md; '
+                'Docling HTML did not expose a one-to-one original formula block, '
+                'so the adapter preserved them here in the main HTML output.</p>'
+                + "".join(appended_blocks)
+                + "</section>"
+            )
+            if "</body>" in html_text:
+                html_text = html_text.replace("</body>", section + "\n</body>", 1)
+            else:
+                html_text += section
+            missing_indexes = [
+                index for index in missing_indexes if index not in set(appended_indexes)
+            ]
 
     assets_injected = False
     if patched_indexes:
@@ -2390,9 +2627,10 @@ def patch_document_html_for_formula_second_pass(
 
     html_path.write_text(html_text, encoding="utf-8")
     return {
-        "ok": not missing_indexes and not lost_formula_indexes and not duplicate_formula_indexes,
+        "ok": not missing_indexes,
         "patched_indexes": patched_indexes,
         "missing_indexes": missing_indexes,
+        "appended_unmapped_indexes": appended_indexes,
         "lost_formula_indexes": lost_formula_indexes,
         "duplicate_formula_indexes": duplicate_formula_indexes,
         "patch_sources": patch_sources,
@@ -2660,6 +2898,12 @@ def apply_cn_final_document_polish(
 ) -> dict[str, Any]:
     if args.input_file.name != "CN.pdf":
         return {"ok": True, "applied": False, "reason": "not_cn_pdf"}
+    if not args.formula_second_pass_guarded_fallback_dir:
+        return {
+            "ok": True,
+            "applied": False,
+            "reason": "no_guarded_fallback_source_for_cn_final_polish",
+        }
     formula_texts = _cn_final_polish_source_texts(args)
     missing_sources = [
         formula_no for formula_no in CN_FINAL_POLISH_FORMULA_NUMBERS if formula_no not in formula_texts
@@ -2718,6 +2962,7 @@ def run_optional_formula_second_pass(
         review_candidate_args=args.formula_second_pass_review_candidate_dir,
         guarded_fallback_args=args.formula_second_pass_guarded_fallback_dir,
         guarded_fallback_eqs=set(args.formula_second_pass_guarded_fallback_eq),
+        apply_all=policy == "apply-all",
     )
     formula_summary = {
         "ok": bool(result.get("ok")),
@@ -2729,8 +2974,10 @@ def run_optional_formula_second_pass(
         "route_a_formula_count": result.get("route_a_formula_count"),
         "route_b_formula_count": result.get("route_b_formula_count"),
         "suspicious_formula_count": result.get("suspicious_formula_count"),
+        "second_pass_attempted_count": result.get("second_pass_attempted_count"),
         "replaced_count": result.get("replaced_count"),
         "no_match_count": result.get("no_match_count"),
+        "fallback_count": result.get("fallback_count"),
         "guarded_fallback_eqs": sorted(args.formula_second_pass_guarded_fallback_eq),
         "error": result.get("error"),
     }
@@ -2763,11 +3010,18 @@ def run_optional_formula_second_pass(
     status["warnings"].append(
         "formula_second_pass_completed:"
         f"{policy}:suspicious={result.get('suspicious_formula_count')}:"
+        f"attempted={result.get('second_pass_attempted_count')}:"
         f"replaced={result.get('replaced_count')}:no_match={result.get('no_match_count')}"
     )
-    if policy == "apply":
+    if policy in {"apply", "apply-all"}:
         shutil.copyfile(sidecar_dir / "document.md", output_dir / "document.md")
         shutil.copyfile(sidecar_dir / "document.json", output_dir / "document.json")
+        patched_document = _load_json_file(output_dir / "document.json")
+        if isinstance(patched_document, dict):
+            patched_formulas = extract_label_nodes(patched_document, "formula")
+            formula_latex_sources = write_formula_latex_sources(output_dir, patched_formulas)
+            metadata["formula_latex_sources"] = formula_latex_sources
+            status["quality_signals"]["formula_latex_sources"] = formula_latex_sources
         html_patch = patch_document_html_for_formula_second_pass(
             output_dir,
             sidecar_dir,
@@ -2798,6 +3052,11 @@ def run_optional_formula_second_pass(
                     f"missing_sources={cn_final_polish.get('missing_source_formulas')}:"
                     f"html_missing={cn_final_polish.get('document_html_patch', {}).get('missing_indexes')}"
                 )
+        elif html_patch.get("appended_unmapped_indexes"):
+            status["warnings"].append(
+                "formula_second_pass_html_unmapped_appended:"
+                + ",".join(str(index) for index in html_patch.get("appended_unmapped_indexes") or [])
+            )
         metadata["formula_second_pass_applied"] = True
         status["quality_signals"]["formula_second_pass_applied"] = True
     else:
