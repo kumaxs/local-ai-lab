@@ -73,6 +73,7 @@ Optional controls:
 --page-start 1 --page-end 3
 --ocr-fallback-policy gxx
 --formula-policy granite_mlx
+--formula-second-pass-policy off
 --timeout-seconds 1200
 --image-export-mode embedded
 --cn-ocr-parity
@@ -181,6 +182,49 @@ The adapter preserves:
 
 The review artifact layer is intentionally post-processing owned by this
 adapter. Docling Server remains the execution backend for Route A.
+
+## Optional Formula Second Pass
+
+`quality_parity_adapter.py` can optionally run `formula_only_second_pass.py`
+after the Route A adapter output and review artifacts are written. This is off
+by default and remains evidence-first:
+
+- Route A remains the document backbone.
+- Route B is used only as a formula candidate source.
+- `route-a-full` or any other fallback source is used only when explicitly
+  passed as a guarded fallback source and only for allowlisted equation numbers.
+- `review` mode writes sidecar evidence without replacing contract files.
+- `apply` mode writes the same sidecar evidence, then replaces only
+  `document.md` and `document.json` with the patched formula text.
+
+CN reviewed command shape:
+
+```bash
+python3 docs/integrations/docling-serve-quality-parity/quality_parity_adapter.py \
+  --serve-url http://127.0.0.1:5001 \
+  --input-file /Users/zeyuan/Projects/n8n-paper-pipeline/test_pdfs/CN.pdf \
+  --output-root /tmp/docling-serve-quality-parity \
+  --job-id CN \
+  --cn-ocr-parity \
+  --formula-second-pass-policy apply \
+  --formula-second-pass-route-b-dir /path/to/route-b/CN \
+  --formula-second-pass-guarded-fallback-dir route-a-full=/path/to/route-a-full/CN \
+  --formula-second-pass-guarded-fallback-eq 5 \
+  --formula-second-pass-guarded-fallback-eq 7 \
+  --formula-second-pass-guarded-fallback-eq 8
+```
+
+When enabled, the adapter records `metadata.json:formula_second_pass`,
+`metadata.json:formula_second_pass_applied`, and
+`status.json:quality_signals.formula_second_pass`. The default sidecar output is:
+
+```text
+<output-root>/<job-id>/formula_second_pass/
+  document.md
+  document.json
+  second_pass_summary.json
+  review_index.html
+```
 
 See `docling_v1_parity_checklist.md` before making further parser improvements.
 For the current `CN.pdf` formula `(3)` and `(5)` investigation, see
