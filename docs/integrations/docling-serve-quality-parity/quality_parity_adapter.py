@@ -25,6 +25,7 @@ from formula_only_second_pass import run_formula_second_pass
 
 GXX_RE = re.compile(r"/G[0-9A-Fa-f]{2}")
 DATA_IMAGE_RE = re.compile(r"data:image/[^\"')\s]+")
+PLAIN_URL_RE = re.compile(r"(?<![\"'=])(https?://[^\s<]+)")
 FORMULA_NUMBER_RE = re.compile(r"\(\s*(\d+)\s*\)")
 SPACED_FORMULA_NUMBER_RE = re.compile(r"\(\s*((?:\d\s+)+\d)\s*\)")
 CN_CHAR_RE = re.compile(r"[\u3400-\u9fff]")
@@ -412,6 +413,45 @@ def broken_local_refs(output_dir: Path, document: dict[str, Any]) -> list[str]:
         if not (output_dir / ref).exists():
             broken.append(ref)
     return broken
+
+
+def _pdf_literal_to_text(value: bytes) -> str:
+    text = value.decode("latin-1", errors="ignore")
+    text = text.replace(r"\(", "(").replace(r"\)", ")").replace(r"\\", "\\")
+    return text
+
+
+def pdf_annotation_link_diagnostics(input_file: Path) -> dict[str, Any]:
+    """Extract lightweight PDF link evidence without depending on Docling internals."""
+    try:
+        pdf_bytes = input_file.read_bytes()
+    except OSError as exc:
+        return {"ok": False, "error": str(exc)}
+
+    uri_values = [
+        _pdf_literal_to_text(match.group(1))
+        for match in re.finditer(rb"/URI\s*\((.*?)\)", pdf_bytes, flags=re.DOTALL)
+    ]
+    goto_values = [
+        _pdf_literal_to_text(match.group(1))
+        for match in re.finditer(rb"/D\s*\((.*?)\)\s*/S\s*/GoTo", pdf_bytes, flags=re.DOTALL)
+    ]
+    return {
+        "ok": True,
+        "pdf_annotation_link_count": len(re.findall(rb"/Subtype\s*/Link\b", pdf_bytes)),
+        "pdf_uri_link_count": len(uri_values),
+        "pdf_goto_link_count": len(goto_values),
+        "pdf_uri_links": sorted(set(uri_values))[:50],
+        "pdf_goto_destinations": sorted(set(goto_values))[:50],
+    }
+
+
+def json_hyperlink_count(document_json: Any) -> int:
+    count = 0
+    for node in iter_nodes(document_json):
+        if isinstance(node, dict) and node.get("hyperlink"):
+            count += 1
+    return count
 
 
 def apply_cn_ocr_options(options: dict[str, Any], args: argparse.Namespace) -> None:
@@ -1082,6 +1122,25 @@ def link_formula_placeholders(document_html: str, targets_by_index: dict[int, di
     return re.sub(r"Formula not decoded", replace, document_html)
 
 
+def inject_formula_source_links_by_mathml_order(
+    document_html: str,
+    targets_by_index: dict[int, dict[str, str]],
+) -> tuple[str, int]:
+    linked = 0
+
+    def replace(match: re.Match[str]) -> str:
+        nonlocal linked
+        formula_index = linked + 1
+        source_links = formula_source_links(formula_index, targets_by_index.get(formula_index, {}))
+        if not source_links:
+            return match.group(0)
+        linked += 1
+        return match.group(0) + source_links
+
+    updated = re.sub(r"<div><math\b(?:(?!</math></div>).)*?</math></div>", replace, document_html, flags=re.S)
+    return updated, linked
+
+
 def inject_formula_source_links(
     output_dir: Path,
     formulas: list[dict[str, Any]],
@@ -1110,9 +1169,249 @@ def inject_formula_source_links(
                 linked_indexes.add(index)
                 break
 
+    if not linked_indexes:
+        updated_html, mathml_link_count = inject_formula_source_links_by_mathml_order(
+            updated_html, targets_by_index
+        )
+        linked_indexes.update(range(1, mathml_link_count + 1))
+
     if updated_html != document_html:
         html_path.write_text(updated_html, encoding="utf-8")
     return len(linked_indexes)
+
+
+ENGLISH_REVIEW_STYLE = """
+<style id="docling-english-review-polish-style">
+math, .docling-math-text {
+  font-family: "STIX Two Math", "Cambria Math", "Noto Sans Math", "DejaVu Math TeX Gyre", "Times New Roman", serif;
+}
+math[display="block"] {
+  display: block;
+  overflow-x: auto;
+  padding: 0.35rem 0;
+}
+.docling-formula-source {
+  display: block;
+  font: 0.85rem system-ui, sans-serif;
+  margin: 0.25rem 0 0.75rem;
+}
+.docling-footnote-marker {
+  line-height: 1;
+  margin: 0.1rem 0;
+}
+.docling-footnote-marker sup,
+.docling-footnote sup,
+sup.docling-footnote-ref {
+  font-size: 0.75em;
+  vertical-align: super;
+}
+.docling-footnote {
+  font-size: 0.9em;
+}
+</style>
+"""
+
+
+def _inject_english_review_style(document_html: str) -> tuple[str, bool]:
+    if "docling-english-review-polish-style" in document_html:
+        return document_html, False
+    if "</head>" in document_html:
+        return document_html.replace("</head>", ENGLISH_REVIEW_STYLE + "\n</head>", 1), True
+    return ENGLISH_REVIEW_STYLE + "\n" + document_html, True
+
+
+def _autolink_plain_urls(document_html: str) -> tuple[str, int]:
+    linked = 0
+
+    def replace(match: re.Match[str]) -> str:
+        nonlocal linked
+        url = match.group(1)
+        trailing = ""
+        while url and url[-1] in ".,);]":
+            trailing = url[-1] + trailing
+            url = url[:-1]
+        if not url or f'href="{html.escape(url, quote=True)}"' in document_html:
+            return match.group(0)
+        linked += 1
+        escaped_url = html.escape(url, quote=True)
+        return f'<a href="{escaped_url}">{html.escape(url)}</a>{html.escape(trailing)}'
+
+    return PLAIN_URL_RE.sub(replace, document_html), linked
+
+
+def _polish_footnote_superscripts(document_html: str) -> tuple[str, int]:
+    replacements = [
+        (
+            r"<p>([∗*†‡])</p>",
+            r'<p class="docling-footnote-marker"><sup>\1</sup></p>',
+        ),
+        (
+            r"<p>([∗*†‡])\s+([^<]+)</p>",
+            r'<p class="docling-footnote"><sup>\1</sup> \2</p>',
+        ),
+    ]
+    updated = document_html
+    total = 0
+    for pattern, replacement in replacements:
+        updated, count = re.subn(pattern, replacement, updated)
+        total += count
+
+    def inline_marker(match: re.Match[str]) -> str:
+        nonlocal total
+        total += 1
+        return f" {match.group(1)}<sup class=\"docling-footnote-ref\">{match.group(2)}</sup>{match.group(3)}"
+
+    updated = re.sub(r"(\w)\s+([∗†‡])\s+(\w)", inline_marker, updated)
+    return updated, total
+
+
+def _mark_math_heavy_text(document_html: str) -> tuple[str, int]:
+    math_chars = "Θ∆Φℝ𝑊𝑟𝑑𝒩×≪ˆ"
+    count = 0
+
+    def replace(match: re.Match[str]) -> str:
+        nonlocal count
+        paragraph = match.group(0)
+        body = html.unescape(paragraph)
+        if "<math" in paragraph or not any(char in body for char in math_chars):
+            return paragraph
+        if not re.search(r"[=|]|d\s*model|LoRA|∆Φ|Φ\s*0|Θ", body):
+            return paragraph
+        count += 1
+        return paragraph.replace("<p>", '<p class="docling-math-text">', 1)
+
+    return re.sub(r"<p>.*?</p>", replace, document_html, flags=re.S), count
+
+
+def footnote_review_diagnostics(document_json: Any) -> list[dict[str, Any]]:
+    diagnostics: list[dict[str, Any]] = []
+    for index, node in enumerate(extract_label_nodes(document_json, "footnote"), start=1):
+        text = str(node.get("text") or "")
+        prov = first_prov(node) or {}
+        geometry = bbox_geometry(prov)
+        reasons: list[str] = []
+        if re.fullmatch(r"\d+", text.strip()):
+            reasons.append("isolated_numeric_footnote_fragment")
+        if text.rstrip().endswith("-"):
+            reasons.append("hyphenated_split_footnote_continuation")
+        if geometry and geometry["b"] < 110:
+            reasons.append("near_page_bottom_footnote")
+        if reasons:
+            page_no = prov.get("page_no")
+            diagnostics.append(
+                {
+                    "index": index,
+                    "text": text[:240],
+                    "reasons": reasons,
+                    "page_no": page_no,
+                    "bbox": geometry,
+                    "evidence": f"pages/page_{page_no}.png" if page_no else None,
+                }
+            )
+    return diagnostics
+
+
+def english_math_review_diagnostics(document_html: str, document_json: Any, input_file: Path) -> dict[str, Any]:
+    decoded = html.unescape(DATA_IMAGE_RE.sub("data:image/<stripped>", document_html))
+    text_nodes = [
+        str(node.get("text") or "")
+        for node in iter_nodes(document_json)
+        if isinstance(node, dict) and isinstance(node.get("text"), str)
+    ]
+    math_text_nodes = [
+        text
+        for text in text_nodes
+        if re.search(r"[Θ∆Φℝ𝑊𝑟𝑑𝒩×≪ˆ]", text)
+    ]
+    missing_lora_numbers: list[int] = []
+    if input_file.name == "two-col-arxiv-ai-lora.pdf":
+        for formula_no in (15, 16):
+            if f"({formula_no})" not in decoded and f"( {formula_no} )" not in decoded:
+                missing_lora_numbers.append(formula_no)
+    return {
+        "mathml_block_count": document_html.count("<math"),
+        "math_unicode_text_node_count": len(math_text_nodes),
+        "math_unicode_text_examples": math_text_nodes[:10],
+        "boxed_math_symbol_count": sum(decoded.count(char) for char in ("□", "▢", "◻", "☐", "■", "▣", "�")),
+        "missing_lora_page6_formula_numbers": missing_lora_numbers,
+    }
+
+
+def polish_english_review_html(
+    output_dir: Path,
+    document_json: Any,
+    metadata: dict[str, Any],
+    status: dict[str, Any],
+    args: argparse.Namespace,
+) -> None:
+    html_path = output_dir / "document.html"
+    if not html_path.exists():
+        return
+    document_html = html_path.read_text(encoding="utf-8")
+    before_href_count = len(re.findall(r"href=\"", document_html))
+    document_html, style_injected = _inject_english_review_style(document_html)
+    document_html, autolink_count = _autolink_plain_urls(document_html)
+    document_html, footnote_sup_count = _polish_footnote_superscripts(document_html)
+    document_html, math_text_count = _mark_math_heavy_text(document_html)
+    html_path.write_text(document_html, encoding="utf-8")
+
+    link_diag = pdf_annotation_link_diagnostics(args.input_file)
+    footnote_diag = footnote_review_diagnostics(document_json)
+    math_diag = english_math_review_diagnostics(document_html, document_json, args.input_file)
+    links_path = output_dir / "links.json"
+    links_path.write_text(json.dumps(link_diag, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    metadata.update(
+        {
+            "pdf_link_diagnostics": link_diag,
+            "pdf_annotation_link_count": link_diag.get("pdf_annotation_link_count"),
+            "pdf_uri_link_count": link_diag.get("pdf_uri_link_count"),
+            "pdf_goto_link_count": link_diag.get("pdf_goto_link_count"),
+            "json_hyperlink_count": json_hyperlink_count(document_json),
+            "html_plain_url_autolink_count": autolink_count,
+            "html_href_count_before_review_polish": before_href_count,
+            "html_href_count_after_review_polish": len(re.findall(r"href=\"", document_html)),
+            "english_review_style_injected": style_injected,
+            "footnote_superscript_polish_count": footnote_sup_count,
+            "math_text_polish_count": math_text_count,
+            "footnote_review_diagnostics": footnote_diag,
+            "english_math_review_diagnostics": math_diag,
+        }
+    )
+    metadata.setdefault("generated_outputs", []).append("links.json")
+    status["quality_signals"].update(
+        {
+            "pdf_annotation_link_count": metadata["pdf_annotation_link_count"],
+            "pdf_uri_link_count": metadata["pdf_uri_link_count"],
+            "pdf_goto_link_count": metadata["pdf_goto_link_count"],
+            "json_hyperlink_count": metadata["json_hyperlink_count"],
+            "html_plain_url_autolink_count": autolink_count,
+            "html_href_count_after_review_polish": metadata["html_href_count_after_review_polish"],
+            "footnote_review_diagnostics": footnote_diag,
+            "english_math_review_diagnostics": math_diag,
+        }
+    )
+    if autolink_count:
+        status["warnings"].append(f"html_plain_urls_autolinked:{autolink_count}")
+    if link_diag.get("pdf_annotation_link_count") and not metadata["json_hyperlink_count"]:
+        status["warnings"].append(
+            "pdf_annotations_not_propagated_by_docling_json:"
+            f"links={link_diag.get('pdf_annotation_link_count')}:"
+            f"uris={link_diag.get('pdf_uri_link_count')}:links.json"
+        )
+    for item in footnote_diag:
+        status["warnings"].append(
+            "suspicious_footnote:"
+            f"{item['index']}:{','.join(item['reasons'])}:"
+            f"{item.get('evidence')}"
+        )
+    missing_lora_numbers = math_diag.get("missing_lora_page6_formula_numbers") or []
+    if missing_lora_numbers:
+        status["warnings"].append(
+            "missing_lora_page6_formula_numbers:"
+            + ",".join(str(number) for number in missing_lora_numbers)
+            + ":requires_docling_or_formula_recovery"
+        )
 
 
 def restore_review_artifact_layer(
@@ -1216,6 +1515,8 @@ def restore_review_artifact_layer(
     formula_source_link_count = inject_formula_source_links(output_dir, formulas)
     metadata["formula_source_link_count"] = formula_source_link_count
     status["quality_signals"]["formula_source_link_count"] = formula_source_link_count
+    if args.input_file.name != "CN.pdf":
+        polish_english_review_html(output_dir, document_json, metadata, status, args)
     (output_dir / "metadata.json").write_text(
         json.dumps(metadata, indent=2, ensure_ascii=False), encoding="utf-8"
     )
