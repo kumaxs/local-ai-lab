@@ -256,3 +256,50 @@ $$w _ { i } = \frac { h _ { i } } { \sum _ { k = 1 } ^ { h _ { i } } } \quad i \
 ```
 
 Formula 14 also benefits from the same restoration path, changing the split `( 1 4 )` tag to `( 14 )` in patched markdown. Guarded fallback behavior remains unchanged and allowlisted only for CN formulas 5, 7, and 8.
+
+---
+
+## 2026-06-04 adapter optional post-step addendum
+
+### DONE
+
+Wired `formula_only_second_pass.py` into `quality_parity_adapter.py` as an optional post-processing step. The default is `--formula-second-pass-policy off`.
+
+### integration_shape
+
+- `off`: no formula second pass.
+- `review`: run the second pass into a sidecar evidence directory without changing adapter contract files.
+- `apply`: run the same sidecar evidence step, then replace only `document.md` and `document.json` with patched formula text.
+
+Route A remains the document backbone. Route B is accepted only through `--formula-second-pass-route-b-dir` and is used only as a formula candidate source. Guarded fallback sources are accepted only through `--formula-second-pass-guarded-fallback-dir`, and only equations explicitly passed with `--formula-second-pass-guarded-fallback-eq` may use them.
+
+Default sidecar:
+
+```text
+<adapter-output>/<job-id>/formula_second_pass/
+  document.md
+  document.json
+  second_pass_summary.json
+  review_index.html
+```
+
+### regression_summary
+
+Validation used copied adapter-produced Route A outputs under ignored `.runtime/review/docling-adapter-second-pass-integration-2026-06-04/`, then invoked the adapter post-step in `apply` mode against all 10 broad regression samples.
+
+| PDF/sample | Suspicious | Replaced | No match | Review links missing |
+| --- | ---: | ---: | ---: | ---: |
+| CN | 7 | 7 | 0 | 0 |
+| table-heavy-ai-table-transformer | 0 | 0 | 0 | 0 |
+| table-heavy-ai-complex-tables-gtr | 0 | 0 | 0 | 0 |
+| layout-doc-ai-layoutlm | 0 | 0 | 0 | 0 |
+| layout-doc-ai-donut | 0 | 0 | 0 | 0 |
+| two-col-arxiv-ai-gat | 0 | 0 | 0 | 0 |
+| two-col-arxiv-ai-rag | 0 | 0 | 0 | 0 |
+| two-col-arxiv-ai-lora | 0 | 0 | 0 | 0 |
+| two-col-arxiv-ai-transformers-gnn | 0 | 0 | 0 | 0 |
+| two-col-arxiv-ai-bert | 0 | 0 | 0 | 0 |
+
+Totals: 10 samples, 7 suspicious formulas, 7 replacements, 0 no-match cases, 0 missing sidecar review links, and 0 non-CN false-positive replacements.
+
+Live adapter CLI probe was attempted, but Docling Server returned HTTP 503 from `/version`; per AGENTS.md, no service start/restart was performed during this task.

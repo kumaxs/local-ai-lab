@@ -14,11 +14,14 @@ import csv
 import html
 import json
 import re
+import shutil
 import time
 import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Any
+
+from formula_only_second_pass import run_formula_second_pass
 
 GXX_RE = re.compile(r"/G[0-9A-Fa-f]{2}")
 DATA_IMAGE_RE = re.compile(r"data:image/[^\"')\s]+")
@@ -174,6 +177,57 @@ def parse_args() -> argparse.Namespace:
         choices=["embedded", "referenced", "placeholder"],
         default="embedded",
         help="Use embedded by default so document.html opens without sidecar images.",
+    )
+    parser.add_argument(
+        "--formula-second-pass-policy",
+        choices=["off", "review", "apply"],
+        default="off",
+        help=(
+            "Optionally run formula_only_second_pass.py after adapter outputs are "
+            "written. review writes sidecar evidence only; apply also replaces "
+            "document.md and document.json with patched formula text."
+        ),
+    )
+    parser.add_argument(
+        "--formula-second-pass-route-b-dir",
+        type=Path,
+        default=None,
+        help="Route B output directory used only as formula candidate source.",
+    )
+    parser.add_argument(
+        "--formula-second-pass-output-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Sidecar output directory for formula second-pass evidence. Defaults "
+            "to <job-output>/formula_second_pass."
+        ),
+    )
+    parser.add_argument(
+        "--formula-second-pass-review-candidate-dir",
+        action="append",
+        default=[],
+        help=(
+            "Optional review-only candidate source as LABEL=DIR or DIR. "
+            "Candidates are shown in review HTML but never patched."
+        ),
+    )
+    parser.add_argument(
+        "--formula-second-pass-guarded-fallback-dir",
+        action="append",
+        default=[],
+        help=(
+            "Optional guarded replacement source as LABEL=DIR or DIR. Only "
+            "equations listed with --formula-second-pass-guarded-fallback-eq "
+            "may use it."
+        ),
+    )
+    parser.add_argument(
+        "--formula-second-pass-guarded-fallback-eq",
+        action="append",
+        type=int,
+        default=[],
+        help="Reviewed equation number allowed to use guarded fallback replacement.",
     )
     return parser.parse_args()
 
@@ -1162,6 +1216,104 @@ def restore_review_artifact_layer(
     )
 
 
+def run_optional_formula_second_pass(
+    output_dir: Path,
+    metadata: dict[str, Any],
+    status: dict[str, Any],
+    args: argparse.Namespace,
+) -> None:
+    """Run optional formula-only second pass and update adapter metadata/status."""
+    policy = args.formula_second_pass_policy
+    metadata["formula_second_pass_policy"] = policy
+    status["quality_signals"]["formula_second_pass_policy"] = policy
+    if policy == "off":
+        return
+
+    def write_updated_contract_state() -> None:
+        (output_dir / "metadata.json").write_text(
+            json.dumps(metadata, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+        (output_dir / "status.json").write_text(
+            json.dumps(status, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+
+    route_b_dir = args.formula_second_pass_route_b_dir
+    sidecar_dir = args.formula_second_pass_output_dir or (output_dir / "formula_second_pass")
+    if route_b_dir is None:
+        message = "formula_second_pass_route_b_dir_required"
+        metadata["formula_second_pass"] = {"ok": False, "error": message}
+        status["warnings"].append(message)
+        status["ok"] = False
+        status["success_class"] = "degraded_failure"
+        write_updated_contract_state()
+        return
+
+    result = run_formula_second_pass(
+        route_a_dir=output_dir,
+        route_b_dir=route_b_dir,
+        output_dir=sidecar_dir,
+        review_candidate_args=args.formula_second_pass_review_candidate_dir,
+        guarded_fallback_args=args.formula_second_pass_guarded_fallback_dir,
+        guarded_fallback_eqs=set(args.formula_second_pass_guarded_fallback_eq),
+    )
+    formula_summary = {
+        "ok": bool(result.get("ok")),
+        "policy": policy,
+        "route_a_dir": str(output_dir),
+        "route_b_dir": str(route_b_dir),
+        "output_dir": str(sidecar_dir),
+        "review_html_path": result.get("review_html_path"),
+        "route_a_formula_count": result.get("route_a_formula_count"),
+        "route_b_formula_count": result.get("route_b_formula_count"),
+        "suspicious_formula_count": result.get("suspicious_formula_count"),
+        "replaced_count": result.get("replaced_count"),
+        "no_match_count": result.get("no_match_count"),
+        "guarded_fallback_eqs": sorted(args.formula_second_pass_guarded_fallback_eq),
+        "error": result.get("error"),
+    }
+    metadata["formula_second_pass"] = formula_summary
+    status["quality_signals"]["formula_second_pass"] = formula_summary
+
+    if not result.get("ok"):
+        status["warnings"].append(f"formula_second_pass_failed:{result.get('error')}")
+        status["ok"] = False
+        status["success_class"] = "degraded_failure"
+        write_updated_contract_state()
+        return
+
+    metadata.setdefault("generated_outputs", []).extend(
+        [
+            str((sidecar_dir / "document.md").relative_to(output_dir))
+            if sidecar_dir.is_relative_to(output_dir)
+            else str(sidecar_dir / "document.md"),
+            str((sidecar_dir / "document.json").relative_to(output_dir))
+            if sidecar_dir.is_relative_to(output_dir)
+            else str(sidecar_dir / "document.json"),
+            str((sidecar_dir / "second_pass_summary.json").relative_to(output_dir))
+            if sidecar_dir.is_relative_to(output_dir)
+            else str(sidecar_dir / "second_pass_summary.json"),
+            str((sidecar_dir / "review_index.html").relative_to(output_dir))
+            if sidecar_dir.is_relative_to(output_dir)
+            else str(sidecar_dir / "review_index.html"),
+        ]
+    )
+    status["warnings"].append(
+        "formula_second_pass_completed:"
+        f"{policy}:suspicious={result.get('suspicious_formula_count')}:"
+        f"replaced={result.get('replaced_count')}:no_match={result.get('no_match_count')}"
+    )
+    if policy == "apply":
+        shutil.copyfile(sidecar_dir / "document.md", output_dir / "document.md")
+        shutil.copyfile(sidecar_dir / "document.json", output_dir / "document.json")
+        metadata["formula_second_pass_applied"] = True
+        status["quality_signals"]["formula_second_pass_applied"] = True
+    else:
+        metadata["formula_second_pass_applied"] = False
+        status["quality_signals"]["formula_second_pass_applied"] = False
+
+    write_updated_contract_state()
+
+
 def page_count_from_document(document_json: Any) -> int | None:
     if not isinstance(document_json, dict):
         return None
@@ -1668,6 +1820,7 @@ def main() -> int:
 
     write_contract_outputs(output_dir, response, metadata, status)
     restore_review_artifact_layer(output_dir, response, metadata, status, args)
+    run_optional_formula_second_pass(output_dir, metadata, status, args)
     summary = {
         "ok": status["ok"],
         "output_dir": str(output_dir),
