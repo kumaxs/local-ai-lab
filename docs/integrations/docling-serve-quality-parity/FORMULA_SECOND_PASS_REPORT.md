@@ -151,14 +151,14 @@ The approach has three practical constraints to document:
 
 1. **Right-column formulas require guarded fallback**: formulas (7) and (8) are right-column equation numbers where Route B's VLM pipeline failed to detect a body. The current fallback is explicitly allowlisted and should not become broad replacement logic without more validation.
 2. **Route B as formula-only source**: Route B (VlmPipeline) is not safe as full-document output; it drops right-column text on CN.pdf pages 3-4 and renders pictures unreliably. The second-pass uses Route B **only** for formula text replacement, never for layout or text.
-3. **Markdown patching limitations**: formulas without embedded equation numbers (like formula 16) are patched via content-prefix matching. The patched markdown loses the equation number tag when `eq_num is None`, which is acceptable for the prototype but should be addressed in a production version.
+3. **Markdown patching limitation fixed on 2026-06-04**: formulas without a clean `main_eq` but with spaced equation tags such as `( 1 6 )` are still patched via content-prefix matching, and the patched markdown now restores a single-number equation tag.
 
 ---
 
 ## next
 
 1. **Generalize guarded fallback carefully** with more CN/right-column examples before production use.
-2. **Add equation-number restoration** to the markdown replacer for formulas without `main_eq`; currently formula (16) markdown loses `(16)`.
+2. **Keep equation-number restoration covered in regression** for formulas without `main_eq`; formula (16) now preserves `(16)` in patched markdown.
 3. **Consider bundling local MathJax assets** if offline review is required; current review uses CDN MathJax with raw LaTeX always visible.
 4. **Production integration decision**: if approved, keep Route A as the backbone and call candidate sources only for formula nodes flagged as suspicious.
 5. **Do not commit** `.runtime/` outputs, model caches, or batch logs.
@@ -236,6 +236,23 @@ This includes English two-column, formula-heavy, table-heavy, and image/layout-h
 
 ### remaining_blockers
 
-- CN formula (16) still loses the equation number in patched markdown because the Route A text does not expose a clean `main_eq`; this is unchanged from the previous report.
 - Guarded fallback remains manual/allowlisted for CN formulas 5, 7, and 8. It should not become broad fallback logic without more right-column examples.
 - MathJax in `review_index.html` still loads from CDN; raw LaTeX remains visible offline.
+
+---
+
+## 2026-06-04 equation-number restoration addendum
+
+### DONE
+
+Fixed markdown equation-number restoration for replacements whose Route A formula text has no clean `main_eq` but does contain a spaced equation number, such as CN formula 16's `( 1 6 )`.
+
+### formula_16
+
+CN formula 16 now patches markdown from the repeated `and` hallucination to:
+
+```text
+$$w _ { i } = \frac { h _ { i } } { \sum _ { k = 1 } ^ { h _ { i } } } \quad i \in [ 1 , t ) \cap \in \mathbb { N } \quad ( 16 )$$
+```
+
+Formula 14 also benefits from the same restoration path, changing the split `( 1 4 )` tag to `( 14 )` in patched markdown. Guarded fallback behavior remains unchanged and allowlisted only for CN formulas 5, 7, and 8.

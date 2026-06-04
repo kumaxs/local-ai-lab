@@ -31,6 +31,8 @@ from typing import Any
 CJK_RE = re.compile(r"[\u3400-\u9fff]")
 # Equation number in formula text: ( 3 ) or (3), spaces optional
 EQ_NUM_RE = re.compile(r"\(\s*(\d+)\s*\)")
+# Equation number split by OCR/LaTeX spacing, e.g. ( 1 6 ) for equation 16.
+SPACED_EQ_NUM_RE = re.compile(r"\(\s*((?:\d\s+)+\d)\s*\)")
 # Repeated "\\ a n d" pattern (at least 3 repeats = hallucination)
 REPEATED_AND_RE = re.compile(r"(\\quad \\ \\ a n d ){3,}")
 # Number-only formula text (just equation numbers, nothing else)
@@ -483,6 +485,31 @@ def _extract_eq_numbers_from_text(text: str) -> list[int]:
     return [int(m.group(1)) for m in EQ_NUM_RE.finditer(text)]
 
 
+def _infer_markdown_eq_number(entry: dict[str, Any]) -> int | None:
+    """Return the equation number to preserve in patched markdown, if known."""
+    eq_num = entry.get("eq_number")
+    if isinstance(eq_num, int):
+        return eq_num
+
+    route_a_text = str(entry.get("route_a_text") or "")
+    for match in SPACED_EQ_NUM_RE.finditer(route_a_text):
+        compact = re.sub(r"\s+", "", match.group(1))
+        if not compact:
+            continue
+        inferred = int(compact)
+        formula_no = entry.get("formula_no")
+        if not isinstance(formula_no, int) or inferred == formula_no:
+            return inferred
+    return None
+
+
+def _formula_text_with_eq_number(formula_text: str, eq_num: int | None) -> str:
+    """Append an equation number when a replacement candidate omits it."""
+    if eq_num is None or EQ_NUM_RE.search(formula_text) or SPACED_EQ_NUM_RE.search(formula_text):
+        return formula_text
+    return f"{formula_text} \\quad ( {eq_num} )"
+
+
 def _find_markdown_block(md_text: str, formula_text: str, eq_num: int | None) -> str:
     """Find the most likely $$...$$ markdown block for a formula."""
     if not md_text:
@@ -524,6 +551,7 @@ def patch_document_md(
         if entry["status"] != "replaced":
             continue
         eq_num = entry.get("eq_number")
+        markdown_eq_num = _infer_markdown_eq_number(entry)
         route_b_text = entry.get("route_b_candidate", "")
         if not route_b_text:
             continue
@@ -541,12 +569,7 @@ def patch_document_md(
         # Route A had eq_num but we replaced with Route B's cleaner text)
         def replacer(m: re.Match) -> str:
             # Preserve the $$ delimiters, replace inner content
-            if eq_num is not None:
-                if EQ_NUM_RE.search(route_b_text):
-                    return f"$${route_b_text}$$"
-                return f"$${route_b_text} \\quad ( {eq_num} )$$"
-            else:
-                return f"$${route_b_text}$$"
+            return f"$${_formula_text_with_eq_number(route_b_text, markdown_eq_num)}$$"
 
         result = pattern.sub(replacer, result)
 
