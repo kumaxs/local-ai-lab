@@ -83,6 +83,65 @@ class EnglishReviewPolishTests(unittest.TestCase):
         self.assertEqual(diagnostics[0]["recovered_number"], 10)
         self.assertIn("equation_number_recoverable_from_formula_text", diagnostics[0]["reasons"])
 
+    def test_formula_tex_qc_sanitizes_bare_alignment_markers(self) -> None:
+        formulas = [
+            {
+                "label": "formula",
+                "text": r"m_i^\ell & = \bigoplus_j m_{ij}^\ell , & ( 1 2 )",
+                "prov": [{"page_no": 5}],
+            }
+        ]
+
+        diagnostics = adapter.formula_tex_qc_diagnostics(formulas)
+        display_text, reasons = adapter.sanitize_formula_display_text(formulas[0]["text"])
+
+        self.assertEqual(len(diagnostics), 1)
+        self.assertIn("bare_alignment_marker_without_alignment_environment", reasons)
+        self.assertNotIn("&", display_text)
+        self.assertEqual(diagnostics[0]["action"], "sanitize_display_tex_preserve_raw_tex")
+
+    def test_formula_renderer_preserves_raw_tex_when_display_is_sanitized(self) -> None:
+        html = adapter._render_second_pass_formula_html(
+            {
+                "formula_no": 12,
+                "status": "qc_formula_tex_safety",
+                "markdown_after": r"$$m_i^\ell & = m_{ij}^\ell , & ( 1 2 )$$",
+                "display_override": r"m_i^\ell = m_{ij}^\ell , ( 1 2 )",
+                "raw_tex": r"m_i^\ell & = m_{ij}^\ell , & ( 1 2 )",
+            },
+            Path("/tmp/out"),
+            Path("/tmp/out"),
+        )
+
+        self.assertIn(r"\[m_i^\ell = m_{ij}^\ell , ( 1 2 )\]", html)
+        self.assertIn(r"m_i^\ell &amp; = m_{ij}^\ell , &amp; ( 1 2 )", html)
+        self.assertIn("docling-formula-display-tex", html)
+
+    def test_apply_all_review_counts_every_formula(self) -> None:
+        formulas = [
+            {"label": "formula", "text": r"x = y \quad ( 1 0 )", "prov": [{"page_no": 1}]},
+            {"label": "formula", "text": r"z = q", "prov": [{"page_no": 1}]},
+        ]
+        number_diag = [
+            {
+                "index": 1,
+                "safe_to_recover": True,
+                "recovered_number": 10,
+                "reasons": ["equation_number_recoverable_from_formula_text"],
+            },
+            {
+                "index": 2,
+                "safe_to_recover": False,
+                "reasons": ["display_formula_missing_equation_number"],
+            },
+        ]
+
+        review = adapter.formula_second_pass_apply_all_review(formulas, number_diag, [], [1])
+
+        self.assertEqual(review["reviewed_count"], 2)
+        self.assertEqual(review["enhanced_count"], 1)
+        self.assertEqual(review["evidence_only_count"], 1)
+
     def test_header_footer_qc_flags_page_edge_noise(self) -> None:
         document = {
             "texts": [
