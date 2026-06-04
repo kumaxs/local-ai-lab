@@ -48,6 +48,15 @@ CN_FINAL_TEXT_CORRECTIONS = (
         "获取历史时刻知识状态的权重为",
     ),
 )
+PAGE_EDGE_LABELS = {"page_header", "page_footer"}
+HEADER_FOOTER_NOISE_RE = re.compile(
+    r"(?i)\b(arxiv|proceedings|conference|workshop|copyright|all rights reserved|"
+    r"technical version|preprint|accepted|published|doi:|isbn)\b"
+)
+MATH_TEXT_RE = re.compile(
+    r"(?:\\(?:frac|sum|int|alpha|beta|gamma|theta|mathcal|mathbf|mathrm|sqrt|infty|cdot|left|right)|"
+    r"[Θ∆Φℝ𝑊𝑟𝑑𝒩×≪ˆ=|])"
+)
 
 START_COMMAND = (
     "UVICORN_WORKERS=1 DOCLING_DEVICE=cpu "
@@ -1283,19 +1292,207 @@ def _mark_math_heavy_text(document_html: str) -> tuple[str, int]:
     return re.sub(r"<p>.*?</p>", replace, document_html, flags=re.S), count
 
 
+def structural_text_records(document_json: Any) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    for node in iter_nodes(document_json):
+        if not isinstance(node, dict):
+            continue
+        text = node.get("text")
+        if not isinstance(text, str):
+            continue
+        label = str(node.get("label") or "")
+        prov = first_prov(node) or {}
+        geometry = bbox_geometry(prov)
+        records.append(
+            {
+                "label": label,
+                "text": text,
+                "page_no": prov.get("page_no"),
+                "bbox": geometry,
+                "prov": prov,
+            }
+        )
+    return records
+
+
+def _normalized_noise_text(text: str) -> str:
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def header_footer_qc_diagnostics(document_json: Any) -> list[dict[str, Any]]:
+    diagnostics: list[dict[str, Any]] = []
+    records = structural_text_records(document_json)
+    edge_records = [record for record in records if record["label"].lower() in PAGE_EDGE_LABELS]
+    text_counts: dict[str, int] = {}
+    for record in edge_records:
+        normalized = _normalized_noise_text(str(record["text"]))
+        if normalized:
+            text_counts[normalized] = text_counts.get(normalized, 0) + 1
+
+    for index, record in enumerate(edge_records, start=1):
+        text = str(record["text"])
+        normalized = _normalized_noise_text(text)
+        geometry = record.get("bbox") or {}
+        reasons: list[str] = [f"docling_label_{record['label'].lower()}"]
+        if re.fullmatch(r"\d+", normalized):
+            reasons.append("page_number")
+        if HEADER_FOOTER_NOISE_RE.search(normalized):
+            reasons.append("template_or_publication_noise")
+        if text_counts.get(normalized, 0) >= 2 and not re.fullmatch(r"\d+", normalized):
+            reasons.append("repeated_page_edge_text")
+        if geometry:
+            if geometry.get("b", 9999) < 80 or geometry.get("t", 0) > 700:
+                reasons.append("page_edge_position")
+            if geometry.get("height", 0) > 120 and geometry.get("width", 9999) < 50:
+                reasons.append("rotated_margin_header")
+        diagnostics.append(
+            {
+                "index": index,
+                "label": record["label"],
+                "text": text[:240],
+                "reasons": reasons,
+                "page_no": record.get("page_no"),
+                "bbox": geometry or None,
+                "evidence": f"pages/page_{record.get('page_no')}.png" if record.get("page_no") else None,
+                "action": "diagnostic_only_no_content_deleted",
+            }
+        )
+    return diagnostics
+
+
+def formula_number_qc_diagnostics(
+    formulas: list[dict[str, Any]],
+    document_html: str,
+) -> list[dict[str, Any]]:
+    diagnostics: list[dict[str, Any]] = []
+    html_blocks = list(FORMULA_MATH_BLOCK_RE.finditer(document_html))
+    for index, formula in enumerate(formulas, start=1):
+        text = str(formula.get("text") or "")
+        prov = first_prov(formula) or {}
+        compact_numbers = _compact_formula_numbers(text)
+        normal_numbers = [int(value) for value in FORMULA_NUMBER_RE.findall(text)]
+        reasons: list[str] = []
+        safe_recovered_number: int | None = None
+        if compact_numbers and not normal_numbers:
+            safe_recovered_number = compact_numbers[-1]
+            reasons.append("equation_number_recoverable_from_formula_text")
+        if MATH_TEXT_RE.search(text) and not compact_numbers:
+            reasons.append("display_formula_missing_equation_number")
+        if index <= len(html_blocks):
+            html_block_text = html.unescape(html_blocks[index - 1].group(0))
+            if compact_numbers and not any(f"({number})" in html_block_text for number in compact_numbers):
+                reasons.append("html_formula_number_not_compactly_visible")
+        if reasons:
+            diagnostics.append(
+                {
+                    "index": index,
+                    "text": text[:300],
+                    "reasons": reasons,
+                    "page_no": prov.get("page_no"),
+                    "bbox": bbox_geometry(prov),
+                    "recovered_number": safe_recovered_number,
+                    "safe_to_recover": safe_recovered_number is not None,
+                    "evidence": f"formulas/formula_{index}_context.png",
+                }
+            )
+    return diagnostics
+
+
+def recover_formula_numbers_in_html(
+    output_dir: Path,
+    document_html: str,
+    formulas: list[dict[str, Any]],
+    diagnostics: list[dict[str, Any]],
+) -> tuple[str, list[int]]:
+    recoverable = {
+        int(item["index"]): int(item["recovered_number"])
+        for item in diagnostics
+        if item.get("safe_to_recover") and item.get("recovered_number")
+    }
+    if not recoverable:
+        return document_html, []
+
+    blocks = list(FORMULA_MATH_BLOCK_RE.finditer(document_html))
+    replacements: list[tuple[int, re.Match[str], str]] = []
+    sidecar_dir = output_dir
+    for formula_index, recovered_number in sorted(recoverable.items()):
+        if not (0 < formula_index <= len(blocks)):
+            continue
+        formula_text = str(formulas[formula_index - 1].get("text") or "").strip()
+        if not formula_text:
+            continue
+        replacement = _render_second_pass_formula_html(
+            {
+                "formula_no": formula_index,
+                "status": "qc_formula_number_recovery",
+                "markdown_after": f"$${formula_text}$$",
+            },
+            output_dir,
+            sidecar_dir,
+        ).replace(
+            'data-formula-status="qc_formula_number_recovery"',
+            (
+                'data-formula-status="qc_formula_number_recovery" '
+                f'data-equation-number="{html.escape(str(recovered_number), quote=True)}"'
+            ),
+            1,
+        )
+        replacements.append((formula_index, blocks[formula_index - 1], replacement))
+
+    if not replacements:
+        return document_html, []
+    updated = _replace_original_html_ranges(document_html, replacements)
+    updated, _assets_injected = _ensure_formula_second_pass_html_assets(updated)
+    return updated, sorted(index for index, _match, _replacement in replacements)
+
+
 def footnote_review_diagnostics(document_json: Any) -> list[dict[str, Any]]:
     diagnostics: list[dict[str, Any]] = []
-    for index, node in enumerate(extract_label_nodes(document_json, "footnote"), start=1):
+    footnotes = extract_label_nodes(document_json, "footnote")
+    anchors_by_page: dict[Any, list[str]] = {}
+    for record in structural_text_records(document_json):
+        text = str(record.get("text") or "").strip()
+        if record.get("label", "").lower() == "footnote":
+            continue
+        page_no = record.get("page_no")
+        if text in {"∗", "*", "†", "‡"} or re.search(r"\w\s+[∗†‡]\s+\w", text):
+            anchors_by_page.setdefault(page_no, []).append(text[:80])
+
+    footnote_geometries: list[tuple[int, Any, dict[str, float], str]] = []
+    for index, node in enumerate(footnotes, start=1):
+        prov = first_prov(node) or {}
+        geometry = bbox_geometry(prov)
+        if geometry:
+            footnote_geometries.append((index, prov.get("page_no"), geometry, str(node.get("text") or "")))
+
+    for index, node in enumerate(footnotes, start=1):
         text = str(node.get("text") or "")
         prov = first_prov(node) or {}
         geometry = bbox_geometry(prov)
         reasons: list[str] = []
         if re.fullmatch(r"\d+", text.strip()):
             reasons.append("isolated_numeric_footnote_fragment")
+        if re.match(r"^\d+\s+\w+", text.strip()):
+            reasons.append("numeric_marker_attached_to_text_fragment")
         if text.rstrip().endswith("-"):
             reasons.append("hyphenated_split_footnote_continuation")
         if geometry and geometry["b"] < 110:
             reasons.append("near_page_bottom_footnote")
+        if geometry:
+            for other_index, other_page, other_geometry, _other_text in footnote_geometries:
+                if other_index == index or other_page != prov.get("page_no"):
+                    continue
+                horizontal_overlap = min(geometry["r"], other_geometry["r"]) - max(
+                    geometry["l"], other_geometry["l"]
+                )
+                vertical_overlap = min(geometry["t"], other_geometry["t"]) - max(
+                    geometry["b"], other_geometry["b"]
+                )
+                if horizontal_overlap > 0 and vertical_overlap > 0:
+                    reasons.append("overlapping_footnote_bbox")
+                    break
+        if anchors_by_page.get(prov.get("page_no")) and re.fullmatch(r"\d+", text.strip()):
+            reasons.append("anchor_content_marker_mismatch")
         if reasons:
             page_no = prov.get("page_no")
             diagnostics.append(
@@ -1306,12 +1503,14 @@ def footnote_review_diagnostics(document_json: Any) -> list[dict[str, Any]]:
                     "page_no": page_no,
                     "bbox": geometry,
                     "evidence": f"pages/page_{page_no}.png" if page_no else None,
+                    "nearby_anchor_examples": anchors_by_page.get(page_no, [])[:5],
+                    "action": "diagnostic_only_no_reordering",
                 }
             )
     return diagnostics
 
 
-def english_math_review_diagnostics(document_html: str, document_json: Any, input_file: Path) -> dict[str, Any]:
+def math_review_diagnostics(document_html: str, document_json: Any) -> dict[str, Any]:
     decoded = html.unescape(DATA_IMAGE_RE.sub("data:image/<stripped>", document_html))
     text_nodes = [
         str(node.get("text") or "")
@@ -1321,25 +1520,20 @@ def english_math_review_diagnostics(document_html: str, document_json: Any, inpu
     math_text_nodes = [
         text
         for text in text_nodes
-        if re.search(r"[Θ∆Φℝ𝑊𝑟𝑑𝒩×≪ˆ]", text)
+        if MATH_TEXT_RE.search(text)
     ]
-    missing_lora_numbers: list[int] = []
-    if input_file.name == "two-col-arxiv-ai-lora.pdf":
-        for formula_no in (15, 16):
-            if f"({formula_no})" not in decoded and f"( {formula_no} )" not in decoded:
-                missing_lora_numbers.append(formula_no)
     return {
         "mathml_block_count": document_html.count("<math"),
         "math_unicode_text_node_count": len(math_text_nodes),
         "math_unicode_text_examples": math_text_nodes[:10],
         "boxed_math_symbol_count": sum(decoded.count(char) for char in ("□", "▢", "◻", "☐", "■", "▣", "�")),
-        "missing_lora_page6_formula_numbers": missing_lora_numbers,
     }
 
 
-def polish_english_review_html(
+def run_unified_review_qc(
     output_dir: Path,
     document_json: Any,
+    formulas: list[dict[str, Any]],
     metadata: dict[str, Any],
     status: dict[str, Any],
     args: argparse.Namespace,
@@ -1353,11 +1547,19 @@ def polish_english_review_html(
     document_html, autolink_count = _autolink_plain_urls(document_html)
     document_html, footnote_sup_count = _polish_footnote_superscripts(document_html)
     document_html, math_text_count = _mark_math_heavy_text(document_html)
+    formula_number_diag = formula_number_qc_diagnostics(formulas, document_html)
+    document_html, formula_number_recovered = recover_formula_numbers_in_html(
+        output_dir,
+        document_html,
+        formulas,
+        formula_number_diag,
+    )
     html_path.write_text(document_html, encoding="utf-8")
 
     link_diag = pdf_annotation_link_diagnostics(args.input_file)
     footnote_diag = footnote_review_diagnostics(document_json)
-    math_diag = english_math_review_diagnostics(document_html, document_json, args.input_file)
+    math_diag = math_review_diagnostics(document_html, document_json)
+    header_footer_diag = header_footer_qc_diagnostics(document_json)
     links_path = output_dir / "links.json"
     links_path.write_text(json.dumps(link_diag, indent=2, ensure_ascii=False), encoding="utf-8")
 
@@ -1371,11 +1573,14 @@ def polish_english_review_html(
             "html_plain_url_autolink_count": autolink_count,
             "html_href_count_before_review_polish": before_href_count,
             "html_href_count_after_review_polish": len(re.findall(r"href=\"", document_html)),
-            "english_review_style_injected": style_injected,
+            "review_qc_style_injected": style_injected,
             "footnote_superscript_polish_count": footnote_sup_count,
             "math_text_polish_count": math_text_count,
             "footnote_review_diagnostics": footnote_diag,
-            "english_math_review_diagnostics": math_diag,
+            "math_review_diagnostics": math_diag,
+            "formula_number_qc_diagnostics": formula_number_diag,
+            "formula_number_recovered_html_indexes": formula_number_recovered,
+            "header_footer_qc_diagnostics": header_footer_diag,
         }
     )
     metadata.setdefault("generated_outputs", []).append("links.json")
@@ -1388,7 +1593,10 @@ def polish_english_review_html(
             "html_plain_url_autolink_count": autolink_count,
             "html_href_count_after_review_polish": metadata["html_href_count_after_review_polish"],
             "footnote_review_diagnostics": footnote_diag,
-            "english_math_review_diagnostics": math_diag,
+            "math_review_diagnostics": math_diag,
+            "formula_number_qc_diagnostics": formula_number_diag,
+            "formula_number_recovered_html_indexes": formula_number_recovered,
+            "header_footer_qc_diagnostics": header_footer_diag,
         }
     )
     if autolink_count:
@@ -1405,12 +1613,35 @@ def polish_english_review_html(
             f"{item['index']}:{','.join(item['reasons'])}:"
             f"{item.get('evidence')}"
         )
-    missing_lora_numbers = math_diag.get("missing_lora_page6_formula_numbers") or []
-    if missing_lora_numbers:
+    for item in formula_number_diag:
+        if item.get("safe_to_recover"):
+            continue
         status["warnings"].append(
-            "missing_lora_page6_formula_numbers:"
-            + ",".join(str(number) for number in missing_lora_numbers)
-            + ":requires_docling_or_formula_recovery"
+            "formula_number_qc:"
+            f"{item['index']}:{','.join(item.get('reasons') or [])}:"
+            f"{item.get('evidence')}"
+        )
+    if formula_number_recovered:
+        status["warnings"].append(
+            "formula_numbers_recovered_in_html:"
+            + ",".join(str(index) for index in formula_number_recovered)
+        )
+    for item in header_footer_diag:
+        status["warnings"].append(
+            "header_footer_qc:"
+            f"{item['label']}:{item.get('page_no')}:{','.join(item.get('reasons') or [])}:"
+            f"{item.get('action')}"
+        )
+    missing_formula_numbers = [
+        item["index"]
+        for item in formula_number_diag
+        if "display_formula_missing_equation_number" in (item.get("reasons") or [])
+    ]
+    if missing_formula_numbers:
+        status["warnings"].append(
+            "display_formula_numbers_missing:"
+            + ",".join(str(number) for number in missing_formula_numbers)
+            + ":requires_structural_source_evidence_for_recovery"
         )
 
 
@@ -1515,8 +1746,7 @@ def restore_review_artifact_layer(
     formula_source_link_count = inject_formula_source_links(output_dir, formulas)
     metadata["formula_source_link_count"] = formula_source_link_count
     status["quality_signals"]["formula_source_link_count"] = formula_source_link_count
-    if args.input_file.name != "CN.pdf":
-        polish_english_review_html(output_dir, document_json, metadata, status, args)
+    run_unified_review_qc(output_dir, document_json, formulas, metadata, status, args)
     (output_dir / "metadata.json").write_text(
         json.dumps(metadata, indent=2, ensure_ascii=False), encoding="utf-8"
     )
@@ -1824,12 +2054,20 @@ def validate_formula_second_pass_html(
 
 
 def _compact_formula_numbers(text: str) -> list[int]:
-    numbers = [int(match.group(1)) for match in FORMULA_NUMBER_RE.finditer(text)]
+    numbers: list[int] = []
+    for match in re.finditer(r"\(\s*(?:\\text\s*\{\s*)?\$?\s*((?:\d\s*){1,3})\s*\$?\s*(?:\}\s*)?\)", text):
+        compact = re.sub(r"\s+", "", match.group(1))
+        if compact:
+            numbers.append(int(compact))
     for match in SPACED_FORMULA_NUMBER_RE.finditer(text):
         compact = re.sub(r"\s+", "", match.group(1))
         if compact:
             numbers.append(int(compact))
-    return numbers
+    deduped: list[int] = []
+    for number in numbers:
+        if number not in deduped:
+            deduped.append(number)
+    return deduped
 
 
 def _formula_number_for_node(formula_no: int, node: dict[str, Any]) -> int | None:
