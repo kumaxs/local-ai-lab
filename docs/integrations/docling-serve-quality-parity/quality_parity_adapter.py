@@ -1220,6 +1220,19 @@ sup.docling-footnote-ref {
 .docling-footnote {
   font-size: 0.9em;
 }
+.docling-footnote-recovery {
+  border-left: 3px solid #0f766e;
+  font-size: 0.9em;
+  margin: 0.35rem 0;
+  padding: 0.35rem 0.65rem;
+}
+.docling-footnote-recovery details {
+  color: #475569;
+  font-size: 0.85em;
+}
+.docling-footnote-recovery pre {
+  white-space: pre-wrap;
+}
 </style>
 """
 
@@ -1617,6 +1630,184 @@ def footnote_review_diagnostics(document_json: Any) -> list[dict[str, Any]]:
     return diagnostics
 
 
+def _footnote_fragment_records(document_json: Any) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    for index, node in enumerate(extract_label_nodes(document_json, "footnote"), start=1):
+        prov = first_prov(node) or {}
+        records.append(
+            {
+                "index": index,
+                "text": str(node.get("text") or ""),
+                "page_no": prov.get("page_no"),
+                "bbox": bbox_geometry(prov),
+            }
+        )
+    return records
+
+
+def first_page_footnote_recovery_diagnostics(document_json: Any) -> list[dict[str, Any]]:
+    diagnostics: list[dict[str, Any]] = []
+    page_one = [
+        record
+        for record in _footnote_fragment_records(document_json)
+        if record.get("page_no") == 1 and record.get("bbox")
+    ]
+    for lead in page_one:
+        lead_text = str(lead.get("text") or "").strip()
+        if not lead_text.endswith("-"):
+            continue
+        lead_bbox = lead.get("bbox") or {}
+        for tail in page_one:
+            tail_text = str(tail.get("text") or "").strip()
+            if tail["index"] == lead["index"] or not re.match(r"^\d+\s+\w+", tail_text):
+                continue
+            tail_bbox = tail.get("bbox") or {}
+            if tail_bbox.get("t", 0) > lead_bbox.get("t", 0):
+                continue
+            if abs(tail_bbox.get("b", 0) - lead_bbox.get("b", 0)) > 25:
+                continue
+            number, tail_body = tail_text.split(None, 1)
+            recovered = f"{number} {lead_text[:-1]}{tail_body}"
+            diagnostics.append(
+                {
+                    "page_no": 1,
+                    "footnote_number": number,
+                    "lead_fragment_index": lead["index"],
+                    "tail_fragment_index": tail["index"],
+                    "lead_fragment": lead_text,
+                    "tail_fragment": tail_text,
+                    "recovered_text": recovered,
+                    "reasons": [
+                        "same_page_bottom_footnote_fragments",
+                        "hyphenated_lead_fragment",
+                        "numeric_tail_fragment_continues_hyphenated_word",
+                    ],
+                    "bbox": {
+                        "lead": lead_bbox,
+                        "tail": tail_bbox,
+                    },
+                    "evidence": "pages/page_1.png",
+                    "action": "html_recovery_preserve_original_fragments",
+                    "safe_to_apply": True,
+                }
+            )
+            break
+    if any(record["text"].strip() == "0" for record in page_one):
+        diagnostics.append(
+            {
+                "page_no": 1,
+                "footnote_number": "0",
+                "reasons": ["isolated_numeric_marker_without_recoverable_body"],
+                "evidence": "pages/page_1.png",
+                "action": "diagnostic_only_no_recovery",
+                "safe_to_apply": False,
+            }
+        )
+    return diagnostics
+
+
+def apply_first_page_footnote_html_recovery(
+    document_html: str,
+    diagnostics: list[dict[str, Any]],
+) -> tuple[str, list[dict[str, Any]]]:
+    applied: list[dict[str, Any]] = []
+    updated = document_html
+    for item in diagnostics:
+        if not item.get("safe_to_apply"):
+            continue
+        lead = str(item.get("lead_fragment") or "")
+        tail = str(item.get("tail_fragment") or "")
+        recovered = str(item.get("recovered_text") or "")
+        if not lead or not tail or not recovered:
+            continue
+        pattern = re.compile(
+            r"<p>" + re.escape(html.escape(tail)) + r"</p>\s*"
+            r"<p>" + re.escape(html.escape(lead)) + r"</p>"
+        )
+        replacement = (
+            '<div class="docling-footnote-recovery" '
+            f'data-page="{html.escape(str(item.get("page_no")), quote=True)}" '
+            f'data-footnote-number="{html.escape(str(item.get("footnote_number")), quote=True)}" '
+            f'data-action="{html.escape(str(item.get("action")), quote=True)}">'
+            '<p class="docling-footnote">'
+            f'<sup>{html.escape(str(item.get("footnote_number")))}</sup> '
+            f'{html.escape(recovered.split(" ", 1)[1] if " " in recovered else recovered)}'
+            '</p>'
+            '<details><summary>Original Docling footnote fragments</summary>'
+            '<pre>'
+            f'{html.escape(tail)}\n{html.escape(lead)}'
+            '</pre></details>'
+            '</div>'
+        )
+        updated, count = pattern.subn(replacement, updated, count=1)
+        if count:
+            applied.append(item)
+    return updated, applied
+
+
+def layout_qc_diagnostics(document_json: Any) -> dict[str, Any]:
+    records = structural_text_records(document_json)
+    pages: dict[Any, list[dict[str, Any]]] = {}
+    labels: dict[str, int] = {}
+    for record in records:
+        labels[record["label"]] = labels.get(record["label"], 0) + 1
+        pages.setdefault(record.get("page_no"), []).append(record)
+    page_diagnostics: list[dict[str, Any]] = []
+    for page_no, page_records in sorted(pages.items(), key=lambda item: (item[0] is None, item[0] or 0)):
+        x_centers = [
+            (record.get("bbox") or {}).get("l", 0) + ((record.get("bbox") or {}).get("width", 0) / 2)
+            for record in page_records
+            if (record.get("bbox") or {}).get("width", 0) > 80
+            and record["label"].lower() not in PAGE_EDGE_LABELS
+        ]
+        left = sum(1 for value in x_centers if value < 300)
+        right = sum(1 for value in x_centers if value >= 300)
+        page_diagnostics.append(
+            {
+                "page_no": page_no,
+                "text_record_count": len(page_records),
+                "wide_text_left_count": left,
+                "wide_text_right_count": right,
+                "layout_hint": "two_column_candidate" if left >= 3 and right >= 3 else "single_or_mixed_layout",
+                "evidence": f"pages/page_{page_no}.png" if page_no else None,
+            }
+        )
+    return {
+        "label_counts": labels,
+        "page_count": len([page for page in pages if page is not None]),
+        "two_column_candidate_pages": [
+            item["page_no"] for item in page_diagnostics if item["layout_hint"] == "two_column_candidate"
+        ],
+        "page_diagnostics": page_diagnostics,
+    }
+
+
+def write_formula_latex_sources(output_dir: Path, formulas: list[dict[str, Any]]) -> dict[str, Any]:
+    if not formulas:
+        return {"written": False, "path": None, "formula_count": 0}
+    lines: list[str] = []
+    for index, formula in enumerate(formulas, start=1):
+        text = str(formula.get("text") or "").strip()
+        prov = first_prov(formula) or {}
+        display_text, reasons = sanitize_formula_display_text(text)
+        lines.append(f"% Formula {index}")
+        if prov.get("page_no") is not None:
+            lines.append(f"% page_no: {prov.get('page_no')}")
+        lines.append(f"% evidence: formulas/formula_{index}_context.png")
+        if reasons:
+            lines.append("% display_tex_sanitized: " + ",".join(reasons))
+            lines.append("% raw_tex:")
+            lines.append(text)
+            lines.append("% display_tex:")
+            lines.append(display_text)
+        else:
+            lines.append(text)
+        lines.append("")
+    path = output_dir / "formulas.tex"
+    path.write_text("\n".join(lines), encoding="utf-8")
+    return {"written": True, "path": "formulas.tex", "formula_count": len(formulas)}
+
+
 def math_review_diagnostics(document_html: str, document_json: Any) -> dict[str, Any]:
     decoded = html.unescape(DATA_IMAGE_RE.sub("data:image/<stripped>", document_html))
     text_nodes = [
@@ -1674,12 +1865,19 @@ def run_unified_review_qc(
         time.monotonic() - formula_second_pass_start,
         6,
     )
+    first_page_footnote_diag = first_page_footnote_recovery_diagnostics(document_json)
+    document_html, first_page_footnote_applied = apply_first_page_footnote_html_recovery(
+        document_html,
+        first_page_footnote_diag,
+    )
     html_path.write_text(document_html, encoding="utf-8")
 
     link_diag = pdf_annotation_link_diagnostics(args.input_file)
     footnote_diag = footnote_review_diagnostics(document_json)
     math_diag = math_review_diagnostics(document_html, document_json)
     header_footer_diag = header_footer_qc_diagnostics(document_json)
+    layout_diag = layout_qc_diagnostics(document_json)
+    formula_latex_sources = write_formula_latex_sources(output_dir, formulas)
     links_path = output_dir / "links.json"
     links_path.write_text(json.dumps(link_diag, indent=2, ensure_ascii=False), encoding="utf-8")
 
@@ -1702,10 +1900,16 @@ def run_unified_review_qc(
             "formula_number_recovered_html_indexes": formula_number_recovered,
             "formula_tex_qc_diagnostics": formula_tex_diag,
             "formula_second_pass_apply_all_review": formula_second_pass_review,
+            "first_page_footnote_recovery_diagnostics": first_page_footnote_diag,
+            "first_page_footnote_recovery_applied": first_page_footnote_applied,
             "header_footer_qc_diagnostics": header_footer_diag,
+            "layout_qc_diagnostics": layout_diag,
+            "formula_latex_sources": formula_latex_sources,
         }
     )
     metadata.setdefault("generated_outputs", []).append("links.json")
+    if formula_latex_sources.get("written"):
+        metadata.setdefault("generated_outputs", []).append(str(formula_latex_sources["path"]))
     status["quality_signals"].update(
         {
             "pdf_annotation_link_count": metadata["pdf_annotation_link_count"],
@@ -1720,7 +1924,11 @@ def run_unified_review_qc(
             "formula_number_recovered_html_indexes": formula_number_recovered,
             "formula_tex_qc_diagnostics": formula_tex_diag,
             "formula_second_pass_apply_all_review": formula_second_pass_review,
+            "first_page_footnote_recovery_diagnostics": first_page_footnote_diag,
+            "first_page_footnote_recovery_applied": first_page_footnote_applied,
             "header_footer_qc_diagnostics": header_footer_diag,
+            "layout_qc_diagnostics": layout_diag,
+            "formula_latex_sources": formula_latex_sources,
         }
     )
     if autolink_count:
@@ -1763,6 +1971,17 @@ def run_unified_review_qc(
             f"enhanced={formula_second_pass_review.get('enhanced_count')}:"
             f"evidence_only={formula_second_pass_review.get('evidence_only_count')}:"
             f"elapsed={formula_second_pass_review.get('elapsed_seconds')}"
+        )
+    for item in first_page_footnote_diag:
+        status["warnings"].append(
+            "first_page_footnote_qc:"
+            f"{item.get('footnote_number')}:{','.join(item.get('reasons') or [])}:"
+            f"{item.get('action')}:{item.get('evidence')}"
+        )
+    if first_page_footnote_applied:
+        status["warnings"].append(
+            "first_page_footnote_recovery_applied:"
+            + ",".join(str(item.get("footnote_number")) for item in first_page_footnote_applied)
         )
     for item in header_footer_diag:
         status["warnings"].append(
