@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import tempfile
 import sys
 import unittest
 from pathlib import Path
@@ -65,6 +66,69 @@ class EnglishReviewPolishTests(unittest.TestCase):
         self.assertIn("isolated_numeric_footnote_fragment", diagnostics[0]["reasons"])
         self.assertIn("near_page_bottom_footnote", diagnostics[0]["reasons"])
         self.assertIn("anchor_content_marker_mismatch", diagnostics[0]["reasons"])
+
+    def test_first_page_footnote_recovery_merges_hyphenated_fragments(self) -> None:
+        document = {
+            "texts": [
+                {
+                    "label": "footnote",
+                    "text": "0",
+                    "prov": [{"page_no": 1, "bbox": {"l": 120, "r": 124, "t": 90, "b": 85}}],
+                },
+                {
+                    "label": "footnote",
+                    "text": "1 mance significantly as shown in Appendix A.",
+                    "prov": [{"page_no": 1, "bbox": {"l": 108, "r": 271, "t": 79, "b": 60}}],
+                },
+                {
+                    "label": "footnote",
+                    "text": (
+                        "Compared to V1, this draft includes better baselines, "
+                        "fine-tuning boosts its perfor-"
+                    ),
+                    "prov": [{"page_no": 1, "bbox": {"l": 124, "r": 504, "t": 88, "b": 70}}],
+                },
+            ]
+        }
+
+        diagnostics = adapter.first_page_footnote_recovery_diagnostics(document)
+        recoverable = [item for item in diagnostics if item.get("safe_to_apply")]
+        evidence_only = [item for item in diagnostics if not item.get("safe_to_apply")]
+
+        self.assertEqual(len(recoverable), 1)
+        self.assertIn("performance significantly", recoverable[0]["recovered_text"])
+        self.assertEqual(recoverable[0]["action"], "html_recovery_preserve_original_fragments")
+        self.assertEqual(evidence_only[0]["footnote_number"], "0")
+
+    def test_first_page_footnote_html_recovery_preserves_trace(self) -> None:
+        diagnostics = [
+            {
+                "page_no": 1,
+                "footnote_number": "1",
+                "lead_fragment": "Compared to V1, fine-tuning boosts its perfor-",
+                "tail_fragment": "1 mance significantly as shown in Appendix A.",
+                "recovered_text": (
+                    "1 Compared to V1, fine-tuning boosts its performance significantly "
+                    "as shown in Appendix A."
+                ),
+                "action": "html_recovery_preserve_original_fragments",
+                "safe_to_apply": True,
+            }
+        ]
+        document_html = (
+            "<p>1 mance significantly as shown in Appendix A.</p>\n"
+            "<p>Compared to V1, fine-tuning boosts its perfor-</p>"
+        )
+
+        updated, applied = adapter.apply_first_page_footnote_html_recovery(
+            document_html,
+            diagnostics,
+        )
+
+        self.assertEqual(len(applied), 1)
+        self.assertIn("docling-footnote-recovery", updated)
+        self.assertIn("performance significantly", updated)
+        self.assertIn("Original Docling footnote fragments", updated)
 
     def test_formula_number_qc_recovers_spaced_number(self) -> None:
         formulas = [
@@ -141,6 +205,23 @@ class EnglishReviewPolishTests(unittest.TestCase):
         self.assertEqual(review["reviewed_count"], 2)
         self.assertEqual(review["enhanced_count"], 1)
         self.assertEqual(review["evidence_only_count"], 1)
+
+    def test_write_formula_latex_sources_outputs_raw_and_display_tex(self) -> None:
+        formulas = [
+            {
+                "label": "formula",
+                "text": r"m_i^\ell & = m_{ij}^\ell , & ( 1 2 )",
+                "prov": [{"page_no": 5}],
+            }
+        ]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result = adapter.write_formula_latex_sources(Path(tmpdir), formulas)
+            text = (Path(tmpdir) / "formulas.tex").read_text()
+
+        self.assertTrue(result["written"])
+        self.assertIn("% raw_tex:", text)
+        self.assertIn("% display_tex:", text)
+        self.assertIn("&", text)
 
     def test_header_footer_qc_flags_page_edge_noise(self) -> None:
         document = {
