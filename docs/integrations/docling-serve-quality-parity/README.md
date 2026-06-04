@@ -196,7 +196,9 @@ by default and remains evidence-first:
 - `review` mode writes sidecar evidence without replacing contract files.
 - `apply` mode writes the same sidecar evidence, then patches
   `document.md`, `document.json`, and the affected formula blocks in
-  `document.html` with traceable second-pass formula text.
+  `document.html` with rendered display math, traceable raw TeX, and review
+  links. The final HTML display text is taken from the patched markdown body so
+  restored equation numbers are preserved.
 
 CN reviewed command shape:
 
@@ -220,8 +222,8 @@ When enabled, the adapter records `metadata.json:formula_second_pass`,
 `metadata.json:formula_second_pass_html_gate`, and
 `status.json:quality_signals.formula_second_pass`. If `apply` reports
 replacements but the final decoded `document.html` does not contain each patched
-formula text with a traceable formula marker, the adapter marks the result as a
-`degraded_failure`. The default sidecar output is:
+formula text, its MathJax display wrapper, and a traceable formula marker, the
+adapter marks the result as a `degraded_failure`. The default sidecar output is:
 
 ```text
 <output-root>/<job-id>/formula_second_pass/

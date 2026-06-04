@@ -324,10 +324,12 @@ misleading.
 
 `quality_parity_adapter.py` now patches affected formula blocks in
 `document.html` during `--formula-second-pass-policy apply`. Each patched block
-contains traceable raw TeX plus links to the adapter formula evidence and the
-second-pass review page. A new HTML quality gate fails the adapter result if
-any reported replacement is not visible in decoded `document.html` with a
-traceable formula marker.
+contains rendered MathJax display math, traceable raw TeX, plus links to the
+adapter formula evidence and the second-pass review page. The final HTML display
+text is sourced from the patched markdown body so restored equation numbers are
+preserved. The HTML quality gate fails the adapter result if any reported
+replacement is not visible in decoded `document.html` with a traceable formula
+marker and display wrapper.
 
 ### validation
 
