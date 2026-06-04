@@ -1320,6 +1320,80 @@ window.MathJax = window.MathJax || {
     return assets + "\n" + html_text, True
 
 
+FORMULA_MATH_BLOCK_RE = re.compile(r"<div><math\b(?:(?!</math></div>).)*?</math></div>", re.DOTALL)
+FORMULA_INDEX_ATTR_RE = re.compile(r'data-formula-index="(\d+)"')
+HTML_TAG_RE = re.compile(r"<[^>]+>")
+
+
+def _normalize_formula_anchor(text: str) -> str:
+    text = html.unescape(text)
+    text = HTML_TAG_RE.sub(" ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _original_formula_html_ranges(html_text: str) -> tuple[list[re.Match[str]], dict[int, re.Match[str]]]:
+    """Return formula MathML blocks and explicit data-formula-index mappings."""
+    blocks = list(FORMULA_MATH_BLOCK_RE.finditer(html_text))
+    by_index: dict[int, re.Match[str]] = {}
+    for block in blocks:
+        index_match = FORMULA_INDEX_ATTR_RE.search(block.group(0))
+        if not index_match:
+            continue
+        formula_no = int(index_match.group(1))
+        by_index.setdefault(formula_no, block)
+    return blocks, by_index
+
+
+def _find_formula_html_block_by_text(
+    blocks: list[re.Match[str]],
+    used_starts: set[int],
+    formula_text: str,
+) -> tuple[re.Match[str] | None, str | None]:
+    """Find an unclaimed original MathML block containing the Route A formula text."""
+    formula_anchor = _normalize_formula_anchor(formula_text)
+    if not formula_anchor:
+        return None, None
+
+    candidates: list[str] = [formula_anchor]
+    if len(formula_anchor) > 80:
+        candidates.append(formula_anchor[:80])
+    if len(formula_anchor) > 40:
+        candidates.append(formula_anchor[:40])
+
+    for candidate in candidates:
+        if not candidate:
+            continue
+        matches: list[re.Match[str]] = []
+        for block in blocks:
+            if block.start() in used_starts:
+                continue
+            block_text = _normalize_formula_anchor(block.group(0))
+            if candidate in block_text:
+                matches.append(block)
+        if len(matches) == 1:
+            return matches[0], "route-a-text"
+    return None, None
+
+
+def _replace_original_html_ranges(
+    html_text: str,
+    replacements: list[tuple[int, re.Match[str], str]],
+) -> str:
+    """Apply replacements against byte ranges captured before any mutation."""
+    result = html_text
+    for _formula_no, match, replacement in sorted(
+        replacements,
+        key=lambda item: item[1].start(),
+        reverse=True,
+    ):
+        result = result[: match.start()] + replacement + result[match.end() :]
+    return result
+
+
+def _formula_indexes_in_html(html_text: str) -> list[int]:
+    return [int(match.group(1)) for match in FORMULA_INDEX_ATTR_RE.finditer(html_text)]
+
+
 def patch_document_html_for_formula_second_pass(
     output_dir: Path,
     sidecar_dir: Path,
@@ -1331,8 +1405,12 @@ def patch_document_html_for_formula_second_pass(
         return {"ok": False, "error": f"document.html not found: {html_path}"}
 
     html_text = html_path.read_text(encoding="utf-8")
+    original_blocks, original_by_index = _original_formula_html_ranges(html_text)
+    replacements: list[tuple[int, re.Match[str], str]] = []
+    used_original_starts: set[int] = set()
     patched_indexes: list[int] = []
     missing_indexes: list[int] = []
+    patch_sources: dict[int, str] = {}
     for entry in sorted(
         replacement_log,
         key=lambda item: int(item.get("formula_no") or 0),
@@ -1344,36 +1422,65 @@ def patch_document_html_for_formula_second_pass(
         if not isinstance(formula_no, int):
             continue
         replacement = _render_second_pass_formula_html(entry, output_dir, sidecar_dir)
-        block_re = re.compile(
-            r"<div><math\b(?:(?!</math></div>).)*?"
-            + re.escape(f'data-formula-index="{formula_no}"')
-            + r"(?:(?!</math></div>).)*?</math></div>",
-            re.DOTALL,
-        )
-        html_text, count = block_re.subn(lambda _match: replacement, html_text, count=1)
-        if count:
+        match = original_by_index.get(formula_no)
+        if match is not None:
+            replacements.append((formula_no, match, replacement))
+            used_original_starts.add(match.start())
             patched_indexes.append(formula_no)
+            patch_sources[formula_no] = "data-formula-index"
             continue
 
-        math_block_re = re.compile(r"<div><math\b(?:(?!</math></div>).)*?</math></div>", re.DOTALL)
-        blocks = list(math_block_re.finditer(html_text))
-        if formula_no <= len(blocks):
-            match = blocks[formula_no - 1]
-            html_text = html_text[: match.start()] + replacement + html_text[match.end() :]
+        match, source = _find_formula_html_block_by_text(
+            original_blocks,
+            used_original_starts,
+            str(entry.get("route_a_text") or ""),
+        )
+        if match is not None:
+            replacements.append((formula_no, match, replacement))
+            used_original_starts.add(match.start())
             patched_indexes.append(formula_no)
+            patch_sources[formula_no] = str(source)
             continue
+
+        if 0 < formula_no <= len(original_blocks):
+            match = original_blocks[formula_no - 1]
+            if match.start() not in used_original_starts:
+                replacements.append((formula_no, match, replacement))
+                used_original_starts.add(match.start())
+                patched_indexes.append(formula_no)
+                patch_sources[formula_no] = "original-block-position"
+                continue
 
         missing_indexes.append(formula_no)
+
+    if replacements:
+        html_text = _replace_original_html_ranges(html_text, replacements)
+
+    missing_indexes = sorted(set(missing_indexes))
 
     assets_injected = False
     if patched_indexes:
         html_text, assets_injected = _ensure_formula_second_pass_html_assets(html_text)
 
+    final_formula_indexes = _formula_indexes_in_html(html_text)
+    final_formula_index_set = set(final_formula_indexes)
+    original_formula_index_set = set(original_by_index)
+    lost_formula_indexes = sorted(original_formula_index_set - final_formula_index_set)
+    duplicate_formula_indexes = sorted(
+        index for index in final_formula_index_set if final_formula_indexes.count(index) > 1
+    )
+
     html_path.write_text(html_text, encoding="utf-8")
     return {
-        "ok": not missing_indexes,
+        "ok": not missing_indexes and not lost_formula_indexes and not duplicate_formula_indexes,
         "patched_indexes": patched_indexes,
         "missing_indexes": missing_indexes,
+        "lost_formula_indexes": lost_formula_indexes,
+        "duplicate_formula_indexes": duplicate_formula_indexes,
+        "patch_sources": patch_sources,
+        "original_formula_block_count": len(original_blocks),
+        "original_formula_index_count": len(original_by_index),
+        "final_formula_index_count": len(final_formula_index_set),
         "rendering_assets_injected": assets_injected,
     }
 
