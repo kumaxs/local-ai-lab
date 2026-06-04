@@ -593,11 +593,31 @@ def patch_document_md(
     return result
 
 
+def candidate_quality_gate(route_a_formula: dict[str, Any], candidate_text: str | None) -> tuple[bool, list[str]]:
+    """Return whether a second-pass candidate is safe enough to enter main output."""
+    reasons: list[str] = []
+    text = (candidate_text or "").strip()
+    if not text:
+        return False, ["candidate_empty"]
+    if NUMBER_ONLY_RE.match(text):
+        reasons.append("candidate_number_only")
+    if CJK_RE.search(text) and not CJK_RE.search(str(route_a_formula.get("text") or "")):
+        reasons.append("candidate_introduces_cjk")
+    if REPEATED_AND_RE.search(text):
+        reasons.append("candidate_repeated_and_hallucination")
+    if REPEATED_SINGLE_RE.search(text):
+        reasons.append("candidate_repeated_single_chars")
+    if len(text) > max(1200, len(str(route_a_formula.get("text") or "")) * 4):
+        reasons.append("candidate_unusually_long")
+    return not reasons, reasons
+
+
 def patch_document_json(
     route_a_doc: dict[str, Any],
     route_b_formulas: list[dict[str, Any]],
     guarded_fallback_sources: list[dict[str, Any]] | None = None,
     guarded_fallback_eqs: set[int] | None = None,
+    apply_all: bool = False,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     """Patch formula text in Route A document.json with Route B candidates.
 
@@ -616,6 +636,8 @@ def patch_document_json(
 
     for i, af in enumerate(route_a_formulas):
         reasons = is_suspicious(af)
+        if apply_all and not reasons:
+            reasons = ["apply_all_candidate"]
         if not reasons:
             continue
 
@@ -630,8 +652,29 @@ def patch_document_json(
         if fallback_match is not None:
             source, fallback_formula = fallback_match
             fallback_text = fallback_formula.get("text", "")
+            candidate_ok, candidate_reasons = candidate_quality_gate(af, fallback_text)
             if not fallback_text.strip():
                 fallback_match = None
+            elif not candidate_ok:
+                log.append({
+                    "index": i,
+                    "formula_no": af.get("formula_no"),
+                    "route_a_text": af["text"],
+                    "page_no": af["page_no"],
+                    "eq_number": af["main_eq"],
+                    "route_a_bbox": _formula_bbox_summary(af.get("bbox_norm")),
+                    "reasons": reasons,
+                    "route_b_candidate": fallback_text,
+                    "route_b_formula_no": None,
+                    "candidate_source": "guarded_fallback",
+                    "candidate_source_label": source["label"],
+                    "candidate_source_dir": str(source["source_dir"]),
+                    "candidate_formula_no": fallback_formula.get("formula_no"),
+                    "candidate_diagnostics": formula_diagnostics(fallback_text),
+                    "status": "fallback_candidate_failed_quality_gate",
+                    "fallback_reason": ",".join(candidate_reasons),
+                })
+                continue
             else:
                 _patch_node_text(af["node"], fallback_text)
                 log.append({
@@ -674,6 +717,7 @@ def patch_document_json(
 
         bf = matches[i]
         route_b_text = bf["text"]
+        candidate_ok, candidate_reasons = candidate_quality_gate(af, route_b_text)
         if not route_b_text.strip():
             log.append({
                 "index": i,
@@ -690,6 +734,26 @@ def patch_document_json(
                 "candidate_formula_no": bf.get("formula_no"),
                 "candidate_diagnostics": formula_diagnostics(None),
                 "status": "route_b_also_empty",
+                "fallback_reason": "candidate_empty",
+            })
+            continue
+        if not candidate_ok:
+            log.append({
+                "index": i,
+                "formula_no": af.get("formula_no"),
+                "route_a_text": af["text"],
+                "page_no": af["page_no"],
+                "eq_number": af["main_eq"],
+                "route_a_bbox": _formula_bbox_summary(af.get("bbox_norm")),
+                "reasons": reasons,
+                "route_b_candidate": route_b_text,
+                "route_b_formula_no": bf.get("formula_no"),
+                "candidate_source": "route_b",
+                "candidate_source_label": "route_b",
+                "candidate_formula_no": bf.get("formula_no"),
+                "candidate_diagnostics": formula_diagnostics(route_b_text),
+                "status": "route_b_candidate_failed_quality_gate",
+                "fallback_reason": ",".join(candidate_reasons),
             })
             continue
 
@@ -1018,6 +1082,7 @@ def run_formula_second_pass(
     review_candidate_args: list[str] | None = None,
     guarded_fallback_args: list[str] | None = None,
     guarded_fallback_eqs: set[int] | None = None,
+    apply_all: bool = False,
 ) -> dict[str, Any]:
     """Run the formula-only second pass on a single document."""
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1043,12 +1108,18 @@ def run_formula_second_pass(
         route_b_formulas,
         guarded_fallback_sources,
         guarded_fallback_eqs or set(),
+        apply_all=apply_all,
     )
 
     replaced_count = sum(1 for e in replacement_log if e["status"] == "replaced")
     no_match_count = sum(
         1 for e in replacement_log
-        if e["status"] in ("suspicious_no_route_b_match", "route_b_also_empty")
+        if e["status"] in (
+            "suspicious_no_route_b_match",
+            "route_b_also_empty",
+            "route_b_candidate_failed_quality_gate",
+            "fallback_candidate_failed_quality_gate",
+        )
     )
 
     # Write patched document.json
@@ -1079,8 +1150,11 @@ def run_formula_second_pass(
         "route_a_formula_count": len(route_a_formulas),
         "route_b_formula_count": len(route_b_formulas),
         "suspicious_formula_count": suspicious_count,
+        "second_pass_attempted_count": len(replacement_log),
         "replaced_count": replaced_count,
         "no_match_count": no_match_count,
+        "fallback_count": no_match_count,
+        "apply_all": apply_all,
         "review_candidate_sources": [
             {
                 "label": source["label"],
@@ -1157,6 +1231,11 @@ def parse_args() -> argparse.Namespace:
         default=[],
         help="Reviewed equation number allowed to use guarded fallback replacement.",
     )
+    parser.add_argument(
+        "--apply-all",
+        action="store_true",
+        help="Attempt second-pass matching for every Route A formula, not only suspicious formulas.",
+    )
     return parser.parse_args()
 
 
@@ -1169,6 +1248,7 @@ def main() -> int:
         args.review_candidate_dir,
         args.guarded_fallback_dir,
         set(args.guarded_fallback_eq),
+        apply_all=args.apply_all,
     )
     print(json.dumps(result, indent=2, ensure_ascii=False))
     return 0 if result.get("ok") else 1
