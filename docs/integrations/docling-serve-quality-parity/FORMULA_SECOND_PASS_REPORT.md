@@ -162,3 +162,80 @@ The approach has three practical constraints to document:
 3. **Consider bundling local MathJax assets** if offline review is required; current review uses CDN MathJax with raw LaTeX always visible.
 4. **Production integration decision**: if approved, keep Route A as the backbone and call candidate sources only for formula nodes flagged as suspicious.
 5. **Do not commit** `.runtime/` outputs, model caches, or batch logs.
+
+---
+
+## 2026-06-04 broad regression addendum
+
+### DONE
+
+Ran the formula-only second pass across all 10 available local `test_pdfs` samples represented in the existing full-dir review outputs. This broadened validation covers:
+
+- CN formula-quality case (`CN.pdf`)
+- English two-column papers (`gat`, `rag`, `lora`, `transformers-gnn`, `bert`)
+- Formula-heavy English samples (`transformers-gnn`, `complex-tables-gtr`)
+- Table-heavy samples (`table-transformer`, `complex-tables-gtr`)
+- Image/layout-heavy samples (`donut`, `layoutlm`)
+
+### output_roots
+
+All outputs are ignored `.runtime` files:
+
+- `.runtime/review/docling-formula-second-pass-regression-2026-06-04/CN/`
+- `.runtime/review/docling-formula-second-pass-regression-2026-06-04/table-heavy-ai-table-transformer/`
+- `.runtime/review/docling-formula-second-pass-regression-2026-06-04/table-heavy-ai-complex-tables-gtr/`
+- `.runtime/review/docling-formula-second-pass-regression-2026-06-04/layout-doc-ai-layoutlm/`
+- `.runtime/review/docling-formula-second-pass-regression-2026-06-04/layout-doc-ai-donut/`
+- `.runtime/review/docling-formula-second-pass-regression-2026-06-04/two-col-arxiv-ai-gat/`
+- `.runtime/review/docling-formula-second-pass-regression-2026-06-04/two-col-arxiv-ai-rag/`
+- `.runtime/review/docling-formula-second-pass-regression-2026-06-04/two-col-arxiv-ai-lora/`
+- `.runtime/review/docling-formula-second-pass-regression-2026-06-04/two-col-arxiv-ai-transformers-gnn/`
+- `.runtime/review/docling-formula-second-pass-regression-2026-06-04/two-col-arxiv-ai-bert/`
+
+Each output root contains `document.json`, `document.md`, `second_pass_summary.json`, and `review_index.html`.
+
+### regression_summary
+
+| PDF/sample | Route A formulas | Route B formulas | Suspicious | Replaced | No match | Review links missing |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| CN | 24 | 16 | 7 | 7 | 0 | 0 |
+| table-heavy-ai-table-transformer | 1 | 1 | 0 | 0 | 0 | 0 |
+| table-heavy-ai-complex-tables-gtr | 9 | 9 | 0 | 0 | 0 | 0 |
+| layout-doc-ai-layoutlm | 0 | 0 | 0 | 0 | 0 | 0 |
+| layout-doc-ai-donut | 0 | 0 | 0 | 0 | 0 | 0 |
+| two-col-arxiv-ai-gat | 6 | 6 | 0 | 0 | 0 | 0 |
+| two-col-arxiv-ai-rag | 3 | 3 | 0 | 0 | 0 | 0 |
+| two-col-arxiv-ai-lora | 6 | 6 | 0 | 0 | 0 | 0 |
+| two-col-arxiv-ai-transformers-gnn | 20 | 20 | 0 | 0 | 0 | 0 |
+| two-col-arxiv-ai-bert | 0 | 0 | 0 | 0 | 0 | 0 |
+
+Totals: 10 samples, 69 Route A formulas, 61 Route B formulas, 7 suspicious formulas, 7 replacements, 0 no-match cases, 0 missing generated review links.
+
+CN replacement sources:
+
+- Route B: formulas 3, 4, 14, and 16.
+- Guarded `route-a-full` fallback: formulas 5, 7, and 8.
+
+### artifact_presence
+
+The second pass itself preserves the Route A document backbone and does not generate table/image assets. Regression evidence confirms the source review roots still contain table/image/page artifacts for the representative sample classes:
+
+- CN formula-quality Route A source: 24 table files, 8 picture files, 7 page images, 48 formula crop/context images.
+- VLM Route B source across the 10 samples: tables and page images are present for every sample; `artifacts/` image regions are present for every non-empty layout/image/table/two-column sample.
+- Full-dir Route A English/table/layout sources contain table files where Docling emitted tables; they generally do not include page/formula/picture crops, which is expected for those pre-existing full-dir review roots.
+
+### false_positives
+
+No false-positive replacements were observed in the broadened regression. Every non-CN sample had:
+
+- 0 suspicious formulas
+- 0 replacements
+- 0 no-match cases
+
+This includes English two-column, formula-heavy, table-heavy, and image/layout-heavy samples.
+
+### remaining_blockers
+
+- CN formula (16) still loses the equation number in patched markdown because the Route A text does not expose a clean `main_eq`; this is unchanged from the previous report.
+- Guarded fallback remains manual/allowlisted for CN formulas 5, 7, and 8. It should not become broad fallback logic without more right-column examples.
+- MathJax in `review_index.html` still loads from CDN; raw LaTeX remains visible offline.
