@@ -1216,6 +1216,123 @@ def restore_review_artifact_layer(
     )
 
 
+def _relative_output_link(output_dir: Path, target: Path) -> str:
+    try:
+        return target.relative_to(output_dir).as_posix()
+    except ValueError:
+        return target.as_posix()
+
+
+def _render_second_pass_formula_html(
+    entry: dict[str, Any],
+    output_dir: Path,
+    sidecar_dir: Path,
+) -> str:
+    formula_no = entry.get("formula_no")
+    candidate_text = str(entry.get("route_b_candidate") or "")
+    source_link = f"formulas/formula_{formula_no}.png" if formula_no else None
+    context_link = f"formulas/formula_{formula_no}_context.png" if formula_no else None
+    review_link = _relative_output_link(output_dir, sidecar_dir / "review_index.html")
+    links = []
+    for label, href in (
+        ("source image", source_link),
+        ("context crop", context_link),
+        ("second-pass review", review_link),
+    ):
+        if href:
+            links.append(f'<a href="{html.escape(href, quote=True)}">{html.escape(label)}</a>')
+    return (
+        '<div class="docling-formula-second-pass" '
+        f'data-formula-index="{html.escape(str(formula_no), quote=True)}" '
+        f'data-formula-status="{html.escape(str(entry.get("status") or ""), quote=True)}">'
+        '<div class="docling-formula-second-pass-label">'
+        f'Formula {html.escape(str(formula_no))} patched by formula second pass'
+        '</div>'
+        '<pre class="docling-formula-tex">'
+        f'{html.escape(candidate_text)}'
+        '</pre>'
+        '<div class="docling-formula-source">'
+        + " | ".join(links)
+        + "</div>"
+        "</div>"
+    )
+
+
+def patch_document_html_for_formula_second_pass(
+    output_dir: Path,
+    sidecar_dir: Path,
+    replacement_log: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Patch replaced formula blocks in document.html with traceable formula text."""
+    html_path = output_dir / "document.html"
+    if not html_path.exists():
+        return {"ok": False, "error": f"document.html not found: {html_path}"}
+
+    html_text = html_path.read_text(encoding="utf-8")
+    patched_indexes: list[int] = []
+    missing_indexes: list[int] = []
+    for entry in sorted(
+        replacement_log,
+        key=lambda item: int(item.get("formula_no") or 0),
+        reverse=True,
+    ):
+        if entry.get("status") != "replaced":
+            continue
+        formula_no = entry.get("formula_no")
+        if not isinstance(formula_no, int):
+            continue
+        replacement = _render_second_pass_formula_html(entry, output_dir, sidecar_dir)
+        block_re = re.compile(
+            r"<div><math\b(?:(?!</math></div>).)*?"
+            + re.escape(f'data-formula-index="{formula_no}"')
+            + r"(?:(?!</math></div>).)*?</math></div>",
+            re.DOTALL,
+        )
+        html_text, count = block_re.subn(lambda _match: replacement, html_text, count=1)
+        if count:
+            patched_indexes.append(formula_no)
+            continue
+
+        math_block_re = re.compile(r"<div><math\b(?:(?!</math></div>).)*?</math></div>", re.DOTALL)
+        blocks = list(math_block_re.finditer(html_text))
+        if formula_no <= len(blocks):
+            match = blocks[formula_no - 1]
+            html_text = html_text[: match.start()] + replacement + html_text[match.end() :]
+            patched_indexes.append(formula_no)
+            continue
+
+        missing_indexes.append(formula_no)
+
+    html_path.write_text(html_text, encoding="utf-8")
+    return {
+        "ok": not missing_indexes,
+        "patched_indexes": patched_indexes,
+        "missing_indexes": missing_indexes,
+    }
+
+
+def validate_formula_second_pass_html(
+    output_dir: Path,
+    replacement_log: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Verify applied replacement text is visible or traceable in document.html."""
+    html_path = output_dir / "document.html"
+    if not html_path.exists():
+        return {"ok": False, "missing_replacements": [], "error": f"document.html not found: {html_path}"}
+    decoded_html = html.unescape(html_path.read_text(encoding="utf-8"))
+    missing: list[int] = []
+    for entry in replacement_log:
+        if entry.get("status") != "replaced":
+            continue
+        formula_no = entry.get("formula_no")
+        candidate_text = str(entry.get("route_b_candidate") or "")
+        marker = f'data-formula-index="{formula_no}"'
+        if candidate_text not in decoded_html or marker not in decoded_html:
+            if isinstance(formula_no, int):
+                missing.append(formula_no)
+    return {"ok": not missing, "missing_replacements": missing, "error": None}
+
+
 def run_optional_formula_second_pass(
     output_dir: Path,
     metadata: dict[str, Any],
@@ -1305,6 +1422,27 @@ def run_optional_formula_second_pass(
     if policy == "apply":
         shutil.copyfile(sidecar_dir / "document.md", output_dir / "document.md")
         shutil.copyfile(sidecar_dir / "document.json", output_dir / "document.json")
+        html_patch = patch_document_html_for_formula_second_pass(
+            output_dir,
+            sidecar_dir,
+            list(result.get("replacement_log") or []),
+        )
+        html_gate = validate_formula_second_pass_html(
+            output_dir,
+            list(result.get("replacement_log") or []),
+        )
+        metadata["formula_second_pass_html_patch"] = html_patch
+        metadata["formula_second_pass_html_gate"] = html_gate
+        status["quality_signals"]["formula_second_pass_html_patch"] = html_patch
+        status["quality_signals"]["formula_second_pass_html_gate"] = html_gate
+        if not html_patch.get("ok") or not html_gate.get("ok"):
+            status["ok"] = False
+            status["success_class"] = "degraded_failure"
+            status["warnings"].append(
+                "formula_second_pass_html_gate_failed:"
+                f"missing={html_gate.get('missing_replacements')}:"
+                f"unpatched={html_patch.get('missing_indexes')}"
+            )
         metadata["formula_second_pass_applied"] = True
         status["quality_signals"]["formula_second_pass_applied"] = True
     else:

@@ -303,3 +303,54 @@ Validation used copied adapter-produced Route A outputs under ignored `.runtime/
 Totals: 10 samples, 7 suspicious formulas, 7 replacements, 0 no-match cases, 0 missing sidecar review links, and 0 non-CN false-positive replacements.
 
 Live adapter CLI probe was attempted, but Docling Server returned HTTP 503 from `/version`; per AGENTS.md, no service start/restart was performed during this task.
+
+---
+
+## 2026-06-04 live HTML apply regression
+
+### diagnosis
+
+The optional second-pass `apply` mode copied patched `document.md` and
+`document.json` from the sidecar output, but left `document.html` as the original
+Route A HTML. The corrected formula text was visible in
+`formula_second_pass/review_index.html`, `formula_second_pass/document.md`,
+`formula_second_pass/document.json`, final `document.md`, and final
+`document.json`, but not in final `document.html` for CN formulas 3, 4, 5, 7,
+and 16. Formulas 8 and 14 appeared partly visible only because their corrected
+text overlapped enough with the original Route A HTML to make spot checks
+misleading.
+
+### fix
+
+`quality_parity_adapter.py` now patches affected formula blocks in
+`document.html` during `--formula-second-pass-policy apply`. Each patched block
+contains traceable raw TeX plus links to the adapter formula evidence and the
+second-pass review page. A new HTML quality gate fails the adapter result if
+any reported replacement is not visible in decoded `document.html` with a
+traceable formula marker.
+
+### validation
+
+Fresh live CN output:
+
+```text
+.runtime/review/docling-adapter-html-patch-live-2026-06-04/CN/
+```
+
+CN apply result after the fix:
+
+- suspicious: 7
+- replaced: 7
+- no match: 0
+- HTML patched indexes: 16, 14, 8, 7, 5, 4, 3
+- HTML gate missing replacements: none
+
+For CN formulas 3, 4, 5, 7, 8, 14, and 16, the corrected formula text is now
+present in:
+
+- second-pass review evidence
+- `formula_second_pass/document.md`
+- `formula_second_pass/document.json`
+- final `document.md`
+- final `document.json`
+- final `document.html`

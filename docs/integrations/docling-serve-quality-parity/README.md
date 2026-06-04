@@ -194,8 +194,9 @@ by default and remains evidence-first:
 - `route-a-full` or any other fallback source is used only when explicitly
   passed as a guarded fallback source and only for allowlisted equation numbers.
 - `review` mode writes sidecar evidence without replacing contract files.
-- `apply` mode writes the same sidecar evidence, then replaces only
-  `document.md` and `document.json` with the patched formula text.
+- `apply` mode writes the same sidecar evidence, then patches
+  `document.md`, `document.json`, and the affected formula blocks in
+  `document.html` with traceable second-pass formula text.
 
 CN reviewed command shape:
 
@@ -215,8 +216,12 @@ python3 docs/integrations/docling-serve-quality-parity/quality_parity_adapter.py
 ```
 
 When enabled, the adapter records `metadata.json:formula_second_pass`,
-`metadata.json:formula_second_pass_applied`, and
-`status.json:quality_signals.formula_second_pass`. The default sidecar output is:
+`metadata.json:formula_second_pass_applied`,
+`metadata.json:formula_second_pass_html_gate`, and
+`status.json:quality_signals.formula_second_pass`. If `apply` reports
+replacements but the final decoded `document.html` does not contain each patched
+formula text with a traceable formula marker, the adapter marks the result as a
+`degraded_failure`. The default sidecar output is:
 
 ```text
 <output-root>/<job-id>/formula_second_pass/
