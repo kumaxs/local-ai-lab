@@ -1223,13 +1223,27 @@ def _relative_output_link(output_dir: Path, target: Path) -> str:
         return target.as_posix()
 
 
+def _strip_display_math_wrapper(text: str) -> str:
+    body = text.strip()
+    if body.startswith("$$") and body.endswith("$$") and len(body) >= 4:
+        body = body[2:-2].strip()
+    return body
+
+
+def _second_pass_formula_display_text(entry: dict[str, Any]) -> str:
+    markdown_after = _strip_display_math_wrapper(str(entry.get("markdown_after") or ""))
+    if markdown_after:
+        return markdown_after
+    return str(entry.get("route_b_candidate") or "").strip()
+
+
 def _render_second_pass_formula_html(
     entry: dict[str, Any],
     output_dir: Path,
     sidecar_dir: Path,
 ) -> str:
     formula_no = entry.get("formula_no")
-    candidate_text = str(entry.get("route_b_candidate") or "")
+    display_text = _second_pass_formula_display_text(entry)
     source_link = f"formulas/formula_{formula_no}.png" if formula_no else None
     context_link = f"formulas/formula_{formula_no}_context.png" if formula_no else None
     review_link = _relative_output_link(output_dir, sidecar_dir / "review_index.html")
@@ -1248,14 +1262,62 @@ def _render_second_pass_formula_html(
         '<div class="docling-formula-second-pass-label">'
         f'Formula {html.escape(str(formula_no))} patched by formula second pass'
         '</div>'
+        '<div class="docling-formula-render">'
+        f'\\[{html.escape(display_text)}\\]'
+        '</div>'
         '<pre class="docling-formula-tex">'
-        f'{html.escape(candidate_text)}'
+        f'{html.escape(display_text)}'
         '</pre>'
         '<div class="docling-formula-source">'
         + " | ".join(links)
         + "</div>"
         "</div>"
     )
+
+
+def _ensure_formula_second_pass_html_assets(html_text: str) -> tuple[str, bool]:
+    """Add MathJax/styles for patched formula blocks while preserving raw TeX fallback."""
+    if "docling-formula-second-pass-mathjax" in html_text:
+        return html_text, False
+    assets = """
+<style id="docling-formula-second-pass-style">
+.docling-formula-second-pass {
+  border-left: 3px solid #2563eb;
+  margin: 1rem 0;
+  padding: 0.75rem 1rem;
+  background: #f8fafc;
+}
+.docling-formula-second-pass-label {
+  color: #475569;
+  font: 0.85rem system-ui, sans-serif;
+  margin-bottom: 0.5rem;
+}
+.docling-formula-render {
+  overflow-x: auto;
+}
+.docling-formula-tex {
+  background: #ffffff;
+  border: 1px solid #cbd5e1;
+  color: #0f172a;
+  overflow-x: auto;
+  padding: 0.5rem;
+  white-space: pre-wrap;
+}
+.docling-formula-source {
+  font: 0.85rem system-ui, sans-serif;
+}
+</style>
+<script id="docling-formula-second-pass-mathjax">
+window.MathJax = window.MathJax || {
+  tex: {inlineMath: [["\\\\(", "\\\\)"]], displayMath: [["\\\\[", "\\\\]"]]},
+  svg: {fontCache: "global"}
+};
+</script>
+<script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-svg.js"></script>
+"""
+    if "</head>" in html_text:
+        return html_text.replace("</head>", assets + "\n</head>", 1), True
+    return assets + "\n" + html_text, True
 
 
 def patch_document_html_for_formula_second_pass(
@@ -1303,11 +1365,16 @@ def patch_document_html_for_formula_second_pass(
 
         missing_indexes.append(formula_no)
 
+    assets_injected = False
+    if patched_indexes:
+        html_text, assets_injected = _ensure_formula_second_pass_html_assets(html_text)
+
     html_path.write_text(html_text, encoding="utf-8")
     return {
         "ok": not missing_indexes,
         "patched_indexes": patched_indexes,
         "missing_indexes": missing_indexes,
+        "rendering_assets_injected": assets_injected,
     }
 
 
@@ -1325,12 +1392,19 @@ def validate_formula_second_pass_html(
         if entry.get("status") != "replaced":
             continue
         formula_no = entry.get("formula_no")
-        candidate_text = str(entry.get("route_b_candidate") or "")
+        display_text = _second_pass_formula_display_text(entry)
         marker = f'data-formula-index="{formula_no}"'
-        if candidate_text not in decoded_html or marker not in decoded_html:
+        render_marker = f"\\[{display_text}\\]"
+        if display_text not in decoded_html or render_marker not in decoded_html or marker not in decoded_html:
             if isinstance(formula_no, int):
                 missing.append(formula_no)
-    return {"ok": not missing, "missing_replacements": missing, "error": None}
+    has_mathjax = "docling-formula-second-pass-mathjax" in decoded_html
+    return {
+        "ok": not missing,
+        "missing_replacements": missing,
+        "mathjax_present": has_mathjax,
+        "error": None,
+    }
 
 
 def run_optional_formula_second_pass(
