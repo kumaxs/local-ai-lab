@@ -42,6 +42,42 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Directory containing per-sample Route B/VLM outputs named by PDF stem.",
     )
+    parser.add_argument(
+        "--formula-second-pass-review-candidate-root",
+        action="append",
+        default=[],
+        help=(
+            "Optional per-sample review-only candidate root as LABEL=DIR or DIR; "
+            "each sample uses <DIR>/<job-id>."
+        ),
+    )
+    parser.add_argument(
+        "--formula-second-pass-guarded-fallback-root",
+        action="append",
+        default=[],
+        help=(
+            "Optional per-sample guarded fallback root as LABEL=DIR or DIR; "
+            "each sample uses <DIR>/<job-id>."
+        ),
+    )
+    parser.add_argument(
+        "--formula-second-pass-guarded-fallback-eq",
+        action="append",
+        type=int,
+        default=[],
+        help="Reviewed equation number allowed to use guarded fallback replacement.",
+    )
+    parser.add_argument(
+        "--cn-ocr-parity",
+        action="store_true",
+        help="Forward CN OCRMac parity fallback options to each adapter invocation.",
+    )
+    parser.add_argument(
+        "--cn-ocr-request-shape",
+        choices=["preset", "custom"],
+        default="preset",
+    )
+    parser.add_argument("--cn-ocr-chunk-size", type=int, default=1)
     return parser.parse_args()
 
 
@@ -55,6 +91,19 @@ def load_json(path: Path) -> dict[str, Any] | None:
         return json.loads(path.read_text(encoding="utf-8"))
     except (FileNotFoundError, json.JSONDecodeError):
         return None
+
+
+def parse_labeled_root(value: str) -> tuple[str | None, Path]:
+    if "=" in value:
+        label, path = value.split("=", 1)
+        return label.strip() or None, Path(path)
+    return None, Path(value)
+
+
+def sample_source_arg(value: str, job_id: str) -> str:
+    label, root = parse_labeled_root(value)
+    sample_dir = root / job_id
+    return f"{label}={sample_dir}" if label else str(sample_dir)
 
 
 def summarize_success(pdf: Path, job_id: str, output_dir: Path, elapsed: float) -> dict[str, Any]:
@@ -251,6 +300,31 @@ def main() -> int:
             if args.formula_second_pass_route_b_root is not None:
                 route_b_dir = args.formula_second_pass_route_b_root / job_id
                 cmd.extend(["--formula-second-pass-route-b-dir", str(route_b_dir)])
+            for value in args.formula_second_pass_review_candidate_root:
+                cmd.extend(
+                    [
+                        "--formula-second-pass-review-candidate-dir",
+                        sample_source_arg(value, job_id),
+                    ]
+                )
+            for value in args.formula_second_pass_guarded_fallback_root:
+                cmd.extend(
+                    [
+                        "--formula-second-pass-guarded-fallback-dir",
+                        sample_source_arg(value, job_id),
+                    ]
+                )
+            for eq_number in args.formula_second_pass_guarded_fallback_eq:
+                cmd.extend(
+                    [
+                        "--formula-second-pass-guarded-fallback-eq",
+                        str(eq_number),
+                    ]
+                )
+        if args.cn_ocr_parity:
+            cmd.append("--cn-ocr-parity")
+            cmd.extend(["--cn-ocr-request-shape", args.cn_ocr_request_shape])
+            cmd.extend(["--cn-ocr-chunk-size", str(args.cn_ocr_chunk_size)])
         print(f"[{index}/{len(pdfs)}] {pdf.name}", flush=True)
         start = time.perf_counter()
         try:

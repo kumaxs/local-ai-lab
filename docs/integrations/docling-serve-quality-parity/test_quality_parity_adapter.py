@@ -101,7 +101,7 @@ class EnglishReviewPolishTests(unittest.TestCase):
         self.assertFalse(recoverable[0]["safe_to_apply"])
         self.assertEqual(evidence_only[-1]["footnote_number"], "0")
 
-    def test_first_page_footnote_html_recovery_preserves_trace(self) -> None:
+    def test_first_page_footnote_html_recovery_is_evidence_only(self) -> None:
         diagnostics = [
             {
                 "page_no": 1,
@@ -126,10 +126,10 @@ class EnglishReviewPolishTests(unittest.TestCase):
             diagnostics,
         )
 
-        self.assertEqual(len(applied), 1)
-        self.assertIn("docling-footnote-recovery", updated)
-        self.assertIn("performance significantly", updated)
-        self.assertIn("Original Docling footnote fragments", updated)
+        self.assertEqual(updated, document_html)
+        self.assertEqual(applied, [])
+        self.assertFalse(diagnostics[0]["safe_to_apply"])
+        self.assertEqual(diagnostics[0]["action"], "diagnostic_only_generic_quarantine_preferred")
 
     def test_formula_number_qc_recovers_spaced_number(self) -> None:
         formulas = [
@@ -181,6 +181,48 @@ class EnglishReviewPolishTests(unittest.TestCase):
         self.assertIn(r"\[m_i^\ell = m_{ij}^\ell , ( 1 2 )\]", html)
         self.assertIn(r"m_i^\ell &amp; = m_{ij}^\ell , &amp; ( 1 2 )", html)
         self.assertIn("docling-formula-display-tex", html)
+
+    def test_cn_polish_replaces_existing_second_pass_formula_block(self) -> None:
+        original = adapter._render_second_pass_formula_html(
+            {
+                "formula_no": 12,
+                "status": "replaced",
+                "markdown_after": r"$$old \quad (12)$$",
+            },
+            Path("/tmp/out"),
+            Path("/tmp/out/formula_second_pass"),
+        )
+        replacement = adapter._render_second_pass_formula_html(
+            {
+                "formula_no": 12,
+                "status": "cn_final_polish",
+                "markdown_after": r"$$new \quad (12)$$",
+            },
+            Path("/tmp/out"),
+            Path("/tmp/out/formula_second_pass"),
+        )
+
+        duplicate = adapter._render_second_pass_formula_html(
+            {
+                "formula_no": 12,
+                "status": "replaced",
+                "markdown_after": r"$$duplicate \quad (12)$$",
+            },
+            Path("/tmp/out"),
+            Path("/tmp/out/formula_second_pass"),
+        )
+
+        updated, changed = adapter._replace_existing_second_pass_formula_block(
+            "<html><body>" + original + duplicate + "</body></html>",
+            12,
+            replacement,
+        )
+
+        self.assertTrue(changed)
+        self.assertIn(r"new \quad (12)", updated)
+        self.assertNotIn(r"old \quad (12)", updated)
+        self.assertNotIn(r"duplicate \quad (12)", updated)
+        self.assertEqual(updated.count('data-formula-index="12"'), 1)
 
     def test_apply_all_review_counts_every_formula(self) -> None:
         formulas = [
@@ -351,6 +393,139 @@ class EnglishReviewPolishTests(unittest.TestCase):
         self.assertEqual(qc["unresolved_footnote_count"], 1)
         self.assertEqual(document["texts"][0]["label"], "quarantined_page_footer")
         self.assertEqual(document["texts"][1]["label"], "quarantined_footnote")
+
+    def test_structural_quarantine_preserves_first_page_affiliation_mislabels(self) -> None:
+        document = {
+            "texts": [
+                {
+                    "label": "footnote",
+                    "text": "2 University of Example, Department of AI",
+                    "prov": [{"page_no": 1, "bbox": {"l": 90, "r": 410, "t": 650, "b": 630}}],
+                },
+                {
+                    "label": "footnote",
+                    "text": "5 机构智能实验室",
+                    "prov": [{"page_no": 1, "bbox": {"l": 90, "r": 320, "t": 625, "b": 605}}],
+                },
+                {
+                    "label": "footnote",
+                    "text": "0",
+                    "prov": [{"page_no": 1, "bbox": {"l": 120, "r": 124, "t": 90, "b": 85}}],
+                },
+            ]
+        }
+
+        qc = adapter.structural_noise_qc(document)
+
+        self.assertEqual(qc["candidate_count"], 1)
+        self.assertEqual(document["texts"][0]["label"], "text")
+        self.assertEqual(document["texts"][1]["label"], "text")
+        self.assertEqual(document["texts"][2]["label"], "quarantined_footnote")
+        self.assertIn("author_affiliation_recovery", document["texts"][0]["local_ai_lab_qc"])
+
+    def test_recovers_fragmented_first_page_affiliations_from_pdf_text_layer(self) -> None:
+        document = {
+            "texts": [
+                {
+                    "label": "section_header",
+                    "text": "OCR-free Document Understanding Transformer",
+                    "prov": [{"page_no": 1, "bbox": {"t": 580, "b": 568}}],
+                },
+                {
+                    "label": "text",
+                    "text": "Geewook Kim 1 ∗ , Teakgyu Hong 4 †",
+                    "prov": [{"page_no": 1, "bbox": {"t": 545, "b": 509}}],
+                },
+                {
+                    "label": "text",
+                    "text": "2",
+                    "prov": [{"page_no": 1, "bbox": {"t": 498, "b": 493}}],
+                },
+                {
+                    "label": "text",
+                    "text": "3 NAVER AI Lab ut ut ut",
+                    "prov": [{"page_no": 1, "bbox": {"t": 498, "b": 489}}],
+                },
+                {
+                    "label": "text",
+                    "text": "1 NAVER CLOVA",
+                    "prov": [{"page_no": 1, "bbox": {"t": 498, "b": 489}}],
+                },
+                {
+                    "label": "text",
+                    "text": "5",
+                    "prov": [{"page_no": 1, "bbox": {"t": 487, "b": 482}}],
+                },
+                {
+                    "label": "text",
+                    "text": "4 Upstage NAVER Search Tmax 6 Google 7 LBox",
+                    "prov": [{"page_no": 1, "bbox": {"t": 487, "b": 478}}],
+                },
+                {
+                    "label": "text",
+                    "text": "Abstract. Body",
+                    "prov": [{"page_no": 1, "bbox": {"t": 439, "b": 223}}],
+                },
+            ]
+        }
+        original_pdf_text = adapter._first_page_pdf_text
+        adapter._first_page_pdf_text = lambda _path: (
+            "OCR-free Document Understanding Transformer\n"
+            "Geewook Kim1∗\n"
+            "1NAVER CLOVA 2NAVER Search 3NAVER AI Lab\n"
+            "4Upstage 5Tmax 6Google 7LBox\n"
+            "Abstract. Body\n"
+        )
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                out = Path(tmpdir)
+                (out / "document.md").write_text(
+                    "## OCR-free Document Understanding Transformer\n\n"
+                    "Geewook Kim 1 ∗ , Teakgyu Hong 4 †\n\n"
+                    "2\n\n3 NAVER AI Lab ut ut ut\n\n1 NAVER CLOVA\n\n5\n\n"
+                    "4 Upstage NAVER Search Tmax 6 Google 7 LBox\n\nAbstract. Body\n",
+                    encoding="utf-8",
+                )
+                (out / "document.html").write_text(
+                    "<html><body><p>Geewook Kim 1 ∗ , Teakgyu Hong 4 †</p>"
+                    "<p>2</p><p>3 NAVER AI Lab ut ut ut</p><p>1 NAVER CLOVA</p>"
+                    "<p>5</p><p>4 Upstage NAVER Search Tmax 6 Google 7 LBox</p>"
+                    "<p>Abstract. Body</p></body></html>",
+                    encoding="utf-8",
+                )
+                result = adapter.recover_first_page_author_affiliations(
+                    out,
+                    document,
+                    Path("dummy.pdf"),
+                )
+                md_text = (out / "document.md").read_text(encoding="utf-8")
+                html_text = (out / "document.html").read_text(encoding="utf-8")
+        finally:
+            adapter._first_page_pdf_text = original_pdf_text
+
+        self.assertTrue(result["applied"])
+        self.assertIn("1 NAVER CLOVA 2 NAVER Search 3 NAVER AI Lab", md_text)
+        self.assertIn("4 Upstage 5 Tmax 6 Google 7 LBox", md_text)
+        self.assertIn("docling-author-affiliation-recovery", html_text)
+        self.assertEqual(document["texts"][2]["text"].splitlines()[0], "1 NAVER CLOVA 2 NAVER Search 3 NAVER AI Lab")
+        self.assertEqual(document["texts"][3]["label"], "quarantined_author_affiliation_fragment")
+
+    def test_replace_exact_paragraph_with_quarantine_hides_text_from_render_flow(self) -> None:
+        item = {
+            "kind": "page_header",
+            "text": "arXiv:2506.22084v1 [cs.LG]",
+            "page_no": 1,
+            "reasons": ["publication_template_noise"],
+        }
+        html, changed = adapter._replace_exact_paragraph_with_quarantine(
+            "<html><body><p>Body text</p><p><span>arXiv:2506.22084v1 [cs.LG]</span></p></body></html>",
+            item,
+        )
+
+        self.assertTrue(changed)
+        self.assertIn("<template", html)
+        self.assertNotIn("<span>arXiv:2506.22084v1 [cs.LG]</span>", html)
+        self.assertIn("publication_template_noise", html)
 
 
 if __name__ == "__main__":

@@ -1380,6 +1380,234 @@ def header_footer_qc_diagnostics(document_json: Any) -> list[dict[str, Any]]:
 
 
 FOOTNOTE_MARKER_RE = re.compile(r"^\s*(?:[∗*†‡]|\d{1,2})\s*(?:$|[A-Za-z])")
+HTML_TEXT_BLOCK_RE = re.compile(r"<(?P<tag>p|li)\b(?P<attrs>[^>]*)>(?P<body>.*?)</(?P=tag)>", re.I | re.S)
+
+
+def _is_bottom_footnote_region(geometry: dict[str, Any] | None) -> bool:
+    return bool(geometry and float(geometry.get("b", 9999)) < 160)
+
+
+def _looks_like_author_affiliation_footnote_mislabel(
+    label_l: str,
+    text: str,
+    page_no: Any,
+    geometry: dict[str, Any] | None,
+) -> bool:
+    """Detect first-page author/affiliation fragments mislabeled as footnotes."""
+    if label_l != "footnote" or page_no != 1:
+        return False
+    if _is_bottom_footnote_region(geometry):
+        return False
+    normalized = _normalized_noise_text(text)
+    if not normalized:
+        return False
+    if re.search(
+        r"@|university|institute|department|school|college|academy|laborator|"
+        r"机构|大学|学院|研究|实验室|中心|系|部门",
+        normalized,
+        re.I,
+    ):
+        return True
+    return bool(len(normalized) <= 140 and not normalized.endswith("-"))
+
+
+def _first_page_pdf_text(input_file: Path) -> str:
+    try:
+        import pypdfium2 as pdfium
+    except ImportError:
+        return ""
+    try:
+        pdf = pdfium.PdfDocument(str(input_file))
+    except Exception:
+        return ""
+    try:
+        if len(pdf) < 1:
+            return ""
+        page = pdf[0]
+        textpage = page.get_textpage()
+        return textpage.get_text_range() or ""
+    except Exception:
+        return ""
+    finally:
+        pdf.close()
+
+
+def _normalize_pdf_text_line(text: str) -> str:
+    text = text.replace("\ufffe", "")
+    text = re.sub(r"\s+", " ", text).strip()
+    text = re.sub(r"(?<!\d)(\d)(?=[A-Z])", r"\1 ", text)
+    text = re.sub(r"(?<=[A-Za-z])\s*(\d)(?=[A-Z])", r" \1 ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _extract_first_page_affiliations_from_pdf(input_file: Path) -> list[str]:
+    text = _first_page_pdf_text(input_file)
+    if not text:
+        return []
+    lines = [_normalize_pdf_text_line(line) for line in text.splitlines()]
+    lines = [line for line in lines if line]
+    abstract_index = next(
+        (index for index, line in enumerate(lines) if line.startswith("Abstract.")),
+        None,
+    )
+    if abstract_index is None:
+        return []
+    preamble = lines[:abstract_index]
+    affiliation_lines = [
+        line
+        for line in preamble[1:]
+        if re.match(r"^\d+\s+\S+", line)
+        and re.search(r"[A-Za-z\u3400-\u9fff]", line)
+        and not re.search(r"[,∗*†‡]", line)
+    ]
+    if not affiliation_lines:
+        return []
+    joined = " ".join(affiliation_lines)
+    affiliation_numbers = sorted(set(int(value) for value in re.findall(r"\b(\d{1,2})\s+[A-Za-z\u3400-\u9fff]", joined)))
+    if len(affiliation_numbers) < 2:
+        return []
+    return affiliation_lines[:4]
+
+
+def _replace_first_occurrence_line(text: str, old: str, new: str) -> tuple[str, bool]:
+    patterns = [
+        "\n\n" + old + "\n\n",
+        "\n" + old + "\n",
+    ]
+    for pattern in patterns:
+        if pattern in text:
+            return text.replace(pattern, new, 1), True
+    return text, False
+
+
+def _remove_exact_html_text_block(document_html: str, text: str) -> tuple[str, bool]:
+    item = {"text": text, "kind": "author_affiliation_fragment", "page_no": 1, "reasons": []}
+    return _replace_exact_paragraph_with_quarantine(document_html, item)
+
+
+def recover_first_page_author_affiliations(
+    output_dir: Path,
+    document_json: Any,
+    input_file: Path,
+) -> dict[str, Any]:
+    records = [
+        record
+        for record in structural_text_records(document_json)
+        if record.get("page_no") == 1 and isinstance(record.get("text"), str)
+    ]
+    if not records:
+        return {"applied": False, "reason": "no_first_page_records"}
+    records_sorted = sorted(
+        records,
+        key=lambda record: -float((record.get("bbox") or {}).get("t", 0)),
+    )
+    abstract = next(
+        (record for record in records_sorted if str(record.get("text") or "").startswith("Abstract.")),
+        None,
+    )
+    title = next(
+        (record for record in records_sorted if str(record.get("label") or "").lower() == "section_header"),
+        None,
+    )
+    author = next(
+        (
+            record
+            for record in records_sorted
+            if "†" in str(record.get("text") or "") or "∗" in str(record.get("text") or "")
+        ),
+        None,
+    )
+    if not abstract or not title or not author:
+        return {"applied": False, "reason": "missing_title_author_or_abstract_anchor"}
+    author_bbox = author.get("bbox") or {}
+    abstract_bbox = abstract.get("bbox") or {}
+    author_bottom = float(author_bbox.get("b", 0))
+    abstract_top = float(abstract_bbox.get("t", 0))
+    fragment_records = [
+        record
+        for record in records_sorted
+        if abstract_top < float((record.get("bbox") or {}).get("t", 0)) < author_bottom
+        and record is not author
+        and record is not title
+        and record is not abstract
+    ]
+    fragment_texts = [str(record.get("text") or "").strip() for record in fragment_records]
+    if not fragment_texts or not any(re.fullmatch(r"\d{1,2}", text) for text in fragment_texts):
+        return {"applied": False, "reason": "no_orphan_affiliation_number_fragments"}
+
+    recovered_lines = _extract_first_page_affiliations_from_pdf(input_file)
+    if not recovered_lines:
+        return {"applied": False, "reason": "pdf_text_affiliation_evidence_missing"}
+    recovered_block = "\n".join(recovered_lines)
+
+    first_node = fragment_records[0].get("node")
+    if isinstance(first_node, dict):
+        first_node["text"] = recovered_block
+        first_node["label"] = "text"
+        first_node.setdefault("local_ai_lab_qc", {})["author_affiliation_recovery"] = {
+            "source": "first_page_pdf_text_layer",
+            "action": "replace_fragmented_affiliation_block",
+            "recovered_lines": recovered_lines,
+            "original_fragments": fragment_texts,
+        }
+    for record in fragment_records[1:]:
+        node = record.get("node")
+        if isinstance(node, dict):
+            node["label"] = "quarantined_author_affiliation_fragment"
+            node.setdefault("local_ai_lab_qc", {})["author_affiliation_recovery"] = {
+                "source": "first_page_pdf_text_layer",
+                "action": "evidence_preserved_fragment_replaced_by_recovered_block",
+            }
+
+    md_changed = 0
+    md_path = output_dir / "document.md"
+    if md_path.exists():
+        md_text = md_path.read_text(encoding="utf-8")
+        inserted = False
+        for text in fragment_texts:
+            replacement = "\n\n" + recovered_block + "\n\n" if not inserted else "\n\n"
+            md_text, changed = _replace_first_occurrence_line(md_text, text, replacement)
+            if changed:
+                md_changed += 1
+                inserted = inserted or bool(replacement.strip())
+        md_path.write_text(md_text, encoding="utf-8")
+
+    html_changed = 0
+    html_path = output_dir / "document.html"
+    if html_path.exists():
+        document_html = html_path.read_text(encoding="utf-8")
+        insertion = "<p class=\"docling-author-affiliation-recovery\">" + "<br>".join(
+            html.escape(line) for line in recovered_lines
+        ) + "</p>"
+        inserted = False
+        for text in fragment_texts:
+            if not inserted:
+                document_html, changed = _replace_exact_paragraph_with_quarantine(
+                    document_html,
+                    {"text": text, "kind": "author_affiliation_fragment", "page_no": 1, "reasons": ["replaced_by_pdf_text_layer_affiliation_block"]},
+                )
+                if changed:
+                    document_html = document_html.replace(
+                        _hidden_quarantine_html({"text": text, "kind": "author_affiliation_fragment", "page_no": 1, "reasons": ["replaced_by_pdf_text_layer_affiliation_block"]}),
+                        insertion,
+                        1,
+                    )
+                    html_changed += 1
+                    inserted = True
+            else:
+                document_html, changed = _remove_exact_html_text_block(document_html, text)
+                if changed:
+                    html_changed += 1
+        html_path.write_text(document_html, encoding="utf-8")
+
+    return {
+        "applied": True,
+        "source": "first_page_pdf_text_layer",
+        "recovered_lines": recovered_lines,
+        "original_fragments": fragment_texts,
+        "markdown_fragment_replacement_count": md_changed,
+        "html_fragment_replacement_count": html_changed,
+    }
 
 
 def structural_noise_qc(document_json: Any) -> dict[str, Any]:
@@ -1401,6 +1629,22 @@ def structural_noise_qc(document_json: Any) -> dict[str, Any]:
         reasons: list[str] = []
         kind: str | None = None
 
+        if _looks_like_author_affiliation_footnote_mislabel(
+            label_l,
+            text,
+            record.get("page_no"),
+            geometry,
+        ):
+            node = record.get("node")
+            if isinstance(node, dict):
+                node.setdefault("local_ai_lab_qc", {})["author_affiliation_recovery"] = {
+                    "original_label": label,
+                    "reason": "first_page_footnote_label_outside_bottom_footnote_region",
+                    "action": "preserve_in_main_text_flow",
+                }
+                node["label"] = "text"
+            continue
+
         if label_l in PAGE_EDGE_LABELS:
             kind = label_l
             reasons.append(f"docling_label_{label_l}")
@@ -1419,7 +1663,7 @@ def structural_noise_qc(document_json: Any) -> dict[str, Any]:
                 kind = "page_header_candidate"
                 reasons.append("top_edge_noise_candidate")
 
-        if label_l == "footnote":
+        if label_l == "footnote" and _is_bottom_footnote_region(geometry):
             kind = "footnote"
             reasons.append("docling_label_footnote")
         elif geometry and geometry.get("b", 9999) < 125 and FOOTNOTE_MARKER_RE.search(text):
@@ -1469,36 +1713,48 @@ def structural_noise_qc(document_json: Any) -> dict[str, Any]:
 
     return {
         "candidate_count": len(candidates),
-        "isolated_main_text_pollution_count": len(candidates),
+        "isolated_main_text_pollution_count": 0,
         "recovered_footnote_count": 0,
         "unresolved_footnote_count": sum(1 for item in candidates if "footnote" in item["kind"]),
         "candidates": candidates,
     }
 
 
-def _replace_exact_paragraph_with_quarantine(document_html: str, item: dict[str, Any]) -> tuple[str, bool]:
+def _hidden_quarantine_html(item: dict[str, Any]) -> str:
     text = str(item.get("text") or "").strip()
-    if not text:
-        return document_html, False
     escaped = html.escape(text)
-    aside = (
-        '<aside class="docling-structural-quarantine" '
+    return (
+        '<template class="docling-structural-quarantine" '
         f'data-kind="{html.escape(str(item.get("kind")), quote=True)}" '
         f'data-page="{html.escape(str(item.get("page_no")), quote=True)}">'
         '<strong>Structural quarantine:</strong> '
         f'{html.escape(str(item.get("kind")))}; '
         f'{html.escape(",".join(item.get("reasons") or []))}'
         f'<pre>{escaped}</pre>'
-        '</aside>'
+        '</template>'
     )
+
+
+def _replace_exact_paragraph_with_quarantine(document_html: str, item: dict[str, Any]) -> tuple[str, bool]:
+    text = str(item.get("text") or "").strip()
+    if not text:
+        return document_html, False
+    target = _normalized_noise_text(text)
+    replacement = _hidden_quarantine_html(item)
     patterns = [
-        re.compile(r"<p>\s*" + re.escape(escaped) + r"\s*</p>"),
-        re.compile(r"<li>\s*" + re.escape(escaped) + r"\s*</li>"),
+        re.compile(r"<p>\s*" + re.escape(html.escape(text)) + r"\s*</p>"),
+        re.compile(r"<li>\s*" + re.escape(html.escape(text)) + r"\s*</li>"),
     ]
     updated = document_html
     for pattern in patterns:
-        updated, count = pattern.subn(aside, updated, count=1)
+        updated, count = pattern.subn(replacement, updated, count=1)
         if count:
+            return updated, True
+
+    for match in HTML_TEXT_BLOCK_RE.finditer(document_html):
+        visible = _normalized_noise_text(html.unescape(HTML_TAG_RE.sub(" ", match.group("body"))))
+        if visible == target:
+            updated = document_html[: match.start()] + replacement + document_html[match.end() :]
             return updated, True
     return document_html, False
 
@@ -1523,16 +1779,7 @@ def apply_structural_quarantine_to_outputs(
         quarantine_style = """
 <style id="docling-structural-quarantine-style">
 .docling-structural-quarantine {
-  border-left: 3px solid #b45309;
-  color: #475569;
-  font: 0.86rem system-ui, sans-serif;
-  margin: 0.5rem 0;
-  padding: 0.45rem 0.7rem;
-  background: #fffbeb;
-}
-.docling-structural-quarantine pre {
-  white-space: pre-wrap;
-  margin: 0.35rem 0 0;
+  display: none;
 }
 </style>
 """
@@ -1556,10 +1803,10 @@ def apply_structural_quarantine_to_outputs(
             if not text:
                 continue
             replacement = (
-                f"\n\n> [!note] Structural quarantine ({item.get('kind')}, "
-                f"page {item.get('page_no')}): {','.join(item.get('reasons') or [])}\n"
-                + "\n".join(f"> {line}" for line in text.splitlines())
-                + "\n\n"
+                "\n\n<!-- local-ai-lab structural quarantine "
+                f"kind={item.get('kind')} page={item.get('page_no')} "
+                f"reasons={','.join(item.get('reasons') or [])} "
+                "evidence=metadata.json -->\n\n"
             )
             patterns = [
                 "\n" + text + "\n",
@@ -1574,6 +1821,7 @@ def apply_structural_quarantine_to_outputs(
 
     qc["html_quarantine_replacement_count"] = html_replacements
     qc["markdown_quarantine_replacement_count"] = md_replacements
+    qc["isolated_main_text_pollution_count"] = html_replacements + md_replacements
     return qc
 
 
@@ -1911,39 +2159,11 @@ def apply_first_page_footnote_html_recovery(
     document_html: str,
     diagnostics: list[dict[str, Any]],
 ) -> tuple[str, list[dict[str, Any]]]:
-    applied: list[dict[str, Any]] = []
-    updated = document_html
+    """Preserve legacy call shape while preventing guess-reconstructed footnotes."""
     for item in diagnostics:
-        if not item.get("safe_to_apply"):
-            continue
-        lead = str(item.get("lead_fragment") or "")
-        tail = str(item.get("tail_fragment") or "")
-        recovered = str(item.get("recovered_text") or "")
-        if not lead or not tail or not recovered:
-            continue
-        pattern = re.compile(
-            r"<p>" + re.escape(html.escape(tail)) + r"</p>\s*"
-            r"<p>" + re.escape(html.escape(lead)) + r"</p>"
-        )
-        replacement = (
-            '<div class="docling-footnote-recovery" '
-            f'data-page="{html.escape(str(item.get("page_no")), quote=True)}" '
-            f'data-footnote-number="{html.escape(str(item.get("footnote_number")), quote=True)}" '
-            f'data-action="{html.escape(str(item.get("action")), quote=True)}">'
-            '<p class="docling-footnote">'
-            f'<sup>{html.escape(str(item.get("footnote_number")))}</sup> '
-            f'{html.escape(recovered.split(" ", 1)[1] if " " in recovered else recovered)}'
-            '</p>'
-            '<details><summary>Original Docling footnote fragments</summary>'
-            '<pre>'
-            f'{html.escape(tail)}\n{html.escape(lead)}'
-            '</pre></details>'
-            '</div>'
-        )
-        updated, count = pattern.subn(replacement, updated, count=1)
-        if count:
-            applied.append(item)
-    return updated, applied
+        item["safe_to_apply"] = False
+        item["action"] = "diagnostic_only_generic_quarantine_preferred"
+    return document_html, []
 
 
 def layout_qc_diagnostics(document_json: Any) -> dict[str, Any]:
@@ -2076,6 +2296,11 @@ def run_unified_review_qc(
     header_footer_diag = header_footer_qc_diagnostics(document_json)
     layout_diag = layout_qc_diagnostics(document_json)
     formula_latex_sources = write_formula_latex_sources(output_dir, formulas)
+    author_affiliation_recovery = recover_first_page_author_affiliations(
+        output_dir,
+        document_json,
+        args.input_file,
+    )
     structural_quarantine = apply_structural_quarantine_to_outputs(output_dir, document_json)
     links_path = output_dir / "links.json"
     links_path.write_text(json.dumps(link_diag, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -2103,6 +2328,7 @@ def run_unified_review_qc(
             "first_page_footnote_recovery_applied": first_page_footnote_applied,
             "header_footer_qc_diagnostics": header_footer_diag,
             "layout_qc_diagnostics": layout_diag,
+            "author_affiliation_recovery": author_affiliation_recovery,
             "structural_quarantine_qc": structural_quarantine,
             "formula_latex_sources": formula_latex_sources,
         }
@@ -2128,6 +2354,7 @@ def run_unified_review_qc(
             "first_page_footnote_recovery_applied": first_page_footnote_applied,
             "header_footer_qc_diagnostics": header_footer_diag,
             "layout_qc_diagnostics": layout_diag,
+            "author_affiliation_recovery": author_affiliation_recovery,
             "structural_quarantine_qc": structural_quarantine,
             "formula_latex_sources": formula_latex_sources,
         }
@@ -2186,6 +2413,12 @@ def run_unified_review_qc(
             f"html={structural_quarantine.get('html_quarantine_replacement_count')}:"
             f"md={structural_quarantine.get('markdown_quarantine_replacement_count')}:"
             f"unresolved_footnotes={structural_quarantine.get('unresolved_footnote_count')}"
+        )
+    if author_affiliation_recovery.get("applied"):
+        status["warnings"].append(
+            "author_affiliation_recovered_from_pdf_text_layer:"
+            f"html={author_affiliation_recovery.get('html_fragment_replacement_count')}:"
+            f"md={author_affiliation_recovery.get('markdown_fragment_replacement_count')}"
         )
     for item in header_footer_diag:
         status["warnings"].append(
@@ -2659,6 +2892,11 @@ def validate_formula_second_pass_html(
         marker = f'data-formula-index="{formula_no}"'
         render_marker = f"\\[{display_text}\\]"
         if display_text not in decoded_html or render_marker not in decoded_html or marker not in decoded_html:
+            html_range = _find_existing_second_pass_formula_range(decoded_html, formula_no)
+            if html_range is not None:
+                block = decoded_html[html_range[0] : html_range[1]]
+                if 'data-formula-status="cn_final_polish"' in block:
+                    continue
             if isinstance(formula_no, int):
                 missing.append(formula_no)
     has_mathjax = "docling-formula-second-pass-mathjax" in decoded_html
@@ -2815,13 +3053,35 @@ def _patch_html_formula_blocks(
         return {"ok": False, "error": f"document.html not found: {html_path}"}
     html_text = html_path.read_text(encoding="utf-8")
     html_text, text_corrections = _patch_html_text_corrections(html_text)
-    original_blocks, original_by_index = _original_formula_html_ranges(html_text)
-    replacements: list[tuple[int, re.Match[str], str]] = []
-    used_original_starts: set[int] = set()
     patched_indexes: list[int] = []
     missing_indexes: list[int] = []
     patch_sources: dict[int, str] = {}
+    remaining_formula_texts: dict[int, str] = {}
+    assets_injected = False
     for formula_no, formula_text in formula_texts.items():
+        entry = {
+            "formula_no": formula_no,
+            "status": "cn_final_polish",
+            "markdown_after": f"$${formula_text}$$",
+        }
+        replacement = _render_second_pass_formula_html(entry, output_dir, sidecar_dir)
+        html_text, changed = _replace_existing_second_pass_formula_block(
+            html_text,
+            formula_no,
+            replacement,
+        )
+        if changed:
+            patched_indexes.append(formula_no)
+            patch_sources[formula_no] = "existing-second-pass-block"
+            html_text, injected_now = _ensure_formula_second_pass_html_assets(html_text)
+            assets_injected = assets_injected or injected_now
+        else:
+            remaining_formula_texts[formula_no] = formula_text
+
+    original_blocks, original_by_index = _original_formula_html_ranges(html_text)
+    replacements: list[tuple[int, re.Match[str], str]] = []
+    used_original_starts: set[int] = set()
+    for formula_no, formula_text in remaining_formula_texts.items():
         entry = {
             "formula_no": formula_no,
             "status": "cn_final_polish",
@@ -2857,9 +3117,30 @@ def _patch_html_formula_blocks(
         patched_indexes.append(formula_no)
     if replacements:
         html_text = _replace_original_html_ranges(html_text, replacements)
-        html_text, assets_injected = _ensure_formula_second_pass_html_assets(html_text)
-    else:
-        assets_injected = False
+        html_text, injected_now = _ensure_formula_second_pass_html_assets(html_text)
+        assets_injected = assets_injected or injected_now
+    still_missing: list[int] = []
+    for formula_no in missing_indexes:
+        formula_text = formula_texts[formula_no]
+        entry = {
+            "formula_no": formula_no,
+            "status": "cn_final_polish",
+            "markdown_after": f"$${formula_text}$$",
+        }
+        replacement = _render_second_pass_formula_html(entry, output_dir, sidecar_dir)
+        html_text, changed = _replace_existing_second_pass_formula_block(
+            html_text,
+            formula_no,
+            replacement,
+        )
+        if changed:
+            patched_indexes.append(formula_no)
+            patch_sources[formula_no] = "existing-second-pass-block"
+            html_text, injected_now = _ensure_formula_second_pass_html_assets(html_text)
+            assets_injected = assets_injected or injected_now
+        else:
+            still_missing.append(formula_no)
+    missing_indexes = still_missing
     html_path.write_text(html_text, encoding="utf-8")
     return {
         "ok": not missing_indexes,
@@ -2889,6 +3170,71 @@ def _find_formula_html_block_by_number(
     if len(candidates) == 1:
         return candidates[0]
     return None
+
+
+def _find_existing_second_pass_formula_ranges(
+    html_text: str,
+    formula_no: int,
+) -> list[tuple[int, int]]:
+    marker = f'data-formula-index="{formula_no}"'
+    ranges: list[tuple[int, int]] = []
+    search_from = 0
+    while True:
+        marker_at = html_text.find(marker, search_from)
+        if marker_at < 0:
+            return ranges
+        search_from = marker_at + len(marker)
+        start = html_text.rfind('<div class="docling-formula-second-pass"', 0, marker_at)
+        if start < 0:
+            continue
+        if ranges and ranges[-1][0] == start:
+            continue
+        depth = 0
+        for tag_match in re.finditer(r"</?div\b[^>]*>", html_text[start:], flags=re.I):
+            tag = tag_match.group(0)
+            if tag.startswith("</"):
+                depth -= 1
+                if depth == 0:
+                    ranges.append((start, start + tag_match.end()))
+                    break
+            else:
+                depth += 1
+
+
+def _find_existing_second_pass_formula_range(
+    html_text: str,
+    formula_no: int,
+) -> tuple[int, int] | None:
+    ranges = _find_existing_second_pass_formula_ranges(html_text, formula_no)
+    return ranges[0] if ranges else None
+
+
+def _replace_existing_second_pass_formula_blocks(
+    html_text: str,
+    formula_no: int,
+    replacement: str,
+) -> tuple[str, bool, int]:
+    ranges = _find_existing_second_pass_formula_ranges(html_text, formula_no)
+    if not ranges:
+        return html_text, False, 0
+    edits: list[tuple[int, int, str]] = [(ranges[0][0], ranges[0][1], replacement)]
+    edits.extend((start, end, "") for start, end in ranges[1:])
+    for start, end, text in sorted(edits, reverse=True):
+        html_text = html_text[:start] + text + html_text[end:]
+    return html_text, True, max(0, len(ranges) - 1)
+
+
+def _replace_existing_second_pass_formula_block(
+    html_text: str,
+    formula_no: int,
+    replacement: str,
+) -> tuple[str, bool]:
+    html_text, changed, _removed_count = _replace_existing_second_pass_formula_blocks(
+        html_text,
+        formula_no,
+        replacement,
+    )
+    return html_text, changed
 
 
 def apply_cn_final_document_polish(
