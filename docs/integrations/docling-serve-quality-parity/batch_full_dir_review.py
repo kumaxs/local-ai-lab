@@ -34,7 +34,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--formula-second-pass-policy",
         choices=["off", "review", "apply", "apply-all"],
-        default="off",
+        default="apply-all",
     )
     parser.add_argument(
         "--formula-second-pass-route-b-root",
@@ -111,6 +111,7 @@ def summarize_success(pdf: Path, job_id: str, output_dir: Path, elapsed: float) 
     status = load_json(output_dir / "status.json") or {}
     signals = status.get("quality_signals") or {}
     second_pass = metadata.get("formula_second_pass") or {}
+    alignment = second_pass.get("alignment_diagnostics") or {}
     structural = metadata.get("structural_quarantine_qc") or {}
     number_diag = metadata.get("formula_number_qc_diagnostics") or []
     recovered_numbers = metadata.get("formula_number_recovered_html_indexes") or []
@@ -129,6 +130,10 @@ def summarize_success(pdf: Path, job_id: str, output_dir: Path, elapsed: float) 
         "second_pass_attempted_count": second_pass.get("second_pass_attempted_count"),
         "second_pass_main_output_replaced_count": second_pass.get("replaced_count"),
         "second_pass_fallback_count": second_pass.get("fallback_count"),
+        "formula_all_second_pass_attempted": alignment.get("all_formulas_attempted"),
+        "formula_sequence_mismatch_count": alignment.get("sequence_mismatch_count"),
+        "duplicate_equation_number_count": alignment.get("duplicate_equation_number_count"),
+        "image_formula_not_converted_count": alignment.get("image_formula_not_converted_count"),
         "missing_formula_number_count": len(
             [
                 item for item in number_diag
@@ -185,6 +190,10 @@ def summarize_failure(
         "second_pass_attempted_count": None,
         "second_pass_main_output_replaced_count": None,
         "second_pass_fallback_count": None,
+        "formula_all_second_pass_attempted": None,
+        "formula_sequence_mismatch_count": None,
+        "duplicate_equation_number_count": None,
+        "image_formula_not_converted_count": None,
         "missing_formula_number_count": None,
         "recovered_formula_number_count": None,
         "unresolved_formula_number_count": None,
@@ -261,6 +270,23 @@ def write_markdown_summary(output_root: Path, rows: list[dict[str, Any]]) -> Non
                 foot_recovered=row.get("recovered_footnote_count"),
                 foot_unresolved=row.get("unresolved_footnote_count"),
                 evidence=str(evidence).replace("|", "\\|"),
+            )
+        )
+    qc_lines.append("")
+    qc_lines.extend(
+        [
+            "| PDF | all formulas attempted | sequence mismatches | duplicate eq nums | image formulas not converted |",
+            "| --- | --- | ---: | ---: | ---: |",
+        ]
+    )
+    for row in rows:
+        qc_lines.append(
+            "| {pdf} | {all_attempted} | {mismatch} | {dupes} | {not_converted} |".format(
+                pdf=row["input_filename"],
+                all_attempted=row.get("formula_all_second_pass_attempted"),
+                mismatch=row.get("formula_sequence_mismatch_count"),
+                dupes=row.get("duplicate_equation_number_count"),
+                not_converted=row.get("image_formula_not_converted_count"),
             )
         )
     (output_root / "all_testpdf_qc_summary.md").write_text(
