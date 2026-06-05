@@ -278,6 +278,82 @@ class EnglishReviewPolishTests(unittest.TestCase):
         self.assertEqual(log[0]["status"], "replaced")
         self.assertEqual(patched["texts"][0]["text"], r"x = y + z \quad (1)")
 
+    def test_formula_second_pass_keeps_duplicate_equation_matches_anchored(self) -> None:
+        route_a = {
+            "texts": [
+                {
+                    "label": "formula",
+                    "text": r"a \quad (13)",
+                    "prov": [{"page_no": 3, "bbox": {"l": 10, "r": 100, "t": 500, "b": 480}}],
+                },
+                {
+                    "label": "formula",
+                    "text": r"b \quad (14)",
+                    "prov": [{"page_no": 3, "bbox": {"l": 10, "r": 100, "t": 450, "b": 430}}],
+                },
+            ]
+        }
+        route_b = [
+            {
+                "text": r"a + c \quad (13)",
+                "page_no": 3,
+                "main_eq": 13,
+                "bbox_norm": {"l": 20, "r": 200, "t": 680, "b": 720},
+                "node": {},
+            },
+            {
+                "text": r"b + d \quad (14)",
+                "page_no": 3,
+                "main_eq": 14,
+                "bbox_norm": {"l": 20, "r": 200, "t": 780, "b": 820},
+                "node": {},
+            },
+        ]
+
+        patched, log = formula_second_pass.patch_document_json(
+            route_a,
+            route_b,
+            apply_all=True,
+        )
+
+        self.assertEqual([entry["status"] for entry in log], ["replaced", "replaced"])
+        self.assertEqual(patched["texts"][0]["text"], r"a + c \quad (13)")
+        self.assertEqual(patched["texts"][1]["text"], r"b + d \quad (14)")
+
+    def test_formula_alignment_diagnostics_reports_all_second_pass_gaps(self) -> None:
+        diagnostics = adapter.formula_second_pass_alignment_diagnostics(
+            [
+                {
+                    "formula_no": 13,
+                    "eq_number": 13,
+                    "status": "suspicious_no_route_b_match",
+                    "route_a_text": "(13)",
+                    "route_b_candidate": None,
+                    "reasons": ["number_only_missing_body"],
+                    "page_no": 4,
+                    "route_a_bbox": {"x_center": 700, "y_center": 500},
+                },
+                {
+                    "formula_no": 14,
+                    "eq_number": 13,
+                    "status": "replaced",
+                    "route_a_text": r"bad \quad (13)",
+                    "route_b_candidate": r"good \quad (13)",
+                    "reasons": ["apply_all_candidate"],
+                    "page_no": 4,
+                    "route_a_bbox": {"x_center": 700, "y_center": 560},
+                },
+            ],
+            15,
+        )
+
+        self.assertFalse(diagnostics["all_formulas_attempted"])
+        self.assertIn(15, diagnostics["missing_attempt_indexes"])
+        self.assertEqual(diagnostics["sequence_mismatch_count"], 1)
+        self.assertEqual(diagnostics["duplicate_equation_number_count"], 1)
+        self.assertEqual(diagnostics["missing_body_number_only_count"], 1)
+        self.assertEqual(diagnostics["image_formula_not_converted_count"], 1)
+
     def test_formula_second_pass_apply_all_fallbacks_bad_candidate(self) -> None:
         route_a = {
             "texts": [
@@ -394,6 +470,92 @@ class EnglishReviewPolishTests(unittest.TestCase):
         self.assertEqual(document["texts"][0]["label"], "quarantined_page_footer")
         self.assertEqual(document["texts"][1]["label"], "quarantined_footnote")
 
+    def test_structural_quarantine_marks_plain_text_bottom_footnote_candidate(self) -> None:
+        document = {
+            "texts": [
+                {
+                    "label": "text",
+                    "text": "Introduction",
+                    "prov": [{"page_no": 1, "bbox": {"l": 80, "r": 240, "t": 705, "b": 680}}],
+                },
+                {
+                    "label": "text",
+                    "text": "1 Correspondence to: author@example.org",
+                    "prov": [{"page_no": 1, "bbox": {"l": 80, "r": 360, "t": 92, "b": 82}}],
+                },
+            ]
+        }
+
+        qc = adapter.structural_noise_qc(document)
+
+        self.assertEqual(qc["candidate_count"], 1)
+        self.assertEqual(document["texts"][1]["label"], "quarantined_footnote_candidate")
+        self.assertIn("small_text_bottom_footnote_marker_candidate", qc["candidates"][0]["reasons"])
+
+    def test_structural_quarantine_does_not_relabel_formula_nodes(self) -> None:
+        document = {
+            "texts": [
+                {
+                    "label": "formula",
+                    "text": r"x = y \quad (24)",
+                    "prov": [{"page_no": 2, "bbox": {"l": 80, "r": 360, "t": 92, "b": 82}}],
+                },
+                {
+                    "label": "text",
+                    "text": "1 Correspondence to: author@example.org",
+                    "prov": [{"page_no": 2, "bbox": {"l": 80, "r": 360, "t": 72, "b": 62}}],
+                },
+            ]
+        }
+
+        qc = adapter.structural_noise_qc(document)
+
+        self.assertEqual(qc["candidate_count"], 1)
+        self.assertEqual(document["texts"][0]["label"], "formula")
+        self.assertEqual(document["texts"][1]["label"], "quarantined_footnote_candidate")
+
+    def test_structural_quarantine_preserves_full_long_footnote_text(self) -> None:
+        long_text = (
+            "Permission to make digital or hard copies of all or part of this work "
+            "for personal or classroom use is granted without fee provided that "
+            "copies are not made or distributed for profit or commercial advantage "
+            "and that copies bear this notice and the full citation on the first page. "
+            "Copyrights for components of this work owned by others than the author "
+            "must be honored, and abstracting with credit is permitted."
+        )
+        document = {
+            "texts": [
+                {
+                    "label": "footnote",
+                    "text": long_text,
+                    "prov": [{"page_no": 1, "bbox": {"l": 40, "r": 540, "t": 190, "b": 170}}],
+                },
+            ]
+        }
+
+        qc = adapter.structural_noise_qc(document)
+
+        self.assertEqual(qc["candidate_count"], 1)
+        self.assertEqual(qc["candidates"][0]["text"], long_text)
+        self.assertLess(len(qc["candidates"][0]["text_preview"]), len(long_text))
+
+    def test_structural_quarantine_marks_marker_led_contribution_footnote(self) -> None:
+        document = {
+            "texts": [
+                {
+                    "label": "text",
+                    "text": "∗ Equal contributions during internship at Microsoft Research Asia.",
+                    "prov": [{"page_no": 1, "bbox": {"l": 53, "r": 243, "t": 188, "b": 180}}],
+                },
+            ]
+        }
+
+        qc = adapter.structural_noise_qc(document)
+
+        self.assertEqual(qc["candidate_count"], 1)
+        self.assertEqual(document["texts"][0]["label"], "quarantined_footnote_candidate")
+        self.assertIn("marker_led_footnote_content_candidate", qc["candidates"][0]["reasons"])
+
     def test_structural_quarantine_preserves_first_page_affiliation_mislabels(self) -> None:
         document = {
             "texts": [
@@ -422,6 +584,23 @@ class EnglishReviewPolishTests(unittest.TestCase):
         self.assertEqual(document["texts"][1]["label"], "text")
         self.assertEqual(document["texts"][2]["label"], "quarantined_footnote")
         self.assertIn("author_affiliation_recovery", document["texts"][0]["local_ai_lab_qc"])
+
+    def test_affiliation_recovery_does_not_preserve_contribution_footnotes(self) -> None:
+        document = {
+            "texts": [
+                {
+                    "label": "footnote",
+                    "text": "∗ Equal contributions during internship at Microsoft Research Asia.",
+                    "prov": [{"page_no": 1, "bbox": {"l": 53, "r": 243, "t": 188, "b": 180}}],
+                },
+            ]
+        }
+
+        qc = adapter.structural_noise_qc(document)
+
+        self.assertEqual(qc["candidate_count"], 1)
+        self.assertEqual(document["texts"][0]["label"], "quarantined_footnote")
+        self.assertNotIn("author_affiliation_recovery", document["texts"][0].get("local_ai_lab_qc", {}))
 
     def test_recovers_fragmented_first_page_affiliations_from_pdf_text_layer(self) -> None:
         document = {

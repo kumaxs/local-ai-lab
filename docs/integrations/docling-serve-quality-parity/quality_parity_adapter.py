@@ -202,7 +202,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--formula-second-pass-policy",
         choices=["off", "review", "apply", "apply-all"],
-        default="off",
+        default="apply-all",
         help=(
             "Optionally run formula_only_second_pass.py after adapter outputs are "
             "written. review writes sidecar evidence only; apply replaces "
@@ -1341,6 +1341,7 @@ def _normalized_noise_text(text: str) -> str:
 def header_footer_qc_diagnostics(document_json: Any) -> list[dict[str, Any]]:
     diagnostics: list[dict[str, Any]] = []
     records = structural_text_records(document_json)
+    page_extents = _page_vertical_extents(records)
     edge_records = [record for record in records if record["label"].lower() in PAGE_EDGE_LABELS]
     text_counts: dict[str, int] = {}
     for record in edge_records:
@@ -1352,6 +1353,10 @@ def header_footer_qc_diagnostics(document_json: Any) -> list[dict[str, Any]]:
         text = str(record["text"])
         normalized = _normalized_noise_text(text)
         geometry = record.get("bbox") or {}
+        bottom_zone, top_zone, _page_height = _edge_zone_flags(
+            geometry,
+            page_extents.get(record.get("page_no")),
+        )
         reasons: list[str] = [f"docling_label_{record['label'].lower()}"]
         if re.fullmatch(r"\d+", normalized):
             reasons.append("page_number")
@@ -1360,7 +1365,7 @@ def header_footer_qc_diagnostics(document_json: Any) -> list[dict[str, Any]]:
         if text_counts.get(normalized, 0) >= 2 and not re.fullmatch(r"\d+", normalized):
             reasons.append("repeated_page_edge_text")
         if geometry:
-            if geometry.get("b", 9999) < 80 or geometry.get("t", 0) > 700:
+            if bottom_zone or top_zone:
                 reasons.append("page_edge_position")
             if geometry.get("height", 0) > 120 and geometry.get("width", 9999) < 50:
                 reasons.append("rotated_margin_header")
@@ -1380,11 +1385,48 @@ def header_footer_qc_diagnostics(document_json: Any) -> list[dict[str, Any]]:
 
 
 FOOTNOTE_MARKER_RE = re.compile(r"^\s*(?:[∗*†‡]|\d{1,2})\s*(?:$|[A-Za-z])")
+FOOTNOTE_CONTENT_NOISE_RE = re.compile(
+    r"(?i)\b(equal contribution|equal contributions|corresponding author|"
+    r"internship|permission to make|copyright|acm isbn|doi\.org|"
+    r"all rights reserved)\b"
+)
 HTML_TEXT_BLOCK_RE = re.compile(r"<(?P<tag>p|li)\b(?P<attrs>[^>]*)>(?P<body>.*?)</(?P=tag)>", re.I | re.S)
 
 
 def _is_bottom_footnote_region(geometry: dict[str, Any] | None) -> bool:
     return bool(geometry and float(geometry.get("b", 9999)) < 160)
+
+
+def _page_vertical_extents(records: list[dict[str, Any]]) -> dict[Any, dict[str, float]]:
+    extents: dict[Any, dict[str, float]] = {}
+    for record in records:
+        page_no = record.get("page_no")
+        geometry = record.get("bbox") or {}
+        if page_no is None or not geometry:
+            continue
+        page = extents.setdefault(page_no, {"top": 0.0, "bottom": float("inf")})
+        page["top"] = max(page["top"], float(geometry.get("t", 0.0)))
+        page["bottom"] = min(page["bottom"], float(geometry.get("b", 0.0)))
+    for page in extents.values():
+        if page["bottom"] == float("inf"):
+            page["bottom"] = 0.0
+    return extents
+
+
+def _edge_zone_flags(
+    geometry: dict[str, Any] | None,
+    page_extent: dict[str, float] | None,
+) -> tuple[bool, bool, float]:
+    if not geometry:
+        return False, False, 0.0
+    page_top = float((page_extent or {}).get("top") or max(float(geometry.get("t", 0)), 800.0))
+    page_bottom = float((page_extent or {}).get("bottom") or 0.0)
+    page_height = max(page_top - page_bottom, 1.0)
+    bottom_limit = page_bottom + page_height * 0.18
+    top_limit = page_top - page_height * 0.10
+    bottom_zone = float(geometry.get("b", 9999)) <= bottom_limit
+    top_zone = float(geometry.get("t", 0)) >= top_limit
+    return bottom_zone, top_zone, page_height
 
 
 def _looks_like_author_affiliation_footnote_mislabel(
@@ -1400,6 +1442,8 @@ def _looks_like_author_affiliation_footnote_mislabel(
         return False
     normalized = _normalized_noise_text(text)
     if not normalized:
+        return False
+    if FOOTNOTE_CONTENT_NOISE_RE.search(normalized):
         return False
     if re.search(
         r"@|university|institute|department|school|college|academy|laborator|"
@@ -1613,6 +1657,7 @@ def recover_first_page_author_affiliations(
 def structural_noise_qc(document_json: Any) -> dict[str, Any]:
     """Classify page-edge and footnote-like fragments for generic quarantine."""
     records = structural_text_records(document_json)
+    page_extents = _page_vertical_extents(records)
     normalized_counts: dict[str, int] = {}
     for record in records:
         normalized = _normalized_noise_text(str(record.get("text") or ""))
@@ -1626,8 +1671,19 @@ def structural_noise_qc(document_json: Any) -> dict[str, Any]:
         text = str(record.get("text") or "")
         normalized = _normalized_noise_text(text)
         geometry = record.get("bbox") or {}
+        bottom_zone, top_zone, page_height = _edge_zone_flags(
+            geometry,
+            page_extents.get(record.get("page_no")),
+        )
+        small_text = bool(
+            geometry
+            and float(geometry.get("height", 0.0)) <= max(14.0, page_height * 0.018)
+        )
         reasons: list[str] = []
         kind: str | None = None
+
+        if label_l in {"formula", "table", "picture"}:
+            continue
 
         if _looks_like_author_affiliation_footnote_mislabel(
             label_l,
@@ -1649,33 +1705,53 @@ def structural_noise_qc(document_json: Any) -> dict[str, Any]:
             kind = label_l
             reasons.append(f"docling_label_{label_l}")
         elif geometry:
-            if geometry.get("b", 9999) < 70 and (
+            if bottom_zone and (
                 re.fullmatch(r"\d{1,3}", normalized)
                 or HEADER_FOOTER_NOISE_RE.search(normalized)
                 or normalized_counts.get(normalized, 0) >= 2
+                or (small_text and not FOOTNOTE_MARKER_RE.search(text))
             ):
                 kind = "page_footer_candidate"
                 reasons.append("bottom_edge_noise_candidate")
-            if geometry.get("t", 0) > 760 and (
+            if top_zone and (
                 HEADER_FOOTER_NOISE_RE.search(normalized)
                 or normalized_counts.get(normalized, 0) >= 2
+                or (small_text and len(normalized) <= 120)
             ):
                 kind = "page_header_candidate"
                 reasons.append("top_edge_noise_candidate")
 
-        if label_l == "footnote" and _is_bottom_footnote_region(geometry):
+        if label_l == "footnote":
             kind = "footnote"
             reasons.append("docling_label_footnote")
-        elif geometry and geometry.get("b", 9999) < 125 and FOOTNOTE_MARKER_RE.search(text):
+        elif FOOTNOTE_MARKER_RE.search(text) and FOOTNOTE_CONTENT_NOISE_RE.search(normalized):
+            kind = "footnote_candidate"
+            reasons.append("marker_led_footnote_content_candidate")
+        elif geometry and bottom_zone and FOOTNOTE_MARKER_RE.search(text):
             kind = kind or "footnote_candidate"
             reasons.append("bottom_region_footnote_marker_candidate")
+            if small_text:
+                reasons.append("small_text_bottom_footnote_marker_candidate")
+        elif geometry and bottom_zone and small_text and re.match(
+            r"^\s*(?:[∗*†‡]|\d{1,2})\s+",
+            normalized,
+        ):
+            kind = kind or "footnote_candidate"
+            reasons.append("small_text_bottom_footnote_marker_candidate")
+        elif geometry and bottom_zone and text.rstrip().endswith("-") and len(normalized) < 180:
+            kind = kind or "footnote_candidate"
+            reasons.append("bottom_region_hyphenated_annotation_candidate")
 
         if normalized_counts.get(normalized, 0) >= 2 and kind in {"page_header", "page_header_candidate", "page_footer", "page_footer_candidate"}:
             reasons.append("repeated_text")
+        if normalized_counts.get(normalized, 0) >= 2 and (bottom_zone or top_zone):
+            reasons.append("cross_page_repetition")
         if re.fullmatch(r"\d{1,3}", normalized) and kind:
             reasons.append("page_or_footnote_number_fragment")
         if HEADER_FOOTER_NOISE_RE.search(normalized):
             reasons.append("publication_template_noise")
+        if small_text and kind:
+            reasons.append("small_text_page_edge_zone")
         if label_l == "footnote" and re.fullmatch(r"\d+", normalized):
             reasons.append("isolated_footnote_marker")
         if label_l == "footnote" and re.match(r"^\d+\s+\w+", normalized):
@@ -1694,15 +1770,15 @@ def structural_noise_qc(document_json: Any) -> dict[str, Any]:
                 "reasons": reasons,
                 "action": action,
             }
-            if label_l in PAGE_EDGE_LABELS or label_l == "footnote":
-                node["label"] = f"quarantined_{label_l}"
+            node["label"] = f"quarantined_{kind}"
 
         candidates.append(
             {
                 "index": index,
                 "kind": kind,
                 "label": label,
-                "text": text[:300],
+                "text": text,
+                "text_preview": text[:300],
                 "page_no": record.get("page_no"),
                 "bbox": geometry or None,
                 "reasons": reasons,
@@ -1747,7 +1823,7 @@ def _replace_exact_paragraph_with_quarantine(document_html: str, item: dict[str,
     ]
     updated = document_html
     for pattern in patterns:
-        updated, count = pattern.subn(replacement, updated, count=1)
+        updated, count = pattern.subn(lambda _match: replacement, updated, count=1)
         if count:
             return updated, True
 
@@ -1946,6 +2022,121 @@ def formula_second_pass_apply_all_review(
         "evidence_only_count": sum(1 for item in reviewed if item["quality_gate"] == "evidence_only"),
         "preserved_count": sum(1 for item in reviewed if item["quality_gate"] == "preserve_route_a"),
         "reviewed_formulas": reviewed,
+    }
+
+
+def formula_second_pass_alignment_diagnostics(
+    replacement_log: list[dict[str, Any]],
+    route_a_formula_count: int | None,
+) -> dict[str, Any]:
+    """Summarize formula second-pass coverage and anchor integrity."""
+    route_a_formula_count = int(route_a_formula_count or 0)
+    attempted_indexes = [
+        int(entry["formula_no"])
+        for entry in replacement_log
+        if isinstance(entry.get("formula_no"), int)
+    ]
+    attempted_set = set(attempted_indexes)
+    missing_attempt_indexes = [
+        index for index in range(1, route_a_formula_count + 1) if index not in attempted_set
+    ]
+    eq_to_entries: dict[int, list[dict[str, Any]]] = {}
+    sequence_mismatches: list[dict[str, Any]] = []
+    missing_body: list[dict[str, Any]] = []
+    image_formula_not_converted: list[dict[str, Any]] = []
+    fallback_reasons: list[dict[str, Any]] = []
+    downstream_offset_risk_after: int | None = None
+
+    for entry in replacement_log:
+        formula_no = entry.get("formula_no")
+        eq_number = entry.get("eq_number")
+        status_value = str(entry.get("status") or "")
+        route_a_text = str(entry.get("route_a_text") or "")
+        candidate_text = str(entry.get("route_b_candidate") or "")
+        if isinstance(eq_number, int):
+            eq_to_entries.setdefault(eq_number, []).append(entry)
+            if isinstance(formula_no, int) and eq_number != formula_no:
+                sequence_mismatches.append(
+                    {
+                        "formula_no": formula_no,
+                        "eq_number": eq_number,
+                        "status": status_value,
+                        "page_no": entry.get("page_no"),
+                        "bbox": entry.get("route_a_bbox"),
+                        "reason": "formula_index_equation_number_mismatch",
+                    }
+                )
+                if downstream_offset_risk_after is None:
+                    downstream_offset_risk_after = formula_no
+        if FORMULA_NUMBER_RE.fullmatch(route_a_text.strip()) or re.fullmatch(
+            r"\s*\(\s*(?:\d\s*){1,3}\s*\)\s*",
+            route_a_text,
+        ):
+            missing_body.append(
+                {
+                    "formula_no": formula_no,
+                    "eq_number": eq_number,
+                    "status": status_value,
+                    "page_no": entry.get("page_no"),
+                    "bbox": entry.get("route_a_bbox"),
+                    "fallback_reason": entry.get("fallback_reason"),
+                    "reason": "missing_body_with_number_only_output",
+                }
+            )
+        if status_value != "replaced":
+            fallback_reasons.append(
+                {
+                    "formula_no": formula_no,
+                    "eq_number": eq_number,
+                    "status": status_value,
+                    "fallback_reason": entry.get("fallback_reason") or status_value,
+                    "page_no": entry.get("page_no"),
+                    "bbox": entry.get("route_a_bbox"),
+                }
+            )
+            if not candidate_text.strip() and (
+                "number_only_missing_body" in (entry.get("reasons") or [])
+                or FORMULA_NUMBER_RE.fullmatch(route_a_text.strip())
+            ):
+                image_formula_not_converted.append(
+                    {
+                        "formula_no": formula_no,
+                        "eq_number": eq_number,
+                        "status": status_value,
+                        "page_no": entry.get("page_no"),
+                        "bbox": entry.get("route_a_bbox"),
+                        "reason": "image_formula_area_not_converted_by_second_pass",
+                    }
+                )
+
+    duplicate_equation_numbers = [
+        {
+            "eq_number": eq_number,
+            "formula_indexes": [
+                entry.get("formula_no") for entry in entries if entry.get("formula_no") is not None
+            ],
+            "statuses": [entry.get("status") for entry in entries],
+        }
+        for eq_number, entries in sorted(eq_to_entries.items())
+        if len(entries) > 1
+    ]
+    return {
+        "route_a_formula_count": route_a_formula_count,
+        "attempted_count": len(attempted_indexes),
+        "all_formulas_attempted": not missing_attempt_indexes,
+        "missing_attempt_indexes": missing_attempt_indexes,
+        "sequence_mismatch_count": len(sequence_mismatches),
+        "sequence_mismatches": sequence_mismatches,
+        "duplicate_equation_number_count": len(duplicate_equation_numbers),
+        "duplicate_equation_numbers": duplicate_equation_numbers,
+        "missing_body_number_only_count": len(missing_body),
+        "missing_body_number_only": missing_body,
+        "image_formula_not_converted_count": len(image_formula_not_converted),
+        "image_formula_not_converted": image_formula_not_converted,
+        "fallback_count": len(fallback_reasons),
+        "fallback_reasons": fallback_reasons,
+        "downstream_offset_risk": downstream_offset_risk_after is not None,
+        "downstream_offset_risk_after_formula": downstream_offset_risk_after,
     }
 
 
@@ -3293,6 +3484,36 @@ def run_optional_formula_second_pass(
     route_b_dir = args.formula_second_pass_route_b_dir
     sidecar_dir = args.formula_second_pass_output_dir or (output_dir / "formula_second_pass")
     if route_b_dir is None:
+        current_document = _load_json_file(output_dir / "document.json")
+        current_formula_count = (
+            len(extract_label_nodes(current_document, "formula"))
+            if isinstance(current_document, dict)
+            else 0
+        )
+        if current_formula_count == 0:
+            formula_summary = {
+                "ok": True,
+                "policy": policy,
+                "route_a_dir": str(output_dir),
+                "route_b_dir": None,
+                "output_dir": str(sidecar_dir),
+                "route_a_formula_count": 0,
+                "route_b_formula_count": None,
+                "suspicious_formula_count": 0,
+                "second_pass_attempted_count": 0,
+                "replaced_count": 0,
+                "no_match_count": 0,
+                "fallback_count": 0,
+                "alignment_diagnostics": formula_second_pass_alignment_diagnostics([], 0),
+                "error": None,
+            }
+            metadata["formula_second_pass"] = formula_summary
+            metadata["formula_second_pass_applied"] = False
+            status["quality_signals"]["formula_second_pass"] = formula_summary
+            status["quality_signals"]["formula_second_pass_applied"] = False
+            status["warnings"].append("formula_second_pass_skipped:no_formula_candidates")
+            write_updated_contract_state()
+            return
         message = "formula_second_pass_route_b_dir_required"
         metadata["formula_second_pass"] = {"ok": False, "error": message}
         status["warnings"].append(message)
@@ -3327,6 +3548,11 @@ def run_optional_formula_second_pass(
         "guarded_fallback_eqs": sorted(args.formula_second_pass_guarded_fallback_eq),
         "error": result.get("error"),
     }
+    alignment_diag = formula_second_pass_alignment_diagnostics(
+        list(result.get("replacement_log") or []),
+        result.get("route_a_formula_count"),
+    )
+    formula_summary["alignment_diagnostics"] = alignment_diag
     metadata["formula_second_pass"] = formula_summary
     status["quality_signals"]["formula_second_pass"] = formula_summary
 
@@ -3359,6 +3585,32 @@ def run_optional_formula_second_pass(
         f"attempted={result.get('second_pass_attempted_count')}:"
         f"replaced={result.get('replaced_count')}:no_match={result.get('no_match_count')}"
     )
+    if not alignment_diag.get("all_formulas_attempted"):
+        status["warnings"].append(
+            "formula_second_pass_missing_attempts:"
+            + ",".join(str(index) for index in alignment_diag.get("missing_attempt_indexes") or [])
+        )
+    if alignment_diag.get("sequence_mismatch_count"):
+        status["warnings"].append(
+            "formula_sequence_mismatch:"
+            f"count={alignment_diag.get('sequence_mismatch_count')}:"
+            f"downstream_offset_after={alignment_diag.get('downstream_offset_risk_after_formula')}"
+        )
+    if alignment_diag.get("duplicate_equation_number_count"):
+        status["warnings"].append(
+            "duplicate_equation_numbers:"
+            f"count={alignment_diag.get('duplicate_equation_number_count')}"
+        )
+    if alignment_diag.get("missing_body_number_only_count"):
+        status["warnings"].append(
+            "formula_missing_body_number_only:"
+            f"count={alignment_diag.get('missing_body_number_only_count')}"
+        )
+    if alignment_diag.get("image_formula_not_converted_count"):
+        status["warnings"].append(
+            "image_formula_not_converted:"
+            f"count={alignment_diag.get('image_formula_not_converted_count')}"
+        )
     if policy in {"apply", "apply-all"}:
         shutil.copyfile(sidecar_dir / "document.md", output_dir / "document.md")
         shutil.copyfile(sidecar_dir / "document.json", output_dir / "document.json")

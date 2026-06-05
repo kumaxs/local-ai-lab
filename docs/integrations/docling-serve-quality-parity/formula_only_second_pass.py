@@ -123,9 +123,11 @@ def extract_formulas(doc: dict[str, Any]) -> list[dict[str, Any]]:
                 "t": t_top_px, "b": b_top_px,
             }
 
-        # Extract equation numbers from formula text
-        eq_numbers: list[int] = [int(m.group(1)) for m in EQ_NUM_RE.finditer(text)]
-        main_eq: int | None = eq_numbers[0] if eq_numbers else None
+        # Extract equation numbers from formula text. Use the trailing number as
+        # the main anchor because display equations normally carry their number
+        # at the right edge, and OCR may also mention other integers in the body.
+        eq_numbers = _extract_eq_numbers_from_text(text)
+        main_eq: int | None = eq_numbers[-1] if eq_numbers else None
 
         results.append({
             "text": text,
@@ -294,8 +296,10 @@ def match_route_b_to_route_a(
     2. Vertical-center proximity on same page (within 100 px).
     3. Text similarity >= sim_threshold (fallback for when bboxes unreliable).
     """
-    # Build Route B lookup: by (page, eq_number)
-    b_by_page_eq: dict[tuple[int | None, int], dict[str, Any]] = {}
+    # Build Route B lookup: by (page, eq_number). Keep all candidates for a
+    # number; duplicate equation labels or OCR split numbers must not overwrite
+    # each other and shift downstream formulas.
+    b_by_page_eq: dict[tuple[int | None, int], list[dict[str, Any]]] = {}
     # Build Route B lookup: by page, sorted by vertical position
     b_by_page: dict[int | None, list[dict[str, Any]]] = {}
 
@@ -303,7 +307,7 @@ def match_route_b_to_route_a(
         page = bf.get("page_no")
         eq = bf.get("main_eq")
         if eq is not None:
-            b_by_page_eq[(page, eq)] = bf
+            b_by_page_eq.setdefault((page, eq), []).append(bf)
         b_by_page.setdefault(page, []).append(bf)
 
     matches: dict[int, dict[str, Any]] = {}
@@ -317,9 +321,32 @@ def match_route_b_to_route_a(
         # Strategy 1: equation number match on same page
         if aeq is not None:
             key = (apage, aeq)
-            if key in b_by_page_eq and id(b_by_page_eq[key]) not in used_b_indices:
-                matches[i] = b_by_page_eq[key]
-                used_b_indices.add(id(b_by_page_eq[key]))
+            same_number_candidates = [
+                candidate
+                for candidate in b_by_page_eq.get(key, [])
+                if id(candidate) not in used_b_indices
+            ]
+            if same_number_candidates:
+                if abbox is not None:
+                    a_cy = formula_vertical_center(abbox)
+                    a_cx = formula_horizontal_center(abbox)
+                    same_number_candidates.sort(
+                        key=lambda candidate: (
+                            abs(
+                                formula_vertical_center(candidate["bbox_norm"]) - a_cy
+                            )
+                            if candidate.get("bbox_norm")
+                            else float("inf"),
+                            abs(
+                                formula_horizontal_center(candidate["bbox_norm"]) - a_cx
+                            )
+                            if candidate.get("bbox_norm")
+                            else float("inf"),
+                        )
+                    )
+                best_eq = same_number_candidates[0]
+                matches[i] = best_eq
+                used_b_indices.add(id(best_eq))
                 continue
 
         # Strategy 2: vertical-center proximity on same page
@@ -336,7 +363,12 @@ def match_route_b_to_route_a(
                     continue
                 c_cy = formula_vertical_center(cbbox)
                 dist = abs(a_cy - c_cy)
-                if dist < best_dist and dist < 100:
+                x_dist = (
+                    abs(formula_horizontal_center(cbbox) - formula_horizontal_center(abbox))
+                    if cbbox and abbox
+                    else 0
+                )
+                if dist < best_dist and dist < 100 and x_dist < 260:
                     best_dist = dist
                     best = cf
             if best is not None:
@@ -482,7 +514,16 @@ def _patch_node_text(node: dict[str, Any], new_text: str) -> None:
 
 
 def _extract_eq_numbers_from_text(text: str) -> list[int]:
-    return [int(m.group(1)) for m in EQ_NUM_RE.finditer(text)]
+    numbers: list[int] = [int(m.group(1)) for m in EQ_NUM_RE.finditer(text)]
+    for match in SPACED_EQ_NUM_RE.finditer(text):
+        compact = re.sub(r"\s+", "", match.group(1))
+        if compact:
+            numbers.append(int(compact))
+    deduped: list[int] = []
+    for number in numbers:
+        if number not in deduped:
+            deduped.append(number)
+    return deduped
 
 
 def _infer_markdown_eq_number(entry: dict[str, Any]) -> int | None:
