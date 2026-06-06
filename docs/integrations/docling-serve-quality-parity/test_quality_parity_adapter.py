@@ -3,6 +3,7 @@ from __future__ import annotations
 import tempfile
 import sys
 import unittest
+from argparse import Namespace
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -12,6 +13,95 @@ import formula_only_second_pass as formula_second_pass  # noqa: E402
 
 
 class EnglishReviewPolishTests(unittest.TestCase):
+    def test_cn_apply_all_resolves_to_accepted_apply_policy(self) -> None:
+        args = Namespace(
+            input_file=Path("/tmp/CN.pdf"),
+            cn_ocr_parity=True,
+            formula_second_pass_policy="apply-all",
+        )
+
+        self.assertTrue(adapter.is_cn_accepted_path(args))
+        self.assertEqual(adapter.effective_formula_second_pass_policy(args), "apply")
+
+    def test_english_apply_all_policy_remains_isolated(self) -> None:
+        args = Namespace(
+            input_file=Path("/tmp/two-col-arxiv-ai-lora.pdf"),
+            cn_ocr_parity=False,
+            formula_second_pass_policy="apply-all",
+        )
+
+        self.assertFalse(adapter.is_cn_accepted_path(args))
+        self.assertEqual(adapter.effective_formula_second_pass_policy(args), "apply-all")
+
+    def test_cn_accepted_baseline_diagnostics(self) -> None:
+        formulas = [
+            {"label": "formula", "text": rf"x_{{{number}}} = y \quad ( {number} )"}
+            for number in range(1, 25)
+        ]
+        document = {
+            "texts": [
+                {
+                    "label": "text",
+                    "text": (
+                        "获取历史时刻知识状态的权重为"
+                        + "知识状态与习题嵌入表示" * 1000
+                    ),
+                },
+                *formulas,
+            ]
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir)
+            (output_dir / "document.json").write_text(
+                adapter.json.dumps(document, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            (output_dir / "document.md").write_text(
+                "获取历史时刻知识状态的权重为",
+                encoding="utf-8",
+            )
+
+            diagnostics = adapter.cn_accepted_baseline_diagnostics(output_dir)
+
+        self.assertTrue(diagnostics["ok"])
+        self.assertEqual(diagnostics["gxx_count"], 0)
+        self.assertEqual(diagnostics["formula_count"], 24)
+        self.assertEqual(diagnostics["equation_numbers"], list(range(1, 25)))
+
+    def test_cn_accepted_baseline_rejects_gxx_and_shifted_formula_sequence(self) -> None:
+        formulas = [
+            {"label": "formula", "text": rf"x_{{{number}}} = y \quad ( {number} )"}
+            for number in range(1, 25)
+        ]
+        formulas[13]["text"] = r"x = y \quad ( 13 )"
+        document = {
+            "texts": [
+                {
+                    "label": "text",
+                    "text": "/G01" + "知识状态与习题嵌入表示" * 1000,
+                },
+                *formulas,
+            ]
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir)
+            (output_dir / "document.json").write_text(
+                adapter.json.dumps(document, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            (output_dir / "document.md").write_text(
+                "获取历史时刻知识状态的权重为",
+                encoding="utf-8",
+            )
+
+            diagnostics = adapter.cn_accepted_baseline_diagnostics(output_dir)
+
+        self.assertFalse(diagnostics["ok"])
+        self.assertIn("gxx_count=1", diagnostics["reasons"])
+        self.assertIn("formula_equation_sequence_mismatch", diagnostics["reasons"])
+
     def test_autolinks_visible_plain_urls(self) -> None:
         html, count = adapter._autolink_plain_urls(
             '<p>Code at https://github.com/microsoft/LoRA .</p>'
@@ -223,6 +313,85 @@ class EnglishReviewPolishTests(unittest.TestCase):
         self.assertNotIn(r"old \quad (12)", updated)
         self.assertNotIn(r"duplicate \quad (12)", updated)
         self.assertEqual(updated.count('data-formula-index="12"'), 1)
+
+    def test_cn_accepted_formula_sources_restore_reviewed_map(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            guarded = root / "guarded"
+            sidecar = root / "sidecar"
+            guarded.mkdir()
+            sidecar.mkdir()
+            formulas = [
+                {
+                    "label": "formula",
+                    "text": (
+                        rf"x_{{{number}}} = y \quad ( {number} ) trailing"
+                        if number == 1
+                        else rf"x_{{{number}}} = y \quad ( {number} )"
+                    ),
+                }
+                for number in range(1, 25)
+            ]
+            (guarded / "document.json").write_text(
+                adapter.json.dumps({"texts": formulas}),
+                encoding="utf-8",
+            )
+            replacement_log = [
+                {
+                    "formula_no": number,
+                    "status": "replaced",
+                    "route_b_candidate": rf"route_b_{{{number}}}",
+                }
+                for number in (3, 4, 5, 7, 8, 14, 16)
+            ]
+            (sidecar / "second_pass_summary.json").write_text(
+                adapter.json.dumps({"replacement_log": replacement_log}),
+                encoding="utf-8",
+            )
+            args = Namespace(
+                formula_second_pass_guarded_fallback_dir=[
+                    f"route-a-full={guarded}"
+                ]
+            )
+
+            texts, sources = adapter._cn_accepted_formula_source_texts(args, sidecar)
+
+        self.assertEqual(len(texts), 24)
+        self.assertEqual(sources[2], "guarded_fallback_full")
+        self.assertEqual(sources[3], "route_b")
+        self.assertEqual(sources[5], "guarded_fallback")
+        self.assertEqual(sources[1], "reviewed_cross_column_repair")
+        self.assertEqual(sources[13], "reviewed_formula_13_repair")
+        self.assertNotIn("trailing", texts[1])
+        self.assertEqual(texts[13], adapter.CN_ACCEPTED_FORMULA_13)
+
+    def test_cn_html_sequence_completion_inserts_before_next_formula(self) -> None:
+        formula_14 = adapter._render_second_pass_formula_html(
+            {
+                "formula_no": 14,
+                "status": "cn_final_polish",
+                "markdown_after": "$$fourteen \\quad ( 14 )$$",
+            },
+            Path("/tmp/out"),
+            Path("/tmp/out/formula_second_pass"),
+        )
+        html_text = f"<html><body>{formula_14}</body></html>"
+
+        updated, inserted = adapter._complete_cn_formula_html_sequence(
+            html_text,
+            Path("/tmp/out"),
+            Path("/tmp/out/formula_second_pass"),
+            {
+                13: r"thirteen \quad ( 13 )",
+                14: r"fourteen \quad ( 14 )",
+            },
+        )
+
+        self.assertEqual(inserted, [13])
+        self.assertLess(
+            updated.index('data-formula-index="13"'),
+            updated.index('data-formula-index="14"'),
+        )
 
     def test_apply_all_review_counts_every_formula(self) -> None:
         formulas = [
