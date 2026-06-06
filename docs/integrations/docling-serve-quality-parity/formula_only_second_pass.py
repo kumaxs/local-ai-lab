@@ -67,7 +67,13 @@ def iter_nodes(obj: Any):
 def extract_formulas(doc: dict[str, Any]) -> list[dict[str, Any]]:
     """Return all formula nodes with normalized provenance info."""
     results: list[dict[str, Any]] = []
-    for node in iter_nodes(doc):
+    ordered_nodes = [
+        node
+        for node in iter_nodes(doc)
+        if isinstance(node, dict) and isinstance(node.get("text"), str)
+    ]
+    page_formula_orders: dict[int | None, int] = {}
+    for reading_order, node in enumerate(ordered_nodes):
         if not isinstance(node, dict):
             continue
         label = str(node.get("label", "")).lower()
@@ -128,8 +134,29 @@ def extract_formulas(doc: dict[str, Any]) -> list[dict[str, Any]]:
         # at the right edge, and OCR may also mention other integers in the body.
         eq_numbers = _extract_eq_numbers_from_text(text)
         main_eq: int | None = eq_numbers[-1] if eq_numbers else None
+        page_order = page_formula_orders.get(page_no, 0)
+        page_formula_orders[page_no] = page_order + 1
+        nearby_before = [
+            str(ordered_nodes[index].get("text") or "")[:160]
+            for index in range(max(0, reading_order - 2), reading_order)
+            if str(ordered_nodes[index].get("label") or "").lower() != "formula"
+        ]
+        nearby_after = [
+            str(ordered_nodes[index].get("text") or "")[:160]
+            for index in range(reading_order + 1, min(len(ordered_nodes), reading_order + 3))
+            if str(ordered_nodes[index].get("label") or "").lower() != "formula"
+        ]
+        nearby_text = nearby_before + nearby_after
+        formula_no = len(results) + 1
 
         results.append({
+            "formula_no": formula_no,
+            "anchor_id": f"formula-{formula_no}-page-{page_no or 'unknown'}-order-{page_order}",
+            "reading_order": reading_order,
+            "page_order": page_order,
+            "nearby_text": nearby_text,
+            "nearby_before": nearby_before,
+            "nearby_after": nearby_after,
             "text": text,
             "page_no": page_no,
             "bbox_norm": bbox_norm,  # TOPLEFT pixel space
@@ -237,6 +264,64 @@ def text_similarity(a: str, b: str) -> float:
     return SequenceMatcher(None, a, b).ratio()
 
 
+def _neighborhood_similarity(a: dict[str, Any], b: dict[str, Any]) -> float:
+    return text_similarity(
+        " ".join(a.get("nearby_text") or []),
+        " ".join(b.get("nearby_text") or []),
+    )
+
+
+def _anchor_match_score(a: dict[str, Any], b: dict[str, Any]) -> tuple[float, dict[str, Any]]:
+    if a.get("page_no") != b.get("page_no"):
+        return float("-inf"), {"reasons": ["page_mismatch"]}
+    score = 0.0
+    reasons: list[str] = ["same_page"]
+    aeq, beq = a.get("main_eq"), b.get("main_eq")
+    if aeq is not None and beq is not None:
+        if aeq == beq:
+            score += 100
+            reasons.append("equation_number")
+        else:
+            score -= 80
+            reasons.append("equation_number_mismatch")
+    abbox, bbbox = a.get("bbox_norm"), b.get("bbox_norm")
+    y_distance = x_distance = None
+    if abbox and bbbox:
+        y_distance = abs(formula_vertical_center(abbox) - formula_vertical_center(bbbox))
+        x_distance = abs(formula_horizontal_center(abbox) - formula_horizontal_center(bbbox))
+        if y_distance <= 50:
+            score += 45
+            reasons.append("bbox_y_close")
+        elif y_distance <= 120:
+            score += 20
+            reasons.append("bbox_y_near")
+        else:
+            score -= min(60, y_distance / 5)
+            reasons.append("bbox_y_far")
+        if x_distance <= 180:
+            score += 15
+            reasons.append("bbox_column")
+        elif x_distance > 320:
+            score -= 30
+            reasons.append("bbox_column_mismatch")
+    order_distance = abs(int(a.get("page_order") or 0) - int(b.get("page_order") or 0))
+    score += max(0, 24 - (order_distance * 12))
+    reasons.append(f"page_order_distance_{order_distance}")
+    neighborhood_similarity = _neighborhood_similarity(a, b)
+    score += neighborhood_similarity * 20
+    formula_similarity = text_similarity(str(a.get("text") or ""), str(b.get("text") or ""))
+    score += formula_similarity * 12
+    return score, {
+        "score": round(score, 3),
+        "reasons": reasons,
+        "y_distance": round(y_distance, 3) if y_distance is not None else None,
+        "x_distance": round(x_distance, 3) if x_distance is not None else None,
+        "page_order_distance": order_distance,
+        "neighborhood_similarity": round(neighborhood_similarity, 4),
+        "formula_similarity": round(formula_similarity, 4),
+    }
+
+
 def formula_diagnostics(formula_text: str | None) -> dict[str, Any]:
     """Return lightweight review diagnostics for formula text."""
     text = formula_text or ""
@@ -287,109 +372,47 @@ def match_route_b_to_route_a(
     route_b_formulas: list[dict[str, Any]],
     sim_threshold: float = 0.50,
 ) -> dict[int, dict[str, Any]]:
-    """Match Route B candidates to Route A formula indices.
-
-    Returns dict: { route_a_index -> matched_route_b_formula }
-
-    Matching strategy (in priority order):
-    1. Equation number exact match on same page.
-    2. Vertical-center proximity on same page (within 100 px).
-    3. Text similarity >= sim_threshold (fallback for when bboxes unreliable).
-    """
-    # Build Route B lookup: by (page, eq_number). Keep all candidates for a
-    # number; duplicate equation labels or OCR split numbers must not overwrite
-    # each other and shift downstream formulas.
-    b_by_page_eq: dict[tuple[int | None, int], list[dict[str, Any]]] = {}
-    # Build Route B lookup: by page, sorted by vertical position
+    """Match candidates monotonically using page, geometry, order, and text evidence."""
     b_by_page: dict[int | None, list[dict[str, Any]]] = {}
-
     for bf in route_b_formulas:
-        page = bf.get("page_no")
-        eq = bf.get("main_eq")
-        if eq is not None:
-            b_by_page_eq.setdefault((page, eq), []).append(bf)
-        b_by_page.setdefault(page, []).append(bf)
+        b_by_page.setdefault(bf.get("page_no"), []).append(bf)
+    for candidates in b_by_page.values():
+        candidates.sort(key=lambda formula: int(formula.get("page_order") or 0))
 
     matches: dict[int, dict[str, Any]] = {}
-    used_b_indices: set[int] = set()  # prevent double-matching
-
+    used_b_indices: set[int] = set()
+    last_source_order_by_page: dict[int | None, int] = {}
     for i, af in enumerate(route_a_formulas):
         apage = af.get("page_no")
-        aeq = af.get("main_eq")
-        abbox = af.get("bbox_norm")
-
-        # Strategy 1: equation number match on same page
-        if aeq is not None:
-            key = (apage, aeq)
-            same_number_candidates = [
-                candidate
-                for candidate in b_by_page_eq.get(key, [])
-                if id(candidate) not in used_b_indices
-            ]
-            if same_number_candidates:
-                if abbox is not None:
-                    a_cy = formula_vertical_center(abbox)
-                    a_cx = formula_horizontal_center(abbox)
-                    same_number_candidates.sort(
-                        key=lambda candidate: (
-                            abs(
-                                formula_vertical_center(candidate["bbox_norm"]) - a_cy
-                            )
-                            if candidate.get("bbox_norm")
-                            else float("inf"),
-                            abs(
-                                formula_horizontal_center(candidate["bbox_norm"]) - a_cx
-                            )
-                            if candidate.get("bbox_norm")
-                            else float("inf"),
-                        )
-                    )
-                best_eq = same_number_candidates[0]
-                matches[i] = best_eq
-                used_b_indices.add(id(best_eq))
+        minimum_source_order = last_source_order_by_page.get(apage, -1)
+        scored: list[tuple[float, dict[str, Any], dict[str, Any]]] = []
+        for candidate in b_by_page.get(apage, []):
+            source_order = int(candidate.get("page_order") or 0)
+            if id(candidate) in used_b_indices or source_order <= minimum_source_order:
                 continue
-
-        # Strategy 2: vertical-center proximity on same page
-        candidates: list[dict[str, Any]] = b_by_page.get(apage, [])
-        if abbox is not None:
-            a_cy = formula_vertical_center(abbox)
-            best: dict[str, Any] | None = None
-            best_dist = float("inf")
-            for cf in candidates:
-                if id(cf) in used_b_indices:
-                    continue
-                cbbox = cf.get("bbox_norm")
-                if cbbox is None:
-                    continue
-                c_cy = formula_vertical_center(cbbox)
-                dist = abs(a_cy - c_cy)
-                x_dist = (
-                    abs(formula_horizontal_center(cbbox) - formula_horizontal_center(abbox))
-                    if cbbox and abbox
-                    else 0
-                )
-                if dist < best_dist and dist < 100 and x_dist < 260:
-                    best_dist = dist
-                    best = cf
-            if best is not None:
-                matches[i] = best
-                used_b_indices.add(id(best))
-                continue
-
-        # Strategy 3: text similarity fallback
-        a_text = af.get("text", "")
-        best_sim = sim_threshold
-        best_sim_cf: dict[str, Any] | None = None
-        for cf in candidates:
-            if id(cf) in used_b_indices:
-                continue
-            sim = text_similarity(a_text, cf.get("text", ""))
-            if sim > best_sim:
-                best_sim = sim
-                best_sim_cf = cf
-        if best_sim_cf is not None:
-            matches[i] = best_sim_cf
-            used_b_indices.add(id(best_sim_cf))
+            score, evidence = _anchor_match_score(af, candidate)
+            scored.append((score, candidate, evidence))
+        scored.sort(key=lambda item: item[0], reverse=True)
+        if not scored:
+            continue
+        best_score, best, evidence = scored[0]
+        second_score = scored[1][0] if len(scored) > 1 else None
+        evidence["score_margin"] = (
+            round(best_score - second_score, 3) if second_score is not None else None
+        )
+        exact_eq = af.get("main_eq") is not None and af.get("main_eq") == best.get("main_eq")
+        minimum_score = max(35.0, sim_threshold * 60)
+        if best_score < minimum_score or (
+            not exact_eq
+            and second_score is not None
+            and best_score - second_score < 8
+        ):
+            continue
+        matched = dict(best)
+        matched["anchor_match"] = evidence
+        matches[i] = matched
+        used_b_indices.add(id(best))
+        last_source_order_by_page[apage] = int(best.get("page_order") or 0)
 
     return matches
 
@@ -586,51 +609,33 @@ def patch_document_md(
     if not md_text or not replacement_log:
         return md_text
 
-    result = md_text
-
+    blocks = list(re.finditer(r"\$\$.*?\$\$", md_text, re.DOTALL))
+    edits: list[tuple[int, int, str]] = []
     for entry in replacement_log:
-        if entry["status"] != "replaced":
+        formula_no = entry.get("formula_no")
+        if not isinstance(formula_no, int) or not (0 < formula_no <= len(blocks)):
+            entry["markdown_anchor_status"] = "anchor_missing"
             continue
-        eq_num = entry.get("eq_number")
-        markdown_eq_num = _infer_markdown_eq_number(entry)
-        route_b_text = entry.get("route_b_candidate", "")
-        if not route_b_text:
-            continue
-
-        # Pattern: $$ ... ( N ) ... $$; replace the entire $$ block.
-        # eq_num may be None (formula has no embedded equation number).
-        # For those, fall back to content-prefix matching.
-        eq_str = str(eq_num)
-        # Find blocks containing this equation number
-        pattern = re.compile(
-            r"\$\$[^$]*?\(\s*" + eq_str + r"\s*\)[^$]*?\$\$",
-            re.DOTALL,
-        )
-        # Also try blocks WITHOUT explicit equation number (for formulas where
-        # Route A had eq_num but we replaced with Route B's cleaner text)
-        def replacer(m: re.Match) -> str:
-            # Preserve the $$ delimiters, replace inner content
-            return f"$${_formula_text_with_eq_number(route_b_text, markdown_eq_num)}$$"
-
-        result = pattern.sub(replacer, result)
-
-        # Fallback for formulas without eq_numbers: match by content prefix.
-        # This handles cases like formula (16) where Route B's VLM pipeline
-        # omits equation numbers but the formula text is identifiable.
-        if eq_num is None and route_b_text:
-            route_a_text = entry.get("route_a_text", "")
-            if route_a_text:
-                # Use the first 30 chars of Route A text as a prefix anchor
-                prefix = route_a_text[:30]
-                # Escape special regex chars in the prefix
-                safe_prefix = re.escape(prefix)
-                # Find the $$ block that starts with this prefix
-                prefix_pattern = re.compile(
-                    r"\$\$" + safe_prefix + r"[^$]*?\$\$",
-                    re.DOTALL,
-                )
-                result = prefix_pattern.sub(replacer, result)
-
+        block = blocks[formula_no - 1]
+        if entry.get("status") == "replaced":
+            candidate = _formula_text_with_eq_number(
+                str(entry.get("route_b_candidate") or ""),
+                _infer_markdown_eq_number(entry),
+            )
+            replacement = f"$${candidate}$$"
+            entry["markdown_anchor_status"] = "replaced_at_anchor"
+        else:
+            reason = str(entry.get("fallback_reason") or entry.get("status") or "not_applied")
+            replacement = (
+                block.group(0)
+                + f"\n<!-- formula-second-pass-fallback anchor={entry.get('anchor_id')} "
+                f"reason={reason} -->"
+            )
+            entry["markdown_anchor_status"] = "fallback_at_anchor"
+        edits.append((block.start(), block.end(), replacement))
+    result = md_text
+    for start, end, replacement in sorted(edits, reverse=True):
+        result = result[:start] + replacement + result[end:]
     return result
 
 
@@ -653,6 +658,43 @@ def candidate_quality_gate(route_a_formula: dict[str, Any], candidate_text: str 
     return not reasons, reasons
 
 
+def validate_candidate_latex(candidate_text: str | None) -> tuple[bool, list[str]]:
+    text = (candidate_text or "").strip()
+    reasons: list[str] = []
+    depth = 0
+    escaped = False
+    for char in text:
+        if escaped:
+            escaped = False
+            continue
+        if char == "\\":
+            escaped = True
+            continue
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth < 0:
+                reasons.append("unmatched_closing_brace")
+                break
+    if depth > 0:
+        reasons.append("unclosed_brace")
+    begins = re.findall(r"\\begin\s*\{\s*([^}]+)\s*\}", text)
+    ends = re.findall(r"\\end\s*\{\s*([^}]+)\s*\}", text)
+    if begins != ends:
+        reasons.append("environment_mismatch")
+    left_count = len(re.findall(r"\\left(?=\s|[\(\[\{\\])", text))
+    right_count = len(re.findall(r"\\right(?=\s|[\)\]\}\\])", text))
+    if left_count != right_count:
+        reasons.append("left_right_mismatch")
+    if "&" in text and not re.search(
+        r"\\begin\s*\{\s*(?:aligned|align|array|matrix|pmatrix|bmatrix|cases|split|gathered)\s*\}",
+        text,
+    ):
+        reasons.append("bare_alignment_marker")
+    return not reasons, reasons
+
+
 def patch_document_json(
     route_a_doc: dict[str, Any],
     route_b_formulas: list[dict[str, Any]],
@@ -667,8 +709,13 @@ def patch_document_json(
     route_a_formulas = extract_formulas(route_a_doc)
     for formula_no, formula in enumerate(route_a_formulas, start=1):
         formula["formula_no"] = formula_no
+    route_b_page_orders: dict[int | None, int] = {}
     for formula_no, formula in enumerate(route_b_formulas, start=1):
         formula["formula_no"] = formula_no
+        page_no = formula.get("page_no")
+        if formula.get("page_order") is None:
+            formula["page_order"] = route_b_page_orders.get(page_no, 0)
+        route_b_page_orders[page_no] = int(formula["page_order"]) + 1
     matches = match_route_b_to_route_a(route_a_formulas, route_b_formulas)
     guarded_fallback_sources = guarded_fallback_sources or []
     guarded_fallback_eqs = guarded_fallback_eqs or set()
@@ -694,6 +741,7 @@ def patch_document_json(
             source, fallback_formula = fallback_match
             fallback_text = fallback_formula.get("text", "")
             candidate_ok, candidate_reasons = candidate_quality_gate(af, fallback_text)
+            latex_ok, latex_reasons = validate_candidate_latex(fallback_text)
             if not fallback_text.strip():
                 fallback_match = None
             elif not candidate_ok:
@@ -714,6 +762,26 @@ def patch_document_json(
                     "candidate_diagnostics": formula_diagnostics(fallback_text),
                     "status": "fallback_candidate_failed_quality_gate",
                     "fallback_reason": ",".join(candidate_reasons),
+                })
+                continue
+            elif not latex_ok:
+                log.append({
+                    "index": i,
+                    "formula_no": af.get("formula_no"),
+                    "route_a_text": af["text"],
+                    "page_no": af["page_no"],
+                    "eq_number": af["main_eq"],
+                    "route_a_bbox": _formula_bbox_summary(af.get("bbox_norm")),
+                    "reasons": reasons,
+                    "route_b_candidate": fallback_text,
+                    "route_b_formula_no": None,
+                    "candidate_source": "guarded_fallback",
+                    "candidate_source_label": source["label"],
+                    "candidate_source_dir": str(source["source_dir"]),
+                    "candidate_formula_no": fallback_formula.get("formula_no"),
+                    "candidate_diagnostics": formula_diagnostics(fallback_text),
+                    "status": "render_failed_latex",
+                    "fallback_reason": ",".join(latex_reasons),
                 })
                 continue
             else:
@@ -759,6 +827,7 @@ def patch_document_json(
         bf = matches[i]
         route_b_text = bf["text"]
         candidate_ok, candidate_reasons = candidate_quality_gate(af, route_b_text)
+        latex_ok, latex_reasons = validate_candidate_latex(route_b_text)
         if not route_b_text.strip():
             log.append({
                 "index": i,
@@ -797,6 +866,25 @@ def patch_document_json(
                 "fallback_reason": ",".join(candidate_reasons),
             })
             continue
+        if not latex_ok:
+            log.append({
+                "index": i,
+                "formula_no": af.get("formula_no"),
+                "route_a_text": af["text"],
+                "page_no": af["page_no"],
+                "eq_number": af["main_eq"],
+                "route_a_bbox": _formula_bbox_summary(af.get("bbox_norm")),
+                "reasons": reasons,
+                "route_b_candidate": route_b_text,
+                "route_b_formula_no": bf.get("formula_no"),
+                "candidate_source": "route_b",
+                "candidate_source_label": "route_b",
+                "candidate_formula_no": bf.get("formula_no"),
+                "candidate_diagnostics": formula_diagnostics(route_b_text),
+                "status": "render_failed_latex",
+                "fallback_reason": ",".join(latex_reasons),
+            })
+            continue
 
         _patch_node_text(af["node"], route_b_text)
         log.append({
@@ -815,6 +903,35 @@ def patch_document_json(
             "candidate_diagnostics": formula_diagnostics(route_b_text),
             "status": "replaced",
         })
+
+    for entry in log:
+        formula_no = entry.get("formula_no")
+        if not isinstance(formula_no, int) or not (0 < formula_no <= len(route_a_formulas)):
+            continue
+        anchor = route_a_formulas[formula_no - 1]
+        entry.update(
+            {
+                "anchor_id": anchor.get("anchor_id"),
+                "anchor_reading_order": anchor.get("reading_order"),
+                "anchor_page_order": anchor.get("page_order"),
+                "anchor_nearby_text": anchor.get("nearby_text"),
+                "anchor_nearby_before": anchor.get("nearby_before"),
+                "anchor_nearby_after": anchor.get("nearby_after"),
+            }
+        )
+        matched = matches.get(formula_no - 1)
+        entry["anchor_match"] = (matched or {}).get("anchor_match")
+        if entry.get("status") != "replaced" and not entry.get("fallback_reason"):
+            entry["fallback_reason"] = f"second_pass_not_applied:{entry.get('status')}"
+        node = anchor["node"]
+        node["local_ai_lab_formula_second_pass"] = {
+            "anchor_id": anchor.get("anchor_id"),
+            "status": entry.get("status"),
+            "fallback_reason": entry.get("fallback_reason"),
+            "candidate_source": entry.get("candidate_source_label"),
+            "candidate_formula_no": entry.get("candidate_formula_no"),
+            "anchor_match": entry.get("anchor_match"),
+        }
 
     return route_a_doc, log
 
@@ -863,6 +980,14 @@ def add_review_evidence(
             )
         else:
             entry["review_candidate_attempts"] = []
+        route_a_evidence = entry.get("route_a_evidence") or {}
+        entry["crop_only_without_formula"] = bool(
+            entry.get("status") != "replaced"
+            and (
+                route_a_evidence.get("formula_crop")
+                or route_a_evidence.get("formula_context")
+            )
+        )
         entry["review_notes"] = review_notes(entry)
 
 
@@ -1160,6 +1285,7 @@ def run_formula_second_pass(
             "route_b_also_empty",
             "route_b_candidate_failed_quality_gate",
             "fallback_candidate_failed_quality_gate",
+            "render_failed_latex",
         )
     )
 
@@ -1195,6 +1321,12 @@ def run_formula_second_pass(
         "replaced_count": replaced_count,
         "no_match_count": no_match_count,
         "fallback_count": no_match_count,
+        "crop_only_without_formula_count": sum(
+            1 for entry in replacement_log if entry.get("crop_only_without_formula")
+        ),
+        "render_failed_latex_count": sum(
+            1 for entry in replacement_log if entry.get("status") == "render_failed_latex"
+        ),
         "apply_all": apply_all,
         "review_candidate_sources": [
             {

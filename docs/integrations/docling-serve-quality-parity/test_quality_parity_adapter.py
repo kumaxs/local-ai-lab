@@ -489,6 +489,182 @@ class EnglishReviewPolishTests(unittest.TestCase):
         self.assertEqual(patched["texts"][0]["text"], r"a + c \quad (13)")
         self.assertEqual(patched["texts"][1]["text"], r"b + d \quad (14)")
 
+    def test_formula_matching_does_not_shift_candidate_downstream(self) -> None:
+        route_a = {
+            "texts": [
+                {
+                    "label": "formula",
+                    "text": r"first \quad (1)",
+                    "prov": [{"page_no": 1, "bbox": {"l": 10, "r": 100, "t": 760, "b": 740}}],
+                },
+                {
+                    "label": "formula",
+                    "text": r"second \quad (2)",
+                    "prov": [{"page_no": 1, "bbox": {"l": 10, "r": 100, "t": 660, "b": 640}}],
+                },
+            ]
+        }
+        route_b_doc = {
+            "texts": [
+                {
+                    "label": "formula",
+                    "text": r"converted_second \quad (2)",
+                    "prov": [{"page_no": 1, "bbox": {"l": 20, "r": 200, "t": 360, "b": 400}}],
+                }
+            ]
+        }
+        route_b = formula_second_pass.extract_formulas(route_b_doc)
+
+        patched, log = formula_second_pass.patch_document_json(
+            route_a,
+            route_b,
+            apply_all=True,
+        )
+
+        self.assertNotEqual(log[0]["status"], "replaced")
+        self.assertEqual(log[0]["formula_no"], 1)
+        self.assertEqual(log[1]["status"], "replaced")
+        self.assertEqual(log[1]["formula_no"], 2)
+        self.assertEqual(patched["texts"][0]["text"], r"first \quad (1)")
+        self.assertEqual(patched["texts"][1]["text"], r"converted_second \quad (2)")
+
+    def test_formula_markdown_fallback_stays_at_own_anchor(self) -> None:
+        markdown = "$$first \\quad (1)$$\n\n$$second \\quad (2)$$"
+        entries = [
+            {
+                "formula_no": 1,
+                "anchor_id": "formula-1-page-1-order-0",
+                "status": "suspicious_no_route_b_match",
+                "fallback_reason": "second_pass_not_applied:no_match",
+            },
+            {
+                "formula_no": 2,
+                "anchor_id": "formula-2-page-1-order-1",
+                "status": "replaced",
+                "route_b_candidate": r"converted_second \quad (2)",
+                "eq_number": 2,
+            },
+        ]
+
+        updated = formula_second_pass.patch_document_md(markdown, [], entries)
+
+        self.assertLess(
+            updated.index("formula-second-pass-fallback"),
+            updated.index("converted_second"),
+        )
+        self.assertIn("$$first \\quad (1)$$", updated)
+        self.assertNotIn("converted_second \\quad (2)$$\n\n$$first", updated)
+
+    def test_failed_latex_keeps_json_formula_and_records_fallback(self) -> None:
+        route_a = {
+            "texts": [
+                {
+                    "label": "formula",
+                    "text": r"x = y \quad (1)",
+                    "prov": [{"page_no": 1, "bbox": {"l": 10, "r": 100, "t": 700, "b": 680}}],
+                }
+            ]
+        }
+        route_b = formula_second_pass.extract_formulas(
+            {
+                "texts": [
+                    {
+                        "label": "formula",
+                        "text": r"\frac{x}{y \quad (1)",
+                        "prov": [{"page_no": 1, "bbox": {"l": 20, "r": 200, "t": 280, "b": 320}}],
+                    }
+                ]
+            }
+        )
+
+        patched, log = formula_second_pass.patch_document_json(
+            route_a,
+            route_b,
+            apply_all=True,
+        )
+
+        self.assertEqual(log[0]["status"], "render_failed_latex")
+        self.assertIn("unclosed_brace", log[0]["fallback_reason"])
+        self.assertEqual(patched["texts"][0]["text"], r"x = y \quad (1)")
+        self.assertEqual(
+            patched["texts"][0]["local_ai_lab_formula_second_pass"]["anchor_id"],
+            "formula-1-page-1-order-0",
+        )
+
+    def test_crop_only_fallback_renders_at_source_anchor(self) -> None:
+        original = (
+            '<html><body><div><math><annotation>'
+            '<span class="docling-formula-source" data-formula-index="1">'
+            '<a href="formulas/formula_1_context.png">context crop</a>'
+            "</span></annotation></math></div>"
+            '<div><math><annotation>'
+            '<span class="docling-formula-source" data-formula-index="2"></span>'
+            "</annotation></math></div></body></html>"
+        )
+        entry = {
+            "formula_no": 1,
+            "anchor_id": "formula-1-page-1-order-0",
+            "status": "suspicious_no_route_b_match",
+            "fallback_reason": "second_pass_not_applied:no_match",
+            "route_b_candidate": None,
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir)
+            (output_dir / "document.html").write_text(original, encoding="utf-8")
+            result = adapter.patch_document_html_for_formula_second_pass(
+                output_dir,
+                output_dir / "formula_second_pass",
+                [entry],
+            )
+            updated = (output_dir / "document.html").read_text(encoding="utf-8")
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["fallback_indexes"], [1])
+        self.assertIn('data-formula-index="1"', updated)
+        self.assertIn("second_pass_not_applied:no_match", updated)
+        self.assertLess(
+            updated.index('data-formula-index="1"'),
+            updated.index('data-formula-index="2"'),
+        )
+
+    def test_missing_html_formula_uses_local_text_neighborhood(self) -> None:
+        original = (
+            "<html><body>"
+            "<p>Paragraph immediately before the omitted formula anchor.</p>"
+            "<p>Paragraph immediately after the omitted formula anchor.</p>"
+            '<div><math><annotation data-formula-index="2">second</annotation></math></div>'
+            "</body></html>"
+        )
+        entry = {
+            "formula_no": 1,
+            "anchor_id": "formula-1-page-1-order-0",
+            "status": "suspicious_no_route_b_match",
+            "fallback_reason": "second_pass_not_applied:no_match",
+            "anchor_nearby_before": [
+                "Paragraph immediately before the omitted formula anchor."
+            ],
+            "anchor_nearby_after": [
+                "Paragraph immediately after the omitted formula anchor."
+            ],
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir)
+            (output_dir / "document.html").write_text(original, encoding="utf-8")
+            result = adapter.patch_document_html_for_formula_second_pass(
+                output_dir,
+                output_dir / "formula_second_pass",
+                [entry],
+            )
+            updated = (output_dir / "document.html").read_text(encoding="utf-8")
+
+        formula_at = updated.index('data-formula-index="1"')
+        self.assertLess(updated.index("immediately before"), formula_at)
+        self.assertLess(formula_at, updated.index("immediately after"))
+        self.assertEqual(
+            result["patch_sources"][1],
+            "anchor-missing-local-neighborhood-after",
+        )
+
     def test_formula_alignment_diagnostics_reports_all_second_pass_gaps(self) -> None:
         diagnostics = adapter.formula_second_pass_alignment_diagnostics(
             [
