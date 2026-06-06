@@ -21,7 +21,12 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
-from formula_only_second_pass import run_formula_second_pass
+from formula_only_second_pass import (
+    extract_formulas,
+    normalize_formula_candidate,
+    run_formula_second_pass,
+    validate_candidate_latex,
+)
 
 GXX_RE = re.compile(r"/G[0-9A-Fa-f]{2}")
 DATA_IMAGE_RE = re.compile(r"data:image/[^\"')\s]+")
@@ -2949,11 +2954,11 @@ def _strip_display_math_wrapper(text: str) -> str:
 def _second_pass_formula_display_text(entry: dict[str, Any]) -> str:
     display_override = str(entry.get("display_override") or "").strip()
     if display_override:
-        return display_override
+        return normalize_formula_candidate(display_override)
     markdown_after = _strip_display_math_wrapper(str(entry.get("markdown_after") or ""))
     if markdown_after:
-        return markdown_after
-    return str(entry.get("route_b_candidate") or "").strip()
+        return normalize_formula_candidate(markdown_after)
+    return normalize_formula_candidate(str(entry.get("route_b_candidate") or "").strip())
 
 
 def _second_pass_formula_raw_text(entry: dict[str, Any]) -> str:
@@ -3021,6 +3026,9 @@ def _render_formula_fallback_html(
     formula_no = entry.get("formula_no")
     reason = str(entry.get("fallback_reason") or entry.get("status") or "second_pass_not_applied")
     raw_candidate = str(entry.get("route_b_candidate") or "").strip()
+    source_formula = normalize_formula_candidate(str(entry.get("route_a_text") or "").strip())
+    if isinstance(entry.get("eq_number"), int):
+        source_formula = _formula_text_with_number(source_formula, int(entry["eq_number"]))
     links = [
         f'<a href="formulas/formula_{formula_no}.png">source image</a>',
         f'<a href="formulas/formula_{formula_no}_context.png">context crop</a>',
@@ -3033,6 +3041,18 @@ def _render_formula_fallback_html(
         if raw_candidate
         else ""
     )
+    source_formula_render = ""
+    if source_formula and not _formula_output_safety_reasons(source_formula):
+        source_formula_render = (
+            '<div class="docling-formula-render docling-formula-preserved-source">'
+            f"\\[{html.escape(source_formula)}\\]"
+            "</div>"
+        )
+    elif source_formula:
+        source_formula_render = (
+            '<pre class="docling-formula-tex docling-formula-preserved-source">'
+            f"{html.escape(source_formula)}</pre>"
+        )
     return (
         '<div class="docling-formula-second-pass docling-formula-fallback" '
         f'data-formula-index="{formula_no}" '
@@ -3041,6 +3061,7 @@ def _render_formula_fallback_html(
         '<div class="docling-formula-second-pass-label">'
         f"Formula {formula_no} kept at its source anchor: {html.escape(reason)}"
         "</div>"
+        + source_formula_render
         + candidate
         + '<div class="docling-formula-source">'
         + " | ".join(links)
@@ -3094,6 +3115,7 @@ window.MathJax = window.MathJax || {
 
 
 FORMULA_MATH_BLOCK_RE = re.compile(r"<div><math\b(?:(?!</math></div>).)*?</math></div>", re.DOTALL)
+FORMULA_FIGURE_BLOCK_RE = re.compile(r"<figure\b(?:(?!</figure>).)*?</figure>", re.DOTALL)
 FORMULA_INDEX_ATTR_RE = re.compile(r'data-formula-index="(\d+)"')
 FORMULA_OUTPUT_INDEX_RE = re.compile(
     r'<div class="docling-formula-second-pass[^"]*"[^>]*data-formula-index="(\d+)"'
@@ -3102,9 +3124,50 @@ HTML_TAG_RE = re.compile(r"<[^>]+>")
 
 
 def _normalize_formula_anchor(text: str) -> str:
-    text = html.unescape(text)
+    alt_text = " ".join(re.findall(r'alt="([^"]*)"', text))
     text = HTML_TAG_RE.sub(" ", text)
-    return re.sub(r"\s+", " ", text).strip()
+    normalized = html.unescape(f"{text} {alt_text}").translate(
+        str.maketrans({"（": "(", "）": ")", "［": "[", "］": "]"})
+    )
+    return re.sub(r"\s+", " ", normalized).strip()
+
+
+def _is_formula_figure_block(block: str) -> bool:
+    if "<figcaption" in block:
+        return False
+    alt_match = re.search(r'alt="([^"]*)"', block)
+    if not alt_match:
+        return False
+    alt_text = html.unescape(alt_match.group(1))
+    return bool(
+        re.search(
+            r"(?:[=∑Σ]|\\(?:frac|sum|sqrt|begin|alpha|phi|sigma)|[（(]\s*\d+\s*[）)])",
+            alt_text,
+        )
+    )
+
+
+def _original_formula_visible_ranges(html_text: str) -> list[re.Match[str]]:
+    blocks: list[re.Match[str]] = list(FORMULA_MATH_BLOCK_RE.finditer(html_text))
+    blocks.extend(
+        block
+        for block in FORMULA_FIGURE_BLOCK_RE.finditer(html_text)
+        if _is_formula_figure_block(block.group(0))
+    )
+    return sorted(blocks, key=lambda block: block.start())
+
+
+def _formula_output_safety_reasons(text: str) -> list[str]:
+    body = text.strip()
+    reasons: list[str] = []
+    if not body or re.fullmatch(r"\s*\(\s*(?:\d\s*)+\)\s*", body):
+        reasons.append("missing_formula_body")
+    latex_ok, latex_reasons = validate_candidate_latex(body)
+    if not latex_ok:
+        reasons.extend(f"latex_{reason}" for reason in latex_reasons)
+    if re.search(r"(?<![A-Za-z])(?:[A-Za-z]\s+){4,}[A-Za-z](?![A-Za-z])", body):
+        reasons.append("garbled_letter_spaced_text")
+    return reasons
 
 
 def _original_formula_html_ranges(html_text: str) -> tuple[list[re.Match[str]], dict[int, re.Match[str]]]:
@@ -3184,7 +3247,11 @@ def _formula_anchor_range(html_text: str, formula_no: int) -> tuple[int, int] | 
 def _formula_neighborhood_insertion_index(
     html_text: str,
     entry: dict[str, Any],
+    search_start: int = 0,
+    search_end: int | None = None,
 ) -> tuple[int, str] | None:
+    search_end = len(html_text) if search_end is None else search_end
+
     def find_snippet(text: str, *, reverse: bool) -> int:
         compact = " ".join(text.split())
         if len(compact) < 24:
@@ -3192,7 +3259,11 @@ def _formula_neighborhood_insertion_index(
         probes = [compact, compact[:120], compact[:80], compact[:48]]
         for probe in probes:
             escaped = html.escape(probe, quote=False)
-            index = html_text.rfind(escaped) if reverse else html_text.find(escaped)
+            index = (
+                html_text.rfind(escaped, search_start, search_end)
+                if reverse
+                else html_text.find(escaped, search_start, search_end)
+            )
             if index >= 0:
                 return index
         return -1
@@ -3201,7 +3272,7 @@ def _formula_neighborhood_insertion_index(
         match_at = find_snippet(str(before_text), reverse=True)
         if match_at < 0:
             continue
-        paragraph_end = html_text.find("</p>", match_at)
+        paragraph_end = html_text.find("</p>", match_at, search_end)
         if paragraph_end >= 0:
             return paragraph_end + len("</p>"), "local-neighborhood-after"
 
@@ -3209,8 +3280,8 @@ def _formula_neighborhood_insertion_index(
         match_at = find_snippet(str(after_text), reverse=False)
         if match_at < 0:
             continue
-        paragraph_start = html_text.rfind("<p", 0, match_at)
-        if paragraph_start >= 0:
+        paragraph_start = html_text.rfind("<p", search_start, match_at)
+        if paragraph_start >= search_start:
             return paragraph_start, "local-neighborhood-before"
     return None
 
@@ -3252,6 +3323,34 @@ def _formula_anchor_insertion_index(
     )
 
 
+def _infer_bounded_equation_number_sequence(entries: list[dict[str, Any]]) -> list[int]:
+    recovered: list[int] = []
+    index = 0
+    while index < len(entries):
+        if isinstance(entries[index].get("eq_number"), int):
+            index += 1
+            continue
+        run_start = index
+        while index < len(entries) and not isinstance(entries[index].get("eq_number"), int):
+            index += 1
+        run_end = index
+        if run_start == 0 or run_end >= len(entries):
+            continue
+        previous = entries[run_start - 1].get("eq_number")
+        following = entries[run_end].get("eq_number")
+        run_length = run_end - run_start
+        if (
+            isinstance(previous, int)
+            and isinstance(following, int)
+            and following - previous == run_length + 1
+        ):
+            for offset, entry in enumerate(entries[run_start:run_end], start=1):
+                entry["eq_number"] = previous + offset
+                entry["equation_number_source"] = "bounded_rendered_sequence"
+                recovered.append(int(entry["formula_no"]))
+    return recovered
+
+
 def patch_document_html_for_formula_second_pass(
     output_dir: Path,
     sidecar_dir: Path,
@@ -3268,6 +3367,87 @@ def patch_document_html_for_formula_second_pass(
     missing_indexes: list[int] = []
     duplicate_blocks_removed: dict[int, int] = {}
     patch_sources: dict[int, str] = {}
+    entries = sorted(
+        replacement_log,
+        key=lambda item: int(item.get("formula_no") or 0),
+    )
+    original_blocks = _original_formula_visible_ranges(html_text)
+    used_original_starts: set[int] = set()
+    mapped_originals: dict[int, re.Match[str]] = {}
+    for position, entry in enumerate(entries):
+        formula_no = entry.get("formula_no")
+        if not isinstance(formula_no, int):
+            continue
+        match, source = _find_formula_html_block_by_text(
+            original_blocks,
+            used_original_starts,
+            str(entry.get("route_a_text") or ""),
+        )
+        if match is None:
+            eq_number = entry.get("eq_number")
+            if isinstance(eq_number, int):
+                match = _find_formula_html_block_by_number(
+                    original_blocks,
+                    used_original_starts,
+                    eq_number,
+                )
+                if match is not None:
+                    source = "rendered-equation-number"
+        if (
+            match is None
+            and len(original_blocks) == len(entries)
+            and position < len(original_blocks)
+            and original_blocks[position].start() not in used_original_starts
+            and (
+                not FORMULA_INDEX_ATTR_RE.search(original_blocks[position].group(0))
+                or int(FORMULA_INDEX_ATTR_RE.search(original_blocks[position].group(0)).group(1))
+                == formula_no
+            )
+        ):
+            match = original_blocks[position]
+            source = "monotonic-rendered-position"
+        if match is None:
+            continue
+        block_numbers = _compact_formula_numbers(_normalize_formula_anchor(match.group(0)))
+        if not isinstance(entry.get("eq_number"), int):
+            recovered_number = formula_no if formula_no in block_numbers else (
+                block_numbers[-1] if len(block_numbers) == 1 else None
+            )
+            if recovered_number is not None:
+                entry["eq_number"] = recovered_number
+                entry["equation_number_source"] = "original_rendered_anchor"
+        mapped_originals[formula_no] = match
+        used_original_starts.add(match.start())
+        patch_sources[formula_no] = f"replace-original-{source}"
+        patched_indexes.append(formula_no)
+        if entry.get("status") != "replaced":
+            fallback_indexes.append(formula_no)
+    recovered_sequence_indexes = _infer_bounded_equation_number_sequence(entries)
+    original_replacements: list[tuple[int, re.Match[str], str]] = []
+    for entry in entries:
+        formula_no = entry.get("formula_no")
+        if not isinstance(formula_no, int) or formula_no not in mapped_originals:
+            continue
+        if entry.get("status") == "replaced":
+            display_text = (
+                _formula_text_with_number(
+                    _second_pass_formula_display_text(entry),
+                    int(entry["eq_number"]),
+                )
+                if isinstance(entry.get("eq_number"), int)
+                else _second_pass_formula_display_text(entry)
+            )
+            entry["display_override"] = display_text
+            entry["markdown_after"] = f"$${display_text}$$"
+        replacement = (
+            _render_second_pass_formula_html(entry, output_dir, sidecar_dir)
+            if entry.get("status") == "replaced"
+            else _render_formula_fallback_html(entry, output_dir, sidecar_dir)
+        )
+        original_replacements.append((formula_no, mapped_originals[formula_no], replacement))
+    if original_replacements:
+        html_text = _replace_original_html_ranges(html_text, original_replacements)
+
     for entry in sorted(
         replacement_log,
         key=lambda item: int(item.get("formula_no") or 0),
@@ -3275,6 +3455,8 @@ def patch_document_html_for_formula_second_pass(
     ):
         formula_no = entry.get("formula_no")
         if not isinstance(formula_no, int):
+            continue
+        if formula_no in mapped_originals:
             continue
         replacement = (
             _render_second_pass_formula_html(entry, output_dir, sidecar_dir)
@@ -3362,8 +3544,83 @@ def patch_document_html_for_formula_second_pass(
         "duplicate_blocks_removed": duplicate_blocks_removed,
         "restored_indexes": sorted(restored_indexes),
         "patch_sources": patch_sources,
+        "recovered_equation_sequence_indexes": recovered_sequence_indexes,
         "final_formula_index_count": len(set(final_formula_indexes)),
         "rendering_assets_injected": assets_injected,
+    }
+
+
+def synchronize_formula_contract_outputs(
+    output_dir: Path,
+    replacement_log: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Keep final JSON and Markdown identical to the rendered formula outcome."""
+    document = _load_json_file(output_dir / "document.json")
+    json_patched: list[int] = []
+    if isinstance(document, dict):
+        formulas = extract_label_nodes(document, "formula")
+        for entry in replacement_log:
+            formula_no = entry.get("formula_no")
+            if not isinstance(formula_no, int) or not (0 < formula_no <= len(formulas)):
+                continue
+            node = formulas[formula_no - 1]
+            if entry.get("status") == "replaced":
+                output_text = _second_pass_formula_display_text(entry)
+            else:
+                output_text = normalize_formula_candidate(str(node.get("text") or ""))
+                if isinstance(entry.get("eq_number"), int):
+                    output_text = _formula_text_with_number(output_text, int(entry["eq_number"]))
+            if str(node.get("text") or "") != output_text:
+                node["text"] = output_text
+                json_patched.append(formula_no)
+            node["local_ai_lab_formula_second_pass"] = {
+                **(node.get("local_ai_lab_formula_second_pass") or {}),
+                "status": entry.get("status"),
+                "fallback_reason": entry.get("fallback_reason"),
+                "final_html_anchor": entry.get("html_anchor_status") or "original_visible_formula_replaced",
+                "equation_number": entry.get("eq_number"),
+                "equation_number_source": entry.get("equation_number_source"),
+            }
+        (output_dir / "document.json").write_text(
+            json.dumps(document, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+
+    markdown_patched: list[int] = []
+    md_path = output_dir / "document.md"
+    if md_path.exists():
+        md_text = md_path.read_text(encoding="utf-8")
+        blocks = list(re.finditer(r"\$\$.*?\$\$", md_text, re.DOTALL))
+        edits: list[tuple[int, int, str]] = []
+        for entry in replacement_log:
+            formula_no = entry.get("formula_no")
+            if (
+                not isinstance(formula_no, int)
+                or not (0 < formula_no <= len(blocks))
+            ):
+                continue
+            if entry.get("status") == "replaced":
+                output_text = _second_pass_formula_display_text(entry)
+            else:
+                output_text = blocks[formula_no - 1].group(0)[2:-2].strip()
+                if isinstance(entry.get("eq_number"), int):
+                    output_text = _formula_text_with_number(
+                        output_text,
+                        int(entry["eq_number"]),
+                    )
+            replacement = f"$${output_text}$$"
+            block = blocks[formula_no - 1]
+            if block.group(0) != replacement:
+                edits.append((block.start(), block.end(), replacement))
+                markdown_patched.append(formula_no)
+        for start, end, replacement in sorted(edits, reverse=True):
+            md_text = md_text[:start] + replacement + md_text[end:]
+        if edits:
+            md_path.write_text(md_text, encoding="utf-8")
+    return {
+        "ok": True,
+        "json_patched_indexes": sorted(json_patched),
+        "markdown_patched_indexes": sorted(markdown_patched),
     }
 
 
@@ -3375,9 +3632,19 @@ def validate_formula_second_pass_html(
     html_path = output_dir / "document.html"
     if not html_path.exists():
         return {"ok": False, "missing_replacements": [], "error": f"document.html not found: {html_path}"}
-    decoded_html = html.unescape(html_path.read_text(encoding="utf-8"))
+    raw_html = html_path.read_text(encoding="utf-8")
+    decoded_html = html.unescape(raw_html)
     missing: list[int] = []
     fallback_missing: list[int] = []
+    missing_equation_numbers: list[int] = []
+    image_only_fallbacks: list[int] = []
+    garbled_formula_indexes: list[int] = []
+    json_mismatches: list[int] = []
+    markdown_mismatches: list[int] = []
+    document = _load_json_file(output_dir / "document.json")
+    json_formulas = extract_label_nodes(document, "formula") if isinstance(document, dict) else []
+    md_text = (output_dir / "document.md").read_text(encoding="utf-8") if (output_dir / "document.md").exists() else ""
+    md_blocks = [match.group(0)[2:-2].strip() for match in re.finditer(r"\$\$.*?\$\$", md_text, re.DOTALL)]
     for entry in replacement_log:
         formula_no = entry.get("formula_no")
         marker = f'data-formula-index="{formula_no}"'
@@ -3398,19 +3665,73 @@ def validate_formula_second_pass_html(
             )
             if not valid and isinstance(formula_no, int):
                 fallback_missing.append(formula_no)
+            if valid and isinstance(formula_no, int):
+                html_range = _find_existing_second_pass_formula_range(raw_html, formula_no)
+                block = raw_html[html_range[0] : html_range[1]] if html_range else ""
+                if "docling-formula-preserved-source" not in block:
+                    image_only_fallbacks.append(formula_no)
         if not valid:
-            html_range = _find_existing_second_pass_formula_range(decoded_html, formula_no)
+            html_range = _find_existing_second_pass_formula_range(raw_html, formula_no)
             if html_range is not None:
-                block = decoded_html[html_range[0] : html_range[1]]
+                block = raw_html[html_range[0] : html_range[1]]
                 if 'data-formula-status="cn_final_polish"' in block:
                     continue
             if isinstance(formula_no, int):
                 missing.append(formula_no)
+        if not isinstance(formula_no, int):
+            continue
+        html_range = _find_existing_second_pass_formula_range(raw_html, formula_no)
+        block = raw_html[html_range[0] : html_range[1]] if html_range else ""
+        if isinstance(entry.get("eq_number"), int):
+            expected_number = int(entry["eq_number"])
+            if expected_number not in _compact_formula_numbers(_normalize_formula_anchor(block)):
+                missing_equation_numbers.append(formula_no)
+        if entry.get("status") == "replaced":
+            display_text = _second_pass_formula_display_text(entry)
+            if _formula_output_safety_reasons(display_text):
+                garbled_formula_indexes.append(formula_no)
+            if formula_no > len(json_formulas) or str(json_formulas[formula_no - 1].get("text") or "").strip() != display_text:
+                json_mismatches.append(formula_no)
+            if formula_no > len(md_blocks) or md_blocks[formula_no - 1] != display_text:
+                markdown_mismatches.append(formula_no)
     has_mathjax = "docling-formula-second-pass-mathjax" in decoded_html
+    formula_indexes = _formula_indexes_in_html(raw_html)
+    duplicate_formula_indexes = sorted(
+        index for index in set(formula_indexes) if formula_indexes.count(index) > 1
+    )
+    expected_order = [
+        int(entry["formula_no"])
+        for entry in replacement_log
+        if isinstance(entry.get("formula_no"), int)
+    ]
+    visible_offset = formula_indexes != expected_order
+    remaining_original_formula_blocks = len(_original_formula_visible_ranges(raw_html))
     return {
-        "ok": not missing,
+        "ok": not any(
+            (
+                missing,
+                duplicate_formula_indexes,
+                missing_equation_numbers,
+                image_only_fallbacks,
+                garbled_formula_indexes,
+                json_mismatches,
+                markdown_mismatches,
+                visible_offset,
+                remaining_original_formula_blocks,
+            )
+        ),
         "missing_replacements": missing,
         "missing_fallbacks": fallback_missing,
+        "duplicate_formula_indexes": duplicate_formula_indexes,
+        "missing_equation_number_indexes": sorted(set(missing_equation_numbers)),
+        "visible_formula_order": formula_indexes,
+        "expected_formula_order": expected_order,
+        "visible_offset": visible_offset,
+        "remaining_original_formula_block_count": remaining_original_formula_blocks,
+        "image_only_fallback_indexes": sorted(set(image_only_fallbacks)),
+        "garbled_formula_indexes": sorted(set(garbled_formula_indexes)),
+        "json_formula_mismatch_indexes": sorted(set(json_mismatches)),
+        "markdown_formula_mismatch_indexes": sorted(set(markdown_mismatches)),
         "mathjax_present": has_mathjax,
         "error": None,
     }
@@ -3491,7 +3812,7 @@ def _cn_accepted_formula_source_texts(
         guarded_full_texts.update(_load_formula_text_by_index(Path(path_text)))
 
     formula_texts = {
-        formula_no: _formula_text_with_number(text, formula_no)
+        formula_no: _formula_text_with_number(normalize_formula_candidate(text), formula_no)
         for formula_no, text in guarded_full_texts.items()
         if formula_no in CN_ACCEPTED_BASELINE["equation_numbers"]
     }
@@ -3510,7 +3831,10 @@ def _cn_accepted_formula_source_texts(
             candidate = str(entry.get("route_b_candidate") or "").strip()
             if not candidate:
                 continue
-            formula_texts[formula_no] = _formula_text_with_number(candidate, formula_no)
+            formula_texts[formula_no] = _formula_text_with_number(
+                normalize_formula_candidate(candidate),
+                formula_no,
+            )
             source_map[formula_no] = (
                 "guarded_fallback"
                 if formula_no in CN_ACCEPTED_GUARDED_FORMULA_NUMBERS
@@ -3522,7 +3846,7 @@ def _cn_accepted_formula_source_texts(
         if match:
             formula_texts[1] = match.group(1).strip()
             source_map[1] = "reviewed_cross_column_repair"
-    formula_texts[13] = CN_ACCEPTED_FORMULA_13
+    formula_texts[13] = normalize_formula_candidate(CN_ACCEPTED_FORMULA_13)
     source_map[13] = "reviewed_formula_13_repair"
     return formula_texts, source_map
 
@@ -3541,11 +3865,12 @@ def _patch_formula_json_nodes(output_dir: Path, formula_texts: dict[int, str]) -
             continue
         old_text = str(formula.get("text") or "")
         new_text = formula_texts[formula_no]
+        safety_reasons = _formula_output_safety_reasons(new_text)
         formula["local_ai_lab_formula_second_pass"] = {
             "anchor_id": f"formula-{index}",
-            "status": "replaced",
+            "status": "replaced" if not safety_reasons else "final_output_unsafe",
             "candidate_source": "cn_final_polish",
-            "fallback_reason": None,
+            "fallback_reason": ",".join(safety_reasons) or None,
         }
         if old_text == new_text:
             continue
@@ -3592,6 +3917,16 @@ def _patch_markdown_formula_blocks(output_dir: Path, formula_texts: dict[int, st
                 changed = True
         if changed:
             patched.append(formula_no)
+            safety_reasons = _formula_output_safety_reasons(formula_text)
+            if safety_reasons:
+                blocks = list(re.finditer(r"\$\$.*?\$\$", md_text, re.DOTALL))
+                if 0 < formula_no <= len(blocks):
+                    block = blocks[formula_no - 1]
+                    comment = (
+                        "\n<!-- formula-final-output-fallback "
+                        f"formula={formula_no} reason={','.join(safety_reasons)} -->"
+                    )
+                    md_text = md_text[: block.end()] + comment + md_text[block.end() :]
     text_corrections: list[str] = []
     for pattern, new in CN_FINAL_TEXT_CORRECTIONS:
         md_text, count = pattern.subn(new, md_text)
@@ -3616,29 +3951,38 @@ def _complete_cn_formula_html_sequence(
     output_dir: Path,
     sidecar_dir: Path,
     formula_texts: dict[int, str],
+    formula_anchors: dict[int, dict[str, Any]],
 ) -> tuple[str, list[int]]:
     present = set(_formula_indexes_in_html(html_text))
     inserted: list[int] = []
     for formula_no in sorted(formula_texts, reverse=True):
         formula_text = formula_texts[formula_no]
         marker = f'data-formula-index="{formula_no}"'
-        if marker in html_text and formula_text in html.unescape(html_text):
+        if marker in html_text:
             continue
-        replacement = _render_second_pass_formula_html(
-            {
-                "formula_no": formula_no,
-                "status": "cn_final_polish",
-                "markdown_after": f"$${formula_text}$$",
-            },
-            output_dir,
-            sidecar_dir,
+        safety_reasons = _formula_output_safety_reasons(formula_text)
+        entry = {
+            "formula_no": formula_no,
+            "status": "cn_final_polish" if not safety_reasons else "final_output_unsafe",
+            "markdown_after": f"$${formula_text}$$",
+            "route_a_text": formula_text,
+            "fallback_reason": ",".join(safety_reasons) or None,
+            **(formula_anchors.get(formula_no) or {}),
+        }
+        replacement = (
+            _render_second_pass_formula_html(entry, output_dir, sidecar_dir)
+            if not safety_reasons
+            else _render_formula_fallback_html(entry, output_dir, sidecar_dir)
         )
         next_numbers = sorted(number for number in present if number > formula_no)
         insertion_at = -1
+        neighborhood = _formula_neighborhood_insertion_index(html_text, entry)
+        if neighborhood is not None:
+            insertion_at, _source = neighborhood
         if next_numbers:
             next_marker = f'data-formula-index="{next_numbers[0]}"'
             next_marker_at = html_text.find(next_marker)
-            if next_marker_at >= 0:
+            if insertion_at < 0 and next_marker_at >= 0:
                 insertion_at = html_text.rfind(
                     '<div class="docling-formula-second-pass"',
                     0,
@@ -3654,6 +3998,61 @@ def _complete_cn_formula_html_sequence(
     return html_text, sorted(inserted)
 
 
+def _remove_numbered_original_formula_duplicates(
+    html_text: str,
+    formula_numbers: set[int],
+) -> tuple[str, list[int]]:
+    edits: list[tuple[int, int]] = []
+    removed: list[int] = []
+    for block in _original_formula_visible_ranges(html_text):
+        numbers = _compact_formula_numbers(_normalize_formula_anchor(block.group(0)))
+        matching = [number for number in numbers if number in formula_numbers]
+        if len(matching) != 1:
+            continue
+        edits.append((block.start(), block.end()))
+        removed.append(matching[0])
+    for start, end in sorted(edits, reverse=True):
+        html_text = html_text[:start] + html_text[end:]
+    return html_text, sorted(removed)
+
+
+def _repair_formula_visible_order(
+    html_text: str,
+    formula_anchors: dict[int, dict[str, Any]],
+) -> tuple[str, list[int]]:
+    repaired: list[int] = []
+    for _attempt in range(len(formula_anchors)):
+        changed = False
+        for formula_no in sorted(formula_anchors):
+            next_no = formula_no + 1
+            if next_no not in formula_anchors:
+                continue
+            current_range = _find_existing_second_pass_formula_range(html_text, formula_no)
+            next_range = _find_existing_second_pass_formula_range(html_text, next_no)
+            if current_range is None or next_range is None or current_range[0] < next_range[0]:
+                continue
+            previous_range = _find_existing_second_pass_formula_range(html_text, formula_no - 1)
+            block = html_text[current_range[0] : current_range[1]]
+            html_text = html_text[: current_range[0]] + html_text[current_range[1] :]
+            updated_next_range = _find_existing_second_pass_formula_range(html_text, next_no)
+            lower_bound = previous_range[1] if previous_range is not None else 0
+            upper_bound = updated_next_range[0] if updated_next_range is not None else len(html_text)
+            entry = formula_anchors.get(formula_no) or {}
+            neighborhood = _formula_neighborhood_insertion_index(
+                html_text,
+                entry,
+                lower_bound,
+                upper_bound,
+            )
+            insertion_at = neighborhood[0] if neighborhood is not None else upper_bound
+            html_text = html_text[:insertion_at] + block + "\n" + html_text[insertion_at:]
+            repaired.append(formula_no)
+            changed = True
+        if not changed:
+            break
+    return html_text, repaired
+
+
 def _patch_html_formula_blocks(
     output_dir: Path,
     sidecar_dir: Path,
@@ -3663,6 +4062,16 @@ def _patch_html_formula_blocks(
     if not html_path.exists():
         return {"ok": False, "error": f"document.html not found: {html_path}"}
     html_text = html_path.read_text(encoding="utf-8")
+    document = _load_json_file(output_dir / "document.json")
+    formula_anchors: dict[int, dict[str, Any]] = {}
+    if isinstance(document, dict):
+        for formula in extract_formulas(document):
+            formula_no = formula.get("formula_no")
+            if isinstance(formula_no, int):
+                formula_anchors[formula_no] = {
+                    "anchor_nearby_before": formula.get("nearby_before"),
+                    "anchor_nearby_after": formula.get("nearby_after"),
+                }
     html_text, text_corrections = _patch_html_text_corrections(html_text)
     patched_indexes: list[int] = []
     missing_indexes: list[int] = []
@@ -3670,12 +4079,19 @@ def _patch_html_formula_blocks(
     remaining_formula_texts: dict[int, str] = {}
     assets_injected = False
     for formula_no, formula_text in formula_texts.items():
+        safety_reasons = _formula_output_safety_reasons(formula_text)
         entry = {
             "formula_no": formula_no,
-            "status": "cn_final_polish",
+            "status": "cn_final_polish" if not safety_reasons else "final_output_unsafe",
             "markdown_after": f"$${formula_text}$$",
+            "route_a_text": formula_text,
+            "fallback_reason": ",".join(safety_reasons) or None,
         }
-        replacement = _render_second_pass_formula_html(entry, output_dir, sidecar_dir)
+        replacement = (
+            _render_second_pass_formula_html(entry, output_dir, sidecar_dir)
+            if not safety_reasons
+            else _render_formula_fallback_html(entry, output_dir, sidecar_dir)
+        )
         html_text, changed = _replace_existing_second_pass_formula_block(
             html_text,
             formula_no,
@@ -3689,16 +4105,31 @@ def _patch_html_formula_blocks(
         else:
             remaining_formula_texts[formula_no] = formula_text
 
-    original_blocks, original_by_index = _original_formula_html_ranges(html_text)
+    original_blocks = _original_formula_visible_ranges(html_text)
+    original_by_index: dict[int, re.Match[str]] = {}
+    for block in original_blocks:
+        index_match = FORMULA_INDEX_ATTR_RE.search(block.group(0))
+        if index_match:
+            original_by_index.setdefault(int(index_match.group(1)), block)
     replacements: list[tuple[int, re.Match[str], str]] = []
     used_original_starts: set[int] = set()
     for formula_no, formula_text in remaining_formula_texts.items():
         entry = {
             "formula_no": formula_no,
-            "status": "cn_final_polish",
+            "status": (
+                "cn_final_polish"
+                if not _formula_output_safety_reasons(formula_text)
+                else "final_output_unsafe"
+            ),
             "markdown_after": f"$${formula_text}$$",
+            "route_a_text": formula_text,
+            "fallback_reason": ",".join(_formula_output_safety_reasons(formula_text)) or None,
         }
-        replacement = _render_second_pass_formula_html(entry, output_dir, sidecar_dir)
+        replacement = (
+            _render_second_pass_formula_html(entry, output_dir, sidecar_dir)
+            if entry["status"] == "cn_final_polish"
+            else _render_formula_fallback_html(entry, output_dir, sidecar_dir)
+        )
         match = original_by_index.get(formula_no)
         if match is None:
             match, source = _find_formula_html_block_by_text(
@@ -3715,11 +4146,6 @@ def _patch_html_formula_blocks(
             if old_text_probe is not None:
                 match = old_text_probe
                 patch_sources[formula_no] = "formula-number"
-        if match is None and 0 < formula_no <= len(original_blocks):
-            positional_match = original_blocks[formula_no - 1]
-            if positional_match.start() not in used_original_starts:
-                match = positional_match
-                patch_sources[formula_no] = "cn-final-allowlist-position"
         if match is None:
             missing_indexes.append(formula_no)
             continue
@@ -3733,12 +4159,19 @@ def _patch_html_formula_blocks(
     still_missing: list[int] = []
     for formula_no in missing_indexes:
         formula_text = formula_texts[formula_no]
+        safety_reasons = _formula_output_safety_reasons(formula_text)
         entry = {
             "formula_no": formula_no,
-            "status": "cn_final_polish",
+            "status": "cn_final_polish" if not safety_reasons else "final_output_unsafe",
             "markdown_after": f"$${formula_text}$$",
+            "route_a_text": formula_text,
+            "fallback_reason": ",".join(safety_reasons) or None,
         }
-        replacement = _render_second_pass_formula_html(entry, output_dir, sidecar_dir)
+        replacement = (
+            _render_second_pass_formula_html(entry, output_dir, sidecar_dir)
+            if not safety_reasons
+            else _render_formula_fallback_html(entry, output_dir, sidecar_dir)
+        )
         html_text, changed = _replace_existing_second_pass_formula_block(
             html_text,
             formula_no,
@@ -3757,6 +4190,7 @@ def _patch_html_formula_blocks(
         output_dir,
         sidecar_dir,
         formula_texts,
+        formula_anchors,
     )
     if sequence_completion_indexes:
         html_text, injected_now = _ensure_formula_second_pass_html_assets(html_text)
@@ -3770,6 +4204,14 @@ def _patch_html_formula_blocks(
             for formula_no in missing_indexes
             if formula_no not in sequence_completion_indexes
         ]
+    html_text, removed_original_duplicates = _remove_numbered_original_formula_duplicates(
+        html_text,
+        set(formula_texts),
+    )
+    html_text, visible_order_repairs = _repair_formula_visible_order(
+        html_text,
+        formula_anchors,
+    )
     html_path.write_text(html_text, encoding="utf-8")
     return {
         "ok": not missing_indexes,
@@ -3777,6 +4219,8 @@ def _patch_html_formula_blocks(
         "missing_indexes": sorted(set(missing_indexes)),
         "patch_sources": patch_sources,
         "sequence_completion_indexes": sequence_completion_indexes,
+        "removed_original_duplicate_indexes": removed_original_duplicates,
+        "visible_order_repair_indexes": visible_order_repairs,
         "text_corrections": text_corrections,
         "rendering_assets_injected": assets_injected,
     }
@@ -3814,7 +4258,7 @@ def _find_existing_second_pass_formula_ranges(
         if marker_at < 0:
             return ranges
         search_from = marker_at + len(marker)
-        start = html_text.rfind('<div class="docling-formula-second-pass"', 0, marker_at)
+        start = html_text.rfind('<div class="docling-formula-second-pass', 0, marker_at)
         if start < 0:
             continue
         if ranges and ranges[-1][0] == start:
@@ -4105,16 +4549,44 @@ def run_optional_formula_second_pass(
                 sidecar_dir,
                 list(result.get("replacement_log") or []),
             )
-        cn_final_polish = apply_cn_final_document_polish(output_dir, sidecar_dir, args)
-        html_gate = validate_formula_second_pass_html(
+        contract_sync = synchronize_formula_contract_outputs(
             output_dir,
             list(result.get("replacement_log") or []),
         )
+        cn_final_polish = apply_cn_final_document_polish(output_dir, sidecar_dir, args)
+        validation_log = list(result.get("replacement_log") or [])
+        if cn_final_polish.get("applied"):
+            final_document = _load_json_file(output_dir / "document.json")
+            if isinstance(final_document, dict):
+                validation_log = []
+                for formula_no, formula in enumerate(
+                    extract_label_nodes(final_document, "formula"),
+                    start=1,
+                ):
+                    formula_text = str(formula.get("text") or "")
+                    formula_meta = formula.get("local_ai_lab_formula_second_pass") or {}
+                    formula_status = str(formula_meta.get("status") or "replaced")
+                    validation_log.append(
+                        {
+                            "formula_no": formula_no,
+                            "status": "replaced" if formula_status == "replaced" else formula_status,
+                            "display_override": formula_text,
+                            "route_a_text": formula_text,
+                            "eq_number": formula_no,
+                            "fallback_reason": formula_meta.get("fallback_reason"),
+                        }
+                    )
+        html_gate = validate_formula_second_pass_html(
+            output_dir,
+            validation_log,
+        )
         metadata["formula_second_pass_html_patch"] = html_patch
         metadata["formula_second_pass_html_gate"] = html_gate
+        metadata["formula_second_pass_contract_sync"] = contract_sync
         metadata["cn_final_document_polish"] = cn_final_polish
         status["quality_signals"]["formula_second_pass_html_patch"] = html_patch
         status["quality_signals"]["formula_second_pass_html_gate"] = html_gate
+        status["quality_signals"]["formula_second_pass_contract_sync"] = contract_sync
         status["quality_signals"]["cn_final_document_polish"] = cn_final_polish
         if not html_patch.get("ok") or not html_gate.get("ok") or not cn_final_polish.get("ok"):
             status["ok"] = False

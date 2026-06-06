@@ -363,7 +363,10 @@ class EnglishReviewPolishTests(unittest.TestCase):
         self.assertEqual(sources[1], "reviewed_cross_column_repair")
         self.assertEqual(sources[13], "reviewed_formula_13_repair")
         self.assertNotIn("trailing", texts[1])
-        self.assertEqual(texts[13], adapter.CN_ACCEPTED_FORMULA_13)
+        self.assertEqual(
+            texts[13],
+            adapter.normalize_formula_candidate(adapter.CN_ACCEPTED_FORMULA_13),
+        )
 
     def test_cn_html_sequence_completion_inserts_before_next_formula(self) -> None:
         formula_14 = adapter._render_second_pass_formula_html(
@@ -385,6 +388,7 @@ class EnglishReviewPolishTests(unittest.TestCase):
                 13: r"thirteen \quad ( 13 )",
                 14: r"fourteen \quad ( 14 )",
             },
+            {},
         )
 
         self.assertEqual(inserted, [13])
@@ -664,6 +668,163 @@ class EnglishReviewPolishTests(unittest.TestCase):
             result["patch_sources"][1],
             "anchor-missing-local-neighborhood-after",
         )
+
+    def test_final_html_replaces_original_mathml_without_duplicate(self) -> None:
+        original = (
+            "<html><body><p>Before.</p>"
+            "<div><math><annotation encoding=\"TeX\">"
+            r"x = y \quad ( 1 )"
+            "</annotation></math></div><p>After.</p></body></html>"
+        )
+        entry = {
+            "formula_no": 1,
+            "status": "replaced",
+            "route_a_text": r"x = y \quad ( 1 )",
+            "route_b_candidate": "x = y",
+            "markdown_after": r"$$x = y \quad ( 1 )$$",
+            "eq_number": 1,
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir)
+            (output_dir / "document.html").write_text(original, encoding="utf-8")
+            result = adapter.patch_document_html_for_formula_second_pass(
+                output_dir,
+                output_dir / "formula_second_pass",
+                [entry],
+            )
+            updated = (output_dir / "document.html").read_text(encoding="utf-8")
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(updated.count('data-formula-index="1"'), 1)
+        self.assertNotIn("<math", updated)
+        self.assertIn(r"\quad ( 1 )", updated)
+
+    def test_final_html_recovers_equation_number_from_original_anchor(self) -> None:
+        original = (
+            "<html><body><div><math><annotation encoding=\"TeX\">"
+            r"x = y \quad ( 7 )"
+            "</annotation></math></div></body></html>"
+        )
+        entry = {
+            "formula_no": 1,
+            "status": "replaced",
+            "route_a_text": "x = y",
+            "route_b_candidate": "x = y",
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir)
+            (output_dir / "document.html").write_text(original, encoding="utf-8")
+            adapter.patch_document_html_for_formula_second_pass(
+                output_dir,
+                output_dir / "formula_second_pass",
+                [entry],
+            )
+            updated = (output_dir / "document.html").read_text(encoding="utf-8")
+
+        self.assertEqual(entry["eq_number"], 7)
+        self.assertEqual(entry["equation_number_source"], "original_rendered_anchor")
+        self.assertIn(r"\quad ( 7 )", updated)
+
+    def test_equation_numbers_recover_only_inside_bounded_sequence(self) -> None:
+        entries = [
+            {"formula_no": 1, "eq_number": 1},
+            {"formula_no": 2, "eq_number": None},
+            {"formula_no": 3, "eq_number": None},
+            {"formula_no": 4, "eq_number": 4},
+            {"formula_no": 5, "eq_number": None},
+        ]
+
+        recovered = adapter._infer_bounded_equation_number_sequence(entries)
+
+        self.assertEqual(recovered, [2, 3])
+        self.assertEqual([entry.get("eq_number") for entry in entries], [1, 2, 3, 4, None])
+        self.assertEqual(entries[2]["equation_number_source"], "bounded_rendered_sequence")
+
+    def test_final_html_replaces_formula_image_at_same_anchor(self) -> None:
+        original = (
+            '<html><body><p>Before.</p><figure><img src="formula.png" '
+            'alt="q = r (13)" /></figure><p>After.</p></body></html>'
+        )
+        entry = {
+            "formula_no": 13,
+            "status": "replaced",
+            "route_a_text": "q = r (13)",
+            "route_b_candidate": "q = r",
+            "markdown_after": r"$$q = r \quad ( 13 )$$",
+            "eq_number": 13,
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir)
+            (output_dir / "document.html").write_text(original, encoding="utf-8")
+            adapter.patch_document_html_for_formula_second_pass(
+                output_dir,
+                output_dir / "formula_second_pass",
+                [entry],
+            )
+            updated = (output_dir / "document.html").read_text(encoding="utf-8")
+
+        self.assertNotIn("<figure", updated)
+        self.assertLess(updated.index("Before."), updated.index('data-formula-index="13"'))
+        self.assertLess(updated.index('data-formula-index="13"'), updated.index("After."))
+
+    def test_final_html_gate_rejects_visible_offset_and_image_only_fallback(self) -> None:
+        html_text = (
+            "<html><head></head><body>"
+            '<div class="docling-formula-second-pass docling-formula-fallback" '
+            'data-formula-index="2" data-formula-fallback-reason="unsafe"></div>'
+            '<div class="docling-formula-second-pass" data-formula-index="1">'
+            r'<div class="docling-formula-render">\[x = y\]</div></div>'
+            "</body></html>"
+        )
+        entries = [
+            {"formula_no": 1, "status": "replaced", "display_override": "x = y"},
+            {
+                "formula_no": 2,
+                "status": "unsafe",
+                "fallback_reason": "unsafe",
+                "route_a_text": "bad",
+            },
+        ]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir)
+            (output_dir / "document.html").write_text(html_text, encoding="utf-8")
+            result = adapter.validate_formula_second_pass_html(output_dir, entries)
+
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["visible_offset"])
+        self.assertEqual(result["image_only_fallback_indexes"], [2])
+
+    def test_final_html_gate_rejects_garbled_accepted_formula(self) -> None:
+        entry = {
+            "formula_no": 1,
+            "status": "replaced",
+            "display_override": "u n k n o w n = x",
+        }
+        html_text = (
+            "<html><head>"
+            '<script id="docling-formula-second-pass-mathjax"></script>'
+            "</head><body>"
+            '<div class="docling-formula-second-pass" data-formula-index="1">'
+            r'<div class="docling-formula-render">\[u n k n o w n = x\]</div>'
+            "</div></body></html>"
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir)
+            (output_dir / "document.html").write_text(html_text, encoding="utf-8")
+            (output_dir / "document.md").write_text(
+                "$$u n k n o w n = x$$",
+                encoding="utf-8",
+            )
+            (output_dir / "document.json").write_text(
+                adapter.json.dumps(
+                    {"texts": [{"label": "formula", "text": "u n k n o w n = x"}]}
+                ),
+                encoding="utf-8",
+            )
+            result = adapter.validate_formula_second_pass_html(output_dir, [entry])
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["garbled_formula_indexes"], [1])
 
     def test_formula_alignment_diagnostics_reports_all_second_pass_gaps(self) -> None:
         diagnostics = adapter.formula_second_pass_alignment_diagnostics(
