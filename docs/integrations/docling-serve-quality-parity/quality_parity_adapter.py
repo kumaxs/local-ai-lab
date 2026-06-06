@@ -2061,6 +2061,10 @@ def formula_second_pass_alignment_diagnostics(
     missing_body: list[dict[str, Any]] = []
     image_formula_not_converted: list[dict[str, Any]] = []
     fallback_reasons: list[dict[str, Any]] = []
+    anchor_mismatches: list[dict[str, Any]] = []
+    crop_only_without_formula: list[dict[str, Any]] = []
+    render_failed_latex: list[dict[str, Any]] = []
+    second_pass_not_applied: list[dict[str, Any]] = []
     downstream_offset_risk_after: int | None = None
 
     for entry in replacement_log:
@@ -2069,6 +2073,23 @@ def formula_second_pass_alignment_diagnostics(
         status_value = str(entry.get("status") or "")
         route_a_text = str(entry.get("route_a_text") or "")
         candidate_text = str(entry.get("route_b_candidate") or "")
+        anchor_match = entry.get("anchor_match") or {}
+        if (
+            "equation_number_mismatch" in (anchor_match.get("reasons") or [])
+            or (anchor_match.get("page_order_distance") or 0) > 1
+            or (anchor_match.get("y_distance") or 0) > 120
+        ):
+            anchor_mismatches.append(
+                {
+                    "formula_no": formula_no,
+                    "anchor_id": entry.get("anchor_id"),
+                    "status": status_value,
+                    "anchor_match": anchor_match,
+                    "reason": "formula_anchor_evidence_mismatch",
+                }
+            )
+            if downstream_offset_risk_after is None and isinstance(formula_no, int):
+                downstream_offset_risk_after = formula_no
         if isinstance(eq_number, int):
             eq_to_entries.setdefault(eq_number, []).append(entry)
             if isinstance(formula_no, int) and eq_number != formula_no:
@@ -2100,6 +2121,14 @@ def formula_second_pass_alignment_diagnostics(
                 }
             )
         if status_value != "replaced":
+            second_pass_not_applied.append(
+                {
+                    "formula_no": formula_no,
+                    "anchor_id": entry.get("anchor_id"),
+                    "status": status_value,
+                    "fallback_reason": entry.get("fallback_reason") or status_value,
+                }
+            )
             fallback_reasons.append(
                 {
                     "formula_no": formula_no,
@@ -2124,6 +2153,25 @@ def formula_second_pass_alignment_diagnostics(
                         "reason": "image_formula_area_not_converted_by_second_pass",
                     }
                 )
+        if entry.get("crop_only_without_formula"):
+            crop_only_without_formula.append(
+                {
+                    "formula_no": formula_no,
+                    "anchor_id": entry.get("anchor_id"),
+                    "status": status_value,
+                    "fallback_reason": entry.get("fallback_reason"),
+                    "evidence": entry.get("route_a_evidence"),
+                }
+            )
+        if status_value == "render_failed_latex":
+            render_failed_latex.append(
+                {
+                    "formula_no": formula_no,
+                    "anchor_id": entry.get("anchor_id"),
+                    "fallback_reason": entry.get("fallback_reason"),
+                    "candidate_text": candidate_text[:400],
+                }
+            )
 
     duplicate_equation_numbers = [
         {
@@ -2151,6 +2199,14 @@ def formula_second_pass_alignment_diagnostics(
         "image_formula_not_converted": image_formula_not_converted,
         "fallback_count": len(fallback_reasons),
         "fallback_reasons": fallback_reasons,
+        "anchor_mismatch_count": len(anchor_mismatches),
+        "anchor_mismatches": anchor_mismatches,
+        "crop_only_without_formula_count": len(crop_only_without_formula),
+        "crop_only_without_formula": crop_only_without_formula,
+        "render_failed_latex_count": len(render_failed_latex),
+        "render_failed_latex": render_failed_latex,
+        "second_pass_not_applied_count": len(second_pass_not_applied),
+        "second_pass_not_applied": second_pass_not_applied,
         "downstream_offset_risk": downstream_offset_risk_after is not None,
         "downstream_offset_risk_after_formula": downstream_offset_risk_after,
     }
@@ -2476,13 +2532,17 @@ def run_unified_review_qc(
     formula_second_pass_start = time.monotonic()
     formula_number_diag = formula_number_qc_diagnostics(formulas, document_html)
     formula_tex_diag = formula_tex_qc_diagnostics(formulas)
-    document_html, formula_number_recovered = recover_formula_numbers_in_html(
-        output_dir,
-        document_html,
-        formulas,
-        formula_number_diag,
-        formula_tex_diag,
-    )
+    formula_second_pass_owns_html = args.formula_second_pass_policy != "off"
+    if formula_second_pass_owns_html:
+        formula_number_recovered = []
+    else:
+        document_html, formula_number_recovered = recover_formula_numbers_in_html(
+            output_dir,
+            document_html,
+            formulas,
+            formula_number_diag,
+            formula_tex_diag,
+        )
     formula_second_pass_review = formula_second_pass_apply_all_review(
         formulas,
         formula_number_diag,
@@ -2529,6 +2589,7 @@ def run_unified_review_qc(
             "math_review_diagnostics": math_diag,
             "formula_number_qc_diagnostics": formula_number_diag,
             "formula_number_recovered_html_indexes": formula_number_recovered,
+            "formula_second_pass_owns_html": formula_second_pass_owns_html,
             "formula_tex_qc_diagnostics": formula_tex_diag,
             "formula_second_pass_apply_all_review": formula_second_pass_review,
             "first_page_footnote_recovery_diagnostics": first_page_footnote_diag,
@@ -2555,6 +2616,7 @@ def run_unified_review_qc(
             "math_review_diagnostics": math_diag,
             "formula_number_qc_diagnostics": formula_number_diag,
             "formula_number_recovered_html_indexes": formula_number_recovered,
+            "formula_second_pass_owns_html": formula_second_pass_owns_html,
             "formula_tex_qc_diagnostics": formula_tex_diag,
             "formula_second_pass_apply_all_review": formula_second_pass_review,
             "first_page_footnote_recovery_diagnostics": first_page_footnote_diag,
@@ -2951,6 +3013,41 @@ def _render_second_pass_formula_html(
     )
 
 
+def _render_formula_fallback_html(
+    entry: dict[str, Any],
+    output_dir: Path,
+    sidecar_dir: Path,
+) -> str:
+    formula_no = entry.get("formula_no")
+    reason = str(entry.get("fallback_reason") or entry.get("status") or "second_pass_not_applied")
+    raw_candidate = str(entry.get("route_b_candidate") or "").strip()
+    links = [
+        f'<a href="formulas/formula_{formula_no}.png">source image</a>',
+        f'<a href="formulas/formula_{formula_no}_context.png">context crop</a>',
+        f'<a href="{html.escape(_relative_output_link(output_dir, sidecar_dir / "review_index.html"))}">'
+        "second-pass review</a>",
+    ]
+    candidate = (
+        '<pre class="docling-formula-tex docling-formula-fallback-candidate">'
+        f"{html.escape(raw_candidate)}</pre>"
+        if raw_candidate
+        else ""
+    )
+    return (
+        '<div class="docling-formula-second-pass docling-formula-fallback" '
+        f'data-formula-index="{formula_no}" '
+        f'data-formula-status="{html.escape(str(entry.get("status") or "fallback"))}" '
+        f'data-formula-fallback-reason="{html.escape(reason, quote=True)}">'
+        '<div class="docling-formula-second-pass-label">'
+        f"Formula {formula_no} kept at its source anchor: {html.escape(reason)}"
+        "</div>"
+        + candidate
+        + '<div class="docling-formula-source">'
+        + " | ".join(links)
+        + "</div></div>"
+    )
+
+
 def _ensure_formula_second_pass_html_assets(html_text: str) -> tuple[str, bool]:
     """Add MathJax/styles for patched formula blocks while preserving raw TeX fallback."""
     if "docling-formula-second-pass-mathjax" in html_text:
@@ -2998,6 +3095,9 @@ window.MathJax = window.MathJax || {
 
 FORMULA_MATH_BLOCK_RE = re.compile(r"<div><math\b(?:(?!</math></div>).)*?</math></div>", re.DOTALL)
 FORMULA_INDEX_ATTR_RE = re.compile(r'data-formula-index="(\d+)"')
+FORMULA_OUTPUT_INDEX_RE = re.compile(
+    r'<div class="docling-formula-second-pass[^"]*"[^>]*data-formula-index="(\d+)"'
+)
 HTML_TAG_RE = re.compile(r"<[^>]+>")
 
 
@@ -3067,7 +3167,89 @@ def _replace_original_html_ranges(
 
 
 def _formula_indexes_in_html(html_text: str) -> list[int]:
-    return [int(match.group(1)) for match in FORMULA_INDEX_ATTR_RE.finditer(html_text)]
+    return [int(match.group(1)) for match in FORMULA_OUTPUT_INDEX_RE.finditer(html_text)]
+
+
+def _formula_anchor_range(html_text: str, formula_no: int) -> tuple[int, int] | None:
+    existing = _find_existing_second_pass_formula_range(html_text, formula_no)
+    if existing is not None:
+        return existing
+    marker = f'data-formula-index="{formula_no}"'
+    for block in FORMULA_MATH_BLOCK_RE.finditer(html_text):
+        if marker in block.group(0):
+            return block.start(), block.end()
+    return None
+
+
+def _formula_neighborhood_insertion_index(
+    html_text: str,
+    entry: dict[str, Any],
+) -> tuple[int, str] | None:
+    def find_snippet(text: str, *, reverse: bool) -> int:
+        compact = " ".join(text.split())
+        if len(compact) < 24:
+            return -1
+        probes = [compact, compact[:120], compact[:80], compact[:48]]
+        for probe in probes:
+            escaped = html.escape(probe, quote=False)
+            index = html_text.rfind(escaped) if reverse else html_text.find(escaped)
+            if index >= 0:
+                return index
+        return -1
+
+    for before_text in reversed(entry.get("anchor_nearby_before") or []):
+        match_at = find_snippet(str(before_text), reverse=True)
+        if match_at < 0:
+            continue
+        paragraph_end = html_text.find("</p>", match_at)
+        if paragraph_end >= 0:
+            return paragraph_end + len("</p>"), "local-neighborhood-after"
+
+    for after_text in entry.get("anchor_nearby_after") or []:
+        match_at = find_snippet(str(after_text), reverse=False)
+        if match_at < 0:
+            continue
+        paragraph_start = html_text.rfind("<p", 0, match_at)
+        if paragraph_start >= 0:
+            return paragraph_start, "local-neighborhood-before"
+    return None
+
+
+def _formula_anchor_insertion_index(
+    html_text: str,
+    formula_no: int,
+    entry: dict[str, Any],
+) -> tuple[int, str]:
+    neighborhood = _formula_neighborhood_insertion_index(html_text, entry)
+    if neighborhood is not None:
+        return neighborhood
+    output_markers = [
+        (int(match.group(1)), match.start())
+        for match in FORMULA_OUTPUT_INDEX_RE.finditer(html_text)
+        if int(match.group(1)) > formula_no
+    ]
+    markers = output_markers or [
+        (int(match.group(1)), match.start())
+        for match in FORMULA_INDEX_ATTR_RE.finditer(html_text)
+        if int(match.group(1)) > formula_no
+    ]
+    if markers:
+        _next_no, marker_at = min(markers)
+        second_pass_start = html_text.rfind(
+            '<div class="docling-formula-second-pass"',
+            0,
+            marker_at,
+        )
+        if second_pass_start >= 0:
+            return second_pass_start, "ordered-next-formula"
+        for block in FORMULA_MATH_BLOCK_RE.finditer(html_text):
+            if block.start() <= marker_at < block.end():
+                return block.start(), "ordered-next-formula"
+    body_end = html_text.rfind("</body>")
+    return (
+        body_end if body_end >= 0 else len(html_text),
+        "document-end-fallback",
+    )
 
 
 def patch_document_html_for_formula_second_pass(
@@ -3075,122 +3257,112 @@ def patch_document_html_for_formula_second_pass(
     sidecar_dir: Path,
     replacement_log: list[dict[str, Any]],
 ) -> dict[str, Any]:
-    """Patch replaced formula blocks in document.html with traceable formula text."""
+    """Render every second-pass outcome at its durable Route A formula anchor."""
     html_path = output_dir / "document.html"
     if not html_path.exists():
         return {"ok": False, "error": f"document.html not found: {html_path}"}
 
     html_text = html_path.read_text(encoding="utf-8")
-    original_blocks, original_by_index = _original_formula_html_ranges(html_text)
-    replacements: list[tuple[int, re.Match[str], str]] = []
-    used_original_starts: set[int] = set()
     patched_indexes: list[int] = []
+    fallback_indexes: list[int] = []
     missing_indexes: list[int] = []
-    appended_indexes: list[int] = []
+    duplicate_blocks_removed: dict[int, int] = {}
     patch_sources: dict[int, str] = {}
-    entries_by_formula_no = {
-        int(entry.get("formula_no")): entry
-        for entry in replacement_log
-        if entry.get("status") == "replaced" and isinstance(entry.get("formula_no"), int)
-    }
     for entry in sorted(
         replacement_log,
         key=lambda item: int(item.get("formula_no") or 0),
         reverse=True,
     ):
-        if entry.get("status") != "replaced":
-            continue
         formula_no = entry.get("formula_no")
         if not isinstance(formula_no, int):
             continue
-        replacement = _render_second_pass_formula_html(entry, output_dir, sidecar_dir)
-        match = original_by_index.get(formula_no)
-        if match is not None:
-            replacements.append((formula_no, match, replacement))
-            used_original_starts.add(match.start())
-            patched_indexes.append(formula_no)
-            patch_sources[formula_no] = "data-formula-index"
-            continue
-
-        match, source = _find_formula_html_block_by_text(
-            original_blocks,
-            used_original_starts,
-            str(entry.get("route_a_text") or ""),
+        replacement = (
+            _render_second_pass_formula_html(entry, output_dir, sidecar_dir)
+            if entry.get("status") == "replaced"
+            else _render_formula_fallback_html(entry, output_dir, sidecar_dir)
         )
-        if match is not None:
-            replacements.append((formula_no, match, replacement))
-            used_original_starts.add(match.start())
+        html_text, existing_changed, removed_count = _replace_existing_second_pass_formula_blocks(
+            html_text,
+            formula_no,
+            replacement,
+        )
+        if existing_changed:
+            patch_sources[formula_no] = "durable-existing-formula-block"
+            if removed_count:
+                duplicate_blocks_removed[formula_no] = removed_count
             patched_indexes.append(formula_no)
-            patch_sources[formula_no] = str(source)
+            if entry.get("status") != "replaced":
+                fallback_indexes.append(formula_no)
             continue
-
-        if 0 < formula_no <= len(original_blocks):
-            match = original_blocks[formula_no - 1]
-            if match.start() not in used_original_starts:
-                replacements.append((formula_no, match, replacement))
-                used_original_starts.add(match.start())
-                patched_indexes.append(formula_no)
-                patch_sources[formula_no] = "original-block-position"
-                continue
-
-        missing_indexes.append(formula_no)
-
-    if replacements:
-        html_text = _replace_original_html_ranges(html_text, replacements)
-
-    missing_indexes = sorted(set(missing_indexes))
-    if missing_indexes:
-        appended_blocks = []
-        for formula_no in missing_indexes:
-            entry = entries_by_formula_no.get(formula_no)
-            if not entry:
-                continue
-            appended_blocks.append(_render_second_pass_formula_html(entry, output_dir, sidecar_dir))
-            appended_indexes.append(formula_no)
-            patched_indexes.append(formula_no)
-            patch_sources[formula_no] = "appended-unmapped-formula-section"
-        if appended_blocks:
-            section = (
-                '<section class="docling-formula-second-pass-unmapped">'
-                '<h2>Unmapped Second-Pass Formulas</h2>'
-                '<p>These formulas were replaced in document.json and document.md; '
-                'Docling HTML did not expose a one-to-one original formula block, '
-                'so the adapter preserved them here in the main HTML output.</p>'
-                + "".join(appended_blocks)
-                + "</section>"
+        anchor_range = _formula_anchor_range(html_text, formula_no)
+        if anchor_range is not None:
+            start, end = anchor_range
+            html_text = html_text[:start] + replacement + html_text[end:]
+            patch_sources[formula_no] = "durable-data-formula-index"
+        else:
+            insertion_at, insertion_source = _formula_anchor_insertion_index(
+                html_text,
+                formula_no,
+                entry,
             )
-            if "</body>" in html_text:
-                html_text = html_text.replace("</body>", section + "\n</body>", 1)
-            else:
-                html_text += section
-            missing_indexes = [
-                index for index in missing_indexes if index not in set(appended_indexes)
-            ]
+            html_text = html_text[:insertion_at] + replacement + "\n" + html_text[insertion_at:]
+            patch_sources[formula_no] = f"anchor-missing-{insertion_source}"
+            entry["html_anchor_status"] = f"anchor_missing_inserted_by_{insertion_source}"
+        patched_indexes.append(formula_no)
+        if entry.get("status") != "replaced":
+            fallback_indexes.append(formula_no)
+
+    restored_indexes: list[int] = []
+    current_output_indexes = set(_formula_indexes_in_html(html_text))
+    for entry in sorted(
+        replacement_log,
+        key=lambda item: int(item.get("formula_no") or 0),
+        reverse=True,
+    ):
+        formula_no = entry.get("formula_no")
+        if not isinstance(formula_no, int) or formula_no in current_output_indexes:
+            continue
+        replacement = (
+            _render_second_pass_formula_html(entry, output_dir, sidecar_dir)
+            if entry.get("status") == "replaced"
+            else _render_formula_fallback_html(entry, output_dir, sidecar_dir)
+        )
+        insertion_at, insertion_source = _formula_anchor_insertion_index(
+            html_text,
+            formula_no,
+            entry,
+        )
+        html_text = html_text[:insertion_at] + replacement + "\n" + html_text[insertion_at:]
+        current_output_indexes.add(formula_no)
+        restored_indexes.append(formula_no)
+        patch_sources[formula_no] = f"anchor-restoration-{insertion_source}"
 
     assets_injected = False
     if patched_indexes:
         html_text, assets_injected = _ensure_formula_second_pass_html_assets(html_text)
 
     final_formula_indexes = _formula_indexes_in_html(html_text)
-    final_formula_index_set = set(final_formula_indexes)
-    original_formula_index_set = set(original_by_index)
-    lost_formula_indexes = sorted(original_formula_index_set - final_formula_index_set)
     duplicate_formula_indexes = sorted(
-        index for index in final_formula_index_set if final_formula_indexes.count(index) > 1
+        index for index in set(final_formula_indexes) if final_formula_indexes.count(index) > 1
+    )
+    missing_indexes = sorted(
+        int(entry["formula_no"])
+        for entry in replacement_log
+        if isinstance(entry.get("formula_no"), int)
+        and int(entry["formula_no"]) not in set(final_formula_indexes)
     )
 
     html_path.write_text(html_text, encoding="utf-8")
     return {
-        "ok": not missing_indexes,
-        "patched_indexes": patched_indexes,
+        "ok": not missing_indexes and not duplicate_formula_indexes,
+        "patched_indexes": sorted(patched_indexes),
+        "fallback_indexes": sorted(fallback_indexes),
         "missing_indexes": missing_indexes,
-        "appended_unmapped_indexes": appended_indexes,
-        "lost_formula_indexes": lost_formula_indexes,
         "duplicate_formula_indexes": duplicate_formula_indexes,
+        "duplicate_blocks_removed": duplicate_blocks_removed,
+        "restored_indexes": sorted(restored_indexes),
         "patch_sources": patch_sources,
-        "original_formula_block_count": len(original_blocks),
-        "original_formula_index_count": len(original_by_index),
-        "final_formula_index_count": len(final_formula_index_set),
+        "final_formula_index_count": len(set(final_formula_indexes)),
         "rendering_assets_injected": assets_injected,
     }
 
@@ -3205,14 +3377,28 @@ def validate_formula_second_pass_html(
         return {"ok": False, "missing_replacements": [], "error": f"document.html not found: {html_path}"}
     decoded_html = html.unescape(html_path.read_text(encoding="utf-8"))
     missing: list[int] = []
+    fallback_missing: list[int] = []
     for entry in replacement_log:
-        if entry.get("status") != "replaced":
-            continue
         formula_no = entry.get("formula_no")
-        display_text = _second_pass_formula_display_text(entry)
         marker = f'data-formula-index="{formula_no}"'
-        render_marker = f"\\[{display_text}\\]"
-        if display_text not in decoded_html or render_marker not in decoded_html or marker not in decoded_html:
+        if entry.get("status") == "replaced":
+            display_text = _second_pass_formula_display_text(entry)
+            render_marker = f"\\[{display_text}\\]"
+            valid = (
+                display_text in decoded_html
+                and render_marker in decoded_html
+                and marker in decoded_html
+            )
+        else:
+            reason = str(entry.get("fallback_reason") or entry.get("status") or "")
+            valid = (
+                marker in decoded_html
+                and "docling-formula-fallback" in decoded_html
+                and reason in decoded_html
+            )
+            if not valid and isinstance(formula_no, int):
+                fallback_missing.append(formula_no)
+        if not valid:
             html_range = _find_existing_second_pass_formula_range(decoded_html, formula_no)
             if html_range is not None:
                 block = decoded_html[html_range[0] : html_range[1]]
@@ -3224,6 +3410,7 @@ def validate_formula_second_pass_html(
     return {
         "ok": not missing,
         "missing_replacements": missing,
+        "missing_fallbacks": fallback_missing,
         "mathjax_present": has_mathjax,
         "error": None,
     }
@@ -3354,6 +3541,12 @@ def _patch_formula_json_nodes(output_dir: Path, formula_texts: dict[int, str]) -
             continue
         old_text = str(formula.get("text") or "")
         new_text = formula_texts[formula_no]
+        formula["local_ai_lab_formula_second_pass"] = {
+            "anchor_id": f"formula-{index}",
+            "status": "replaced",
+            "candidate_source": "cn_final_polish",
+            "fallback_reason": None,
+        }
         if old_text == new_text:
             continue
         formula["text"] = new_text
@@ -3802,6 +3995,8 @@ def run_optional_formula_second_pass(
         "replaced_count": result.get("replaced_count"),
         "no_match_count": result.get("no_match_count"),
         "fallback_count": result.get("fallback_count"),
+        "crop_only_without_formula_count": result.get("crop_only_without_formula_count"),
+        "render_failed_latex_count": result.get("render_failed_latex_count"),
         "guarded_fallback_eqs": sorted(args.formula_second_pass_guarded_fallback_eq),
         "error": result.get("error"),
     }
@@ -3868,6 +4063,27 @@ def run_optional_formula_second_pass(
             "image_formula_not_converted:"
             f"count={alignment_diag.get('image_formula_not_converted_count')}"
         )
+    if alignment_diag.get("anchor_mismatch_count"):
+        status["warnings"].append(
+            "formula_anchor_mismatch:"
+            f"count={alignment_diag.get('anchor_mismatch_count')}:"
+            f"downstream_shift={alignment_diag.get('downstream_offset_risk')}"
+        )
+    if alignment_diag.get("crop_only_without_formula_count"):
+        status["warnings"].append(
+            "formula_crop_only_without_formula:"
+            f"count={alignment_diag.get('crop_only_without_formula_count')}"
+        )
+    if alignment_diag.get("render_failed_latex_count"):
+        status["warnings"].append(
+            "formula_render_failed_latex:"
+            f"count={alignment_diag.get('render_failed_latex_count')}"
+        )
+    if alignment_diag.get("second_pass_not_applied_count"):
+        status["warnings"].append(
+            "formula_second_pass_not_applied:"
+            f"count={alignment_diag.get('second_pass_not_applied_count')}"
+        )
     if policy in {"apply", "apply-all"}:
         shutil.copyfile(sidecar_dir / "document.md", output_dir / "document.md")
         shutil.copyfile(sidecar_dir / "document.json", output_dir / "document.json")
@@ -3914,10 +4130,17 @@ def run_optional_formula_second_pass(
                     f"missing_sources={cn_final_polish.get('missing_source_formulas')}:"
                     f"html_missing={cn_final_polish.get('document_html_patch', {}).get('missing_indexes')}"
                 )
-        elif html_patch.get("appended_unmapped_indexes"):
+        elif any(
+            source.startswith("anchor-missing-")
+            for source in (html_patch.get("patch_sources") or {}).values()
+        ):
             status["warnings"].append(
-                "formula_second_pass_html_unmapped_appended:"
-                + ",".join(str(index) for index in html_patch.get("appended_unmapped_indexes") or [])
+                "formula_html_anchor_missing_fallback:"
+                + ",".join(
+                    str(index)
+                    for index, source in (html_patch.get("patch_sources") or {}).items()
+                    if source.startswith("anchor-missing-")
+                )
             )
         metadata["formula_second_pass_applied"] = True
         status["quality_signals"]["formula_second_pass_applied"] = True
