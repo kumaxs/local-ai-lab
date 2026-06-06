@@ -39,6 +39,18 @@ REPEATED_AND_RE = re.compile(r"(\\quad \\ \\ a n d ){3,}")
 NUMBER_ONLY_RE = re.compile(r"^\s*(\(\s*[0-9]+\s*\)\s*)+\s*$")
 # Suspicious repeated single characters like \ T \ T \ T (4+ repeats)
 REPEATED_SINGLE_RE = re.compile(r"(\\ [a-zA-Z]\s*){4,}")
+SPACED_OPERATOR_REPLACEMENTS = (
+    (re.compile(r"(?<![A-Za-z])s\s+o\s+f\s+t\s+m\s+a\s+x(?![A-Za-z])", re.I), r"\operatorname{softmax}"),
+    (re.compile(r"(?<![A-Za-z])s\s+i\s+g\s+m\s+o\s+i\s+d(?![A-Za-z])", re.I), r"\operatorname{sigmoid}"),
+    (re.compile(r"(?<![A-Za-z])L\s+e\s+a\s+k\s+y\s+R\s+e\s+L\s+U(?![A-Za-z])"), r"\operatorname{LeakyReLU}"),
+    (re.compile(r"(?<![A-Za-z])R\s+e\s+L\s+U(?![A-Za-z])"), r"\operatorname{ReLU}"),
+    (re.compile(r"(?<![A-Za-z])L\s+a\s+y\s+e\s+r\s+N\s+o\s+r\s+m(?![A-Za-z])"), r"\operatorname{LayerNorm}"),
+    (re.compile(r"(?<![A-Za-z])A\s+t\s+t\s+e\s+n\s+t\s+i\s+o\s+n(?![A-Za-z])"), r"\operatorname{Attention}"),
+    (re.compile(r"(?<![A-Za-z])M\s+L\s+P(?![A-Za-z])"), r"\operatorname{MLP}"),
+    (re.compile(r"(?<![A-Za-z])t\s+a\s+n\s+h(?![A-Za-z])", re.I), r"\operatorname{tanh}"),
+    (re.compile(r"(?<![A-Za-z])e\s+x\s+p(?![A-Za-z])", re.I), r"\exp"),
+    (re.compile(r"(?<![A-Za-z])M\s+a\s+x\s+P\s+o\s+o\s+l\s+i\s+n\s+g(?![A-Za-z])"), r"\operatorname{MaxPooling}"),
+)
 # Source bbox area threshold (tiny = likely wrong detection)
 MIN_BBOX_AREA = 50.0  # PDF points^2
 # Route B uses ~2x pixel scale (1190x1684 for a PDF page 595x842)
@@ -574,6 +586,14 @@ def _formula_text_with_eq_number(formula_text: str, eq_num: int | None) -> str:
     return f"{formula_text} \\quad ( {eq_num} )"
 
 
+def normalize_formula_candidate(formula_text: str) -> str:
+    """Repair only unambiguous OCR letter-spaced operator names."""
+    normalized = formula_text
+    for pattern, replacement in SPACED_OPERATOR_REPLACEMENTS:
+        normalized = pattern.sub(lambda _match, value=replacement: value, normalized)
+    return normalized
+
+
 def _find_markdown_block(md_text: str, formula_text: str, eq_num: int | None) -> str:
     """Find the most likely $$...$$ markdown block for a formula."""
     if not md_text:
@@ -619,7 +639,7 @@ def patch_document_md(
         block = blocks[formula_no - 1]
         if entry.get("status") == "replaced":
             candidate = _formula_text_with_eq_number(
-                str(entry.get("route_b_candidate") or ""),
+                normalize_formula_candidate(str(entry.get("route_b_candidate") or "")),
                 _infer_markdown_eq_number(entry),
             )
             replacement = f"$${candidate}$$"
@@ -739,7 +759,8 @@ def patch_document_json(
 
         if fallback_match is not None:
             source, fallback_formula = fallback_match
-            fallback_text = fallback_formula.get("text", "")
+            fallback_raw_text = str(fallback_formula.get("text") or "")
+            fallback_text = normalize_formula_candidate(fallback_raw_text)
             candidate_ok, candidate_reasons = candidate_quality_gate(af, fallback_text)
             latex_ok, latex_reasons = validate_candidate_latex(fallback_text)
             if not fallback_text.strip():
@@ -785,7 +806,8 @@ def patch_document_json(
                 })
                 continue
             else:
-                _patch_node_text(af["node"], fallback_text)
+                output_text = _formula_text_with_eq_number(fallback_text, af.get("main_eq"))
+                _patch_node_text(af["node"], output_text)
                 log.append({
                     "index": i,
                     "formula_no": af.get("formula_no"),
@@ -794,7 +816,8 @@ def patch_document_json(
                     "eq_number": af["main_eq"],
                     "route_a_bbox": _formula_bbox_summary(af.get("bbox_norm")),
                     "reasons": reasons,
-                    "route_b_candidate": fallback_text,
+                    "route_b_candidate": output_text,
+                    "route_b_raw_candidate": fallback_raw_text,
                     "route_b_formula_no": None,
                     "candidate_source": "guarded_fallback",
                     "candidate_source_label": source["label"],
@@ -825,7 +848,7 @@ def patch_document_json(
             continue
 
         bf = matches[i]
-        route_b_text = bf["text"]
+        route_b_text = normalize_formula_candidate(bf["text"])
         candidate_ok, candidate_reasons = candidate_quality_gate(af, route_b_text)
         latex_ok, latex_reasons = validate_candidate_latex(route_b_text)
         if not route_b_text.strip():
@@ -886,7 +909,8 @@ def patch_document_json(
             })
             continue
 
-        _patch_node_text(af["node"], route_b_text)
+        output_text = _formula_text_with_eq_number(route_b_text, af.get("main_eq"))
+        _patch_node_text(af["node"], output_text)
         log.append({
             "index": i,
             "formula_no": af.get("formula_no"),
@@ -895,7 +919,8 @@ def patch_document_json(
             "eq_number": af["main_eq"],
             "route_a_bbox": _formula_bbox_summary(af.get("bbox_norm")),
             "reasons": reasons,
-            "route_b_candidate": route_b_text,
+            "route_b_candidate": output_text,
+            "route_b_raw_candidate": bf["text"],
             "route_b_formula_no": bf.get("formula_no"),
             "candidate_source": "route_b",
             "candidate_source_label": "route_b",
