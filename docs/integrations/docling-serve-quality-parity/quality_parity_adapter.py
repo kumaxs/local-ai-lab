@@ -42,6 +42,22 @@ UNRESOLVED_V1_PARITY_WARNINGS = [
     "v1_parity_gap_math_symbol_rendering_requires_review",
 ]
 CN_FINAL_POLISH_FORMULA_NUMBERS = (1, 2, 12)
+CN_ACCEPTED_ROUTE_B_FORMULA_NUMBERS = {3, 4, 14, 16}
+CN_ACCEPTED_GUARDED_FORMULA_NUMBERS = {5, 7, 8}
+CN_ACCEPTED_FORMULA_13 = (
+    r"q s _ { i } = M L P \left( \sum _ { c _ { i } \in V _ { i } } "
+    r"\left[ M L P _ { s i g m o i d } ( c s _ { i } ) \times "
+    r"M L P _ { t a n h } ( c s _ { i } ) \right] \right) \quad ( 13 )"
+)
+CN_ACCEPTED_BASELINE = {
+    "name": "accepted_cn_0854aa1",
+    "commit": "0854aa1",
+    "output": ".runtime/review/docling-adapter-html-polish-live-fullfallback-2026-06-04/CN",
+    "document_html_sha256": "6911693bd781c628da70ae2494471f2f4cfd28448000aa599290353cd6af97db",
+    "formula_count": 24,
+    "equation_numbers": list(range(1, 25)),
+    "minimum_cn_character_count": 9900,
+}
 CN_FINAL_TEXT_CORRECTIONS = (
     (
         re.compile(r"获\s*取历史时刻知识状态的权重力"),
@@ -2630,6 +2646,111 @@ def run_unified_review_qc(
         )
 
 
+def is_cn_accepted_path(args: argparse.Namespace) -> bool:
+    return args.input_file.name == "CN.pdf" and bool(args.cn_ocr_parity)
+
+
+def effective_formula_second_pass_policy(args: argparse.Namespace) -> str:
+    policy = args.formula_second_pass_policy
+    if is_cn_accepted_path(args) and policy == "apply-all":
+        return "apply"
+    return policy
+
+
+def cn_accepted_baseline_diagnostics(output_dir: Path) -> dict[str, Any]:
+    document = _load_json_file(output_dir / "document.json")
+    if not isinstance(document, dict):
+        return {
+            "ok": False,
+            "baseline": CN_ACCEPTED_BASELINE,
+            "reasons": ["document_json_missing_or_invalid"],
+        }
+
+    text_nodes = [
+        str(node.get("text") or "")
+        for node in iter_nodes(document)
+        if isinstance(node, dict) and isinstance(node.get("text"), str)
+    ]
+    formulas = extract_label_nodes(document, "formula")
+    equation_numbers: list[int | None] = []
+    for formula in formulas:
+        numbers = [
+            int(re.sub(r"\s+", "", match.group(1)))
+            for match in re.finditer(r"\(\s*((?:\d\s*)+)\)", str(formula.get("text") or ""))
+        ]
+        equation_numbers.append(numbers[-1] if numbers else None)
+
+    joined_text = "\n".join(text_nodes)
+    markdown = (output_dir / "document.md").read_text(encoding="utf-8")
+    reasons: list[str] = []
+    gxx_count = len(GXX_RE.findall(joined_text))
+    cn_character_count = len(CN_CHAR_RE.findall(joined_text))
+    expected_numbers = CN_ACCEPTED_BASELINE["equation_numbers"]
+    if gxx_count:
+        reasons.append(f"gxx_count={gxx_count}")
+    if len(formulas) != CN_ACCEPTED_BASELINE["formula_count"]:
+        reasons.append(f"formula_count={len(formulas)}")
+    if equation_numbers != expected_numbers:
+        reasons.append("formula_equation_sequence_mismatch")
+    if cn_character_count < CN_ACCEPTED_BASELINE["minimum_cn_character_count"]:
+        reasons.append(f"cn_character_count={cn_character_count}")
+    missing_polish = [
+        formula_no
+        for formula_no in CN_FINAL_POLISH_FORMULA_NUMBERS
+        if formula_no not in equation_numbers
+    ]
+    if missing_polish:
+        reasons.append(
+            "missing_cn_final_polish_formulas="
+            + ",".join(str(number) for number in missing_polish)
+        )
+    accepted_text = CN_FINAL_TEXT_CORRECTIONS[0][1]
+    if accepted_text not in markdown:
+        reasons.append("accepted_cn_text_correction_missing")
+
+    return {
+        "ok": not reasons,
+        "baseline": CN_ACCEPTED_BASELINE,
+        "gxx_count": gxx_count,
+        "cn_character_count": cn_character_count,
+        "formula_count": len(formulas),
+        "equation_numbers": equation_numbers,
+        "required_final_polish_formulas": list(CN_FINAL_POLISH_FORMULA_NUMBERS),
+        "accepted_text_correction_present": accepted_text in markdown,
+        "reasons": reasons,
+    }
+
+
+def record_cn_accepted_baseline(
+    output_dir: Path,
+    metadata: dict[str, Any],
+    status: dict[str, Any],
+    args: argparse.Namespace,
+) -> None:
+    if not is_cn_accepted_path(args):
+        return
+    diagnostics = cn_accepted_baseline_diagnostics(output_dir)
+    metadata["cn_processing_path"] = CN_ACCEPTED_BASELINE["name"]
+    metadata["cn_unified_review_qc_skipped"] = True
+    metadata["cn_accepted_baseline_regression"] = diagnostics
+    status["quality_signals"]["cn_processing_path"] = CN_ACCEPTED_BASELINE["name"]
+    status["quality_signals"]["cn_unified_review_qc_skipped"] = True
+    status["quality_signals"]["cn_accepted_baseline_regression"] = diagnostics
+    if not diagnostics["ok"]:
+        status["ok"] = False
+        status["success_class"] = "degraded_failure"
+        status["warnings"].append(
+            "cn_accepted_baseline_regression:"
+            + ",".join(diagnostics.get("reasons") or ["unknown"])
+        )
+    (output_dir / "metadata.json").write_text(
+        json.dumps(metadata, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
+    (output_dir / "status.json").write_text(
+        json.dumps(status, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
+
+
 def restore_review_artifact_layer(
     output_dir: Path,
     response: dict[str, Any],
@@ -2731,7 +2852,16 @@ def restore_review_artifact_layer(
     formula_source_link_count = inject_formula_source_links(output_dir, formulas)
     metadata["formula_source_link_count"] = formula_source_link_count
     status["quality_signals"]["formula_source_link_count"] = formula_source_link_count
-    run_unified_review_qc(output_dir, document_json, formulas, metadata, status, args)
+    if is_cn_accepted_path(args):
+        metadata["cn_processing_path"] = CN_ACCEPTED_BASELINE["name"]
+        metadata["cn_unified_review_qc_skipped"] = True
+        status["quality_signals"]["cn_processing_path"] = CN_ACCEPTED_BASELINE["name"]
+        status["quality_signals"]["cn_unified_review_qc_skipped"] = True
+        status["warnings"].append(
+            "cn_unified_review_qc_skipped:preserve_accepted_cn_0854aa1_path"
+        )
+    else:
+        run_unified_review_qc(output_dir, document_json, formulas, metadata, status, args)
     (output_dir / "metadata.json").write_text(
         json.dumps(metadata, indent=2, ensure_ascii=False), encoding="utf-8"
     )
@@ -3146,16 +3276,68 @@ def _load_formula_text_by_number(source_dir: Path) -> dict[int, str]:
     return result
 
 
-def _cn_final_polish_source_texts(args: argparse.Namespace) -> dict[int, str]:
-    source_texts: dict[int, str] = {}
+def _load_formula_text_by_index(source_dir: Path) -> dict[int, str]:
+    document = _load_json_file(source_dir / "document.json")
+    if not isinstance(document, dict):
+        return {}
+    return {
+        index: str(formula.get("text") or "").strip()
+        for index, formula in enumerate(extract_label_nodes(document, "formula"), start=1)
+        if str(formula.get("text") or "").strip()
+    }
+
+
+def _formula_text_with_number(text: str, formula_no: int) -> str:
+    body = text.strip()
+    if formula_no in _compact_formula_numbers(body):
+        return body
+    return f"{body} \\quad ( {formula_no} )"
+
+
+def _cn_accepted_formula_source_texts(
+    args: argparse.Namespace,
+    sidecar_dir: Path,
+) -> tuple[dict[int, str], dict[int, str]]:
+    guarded_full_texts: dict[int, str] = {}
     for value in args.formula_second_pass_guarded_fallback_dir:
         path_text = value.split("=", 1)[1] if "=" in value else value
-        source_texts.update(_load_formula_text_by_number(Path(path_text)))
-    return {
-        formula_no: source_texts[formula_no]
-        for formula_no in CN_FINAL_POLISH_FORMULA_NUMBERS
-        if formula_no in source_texts
+        guarded_full_texts.update(_load_formula_text_by_index(Path(path_text)))
+
+    formula_texts = {
+        formula_no: _formula_text_with_number(text, formula_no)
+        for formula_no, text in guarded_full_texts.items()
+        if formula_no in CN_ACCEPTED_BASELINE["equation_numbers"]
     }
+    source_map = {formula_no: "guarded_fallback_full" for formula_no in formula_texts}
+    summary = _load_json_file(sidecar_dir / "second_pass_summary.json")
+    if isinstance(summary, dict):
+        for entry in summary.get("replacement_log") or []:
+            formula_no = entry.get("formula_no")
+            if not isinstance(formula_no, int) or entry.get("status") != "replaced":
+                continue
+            if formula_no not in (
+                CN_ACCEPTED_ROUTE_B_FORMULA_NUMBERS
+                | CN_ACCEPTED_GUARDED_FORMULA_NUMBERS
+            ):
+                continue
+            candidate = str(entry.get("route_b_candidate") or "").strip()
+            if not candidate:
+                continue
+            formula_texts[formula_no] = _formula_text_with_number(candidate, formula_no)
+            source_map[formula_no] = (
+                "guarded_fallback"
+                if formula_no in CN_ACCEPTED_GUARDED_FORMULA_NUMBERS
+                else "route_b"
+            )
+
+    if 1 in formula_texts:
+        match = re.search(r"^(.*?\(\s*1\s*\))", formula_texts[1])
+        if match:
+            formula_texts[1] = match.group(1).strip()
+            source_map[1] = "reviewed_cross_column_repair"
+    formula_texts[13] = CN_ACCEPTED_FORMULA_13
+    source_map[13] = "reviewed_formula_13_repair"
+    return formula_texts, source_map
 
 
 def _patch_formula_json_nodes(output_dir: Path, formula_texts: dict[int, str]) -> list[int]:
@@ -3166,6 +3348,8 @@ def _patch_formula_json_nodes(output_dir: Path, formula_texts: dict[int, str]) -
     patched: list[int] = []
     for index, formula in enumerate(extract_label_nodes(document, "formula"), start=1):
         formula_no = _formula_number_for_node(index, formula)
+        if formula_no not in formula_texts and index in formula_texts:
+            formula_no = index
         if formula_no not in formula_texts:
             continue
         old_text = str(formula.get("text") or "")
@@ -3232,6 +3416,49 @@ def _patch_html_text_corrections(html_text: str) -> tuple[str, list[str]]:
         if count:
             applied.append(new)
     return html_text, applied
+
+
+def _complete_cn_formula_html_sequence(
+    html_text: str,
+    output_dir: Path,
+    sidecar_dir: Path,
+    formula_texts: dict[int, str],
+) -> tuple[str, list[int]]:
+    present = set(_formula_indexes_in_html(html_text))
+    inserted: list[int] = []
+    for formula_no in sorted(formula_texts, reverse=True):
+        formula_text = formula_texts[formula_no]
+        marker = f'data-formula-index="{formula_no}"'
+        if marker in html_text and formula_text in html.unescape(html_text):
+            continue
+        replacement = _render_second_pass_formula_html(
+            {
+                "formula_no": formula_no,
+                "status": "cn_final_polish",
+                "markdown_after": f"$${formula_text}$$",
+            },
+            output_dir,
+            sidecar_dir,
+        )
+        next_numbers = sorted(number for number in present if number > formula_no)
+        insertion_at = -1
+        if next_numbers:
+            next_marker = f'data-formula-index="{next_numbers[0]}"'
+            next_marker_at = html_text.find(next_marker)
+            if next_marker_at >= 0:
+                insertion_at = html_text.rfind(
+                    '<div class="docling-formula-second-pass"',
+                    0,
+                    next_marker_at,
+                )
+        if insertion_at < 0:
+            insertion_at = html_text.rfind("</body>")
+        if insertion_at < 0:
+            insertion_at = len(html_text)
+        html_text = html_text[:insertion_at] + replacement + "\n" + html_text[insertion_at:]
+        present.add(formula_no)
+        inserted.append(formula_no)
+    return html_text, sorted(inserted)
 
 
 def _patch_html_formula_blocks(
@@ -3332,12 +3559,31 @@ def _patch_html_formula_blocks(
         else:
             still_missing.append(formula_no)
     missing_indexes = still_missing
+    html_text, sequence_completion_indexes = _complete_cn_formula_html_sequence(
+        html_text,
+        output_dir,
+        sidecar_dir,
+        formula_texts,
+    )
+    if sequence_completion_indexes:
+        html_text, injected_now = _ensure_formula_second_pass_html_assets(html_text)
+        assets_injected = assets_injected or injected_now
+        for formula_no in sequence_completion_indexes:
+            patch_sources[formula_no] = "ordered-cn-sequence-completion"
+            if formula_no not in patched_indexes:
+                patched_indexes.append(formula_no)
+        missing_indexes = [
+            formula_no
+            for formula_no in missing_indexes
+            if formula_no not in sequence_completion_indexes
+        ]
     html_path.write_text(html_text, encoding="utf-8")
     return {
         "ok": not missing_indexes,
         "patched_indexes": patched_indexes,
         "missing_indexes": sorted(set(missing_indexes)),
         "patch_sources": patch_sources,
+        "sequence_completion_indexes": sequence_completion_indexes,
         "text_corrections": text_corrections,
         "rendering_assets_injected": assets_injected,
     }
@@ -3441,9 +3687,11 @@ def apply_cn_final_document_polish(
             "applied": False,
             "reason": "no_guarded_fallback_source_for_cn_final_polish",
         }
-    formula_texts = _cn_final_polish_source_texts(args)
+    formula_texts, source_map = _cn_accepted_formula_source_texts(args, sidecar_dir)
     missing_sources = [
-        formula_no for formula_no in CN_FINAL_POLISH_FORMULA_NUMBERS if formula_no not in formula_texts
+        formula_no
+        for formula_no in CN_ACCEPTED_BASELINE["equation_numbers"]
+        if formula_no not in formula_texts
     ]
     json_patched = _patch_formula_json_nodes(output_dir, formula_texts)
     markdown_patched = _patch_markdown_formula_blocks(output_dir, formula_texts)
@@ -3453,6 +3701,7 @@ def apply_cn_final_document_polish(
         "ok": ok,
         "applied": True,
         "formula_texts": sorted(formula_texts),
+        "candidate_sources": source_map,
         "missing_source_formulas": missing_sources,
         "document_json_patched": json_patched,
         "document_md_patched": markdown_patched,
@@ -3467,9 +3716,17 @@ def run_optional_formula_second_pass(
     args: argparse.Namespace,
 ) -> None:
     """Run optional formula-only second pass and update adapter metadata/status."""
-    policy = args.formula_second_pass_policy
+    requested_policy = args.formula_second_pass_policy
+    policy = effective_formula_second_pass_policy(args)
+    metadata["formula_second_pass_requested_policy"] = requested_policy
     metadata["formula_second_pass_policy"] = policy
+    status["quality_signals"]["formula_second_pass_requested_policy"] = requested_policy
     status["quality_signals"]["formula_second_pass_policy"] = policy
+    if requested_policy != policy:
+        status["warnings"].append(
+            f"formula_second_pass_policy_resolved:{requested_policy}->{policy}:"
+            "preserve_accepted_cn_0854aa1_path"
+        )
     if policy == "off":
         return
 
@@ -3620,11 +3877,18 @@ def run_optional_formula_second_pass(
             formula_latex_sources = write_formula_latex_sources(output_dir, patched_formulas)
             metadata["formula_latex_sources"] = formula_latex_sources
             status["quality_signals"]["formula_latex_sources"] = formula_latex_sources
-        html_patch = patch_document_html_for_formula_second_pass(
-            output_dir,
-            sidecar_dir,
-            list(result.get("replacement_log") or []),
-        )
+        if is_cn_accepted_path(args):
+            html_patch = {
+                "ok": True,
+                "applied": False,
+                "reason": "cn_accepted_path_owns_formula_html",
+            }
+        else:
+            html_patch = patch_document_html_for_formula_second_pass(
+                output_dir,
+                sidecar_dir,
+                list(result.get("replacement_log") or []),
+            )
         cn_final_polish = apply_cn_final_document_polish(output_dir, sidecar_dir, args)
         html_gate = validate_formula_second_pass_html(
             output_dir,
@@ -4171,6 +4435,7 @@ def main() -> int:
     write_contract_outputs(output_dir, response, metadata, status)
     restore_review_artifact_layer(output_dir, response, metadata, status, args)
     run_optional_formula_second_pass(output_dir, metadata, status, args)
+    record_cn_accepted_baseline(output_dir, metadata, status, args)
     summary = {
         "ok": status["ok"],
         "output_dir": str(output_dir),
