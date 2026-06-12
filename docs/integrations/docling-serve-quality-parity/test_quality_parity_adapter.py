@@ -1066,6 +1066,232 @@ class EnglishReviewPolishTests(unittest.TestCase):
         self.assertEqual(qc["candidate_count"], 0)
         self.assertEqual(document["texts"][0]["label"], "section_header")
 
+    def test_structural_qc_quarantines_text_rendered_inside_picture(self) -> None:
+        document = {
+            "pictures": [
+                {
+                    "label": "picture",
+                    "prov": [
+                        {
+                            "page_no": 2,
+                            "bbox": {"l": 60, "r": 560, "t": 700, "b": 520},
+                        }
+                    ],
+                }
+            ],
+            "texts": [
+                {
+                    "label": "text",
+                    "text": "AUTHORIZATION MD.! _ MP-75",
+                    "prov": [
+                        {
+                            "page_no": 2,
+                            "bbox": {"l": 200, "r": 300, "t": 670, "b": 650},
+                        }
+                    ],
+                },
+                {
+                    "label": "caption",
+                    "text": "Figure 1: Scanned business documents",
+                    "prov": [
+                        {
+                            "page_no": 2,
+                            "bbox": {"l": 120, "r": 480, "t": 510, "b": 495},
+                        }
+                    ],
+                },
+            ],
+        }
+
+        qc = adapter.structural_noise_qc(document)
+
+        self.assertEqual(qc["candidate_count"], 1)
+        self.assertEqual(qc["candidates"][0]["kind"], "visual_annotation")
+        self.assertEqual(qc["candidates"][0]["confidence"], "high")
+        self.assertEqual(document["texts"][0]["label"], "quarantined_visual_annotation")
+        self.assertEqual(document["texts"][1]["label"], "caption")
+
+    def test_structural_qc_quarantines_small_ocr_text_just_above_picture_bbox(self) -> None:
+        document = {
+            "pictures": [
+                {
+                    "label": "picture",
+                    "prov": [
+                        {
+                            "page_no": 2,
+                            "bbox": {"l": 60, "r": 560, "t": 700, "b": 520},
+                        }
+                    ],
+                }
+            ],
+            "texts": [
+                {
+                    "label": "text",
+                    "text": "AUTHORIZATION MD.! _ MP-75",
+                    "prov": [
+                        {
+                            "page_no": 2,
+                            "bbox": {"l": 208, "r": 251, "t": 767, "b": 762},
+                        }
+                    ],
+                },
+                {
+                    "label": "text",
+                    "text": "A normal paragraph outside the figure annotation zone.",
+                    "prov": [
+                        {
+                            "page_no": 2,
+                            "bbox": {"l": 60, "r": 560, "t": 490, "b": 450},
+                        }
+                    ],
+                },
+            ],
+        }
+
+        qc = adapter.structural_noise_qc(document)
+
+        self.assertEqual(qc["candidate_count"], 1)
+        candidate = qc["candidates"][0]
+        self.assertEqual(candidate["kind"], "visual_annotation")
+        self.assertEqual(
+            candidate["picture_overlap"]["region_match"],
+            "small_text_in_expanded_picture_annotation_zone",
+        )
+        self.assertEqual(document["texts"][1]["label"], "text")
+
+    def test_structural_qc_quarantines_same_page_picture_annotation_shadow(self) -> None:
+        document = {
+            "pictures": [
+                {
+                    "label": "picture",
+                    "prov": [
+                        {
+                            "page_no": 7,
+                            "bbox": {"l": 100, "r": 500, "t": 500, "b": 250},
+                        }
+                    ],
+                }
+            ],
+            "texts": [
+                {
+                    "label": "text",
+                    "text": "Guernsey",
+                    "prov": [
+                        {
+                            "page_no": 7,
+                            "bbox": {"l": 200, "r": 250, "t": 400, "b": 390},
+                        }
+                    ],
+                },
+                {
+                    "label": "text",
+                    "text": "Guernsey",
+                    "prov": [
+                        {
+                            "page_no": 7,
+                            "bbox": {"l": 600, "r": 650, "t": 400, "b": 390},
+                        }
+                    ],
+                },
+            ],
+        }
+
+        qc = adapter.structural_noise_qc(document)
+
+        self.assertEqual(qc["candidate_count"], 2)
+        self.assertEqual(qc["candidates"][0]["kind"], "visual_annotation")
+        self.assertEqual(qc["candidates"][1]["kind"], "visual_annotation_shadow")
+        self.assertEqual(
+            document["texts"][1]["label"],
+            "quarantined_visual_annotation_shadow",
+        )
+
+    def test_structural_qc_quarantines_abrupt_visual_suffix_without_body(self) -> None:
+        body = (
+            "This is a long research paragraph describing the method and its "
+            "evaluation in ordinary sentence case. " * 8
+            + "The model combines textual and visual information for ACUTE TOXICITY IN MICE"
+        )
+        document = {
+            "texts": [
+                {
+                    "label": "text",
+                    "text": body,
+                    "prov": [
+                        {
+                            "page_no": 1,
+                            "bbox": {"l": 50, "r": 300, "t": 550, "b": 100},
+                        }
+                    ],
+                }
+            ]
+        }
+
+        qc = adapter.structural_noise_qc(document)
+
+        self.assertEqual(qc["candidate_count"], 1)
+        candidate = qc["candidates"][0]
+        self.assertEqual(candidate["kind"], "reading_order_annotation")
+        self.assertEqual(candidate["match_mode"], "fragment")
+        self.assertEqual(candidate["text"], " for ACUTE TOXICITY IN MICE")
+        self.assertEqual(document["texts"][0]["label"], "text")
+
+    def test_structural_fragment_quarantine_removes_only_visible_suffix(self) -> None:
+        body = "The model combines textual and visual information for ACUTE TOXICITY IN MICE"
+        item = {
+            "kind": "reading_order_annotation",
+            "text": " for ACUTE TOXICITY IN MICE",
+            "page_no": 1,
+            "reasons": ["abrupt_terminal_uppercase_fragment"],
+            "match_mode": "fragment",
+        }
+
+        updated, changed = adapter._replace_html_fragment_with_quarantine(
+            f"<html><body><p>{body}</p></body></html>",
+            item,
+        )
+
+        self.assertTrue(changed)
+        self.assertIn("<p>The model combines textual and visual information</p>", updated)
+        self.assertNotIn("information for ACUTE TOXICITY", adapter._visible_html_text(updated))
+
+    def test_structural_qc_quarantines_duplicate_shadow_of_page_header(self) -> None:
+        document = {
+            "texts": [
+                {
+                    "label": "page_header",
+                    "text": "23",
+                    "prov": [
+                        {
+                            "page_no": 23,
+                            "bbox": {"l": 350, "r": 366, "t": 604, "b": 594},
+                        }
+                    ],
+                },
+                {
+                    "label": "text",
+                    "text": "23",
+                    "prov": [
+                        {
+                            "page_no": 23,
+                            "bbox": {"l": 353, "r": 364, "t": 604, "b": 594},
+                        }
+                    ],
+                },
+            ]
+        }
+
+        qc = adapter.structural_noise_qc(document)
+
+        self.assertEqual(qc["candidate_count"], 2)
+        shadow = next(item for item in qc["candidates"] if item["kind"] == "page_header_shadow")
+        self.assertEqual(shadow["confidence"], "high")
+        self.assertIn(
+            "duplicate_text_overlaps_labeled_structural_region",
+            shadow["reasons"],
+        )
+        self.assertEqual(document["texts"][1]["label"], "quarantined_page_header_shadow")
+
     def test_structural_qc_writes_evidence_sidecar_and_audits_final_output(self) -> None:
         text = "1 Correspondence to: author@example.org"
         document = {
@@ -1092,6 +1318,53 @@ class EnglishReviewPolishTests(unittest.TestCase):
         self.assertEqual(result["final_output_residual_count"], 0)
         self.assertEqual(sidecar["quarantine_candidate_count"], 1)
         self.assertEqual(sidecar["candidates"][0]["confidence"], "high")
+
+    def test_structural_quarantine_matches_markdown_escaped_punctuation(self) -> None:
+        text = "AUTHORIZATION MD.! _ MP-75"
+        document = {
+            "pictures": [
+                {
+                    "label": "picture",
+                    "prov": [
+                        {
+                            "page_no": 2,
+                            "bbox": {"l": 60, "r": 560, "t": 700, "b": 520},
+                        }
+                    ],
+                }
+            ],
+            "texts": [
+                {
+                    "label": "text",
+                    "text": text,
+                    "prov": [
+                        {
+                            "page_no": 2,
+                            "bbox": {"l": 208, "r": 251, "t": 767, "b": 762},
+                        }
+                    ],
+                }
+            ],
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir)
+            (output_dir / "document.html").write_text(
+                f"<html><body><p>{text}</p></body></html>",
+                encoding="utf-8",
+            )
+            (output_dir / "document.md").write_text(
+                "AUTHORIZATION MD.! \\_ MP-75\n",
+                encoding="utf-8",
+            )
+            result = adapter.apply_structural_quarantine_to_outputs(output_dir, document)
+            markdown = (output_dir / "document.md").read_text(encoding="utf-8")
+
+        self.assertEqual(result["markdown_quarantine_replacement_count"], 1)
+        self.assertNotIn(
+            "AUTHORIZATION MD",
+            adapter.re.sub(r"<!--.*?-->", "", markdown),
+        )
+        self.assertEqual(result["final_output_residual_count"], 0)
 
     def test_structural_quarantine_does_not_relabel_formula_nodes(self) -> None:
         document = {

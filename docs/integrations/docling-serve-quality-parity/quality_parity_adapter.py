@@ -1351,6 +1351,28 @@ def structural_text_records(document_json: Any) -> list[dict[str, Any]]:
     return records
 
 
+def structural_picture_records(document_json: Any) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    pictures = document_json.get("pictures") if isinstance(document_json, dict) else None
+    if not isinstance(pictures, list):
+        return records
+    for index, node in enumerate(pictures, start=1):
+        if not isinstance(node, dict):
+            continue
+        prov = first_prov(node) or {}
+        geometry = bbox_geometry(prov)
+        if geometry:
+            records.append(
+                {
+                    "index": index,
+                    "page_no": prov.get("page_no"),
+                    "bbox": geometry,
+                    "node": node,
+                }
+            )
+    return records
+
+
 def _normalized_noise_text(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
@@ -1408,6 +1430,10 @@ FOOTNOTE_CONTENT_NOISE_RE = re.compile(
     r"all rights reserved)\b"
 )
 HTML_TEXT_BLOCK_RE = re.compile(r"<(?P<tag>p|li)\b(?P<attrs>[^>]*)>(?P<body>.*?)</(?P=tag)>", re.I | re.S)
+ABRUPT_VISUAL_TEXT_SUFFIX_RE = re.compile(
+    r"(?P<fragment>\s+(?:for|with|of|to|in)\s+"
+    r"(?P<artifact>[A-Z][A-Z0-9._/-]*(?:\s+[A-Z][A-Z0-9._/-]*){2,}))\s*$"
+)
 
 
 def _is_bottom_footnote_region(geometry: dict[str, Any] | None) -> bool:
@@ -1444,6 +1470,104 @@ def _edge_zone_flags(
     bottom_zone = float(geometry.get("b", 9999)) <= bottom_limit
     top_zone = float(geometry.get("t", 0)) >= top_limit
     return bottom_zone, top_zone, page_height
+
+
+def _bbox_intersection_ratio(
+    inner: dict[str, Any] | None,
+    outer: dict[str, Any] | None,
+) -> float:
+    if not inner or not outer:
+        return 0.0
+    width = max(float(inner.get("width", 0.0)), 0.0)
+    height = max(float(inner.get("height", 0.0)), 0.0)
+    area = width * height
+    if area <= 0:
+        return 0.0
+    overlap_width = max(
+        0.0,
+        min(float(inner.get("r", 0.0)), float(outer.get("r", 0.0)))
+        - max(float(inner.get("l", 0.0)), float(outer.get("l", 0.0))),
+    )
+    overlap_height = max(
+        0.0,
+        min(float(inner.get("t", 0.0)), float(outer.get("t", 0.0)))
+        - max(float(inner.get("b", 0.0)), float(outer.get("b", 0.0))),
+    )
+    return overlap_width * overlap_height / area
+
+
+def _picture_annotation_evidence(
+    geometry: dict[str, Any] | None,
+    picture: dict[str, Any],
+) -> dict[str, Any] | None:
+    picture_geometry = picture.get("bbox")
+    overlap = _bbox_intersection_ratio(geometry, picture_geometry)
+    if overlap >= 0.8:
+        return {
+            "picture_index": picture["index"],
+            "overlap_ratio": round(overlap, 4),
+            "region_match": "inside_picture_bbox",
+        }
+    if not geometry or not picture_geometry:
+        return None
+    if float(geometry.get("height", 999.0)) > 14.0:
+        return None
+    picture_width = float(picture_geometry.get("width", 0.0))
+    picture_height = float(picture_geometry.get("height", 0.0))
+    expanded = {
+        "l": float(picture_geometry.get("l", 0.0)) - picture_width * 0.1,
+        "r": float(picture_geometry.get("r", 0.0)) + picture_width * 0.1,
+        "t": float(picture_geometry.get("t", 0.0)) + picture_height * 0.45,
+        "b": float(picture_geometry.get("b", 0.0)) - picture_height * 0.1,
+    }
+    center_x = (float(geometry.get("l", 0.0)) + float(geometry.get("r", 0.0))) / 2
+    center_y = (float(geometry.get("t", 0.0)) + float(geometry.get("b", 0.0))) / 2
+    if (
+        expanded["l"] <= center_x <= expanded["r"]
+        and expanded["b"] <= center_y <= expanded["t"]
+    ):
+        return {
+            "picture_index": picture["index"],
+            "overlap_ratio": round(overlap, 4),
+            "region_match": "small_text_in_expanded_picture_annotation_zone",
+        }
+    return None
+
+
+def _structural_shadow_record(
+    record: dict[str, Any],
+    known_structural_records: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    geometry = record.get("bbox")
+    normalized = _normalized_noise_text(str(record.get("text") or ""))
+    if not geometry or not normalized:
+        return None
+    for structural in known_structural_records:
+        if structural is record or structural.get("page_no") != record.get("page_no"):
+            continue
+        structural_text = _normalized_noise_text(str(structural.get("text") or ""))
+        if structural_text != normalized:
+            continue
+        overlap = _bbox_intersection_ratio(geometry, structural.get("bbox"))
+        if overlap >= 0.75:
+            return {
+                "label": structural.get("label"),
+                "overlap_ratio": round(overlap, 4),
+                "reading_order": structural.get("reading_order"),
+            }
+    return None
+
+
+def _abrupt_visual_text_suffix(text: str) -> str | None:
+    if len(text) < 500 or text.rstrip().endswith((".", "!", "?", ":", ";")):
+        return None
+    match = ABRUPT_VISUAL_TEXT_SUFFIX_RE.search(text)
+    if not match:
+        return None
+    artifact = match.group("artifact")
+    if len(artifact) < 18:
+        return None
+    return match.group("fragment")
 
 
 def _looks_like_author_affiliation_footnote_mislabel(
@@ -1674,7 +1798,31 @@ def recover_first_page_author_affiliations(
 def structural_noise_qc(document_json: Any) -> dict[str, Any]:
     """Identify structural regions and quarantine only evidence-rich candidates."""
     records = structural_text_records(document_json)
+    picture_records = structural_picture_records(document_json)
     page_extents = _page_vertical_extents(records)
+    known_structural_records = [
+        record
+        for record in records
+        if str(record.get("label") or "").lower() in PAGE_EDGE_LABELS | {"footnote"}
+    ]
+    picture_annotation_keys: dict[tuple[Any, str], dict[str, Any]] = {}
+    for record in records:
+        record_label = str(record.get("label") or "").lower()
+        if record_label != "text" and not record_label.startswith(
+            "quarantined_visual_annotation"
+        ):
+            continue
+        normalized = _normalized_noise_text(str(record.get("text") or ""))
+        geometry = record.get("bbox")
+        if not normalized or not geometry:
+            continue
+        for picture in picture_records:
+            if picture.get("page_no") != record.get("page_no"):
+                continue
+            evidence = _picture_annotation_evidence(geometry, picture)
+            if evidence:
+                picture_annotation_keys[(record.get("page_no"), normalized)] = evidence
+                break
     normalized_counts: dict[str, int] = {}
     normalized_pages: dict[str, set[Any]] = {}
     for record in records:
@@ -1713,6 +1861,33 @@ def structural_noise_qc(document_json: Any) -> dict[str, Any]:
         if label_l in {"formula", "table", "picture"}:
             continue
 
+        picture_overlap: dict[str, Any] | None = None
+        if label_l == "text" and geometry:
+            for picture in picture_records:
+                if picture.get("page_no") != record.get("page_no"):
+                    continue
+                picture_overlap = _picture_annotation_evidence(geometry, picture)
+                if picture_overlap:
+                    break
+        structural_shadow = (
+            _structural_shadow_record(record, known_structural_records)
+            if label_l not in PAGE_EDGE_LABELS | {"footnote"}
+            else None
+        )
+        abrupt_visual_suffix = (
+            _abrupt_visual_text_suffix(text)
+            if label_l == "text" and not picture_overlap and not structural_shadow
+            else None
+        )
+        visual_annotation_shadow = (
+            picture_annotation_keys.get((record.get("page_no"), normalized))
+            if label_l == "text"
+            and not picture_overlap
+            and not structural_shadow
+            and len(normalized) <= 80
+            else None
+        )
+
         if _looks_like_author_affiliation_footnote_mislabel(
             label_l,
             text,
@@ -1729,7 +1904,72 @@ def structural_noise_qc(document_json: Any) -> dict[str, Any]:
                 node["label"] = "text"
             continue
 
-        if label_l in PAGE_EDGE_LABELS:
+        if abrupt_visual_suffix:
+            candidates.append(
+                {
+                    "index": index,
+                    "kind": "reading_order_annotation",
+                    "label": label,
+                    "text": abrupt_visual_suffix,
+                    "text_preview": abrupt_visual_suffix.strip()[:300],
+                    "page_no": record.get("page_no"),
+                    "bbox": geometry or None,
+                    "reasons": [
+                        "abrupt_terminal_uppercase_fragment",
+                        "long_body_paragraph_reading_order_discontinuity",
+                        "fragment_quarantined_without_removing_body_paragraph",
+                    ],
+                    "action": "quarantine_from_main_text_flow",
+                    "confidence": "high",
+                    "evidence_score": 6,
+                    "reading_order": record.get("reading_order"),
+                    "repeated_page_count": repeated_page_count,
+                    "picture_overlap": None,
+                    "structural_shadow": None,
+                    "match_mode": "fragment",
+                    "evidence": (
+                        f"pages/page_{record.get('page_no')}.png"
+                        if record.get("page_no")
+                        else None
+                    ),
+                }
+            )
+            node = record.get("node")
+            if isinstance(node, dict):
+                node.setdefault("local_ai_lab_qc", {})["structural_fragment_quarantine"] = {
+                    "kind": "reading_order_annotation",
+                    "text": abrupt_visual_suffix,
+                    "action": "quarantine_from_main_text_flow",
+                    "confidence": "high",
+                }
+            continue
+
+        if picture_overlap:
+            kind = "visual_annotation"
+            reasons.extend(
+                [
+                    "text_bbox_inside_rendered_picture",
+                    "duplicate_visual_ocr_removed_from_linear_reading_flow",
+                ]
+            )
+        elif visual_annotation_shadow:
+            kind = "visual_annotation_shadow"
+            reasons.extend(
+                [
+                    "same_page_duplicate_of_picture_annotation",
+                    "duplicate_visual_ocr_removed_from_linear_reading_flow",
+                ]
+            )
+        elif structural_shadow:
+            shadow_label = str(structural_shadow.get("label") or "structural")
+            kind = f"{shadow_label}_shadow"
+            reasons.extend(
+                [
+                    "duplicate_text_overlaps_labeled_structural_region",
+                    f"shadow_of_{shadow_label}",
+                ]
+            )
+        elif label_l in PAGE_EDGE_LABELS:
             kind = label_l
             reasons.append(f"docling_label_{label_l}")
         elif geometry and not body_semantic_label:
@@ -1818,6 +2058,12 @@ def structural_noise_qc(document_json: Any) -> dict[str, Any]:
             continue
 
         score = 0
+        if picture_overlap:
+            score += 6
+        if visual_annotation_shadow:
+            score += 6
+        if structural_shadow:
+            score += 6
         if label_l in PAGE_EDGE_LABELS or label_l == "footnote":
             score += 5
         if repeated_page_count >= 2:
@@ -1863,6 +2109,9 @@ def structural_noise_qc(document_json: Any) -> dict[str, Any]:
                 "evidence_score": score,
                 "reading_order": record.get("reading_order"),
                 "repeated_page_count": repeated_page_count,
+                "picture_overlap": picture_overlap,
+                "visual_annotation_shadow": visual_annotation_shadow,
+                "structural_shadow": structural_shadow,
                 "evidence": f"pages/page_{record.get('page_no')}.png" if record.get("page_no") else None,
             }
         )
@@ -1929,6 +2178,34 @@ def _replace_exact_paragraph_with_quarantine(document_html: str, item: dict[str,
     return document_html, False
 
 
+def _replace_html_fragment_with_quarantine(
+    document_html: str,
+    item: dict[str, Any],
+) -> tuple[str, bool]:
+    text = str(item.get("text") or "")
+    if not text.strip():
+        return document_html, False
+    escaped = html.escape(text)
+    replacement = _hidden_quarantine_html(item)
+    for match in HTML_TEXT_BLOCK_RE.finditer(document_html):
+        body = match.group("body")
+        if escaped not in body:
+            continue
+        updated_body = body.replace(escaped, "", 1).rstrip()
+        updated_block = (
+            f"<{match.group('tag')}{match.group('attrs')}>"
+            f"{updated_body}</{match.group('tag')}>"
+            f"{replacement}"
+        )
+        return (
+            document_html[: match.start()]
+            + updated_block
+            + document_html[match.end() :],
+            True,
+        )
+    return document_html, False
+
+
 def _visible_html_text(document_html: str) -> str:
     visible = re.sub(
         r"<(?:template|style|script)\b.*?</(?:template|style|script)>",
@@ -1957,13 +2234,33 @@ def _html_has_exact_visible_block(document_html: str, text: str) -> bool:
 
 
 def _markdown_exact_text_pattern(text: str) -> re.Pattern[str]:
-    parts = [re.escape(part) for part in text.split()]
+    parts = [_markdown_token_pattern(part) for part in text.split()]
     return re.compile(
         r"(?:\A|\n\s*\n)\s*"
         + r"\s+".join(parts)
         + r"\s*(?=\n\s*\n|\Z)",
         re.DOTALL,
     )
+
+
+def _markdown_token_pattern(token: str) -> str:
+    markdown_escaped = r"\`*{}[]()#+-.!_|>"
+    return "".join(
+        r"\\?" + re.escape(char)
+        if char in markdown_escaped
+        else re.escape(char)
+        for char in token
+    )
+
+
+def _markdown_fragment_pattern(text: str) -> re.Pattern[str]:
+    parts = [_markdown_token_pattern(part) for part in text.split()]
+    return re.compile(r"\s+".join(parts))
+
+
+def _normalized_markdown_text(text: str) -> str:
+    text = re.sub(r"\\([\\`*{}\[\]()#+\-.!_|>])", r"\1", text)
+    return _normalized_noise_text(text)
 
 
 def apply_structural_quarantine_to_outputs(
@@ -2000,7 +2297,10 @@ def apply_structural_quarantine_to_outputs(
             else:
                 html_text = quarantine_style + "\n" + html_text
         for item in quarantine_candidates:
-            html_text, changed = _replace_exact_paragraph_with_quarantine(html_text, item)
+            if item.get("match_mode") == "fragment":
+                html_text, changed = _replace_html_fragment_with_quarantine(html_text, item)
+            else:
+                html_text, changed = _replace_exact_paragraph_with_quarantine(html_text, item)
             if changed:
                 html_replacements += 1
         html_path.write_text(html_text, encoding="utf-8")
@@ -2019,11 +2319,18 @@ def apply_structural_quarantine_to_outputs(
                 f"reasons={','.join(item.get('reasons') or [])} "
                 "evidence=metadata.json -->\n\n"
             )
-            md_text, count = _markdown_exact_text_pattern(text).subn(
-                replacement,
-                md_text,
-                count=1,
-            )
+            if item.get("match_mode") == "fragment":
+                md_text, count = _markdown_fragment_pattern(text).subn(
+                    replacement,
+                    md_text,
+                    count=1,
+                )
+            else:
+                md_text, count = _markdown_exact_text_pattern(text).subn(
+                    replacement,
+                    md_text,
+                    count=1,
+                )
             if count:
                 md_replacements += 1
         md_path.write_text(md_text, encoding="utf-8")
@@ -2040,9 +2347,21 @@ def apply_structural_quarantine_to_outputs(
     for item in quarantine_candidates:
         target = _normalized_noise_text(str(item.get("text") or ""))
         residual_surfaces = []
-        if target and _html_has_exact_visible_block(final_html, target):
+        if (
+            target
+            and item.get("match_mode") == "fragment"
+            and target in _visible_html_text(final_html)
+        ):
             residual_surfaces.append("document.html")
-        if target and _markdown_exact_text_pattern(target).search(markdown_without_comments):
+        elif target and _html_has_exact_visible_block(final_html, target):
+            residual_surfaces.append("document.html")
+        if (
+            target
+            and item.get("match_mode") == "fragment"
+            and target in _normalized_markdown_text(markdown_without_comments)
+        ):
+            residual_surfaces.append("document.md")
+        elif target and _markdown_exact_text_pattern(target).search(markdown_without_comments):
             residual_surfaces.append("document.md")
         item["final_output_residual_surfaces"] = residual_surfaces
         if residual_surfaces:
