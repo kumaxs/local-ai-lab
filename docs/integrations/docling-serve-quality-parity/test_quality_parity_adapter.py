@@ -1314,10 +1314,88 @@ class EnglishReviewPolishTests(unittest.TestCase):
             sidecar = adapter.json.loads(
                 (output_dir / "structural_regions.json").read_text(encoding="utf-8")
             )
+            content = adapter.json.loads(
+                (output_dir / "structural_content.json").read_text(encoding="utf-8")
+            )
+            final_html = (output_dir / "document.html").read_text(encoding="utf-8")
+            final_md = (output_dir / "document.md").read_text(encoding="utf-8")
 
         self.assertEqual(result["final_output_residual_count"], 0)
         self.assertEqual(sidecar["quarantine_candidate_count"], 1)
         self.assertEqual(sidecar["candidates"][0]["confidence"], "high")
+        self.assertEqual(content["record_count"], 1)
+        self.assertEqual(content["records"][0]["kind"], "footnote")
+        self.assertEqual(result["html_structural_content_count"], 1)
+        self.assertEqual(result["markdown_structural_content_count"], 1)
+        self.assertIn("Extracted page-edge notes", final_html)
+        self.assertIn(text, final_html)
+        self.assertIn("## Extracted page-edge notes", final_md)
+        self.assertIn(text, final_md)
+        self.assertNotIn(text, adapter._visible_html_text(
+            adapter._html_without_structural_content(final_html)
+        ))
+
+    def test_structural_content_exports_only_high_confidence_page_edge_material(self) -> None:
+        candidates = [
+            {
+                "kind": "page_header",
+                "text": "Repeated conference header",
+                "page_no": 2,
+                "reading_order": 1,
+                "action": "quarantine_from_main_text_flow",
+                "confidence": "high",
+                "evidence_score": 6,
+                "reasons": ["repeated_header"],
+            },
+            {
+                "kind": "visual_annotation",
+                "text": "Figure OCR noise",
+                "page_no": 2,
+                "reading_order": 2,
+                "action": "quarantine_from_main_text_flow",
+                "confidence": "high",
+                "evidence_score": 7,
+                "reasons": ["inside_picture"],
+            },
+            {
+                "kind": "page_footer",
+                "text": "Uncertain footer",
+                "page_no": 2,
+                "reading_order": 3,
+                "action": "diagnostic_only",
+                "confidence": "medium",
+                "evidence_score": 2,
+                "reasons": ["bottom_zone"],
+            },
+        ]
+
+        records = adapter._structural_export_records(candidates)
+
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["kind"], "page_header")
+        self.assertEqual(records[0]["text"], "Repeated conference header")
+
+    def test_structural_content_deduplicates_same_page_shadow(self) -> None:
+        candidates = [
+            {
+                "kind": "page_footer",
+                "text": "Proceedings footer",
+                "page_no": 3,
+                "action": "quarantine_from_main_text_flow",
+                "confidence": "high",
+            },
+            {
+                "kind": "page_footer_shadow",
+                "text": "Proceedings footer",
+                "page_no": 3,
+                "action": "quarantine_from_main_text_flow",
+                "confidence": "high",
+            },
+        ]
+
+        records = adapter._structural_export_records(candidates)
+
+        self.assertEqual(len(records), 1)
 
     def test_structural_quarantine_matches_markdown_escaped_punctuation(self) -> None:
         text = "AUTHORIZATION MD.! _ MP-75"
