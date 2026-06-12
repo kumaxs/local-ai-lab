@@ -13,7 +13,7 @@ import formula_only_second_pass as formula_second_pass  # noqa: E402
 
 
 class EnglishReviewPolishTests(unittest.TestCase):
-    def test_cn_apply_all_resolves_to_accepted_apply_policy(self) -> None:
+    def test_cn_apply_all_uses_same_formula_policy_as_english(self) -> None:
         args = Namespace(
             input_file=Path("/tmp/CN.pdf"),
             cn_ocr_parity=True,
@@ -21,7 +21,7 @@ class EnglishReviewPolishTests(unittest.TestCase):
         )
 
         self.assertTrue(adapter.is_cn_accepted_path(args))
-        self.assertEqual(adapter.effective_formula_second_pass_policy(args), "apply")
+        self.assertEqual(adapter.effective_formula_second_pass_policy(args), "apply-all")
 
     def test_english_apply_all_policy_remains_isolated(self) -> None:
         args = Namespace(
@@ -314,7 +314,7 @@ class EnglishReviewPolishTests(unittest.TestCase):
         self.assertNotIn(r"duplicate \quad (12)", updated)
         self.assertEqual(updated.count('data-formula-index="12"'), 1)
 
-    def test_cn_accepted_formula_sources_restore_reviewed_map(self) -> None:
+    def test_cn_formula_sources_use_general_candidate_selection(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             guarded = root / "guarded"
@@ -358,14 +358,66 @@ class EnglishReviewPolishTests(unittest.TestCase):
 
         self.assertEqual(len(texts), 24)
         self.assertEqual(sources[2], "guarded_fallback_full")
-        self.assertEqual(sources[3], "route_b")
-        self.assertEqual(sources[5], "guarded_fallback")
-        self.assertEqual(sources[1], "reviewed_cross_column_repair")
-        self.assertEqual(sources[13], "reviewed_formula_13_repair")
-        self.assertNotIn("trailing", texts[1])
+        self.assertIn(sources[3], {"formula_second_pass", "guarded_fallback_full"})
+        self.assertIn(sources[5], {"formula_second_pass", "guarded_fallback_full"})
+        self.assertIn(sources[13], {"formula_second_pass", "guarded_fallback_full"})
+        self.assertEqual(adapter._compact_formula_numbers(texts[1]), [1])
+
+    def test_formula_final_canonicalization_trims_noise_and_duplicate_number(self) -> None:
+        text, repairs = formula_second_pass.canonicalize_formula_output(
+            r"x = y \quad ( 9 ) \quad ( 9 ) "
+            + " ".join([r"\mathfrak { m }"] * 12),
+            9,
+        )
+
+        self.assertEqual(text, r"x = y \quad ( 9 )")
+        self.assertIn("trimmed_hallucinated_suffix", repairs)
+        self.assertEqual(adapter._compact_formula_numbers(text), [9])
+
+    def test_formula_final_canonicalization_removes_low_information_trailing_array(self) -> None:
+        text, repairs = formula_second_pass.canonicalize_formula_output(
+            r"h' = \operatorname{ReLU}(x) \quad "
+            r"\begin{array}{ll}{K_{t-1}}\\{\,}\end{array} ( 17 )",
+            17,
+        )
+
+        self.assertEqual(text, r"h' = \operatorname{ReLU}(x) \quad ( 17 )")
+        self.assertIn("trimmed_low_information_trailing_array", repairs)
+
+    def test_formula_safety_rejects_cjk_and_identical_integral_limits(self) -> None:
+        self.assertIn(
+            "formula_contains_cjk_prose",
+            adapter._formula_output_safety_reasons(r"x = y \quad \text{其中}"),
+        )
+        self.assertIn(
+            "identical_integral_limits",
+            adapter._formula_output_safety_reasons(r"x = \int_{t-1}^{t-1} f(t)"),
+        )
+
+    def test_formula_normalization_repairs_unambiguous_one_hot_zero(self) -> None:
         self.assertEqual(
-            texts[13],
-            adapter.normalize_formula_candidate(adapter.CN_ACCEPTED_FORMULA_13),
+            formula_second_pass.normalize_formula_candidate(
+                r"q' = 0 ( q ) \times W_q"
+            ),
+            r"q' = O ( q ) \times W_q",
+        )
+        self.assertEqual(
+            formula_second_pass.normalize_formula_candidate(
+                r"e _ { _ { h \rightarrow p } } = x"
+            ),
+            r"e _ { h \rightarrow p } = x",
+        )
+
+    def test_formula_safety_rejects_malformed_wrapper_candidates(self) -> None:
+        self.assertIn(
+            "malformed_nested_subscript",
+            adapter._formula_output_safety_reasons(r"c' _ { \, _ { p } } = O(c_p)"),
+        )
+        self.assertIn(
+            "unnecessary_single_formula_array",
+            adapter._formula_output_safety_reasons(
+                r"\begin{array}{r} q' = O(q) \times W \end{array}"
+            ),
         )
 
     def test_cn_html_sequence_completion_inserts_before_next_formula(self) -> None:
@@ -996,7 +1048,50 @@ class EnglishReviewPolishTests(unittest.TestCase):
 
         self.assertEqual(qc["candidate_count"], 1)
         self.assertEqual(document["texts"][1]["label"], "quarantined_footnote_candidate")
-        self.assertIn("small_text_bottom_footnote_marker_candidate", qc["candidates"][0]["reasons"])
+        self.assertIn("marker_led_footnote_content_candidate", qc["candidates"][0]["reasons"])
+
+    def test_structural_qc_does_not_treat_edge_section_heading_as_footer(self) -> None:
+        document = {
+            "texts": [
+                {
+                    "label": "section_header",
+                    "text": "2.3 Model Architecture",
+                    "prov": [{"page_no": 3, "bbox": {"l": 318, "r": 439, "t": 138, "b": 129}}],
+                }
+            ]
+        }
+
+        qc = adapter.structural_noise_qc(document)
+
+        self.assertEqual(qc["candidate_count"], 0)
+        self.assertEqual(document["texts"][0]["label"], "section_header")
+
+    def test_structural_qc_writes_evidence_sidecar_and_audits_final_output(self) -> None:
+        text = "1 Correspondence to: author@example.org"
+        document = {
+            "texts": [
+                {
+                    "label": "footnote",
+                    "text": text,
+                    "prov": [{"page_no": 1, "bbox": {"l": 80, "r": 360, "t": 92, "b": 82}}],
+                }
+            ]
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir)
+            (output_dir / "document.html").write_text(
+                f"<html><body><p>{text}</p></body></html>",
+                encoding="utf-8",
+            )
+            (output_dir / "document.md").write_text(f"\n{text}\n", encoding="utf-8")
+            result = adapter.apply_structural_quarantine_to_outputs(output_dir, document)
+            sidecar = adapter.json.loads(
+                (output_dir / "structural_regions.json").read_text(encoding="utf-8")
+            )
+
+        self.assertEqual(result["final_output_residual_count"], 0)
+        self.assertEqual(sidecar["quarantine_candidate_count"], 1)
+        self.assertEqual(sidecar["candidates"][0]["confidence"], "high")
 
     def test_structural_quarantine_does_not_relabel_formula_nodes(self) -> None:
         document = {

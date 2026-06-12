@@ -22,7 +22,9 @@ from pathlib import Path
 from typing import Any
 
 from formula_only_second_pass import (
+    canonicalize_formula_output,
     extract_formulas,
+    formula_hallucination_reasons,
     normalize_formula_candidate,
     run_formula_second_pass,
     validate_candidate_latex,
@@ -47,13 +49,6 @@ UNRESOLVED_V1_PARITY_WARNINGS = [
     "v1_parity_gap_math_symbol_rendering_requires_review",
 ]
 CN_FINAL_POLISH_FORMULA_NUMBERS = (1, 2, 12)
-CN_ACCEPTED_ROUTE_B_FORMULA_NUMBERS = {3, 4, 14, 16}
-CN_ACCEPTED_GUARDED_FORMULA_NUMBERS = {5, 7, 8}
-CN_ACCEPTED_FORMULA_13 = (
-    r"q s _ { i } = M L P \left( \sum _ { c _ { i } \in V _ { i } } "
-    r"\left[ M L P _ { s i g m o i d } ( c s _ { i } ) \times "
-    r"M L P _ { t a n h } ( c s _ { i } ) \right] \right) \quad ( 13 )"
-)
 CN_ACCEPTED_BASELINE = {
     "name": "accepted_cn_0854aa1",
     "commit": "0854aa1",
@@ -1333,7 +1328,7 @@ def _mark_math_heavy_text(document_html: str) -> tuple[str, int]:
 
 def structural_text_records(document_json: Any) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
-    for node in iter_nodes(document_json):
+    for reading_order, node in enumerate(iter_nodes(document_json)):
         if not isinstance(node, dict):
             continue
         text = node.get("text")
@@ -1350,6 +1345,7 @@ def structural_text_records(document_json: Any) -> list[dict[str, Any]]:
                 "bbox": geometry,
                 "prov": prov,
                 "node": node,
+                "reading_order": reading_order,
             }
         )
     return records
@@ -1407,7 +1403,7 @@ def header_footer_qc_diagnostics(document_json: Any) -> list[dict[str, Any]]:
 
 FOOTNOTE_MARKER_RE = re.compile(r"^\s*(?:[∗*†‡]|\d{1,2})\s*(?:$|[A-Za-z])")
 FOOTNOTE_CONTENT_NOISE_RE = re.compile(
-    r"(?i)\b(equal contribution|equal contributions|corresponding author|"
+    r"(?i)\b(equal contribution|equal contributions|corresponding author|correspondence to|"
     r"internship|permission to make|copyright|acm isbn|doi\.org|"
     r"all rights reserved)\b"
 )
@@ -1676,14 +1672,16 @@ def recover_first_page_author_affiliations(
 
 
 def structural_noise_qc(document_json: Any) -> dict[str, Any]:
-    """Classify page-edge and footnote-like fragments for generic quarantine."""
+    """Identify structural regions and quarantine only evidence-rich candidates."""
     records = structural_text_records(document_json)
     page_extents = _page_vertical_extents(records)
     normalized_counts: dict[str, int] = {}
+    normalized_pages: dict[str, set[Any]] = {}
     for record in records:
         normalized = _normalized_noise_text(str(record.get("text") or ""))
         if normalized:
             normalized_counts[normalized] = normalized_counts.get(normalized, 0) + 1
+            normalized_pages.setdefault(normalized, set()).add(record.get("page_no"))
 
     candidates: list[dict[str, Any]] = []
     for index, record in enumerate(records, start=1):
@@ -1702,6 +1700,15 @@ def structural_noise_qc(document_json: Any) -> dict[str, Any]:
         )
         reasons: list[str] = []
         kind: str | None = None
+        repeated_page_count = len(normalized_pages.get(normalized, set()))
+        body_semantic_label = label_l in {
+            "section_header",
+            "caption",
+            "list_item",
+            "table",
+            "formula",
+            "picture",
+        }
 
         if label_l in {"formula", "table", "picture"}:
             continue
@@ -1725,19 +1732,31 @@ def structural_noise_qc(document_json: Any) -> dict[str, Any]:
         if label_l in PAGE_EDGE_LABELS:
             kind = label_l
             reasons.append(f"docling_label_{label_l}")
-        elif geometry:
+        elif geometry and not body_semantic_label:
             if bottom_zone and (
                 re.fullmatch(r"\d{1,3}", normalized)
-                or HEADER_FOOTER_NOISE_RE.search(normalized)
-                or normalized_counts.get(normalized, 0) >= 2
-                or (small_text and not FOOTNOTE_MARKER_RE.search(text))
+                or (
+                    HEADER_FOOTER_NOISE_RE.search(normalized)
+                    and len(normalized) <= 160
+                )
+                or (
+                    repeated_page_count >= 2
+                    and len(normalized) >= 6
+                    and bool(re.search(r"[A-Za-z\u3400-\u9fff]", normalized))
+                )
             ):
                 kind = "page_footer_candidate"
                 reasons.append("bottom_edge_noise_candidate")
             if top_zone and (
-                HEADER_FOOTER_NOISE_RE.search(normalized)
-                or normalized_counts.get(normalized, 0) >= 2
-                or (small_text and len(normalized) <= 120)
+                (
+                    HEADER_FOOTER_NOISE_RE.search(normalized)
+                    and len(normalized) <= 160
+                )
+                or (
+                    repeated_page_count >= 2
+                    and len(normalized) >= 6
+                    and bool(re.search(r"[A-Za-z\u3400-\u9fff]", normalized))
+                )
             ):
                 kind = "page_header_candidate"
                 reasons.append("top_edge_noise_candidate")
@@ -1745,27 +1764,42 @@ def structural_noise_qc(document_json: Any) -> dict[str, Any]:
         if label_l == "footnote":
             kind = "footnote"
             reasons.append("docling_label_footnote")
-        elif FOOTNOTE_MARKER_RE.search(text) and FOOTNOTE_CONTENT_NOISE_RE.search(normalized):
+        elif (
+            not body_semantic_label
+            and FOOTNOTE_MARKER_RE.search(text)
+            and FOOTNOTE_CONTENT_NOISE_RE.search(normalized)
+        ):
             kind = "footnote_candidate"
             reasons.append("marker_led_footnote_content_candidate")
-        elif geometry and bottom_zone and FOOTNOTE_MARKER_RE.search(text):
+        elif (
+            not body_semantic_label
+            and geometry
+            and bottom_zone
+            and FOOTNOTE_MARKER_RE.search(text)
+        ):
             kind = kind or "footnote_candidate"
             reasons.append("bottom_region_footnote_marker_candidate")
             if small_text:
                 reasons.append("small_text_bottom_footnote_marker_candidate")
-        elif geometry and bottom_zone and small_text and re.match(
+        elif not body_semantic_label and geometry and bottom_zone and small_text and re.match(
             r"^\s*(?:[∗*†‡]|\d{1,2})\s+",
             normalized,
         ):
             kind = kind or "footnote_candidate"
             reasons.append("small_text_bottom_footnote_marker_candidate")
-        elif geometry and bottom_zone and text.rstrip().endswith("-") and len(normalized) < 180:
+        elif (
+            not body_semantic_label
+            and geometry
+            and bottom_zone
+            and text.rstrip().endswith("-")
+            and len(normalized) < 180
+        ):
             kind = kind or "footnote_candidate"
             reasons.append("bottom_region_hyphenated_annotation_candidate")
 
-        if normalized_counts.get(normalized, 0) >= 2 and kind in {"page_header", "page_header_candidate", "page_footer", "page_footer_candidate"}:
+        if repeated_page_count >= 2 and kind in {"page_header", "page_header_candidate", "page_footer", "page_footer_candidate"}:
             reasons.append("repeated_text")
-        if normalized_counts.get(normalized, 0) >= 2 and (bottom_zone or top_zone):
+        if repeated_page_count >= 2 and (bottom_zone or top_zone):
             reasons.append("cross_page_repetition")
         if re.fullmatch(r"\d{1,3}", normalized) and kind:
             reasons.append("page_or_footnote_number_fragment")
@@ -1783,15 +1817,36 @@ def structural_noise_qc(document_json: Any) -> dict[str, Any]:
         if not kind or not reasons:
             continue
 
-        action = "quarantine_from_main_text_flow"
+        score = 0
+        if label_l in PAGE_EDGE_LABELS or label_l == "footnote":
+            score += 5
+        if repeated_page_count >= 2:
+            score += 3
+        if bottom_zone or top_zone:
+            score += 1
+        if FOOTNOTE_MARKER_RE.search(text):
+            score += 2
+        if FOOTNOTE_CONTENT_NOISE_RE.search(normalized) or HEADER_FOOTER_NOISE_RE.search(normalized):
+            score += 2
+        if small_text:
+            score += 1
+        confidence = "high" if score >= 5 else "medium" if score >= 3 else "low"
+        action = (
+            "quarantine_from_main_text_flow"
+            if confidence == "high"
+            else "diagnostic_annotation_only"
+        )
         node = record.get("node")
         if isinstance(node, dict):
             node.setdefault("local_ai_lab_qc", {})["structural_quarantine"] = {
                 "kind": kind,
                 "reasons": reasons,
                 "action": action,
+                "confidence": confidence,
+                "evidence_score": score,
             }
-            node["label"] = f"quarantined_{kind}"
+            if action == "quarantine_from_main_text_flow":
+                node["label"] = f"quarantined_{kind}"
 
         candidates.append(
             {
@@ -1804,15 +1859,33 @@ def structural_noise_qc(document_json: Any) -> dict[str, Any]:
                 "bbox": geometry or None,
                 "reasons": reasons,
                 "action": action,
+                "confidence": confidence,
+                "evidence_score": score,
+                "reading_order": record.get("reading_order"),
+                "repeated_page_count": repeated_page_count,
                 "evidence": f"pages/page_{record.get('page_no')}.png" if record.get("page_no") else None,
             }
         )
 
+    quarantined = [
+        item for item in candidates
+        if item["action"] == "quarantine_from_main_text_flow"
+    ]
     return {
         "candidate_count": len(candidates),
+        "quarantine_candidate_count": len(quarantined),
+        "annotation_only_candidate_count": len(candidates) - len(quarantined),
+        "candidate_counts_by_kind": {
+            kind: sum(1 for item in candidates if item["kind"] == kind)
+            for kind in sorted({item["kind"] for item in candidates})
+        },
+        "candidate_counts_by_confidence": {
+            confidence: sum(1 for item in candidates if item["confidence"] == confidence)
+            for confidence in ("high", "medium", "low")
+        },
         "isolated_main_text_pollution_count": 0,
         "recovered_footnote_count": 0,
-        "unresolved_footnote_count": sum(1 for item in candidates if "footnote" in item["kind"]),
+        "unresolved_footnote_count": sum(1 for item in quarantined if "footnote" in item["kind"]),
         "candidates": candidates,
     }
 
@@ -1856,6 +1929,43 @@ def _replace_exact_paragraph_with_quarantine(document_html: str, item: dict[str,
     return document_html, False
 
 
+def _visible_html_text(document_html: str) -> str:
+    visible = re.sub(
+        r"<(?:template|style|script)\b.*?</(?:template|style|script)>",
+        " ",
+        document_html,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    return _normalized_noise_text(html.unescape(HTML_TAG_RE.sub(" ", visible)))
+
+
+def _html_has_exact_visible_block(document_html: str, text: str) -> bool:
+    target = _normalized_noise_text(text)
+    if not target:
+        return False
+    visible_html = re.sub(
+        r"<(?:template|style|script)\b.*?</(?:template|style|script)>",
+        " ",
+        document_html,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    return any(
+        _normalized_noise_text(html.unescape(HTML_TAG_RE.sub(" ", match.group("body"))))
+        == target
+        for match in HTML_TEXT_BLOCK_RE.finditer(visible_html)
+    )
+
+
+def _markdown_exact_text_pattern(text: str) -> re.Pattern[str]:
+    parts = [re.escape(part) for part in text.split()]
+    return re.compile(
+        r"(?:\A|\n\s*\n)\s*"
+        + r"\s+".join(parts)
+        + r"\s*(?=\n\s*\n|\Z)",
+        re.DOTALL,
+    )
+
+
 def apply_structural_quarantine_to_outputs(
     output_dir: Path,
     document_json: Any,
@@ -1863,6 +1973,10 @@ def apply_structural_quarantine_to_outputs(
     """Apply generic structural quarantine to JSON, HTML, and Markdown outputs."""
     qc = structural_noise_qc(document_json)
     candidates = qc["candidates"]
+    quarantine_candidates = [
+        item for item in candidates
+        if item.get("action") == "quarantine_from_main_text_flow"
+    ]
 
     json_path = output_dir / "document.json"
     if json_path.exists():
@@ -1870,7 +1984,7 @@ def apply_structural_quarantine_to_outputs(
 
     html_replacements = 0
     html_path = output_dir / "document.html"
-    if html_path.exists() and candidates:
+    if html_path.exists() and quarantine_candidates:
         html_text = html_path.read_text(encoding="utf-8")
         html_text, _style = _inject_english_review_style(html_text)
         quarantine_style = """
@@ -1885,7 +1999,7 @@ def apply_structural_quarantine_to_outputs(
                 html_text = html_text.replace("</head>", quarantine_style + "\n</head>", 1)
             else:
                 html_text = quarantine_style + "\n" + html_text
-        for item in candidates:
+        for item in quarantine_candidates:
             html_text, changed = _replace_exact_paragraph_with_quarantine(html_text, item)
             if changed:
                 html_replacements += 1
@@ -1893,9 +2007,9 @@ def apply_structural_quarantine_to_outputs(
 
     md_replacements = 0
     md_path = output_dir / "document.md"
-    if md_path.exists() and candidates:
+    if md_path.exists() and quarantine_candidates:
         md_text = md_path.read_text(encoding="utf-8")
-        for item in candidates:
+        for item in quarantine_candidates:
             text = str(item.get("text") or "").strip()
             if not text:
                 continue
@@ -1905,20 +2019,50 @@ def apply_structural_quarantine_to_outputs(
                 f"reasons={','.join(item.get('reasons') or [])} "
                 "evidence=metadata.json -->\n\n"
             )
-            patterns = [
-                "\n" + text + "\n",
-                "\n\n" + text + "\n\n",
-            ]
-            for pattern in patterns:
-                if pattern in md_text:
-                    md_text = md_text.replace(pattern, replacement, 1)
-                    md_replacements += 1
-                    break
+            md_text, count = _markdown_exact_text_pattern(text).subn(
+                replacement,
+                md_text,
+                count=1,
+            )
+            if count:
+                md_replacements += 1
         md_path.write_text(md_text, encoding="utf-8")
+
+    final_html = html_path.read_text(encoding="utf-8") if html_path.exists() else ""
+    final_md = md_path.read_text(encoding="utf-8") if md_path.exists() else ""
+    markdown_without_comments = re.sub(
+        r"<!--.*?-->",
+        " ",
+        final_md,
+        flags=re.DOTALL,
+    )
+    residuals: list[dict[str, Any]] = []
+    for item in quarantine_candidates:
+        target = _normalized_noise_text(str(item.get("text") or ""))
+        residual_surfaces = []
+        if target and _html_has_exact_visible_block(final_html, target):
+            residual_surfaces.append("document.html")
+        if target and _markdown_exact_text_pattern(target).search(markdown_without_comments):
+            residual_surfaces.append("document.md")
+        item["final_output_residual_surfaces"] = residual_surfaces
+        if residual_surfaces:
+            residuals.append(
+                {
+                    "kind": item.get("kind"),
+                    "page_no": item.get("page_no"),
+                    "text_preview": item.get("text_preview"),
+                    "surfaces": residual_surfaces,
+                }
+            )
 
     qc["html_quarantine_replacement_count"] = html_replacements
     qc["markdown_quarantine_replacement_count"] = md_replacements
     qc["isolated_main_text_pollution_count"] = html_replacements + md_replacements
+    qc["final_output_residual_count"] = len(residuals)
+    qc["final_output_residuals"] = residuals
+    sidecar_path = output_dir / "structural_regions.json"
+    sidecar_path.write_text(json.dumps(qc, indent=2, ensure_ascii=False), encoding="utf-8")
+    qc["sidecar_path"] = sidecar_path.name
     return qc
 
 
@@ -2606,7 +2750,9 @@ def run_unified_review_qc(
             "formula_latex_sources": formula_latex_sources,
         }
     )
-    metadata.setdefault("generated_outputs", []).append("links.json")
+    metadata.setdefault("generated_outputs", []).extend(
+        ["links.json", structural_quarantine["sidecar_path"]]
+    )
     if formula_latex_sources.get("written"):
         metadata.setdefault("generated_outputs", []).append(str(formula_latex_sources["path"]))
     status["quality_signals"].update(
@@ -2718,10 +2864,7 @@ def is_cn_accepted_path(args: argparse.Namespace) -> bool:
 
 
 def effective_formula_second_pass_policy(args: argparse.Namespace) -> str:
-    policy = args.formula_second_pass_policy
-    if is_cn_accepted_path(args) and policy == "apply-all":
-        return "apply"
-    return policy
+    return args.formula_second_pass_policy
 
 
 def cn_accepted_baseline_diagnostics(output_dir: Path) -> dict[str, Any]:
@@ -2954,11 +3097,20 @@ def _strip_display_math_wrapper(text: str) -> str:
 def _second_pass_formula_display_text(entry: dict[str, Any]) -> str:
     display_override = str(entry.get("display_override") or "").strip()
     if display_override:
-        return normalize_formula_candidate(display_override)
-    markdown_after = _strip_display_math_wrapper(str(entry.get("markdown_after") or ""))
-    if markdown_after:
-        return normalize_formula_candidate(markdown_after)
-    return normalize_formula_candidate(str(entry.get("route_b_candidate") or "").strip())
+        candidate = display_override
+    else:
+        markdown_after = _strip_display_math_wrapper(str(entry.get("markdown_after") or ""))
+        candidate = markdown_after or str(entry.get("route_b_candidate") or "").strip()
+    equation_number = entry.get("eq_number")
+    normalized, repairs = canonicalize_formula_output(
+        candidate,
+        equation_number if isinstance(equation_number, int) else None,
+    )
+    if repairs:
+        entry.setdefault("final_output_repairs", []).extend(
+            repair for repair in repairs if repair not in entry.get("final_output_repairs", [])
+        )
+    return normalized
 
 
 def _second_pass_formula_raw_text(entry: dict[str, Any]) -> str:
@@ -3026,9 +3178,7 @@ def _render_formula_fallback_html(
     formula_no = entry.get("formula_no")
     reason = str(entry.get("fallback_reason") or entry.get("status") or "second_pass_not_applied")
     raw_candidate = str(entry.get("route_b_candidate") or "").strip()
-    source_formula = normalize_formula_candidate(str(entry.get("route_a_text") or "").strip())
-    if isinstance(entry.get("eq_number"), int):
-        source_formula = _formula_text_with_number(source_formula, int(entry["eq_number"]))
+    source_formula, fallback_source = _best_formula_fallback_text(entry)
     links = [
         f'<a href="formulas/formula_{formula_no}.png">source image</a>',
         f'<a href="formulas/formula_{formula_no}_context.png">context crop</a>',
@@ -3037,8 +3187,8 @@ def _render_formula_fallback_html(
     ]
     candidate = (
         '<pre class="docling-formula-tex docling-formula-fallback-candidate">'
-        f"{html.escape(raw_candidate)}</pre>"
-        if raw_candidate
+        f"{html.escape(raw_candidate[:1200])}</pre>"
+        if raw_candidate and raw_candidate != source_formula
         else ""
     )
     source_formula_render = ""
@@ -3053,6 +3203,20 @@ def _render_formula_fallback_html(
             '<pre class="docling-formula-tex docling-formula-preserved-source">'
             f"{html.escape(source_formula)}</pre>"
         )
+    else:
+        source_formula_render = (
+            '<p class="docling-formula-unavailable">'
+            "Formula body could not be recovered safely; source evidence is preserved below."
+            "</p>"
+        )
+    crop_path = output_dir / "formulas" / f"formula_{formula_no}.png"
+    crop = (
+        '<figure class="docling-formula-fallback-evidence">'
+        f'<img src="formulas/formula_{formula_no}.png" alt="Formula {formula_no} source crop">'
+        "</figure>"
+        if crop_path.exists()
+        else ""
+    )
     return (
         '<div class="docling-formula-second-pass docling-formula-fallback" '
         f'data-formula-index="{formula_no}" '
@@ -3063,6 +3227,8 @@ def _render_formula_fallback_html(
         "</div>"
         + source_formula_render
         + candidate
+        + crop
+        + f'<div class="docling-formula-fallback-source">Fallback source: {html.escape(fallback_source)}</div>'
         + '<div class="docling-formula-source">'
         + " | ".join(links)
         + "</div></div>"
@@ -3099,6 +3265,19 @@ def _ensure_formula_second_pass_html_assets(html_text: str) -> tuple[str, bool]:
 }
 .docling-formula-source {
   font: 0.85rem system-ui, sans-serif;
+}
+.docling-formula-unavailable {
+  border: 1px solid #cbd5e1;
+  background: #fff;
+  padding: 0.6rem;
+}
+.docling-formula-fallback-evidence img {
+  display: block;
+  max-width: 100%;
+}
+.docling-formula-fallback-source {
+  color: #64748b;
+  font: 0.8rem system-ui, sans-serif;
 }
 </style>
 <script id="docling-formula-second-pass-mathjax">
@@ -3160,14 +3339,71 @@ def _original_formula_visible_ranges(html_text: str) -> list[re.Match[str]]:
 def _formula_output_safety_reasons(text: str) -> list[str]:
     body = text.strip()
     reasons: list[str] = []
-    if not body or re.fullmatch(r"\s*\(\s*(?:\d\s*)+\)\s*", body):
-        reasons.append("missing_formula_body")
+    reasons.extend(formula_hallucination_reasons(body))
     latex_ok, latex_reasons = validate_candidate_latex(body)
     if not latex_ok:
         reasons.extend(f"latex_{reason}" for reason in latex_reasons)
     if re.search(r"(?<![A-Za-z])(?:[A-Za-z]\s+){4,}[A-Za-z](?![A-Za-z])", body):
         reasons.append("garbled_letter_spaced_text")
-    return reasons
+    if CN_CHAR_RE.search(body):
+        reasons.append("formula_contains_cjk_prose")
+    if re.search(r"_\s*\{\s*(?:\\[,;:!]|\s)*_\s*\{", body):
+        reasons.append("malformed_nested_subscript")
+    if re.match(r"^\s*\\begin\s*\{\s*array\s*\}", body):
+        relation_count = len(re.findall(r"(?<![<>])=(?!=)", body))
+        row_count = len(re.findall(r"\\\\", body))
+        if relation_count <= 1 and row_count <= 1:
+            reasons.append("unnecessary_single_formula_array")
+    for integral in re.finditer(
+        r"\\int\s*_\s*\{\s*(?P<lower>[^{}]{1,32})\s*\}"
+        r"\s*\^\s*\{\s*(?P<upper>[^{}]{1,32})\s*\}",
+        body,
+    ):
+        lower = re.sub(r"\s+", "", integral.group("lower"))
+        upper = re.sub(r"\s+", "", integral.group("upper"))
+        if lower == upper:
+            reasons.append("identical_integral_limits")
+            break
+    numbers = _compact_formula_numbers(body)
+    if len(numbers) != len(set(numbers)):
+        reasons.append("duplicate_equation_number")
+    return list(dict.fromkeys(reasons))
+
+
+def _formula_candidate_rank(text: str, equation_number: int | None) -> tuple[int, int, int]:
+    normalized, _repairs = canonicalize_formula_output(text, equation_number)
+    reasons = _formula_output_safety_reasons(normalized)
+    body_length = len(re.sub(r"\s+", "", normalized))
+    return (len(reasons), 0 if body_length >= 8 else 1, -min(body_length, 1200))
+
+
+def _best_formula_fallback_text(entry: dict[str, Any]) -> tuple[str, str]:
+    equation_number = entry.get("eq_number")
+    eq_number = equation_number if isinstance(equation_number, int) else None
+    candidates = [
+        ("second_pass_candidate", str(entry.get("route_b_candidate") or "")),
+        ("route_a_source", str(entry.get("route_a_text") or "")),
+        ("raw_tex", str(entry.get("raw_tex") or "")),
+    ]
+    ranked: list[tuple[tuple[int, int, int], str, str]] = []
+    for source, candidate in candidates:
+        normalized, _repairs = canonicalize_formula_output(candidate, eq_number)
+        if not normalized or formula_hallucination_reasons(normalized):
+            continue
+        ranked.append((_formula_candidate_rank(normalized, eq_number), normalized, source))
+    if not ranked:
+        return "", "unavailable"
+    _rank, text, source = min(ranked, key=lambda item: item[0])
+    return text[:1200], source
+
+
+def _formula_fallback_contract_text(entry: dict[str, Any]) -> str:
+    text, _source = _best_formula_fallback_text(entry)
+    if text:
+        return text
+    formula_no = entry.get("eq_number") or entry.get("formula_no")
+    suffix = f" \\quad ( {formula_no} )" if isinstance(formula_no, int) else ""
+    return r"\text{Formula body unavailable; see source evidence}" + suffix
 
 
 def _original_formula_html_ranges(html_text: str) -> tuple[list[re.Match[str]], dict[int, re.Match[str]]]:
@@ -3567,9 +3803,9 @@ def synchronize_formula_contract_outputs(
             if entry.get("status") == "replaced":
                 output_text = _second_pass_formula_display_text(entry)
             else:
-                output_text = normalize_formula_candidate(str(node.get("text") or ""))
-                if isinstance(entry.get("eq_number"), int):
-                    output_text = _formula_text_with_number(output_text, int(entry["eq_number"]))
+                output_text = _formula_fallback_contract_text(
+                    {**entry, "route_a_text": str(node.get("text") or "")}
+                )
             if str(node.get("text") or "") != output_text:
                 node["text"] = output_text
                 json_patched.append(formula_no)
@@ -3602,13 +3838,19 @@ def synchronize_formula_contract_outputs(
             if entry.get("status") == "replaced":
                 output_text = _second_pass_formula_display_text(entry)
             else:
-                output_text = blocks[formula_no - 1].group(0)[2:-2].strip()
-                if isinstance(entry.get("eq_number"), int):
-                    output_text = _formula_text_with_number(
-                        output_text,
-                        int(entry["eq_number"]),
-                    )
+                output_text = _formula_fallback_contract_text(
+                    {
+                        **entry,
+                        "route_a_text": blocks[formula_no - 1].group(0)[2:-2].strip(),
+                    }
+                )
             replacement = f"$${output_text}$$"
+            if entry.get("status") != "replaced":
+                replacement += (
+                    "\n<!-- formula-final-output-fallback "
+                    f"formula={formula_no} reason="
+                    f"{entry.get('fallback_reason') or entry.get('status')} -->"
+                )
             block = blocks[formula_no - 1]
             if block.group(0) != replacement:
                 edits.append((block.start(), block.end(), replacement))
@@ -3638,6 +3880,7 @@ def validate_formula_second_pass_html(
     fallback_missing: list[int] = []
     missing_equation_numbers: list[int] = []
     image_only_fallbacks: list[int] = []
+    blank_visible_formulas: list[int] = []
     garbled_formula_indexes: list[int] = []
     json_mismatches: list[int] = []
     markdown_mismatches: list[int] = []
@@ -3668,7 +3911,10 @@ def validate_formula_second_pass_html(
             if valid and isinstance(formula_no, int):
                 html_range = _find_existing_second_pass_formula_range(raw_html, formula_no)
                 block = raw_html[html_range[0] : html_range[1]] if html_range else ""
-                if "docling-formula-preserved-source" not in block:
+                if (
+                    "docling-formula-preserved-source" not in block
+                    and "docling-formula-unavailable" not in block
+                ):
                     image_only_fallbacks.append(formula_no)
         if not valid:
             html_range = _find_existing_second_pass_formula_range(raw_html, formula_no)
@@ -3682,6 +3928,12 @@ def validate_formula_second_pass_html(
             continue
         html_range = _find_existing_second_pass_formula_range(raw_html, formula_no)
         block = raw_html[html_range[0] : html_range[1]] if html_range else ""
+        visible_block = _visible_html_text(block)
+        if not visible_block or (
+            entry.get("status") == "replaced"
+            and not _second_pass_formula_display_text(entry).strip()
+        ):
+            blank_visible_formulas.append(formula_no)
         if isinstance(entry.get("eq_number"), int):
             expected_number = int(entry["eq_number"])
             if expected_number not in _compact_formula_numbers(_normalize_formula_anchor(block)):
@@ -3713,6 +3965,7 @@ def validate_formula_second_pass_html(
                 duplicate_formula_indexes,
                 missing_equation_numbers,
                 image_only_fallbacks,
+                blank_visible_formulas,
                 garbled_formula_indexes,
                 json_mismatches,
                 markdown_mismatches,
@@ -3729,6 +3982,7 @@ def validate_formula_second_pass_html(
         "visible_offset": visible_offset,
         "remaining_original_formula_block_count": remaining_original_formula_blocks,
         "image_only_fallback_indexes": sorted(set(image_only_fallbacks)),
+        "blank_visible_formula_indexes": sorted(set(blank_visible_formulas)),
         "garbled_formula_indexes": sorted(set(garbled_formula_indexes)),
         "json_formula_mismatch_indexes": sorted(set(json_mismatches)),
         "markdown_formula_mismatch_indexes": sorted(set(markdown_mismatches)),
@@ -3806,48 +4060,70 @@ def _cn_accepted_formula_source_texts(
     args: argparse.Namespace,
     sidecar_dir: Path,
 ) -> tuple[dict[int, str], dict[int, str]]:
-    guarded_full_texts: dict[int, str] = {}
+    candidate_texts: dict[int, list[tuple[str, str]]] = {}
     for value in args.formula_second_pass_guarded_fallback_dir:
         path_text = value.split("=", 1)[1] if "=" in value else value
-        guarded_full_texts.update(_load_formula_text_by_index(Path(path_text)))
+        for formula_no, text in _load_formula_text_by_index(Path(path_text)).items():
+            candidate_texts.setdefault(formula_no, []).append(("guarded_fallback_full", text))
 
-    formula_texts = {
-        formula_no: _formula_text_with_number(normalize_formula_candidate(text), formula_no)
-        for formula_no, text in guarded_full_texts.items()
-        if formula_no in CN_ACCEPTED_BASELINE["equation_numbers"]
-    }
-    source_map = {formula_no: "guarded_fallback_full" for formula_no in formula_texts}
     summary = _load_json_file(sidecar_dir / "second_pass_summary.json")
     if isinstance(summary, dict):
         for entry in summary.get("replacement_log") or []:
             formula_no = entry.get("formula_no")
-            if not isinstance(formula_no, int) or entry.get("status") != "replaced":
-                continue
-            if formula_no not in (
-                CN_ACCEPTED_ROUTE_B_FORMULA_NUMBERS
-                | CN_ACCEPTED_GUARDED_FORMULA_NUMBERS
-            ):
+            if not isinstance(formula_no, int):
                 continue
             candidate = str(entry.get("route_b_candidate") or "").strip()
-            if not candidate:
-                continue
-            formula_texts[formula_no] = _formula_text_with_number(
-                normalize_formula_candidate(candidate),
-                formula_no,
-            )
-            source_map[formula_no] = (
-                "guarded_fallback"
-                if formula_no in CN_ACCEPTED_GUARDED_FORMULA_NUMBERS
-                else "route_b"
+            if candidate:
+                candidate_texts.setdefault(formula_no, []).append(
+                    (
+                        str(entry.get("candidate_source") or "formula_second_pass"),
+                        candidate,
+                    )
+                )
+
+    current_document = _load_json_file(sidecar_dir / "document.json")
+    if isinstance(current_document, dict):
+        for formula_no, formula in enumerate(
+            extract_label_nodes(current_document, "formula"),
+            start=1,
+        ):
+            candidate_texts.setdefault(formula_no, []).append(
+                ("current_formula_output", str(formula.get("text") or ""))
             )
 
-    if 1 in formula_texts:
-        match = re.search(r"^(.*?\(\s*1\s*\))", formula_texts[1])
-        if match:
-            formula_texts[1] = match.group(1).strip()
-            source_map[1] = "reviewed_cross_column_repair"
-    formula_texts[13] = normalize_formula_candidate(CN_ACCEPTED_FORMULA_13)
-    source_map[13] = "reviewed_formula_13_repair"
+    formula_texts: dict[int, str] = {}
+    source_map: dict[int, str] = {}
+    source_priority = {
+        "guarded_fallback": 0,
+        "guarded_fallback_full": 0,
+        "route_b": 1,
+        "formula_second_pass": 1,
+        "current_formula_output": 2,
+    }
+    for formula_no, candidates in candidate_texts.items():
+        ranked: list[tuple[tuple[int, int, int, int], str, str]] = []
+        for source, candidate in candidates:
+            normalized, _repairs = canonicalize_formula_output(candidate, formula_no)
+            if not normalized:
+                continue
+            base_rank = _formula_candidate_rank(normalized, formula_no)
+            ranked.append(
+                (
+                    (
+                        base_rank[0],
+                        base_rank[1],
+                        source_priority.get(source, 3),
+                        base_rank[2],
+                    ),
+                    normalized,
+                    source,
+                )
+            )
+        if not ranked:
+            continue
+        _rank, selected, source = min(ranked, key=lambda item: item[0])
+        formula_texts[formula_no] = selected
+        source_map[formula_no] = source
     return formula_texts, source_map
 
 
