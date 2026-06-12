@@ -2263,6 +2263,220 @@ def _normalized_markdown_text(text: str) -> str:
     return _normalized_noise_text(text)
 
 
+STRUCTURAL_CONTENT_HTML_ID = "docling-structural-content"
+STRUCTURAL_CONTENT_MD_START = "<!-- local-ai-lab structural content start -->"
+STRUCTURAL_CONTENT_MD_END = "<!-- local-ai-lab structural content end -->"
+
+
+def _exportable_structural_kind(kind: str) -> str | None:
+    normalized = kind.lower()
+    if "footnote" in normalized:
+        return "footnote"
+    if "page_header" in normalized:
+        return "page_header"
+    if "page_footer" in normalized:
+        return "page_footer"
+    return None
+
+
+def _structural_export_records(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    seen: set[tuple[Any, str, str]] = set()
+    for index, item in enumerate(candidates, start=1):
+        export_kind = _exportable_structural_kind(str(item.get("kind") or ""))
+        text = str(item.get("text") or "").strip()
+        if (
+            not export_kind
+            or not text
+            or item.get("action") != "quarantine_from_main_text_flow"
+            or item.get("confidence") != "high"
+        ):
+            continue
+        key = (item.get("page_no"), export_kind, _normalized_noise_text(text))
+        if key in seen:
+            continue
+        seen.add(key)
+        records.append(
+            {
+                "index": index,
+                "kind": export_kind,
+                "source_kind": item.get("kind"),
+                "page_no": item.get("page_no"),
+                "reading_order": item.get("reading_order"),
+                "text": text,
+                "confidence": item.get("confidence"),
+                "evidence_score": item.get("evidence_score"),
+                "bbox": item.get("bbox"),
+                "reasons": item.get("reasons") or [],
+                "evidence": item.get("evidence"),
+            }
+        )
+    return sorted(
+        records,
+        key=lambda item: (
+            item.get("page_no") is None,
+            item.get("page_no") or 0,
+            item.get("reading_order") is None,
+            item.get("reading_order") or 0,
+            item["index"],
+        ),
+    )
+
+
+def _structural_content_html(records: list[dict[str, Any]]) -> str:
+    if not records:
+        return ""
+    labels = {
+        "page_header": "Page header",
+        "page_footer": "Page footer",
+        "footnote": "Footnote",
+    }
+    items = []
+    for record in records:
+        reasons = ", ".join(str(reason) for reason in record.get("reasons") or [])
+        items.append(
+            '<article class="docling-structural-item" '
+            f'data-kind="{html.escape(record["kind"], quote=True)}" '
+            f'data-page="{html.escape(str(record.get("page_no")), quote=True)}">'
+            '<header>'
+            f'<strong>{labels[record["kind"]]}</strong>'
+            f'<span>Page {html.escape(str(record.get("page_no") or "unknown"))}</span>'
+            '</header>'
+            f'<p>{html.escape(record["text"])}</p>'
+            '<small>'
+            f'confidence={html.escape(str(record.get("confidence")))}; '
+            f'evidence_score={html.escape(str(record.get("evidence_score")))}; '
+            f'reasons={html.escape(reasons)}'
+            '</small>'
+            '</article>'
+        )
+    return (
+        f'<section id="{STRUCTURAL_CONTENT_HTML_ID}" '
+        'class="docling-structural-content" role="doc-endnotes" '
+        'aria-labelledby="docling-structural-content-title">'
+        '<h2 id="docling-structural-content-title">Extracted page-edge notes</h2>'
+        '<p class="docling-structural-content-note">'
+        'High-confidence headers, footers, and footnotes isolated from the main reading flow.'
+        '</p>'
+        + "".join(items)
+        + '</section>'
+    )
+
+
+def _append_structural_content_html(
+    document_html: str,
+    records: list[dict[str, Any]],
+) -> str:
+    appendix = _structural_content_html(records)
+    if not appendix or f'id="{STRUCTURAL_CONTENT_HTML_ID}"' in document_html:
+        return document_html
+    style = """
+<style id="docling-structural-content-style">
+.docling-structural-content {
+  margin: 3rem auto 1rem;
+  padding: 1.25rem 0 0;
+  border-top: 2px solid #5f6b75;
+  max-width: 72rem;
+}
+.docling-structural-content-note,
+.docling-structural-item small {
+  color: #52606d;
+}
+.docling-structural-item {
+  margin: 1rem 0;
+  padding: .75rem 1rem;
+  border-left: 3px solid #8b99a6;
+  background: #f5f7f8;
+}
+.docling-structural-item header {
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+}
+.docling-structural-item p {
+  margin: .5rem 0;
+  white-space: pre-wrap;
+}
+</style>
+"""
+    if "docling-structural-content-style" not in document_html:
+        if "</head>" in document_html:
+            document_html = document_html.replace("</head>", style + "\n</head>", 1)
+        else:
+            document_html = style + "\n" + document_html
+    if "</body>" in document_html:
+        return document_html.replace("</body>", appendix + "\n</body>", 1)
+    return document_html + "\n" + appendix
+
+
+def _structural_content_markdown(records: list[dict[str, Any]]) -> str:
+    if not records:
+        return ""
+    labels = {
+        "page_header": "Page header",
+        "page_footer": "Page footer",
+        "footnote": "Footnote",
+    }
+    lines = [
+        STRUCTURAL_CONTENT_MD_START,
+        "",
+        "---",
+        "",
+        "## Extracted page-edge notes",
+        "",
+        "High-confidence headers, footers, and footnotes isolated from the main reading flow.",
+        "",
+    ]
+    for record in records:
+        lines.extend(
+            [
+                f"### Page {record.get('page_no') or 'unknown'} - {labels[record['kind']]}",
+                "",
+                record["text"],
+                "",
+                (
+                    "<!-- structural evidence "
+                    f"confidence={record.get('confidence')} "
+                    f"score={record.get('evidence_score')} "
+                    f"reasons={','.join(record.get('reasons') or [])} -->"
+                ),
+                "",
+            ]
+        )
+    lines.append(STRUCTURAL_CONTENT_MD_END)
+    return "\n".join(lines) + "\n"
+
+
+def _append_structural_content_markdown(
+    document_markdown: str,
+    records: list[dict[str, Any]],
+) -> str:
+    appendix = _structural_content_markdown(records)
+    if not appendix or STRUCTURAL_CONTENT_MD_START in document_markdown:
+        return document_markdown
+    return document_markdown.rstrip() + "\n\n" + appendix
+
+
+def _html_without_structural_content(document_html: str) -> str:
+    return re.sub(
+        rf'<section\b[^>]*id="{re.escape(STRUCTURAL_CONTENT_HTML_ID)}"[^>]*>.*?</section>',
+        " ",
+        document_html,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+
+
+def _markdown_without_structural_content(document_markdown: str) -> str:
+    return re.sub(
+        re.escape(STRUCTURAL_CONTENT_MD_START)
+        + r".*?"
+        + re.escape(STRUCTURAL_CONTENT_MD_END),
+        " ",
+        document_markdown,
+        flags=re.DOTALL,
+    )
+
+
 def apply_structural_quarantine_to_outputs(
     output_dir: Path,
     document_json: Any,
@@ -2274,6 +2488,7 @@ def apply_structural_quarantine_to_outputs(
         item for item in candidates
         if item.get("action") == "quarantine_from_main_text_flow"
     ]
+    export_records = _structural_export_records(candidates)
 
     json_path = output_dir / "document.json"
     if json_path.exists():
@@ -2303,6 +2518,7 @@ def apply_structural_quarantine_to_outputs(
                 html_text, changed = _replace_exact_paragraph_with_quarantine(html_text, item)
             if changed:
                 html_replacements += 1
+        html_text = _append_structural_content_html(html_text, export_records)
         html_path.write_text(html_text, encoding="utf-8")
 
     md_replacements = 0
@@ -2333,14 +2549,17 @@ def apply_structural_quarantine_to_outputs(
                 )
             if count:
                 md_replacements += 1
+        md_text = _append_structural_content_markdown(md_text, export_records)
         md_path.write_text(md_text, encoding="utf-8")
 
     final_html = html_path.read_text(encoding="utf-8") if html_path.exists() else ""
     final_md = md_path.read_text(encoding="utf-8") if md_path.exists() else ""
+    body_html = _html_without_structural_content(final_html)
+    body_md = _markdown_without_structural_content(final_md)
     markdown_without_comments = re.sub(
         r"<!--.*?-->",
         " ",
-        final_md,
+        body_md,
         flags=re.DOTALL,
     )
     residuals: list[dict[str, Any]] = []
@@ -2350,10 +2569,10 @@ def apply_structural_quarantine_to_outputs(
         if (
             target
             and item.get("match_mode") == "fragment"
-            and target in _visible_html_text(final_html)
+            and target in _visible_html_text(body_html)
         ):
             residual_surfaces.append("document.html")
-        elif target and _html_has_exact_visible_block(final_html, target):
+        elif target and _html_has_exact_visible_block(body_html, target):
             residual_surfaces.append("document.html")
         if (
             target
@@ -2379,6 +2598,37 @@ def apply_structural_quarantine_to_outputs(
     qc["isolated_main_text_pollution_count"] = html_replacements + md_replacements
     qc["final_output_residual_count"] = len(residuals)
     qc["final_output_residuals"] = residuals
+    qc["exported_structural_content_count"] = len(export_records)
+    qc["exported_structural_content_counts_by_kind"] = {
+        kind: sum(1 for item in export_records if item["kind"] == kind)
+        for kind in ("page_header", "page_footer", "footnote")
+    }
+    qc["html_structural_content_count"] = sum(
+        1
+        for item in export_records
+        if _html_has_exact_visible_block(final_html, item["text"])
+    )
+    qc["markdown_structural_content_count"] = sum(
+        1
+        for item in export_records
+        if _markdown_exact_text_pattern(item["text"]).search(final_md)
+    )
+    content_sidecar = {
+        "schema_version": 1,
+        "description": (
+            "High-confidence headers, footers, and footnotes exported outside "
+            "the main reading flow."
+        ),
+        "record_count": len(export_records),
+        "counts_by_kind": qc["exported_structural_content_counts_by_kind"],
+        "records": export_records,
+    }
+    content_sidecar_path = output_dir / "structural_content.json"
+    content_sidecar_path.write_text(
+        json.dumps(content_sidecar, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    qc["content_sidecar_path"] = content_sidecar_path.name
     sidecar_path = output_dir / "structural_regions.json"
     sidecar_path.write_text(json.dumps(qc, indent=2, ensure_ascii=False), encoding="utf-8")
     qc["sidecar_path"] = sidecar_path.name
@@ -3070,7 +3320,11 @@ def run_unified_review_qc(
         }
     )
     metadata.setdefault("generated_outputs", []).extend(
-        ["links.json", structural_quarantine["sidecar_path"]]
+        [
+            "links.json",
+            structural_quarantine["sidecar_path"],
+            structural_quarantine["content_sidecar_path"],
+        ]
     )
     if formula_latex_sources.get("written"):
         metadata.setdefault("generated_outputs", []).append(str(formula_latex_sources["path"]))

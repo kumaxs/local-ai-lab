@@ -9,6 +9,7 @@ top-level run summaries for manual inspection.
 from __future__ import annotations
 
 import argparse
+import html
 import json
 import re
 import subprocess
@@ -150,6 +151,11 @@ def summarize_success(pdf: Path, job_id: str, output_dir: Path, elapsed: float) 
         ),
         "header_footer_footnote_candidate_count": structural.get("candidate_count"),
         "isolated_main_text_pollution_count": structural.get("isolated_main_text_pollution_count"),
+        "exported_structural_content_count": structural.get("exported_structural_content_count"),
+        "exported_structural_content_counts_by_kind": (
+            structural.get("exported_structural_content_counts_by_kind") or {}
+        ),
+        "final_output_structural_residual_count": structural.get("final_output_residual_count"),
         "recovered_footnote_count": structural.get("recovered_footnote_count"),
         "unresolved_footnote_count": structural.get("unresolved_footnote_count"),
         "evidence_links": {
@@ -157,6 +163,8 @@ def summarize_success(pdf: Path, job_id: str, output_dir: Path, elapsed: float) 
             "metadata": str(output_dir / "metadata.json"),
             "status": str(output_dir / "status.json"),
             "formula_second_pass": str(output_dir / "formula_second_pass" / "second_pass_summary.json"),
+            "structural_content": str(output_dir / "structural_content.json"),
+            "structural_regions": str(output_dir / "structural_regions.json"),
         },
         "table_count": metadata.get("table_count"),
         "image_refs_embedded": metadata.get("image_refs_embedded"),
@@ -199,6 +207,9 @@ def summarize_failure(
         "unresolved_formula_number_count": None,
         "header_footer_footnote_candidate_count": None,
         "isolated_main_text_pollution_count": None,
+        "exported_structural_content_count": None,
+        "exported_structural_content_counts_by_kind": {},
+        "final_output_structural_residual_count": None,
         "recovered_footnote_count": None,
         "unresolved_footnote_count": None,
         "evidence_links": {},
@@ -291,6 +302,115 @@ def write_markdown_summary(output_root: Path, rows: list[dict[str, Any]]) -> Non
         )
     (output_root / "all_testpdf_qc_summary.md").write_text(
         "\n".join(qc_lines) + "\n", encoding="utf-8"
+    )
+
+
+def write_manual_review_index(output_root: Path, rows: list[dict[str, Any]]) -> None:
+    review_dir = output_root / "manual_review"
+    review_dir.mkdir(parents=True, exist_ok=True)
+    table_rows = []
+    markdown_rows = []
+    for row in rows:
+        job_id = row["job_id"]
+        prefix = f"../{job_id}"
+        status_label = "OK" if row.get("ok") else "FAILED"
+        output_dir = output_root / job_id
+        html_link = (
+            f'<a href="{prefix}/document.html">HTML</a>'
+            if (output_dir / "document.html").exists()
+            else "N/A"
+        )
+        md_link = (
+            f'<a href="{prefix}/document.md">Markdown</a>'
+            if (output_dir / "document.md").exists()
+            else "N/A"
+        )
+        structural_content_link = (
+            f'<a href="{prefix}/structural_content.json">Extracted structure</a>'
+            if (output_dir / "structural_content.json").exists()
+            else "Not generated"
+        )
+        structural_regions_link = (
+            f'<a href="{prefix}/structural_regions.json">QC evidence</a>'
+            if (output_dir / "structural_regions.json").exists()
+            else "Not generated"
+        )
+        table_rows.append(
+            "<tr>"
+            f"<td>{html.escape(row['input_filename'])}</td>"
+            f"<td>{status_label}</td>"
+            f"<td>{html_link}</td>"
+            f"<td>{md_link}</td>"
+            f"<td>{structural_content_link}</td>"
+            f"<td>{structural_regions_link}</td>"
+            "</tr>"
+        )
+        md_html_link = (
+            f"[HTML]({job_id}/document.html)"
+            if (output_dir / "document.html").exists()
+            else "N/A"
+        )
+        md_document_link = (
+            f"[Markdown]({job_id}/document.md)"
+            if (output_dir / "document.md").exists()
+            else "N/A"
+        )
+        md_structural_content_link = (
+            f"[Extracted structure]({job_id}/structural_content.json)"
+            if (output_dir / "structural_content.json").exists()
+            else "Not generated"
+        )
+        md_structural_regions_link = (
+            f"[QC evidence]({job_id}/structural_regions.json)"
+            if (output_dir / "structural_regions.json").exists()
+            else "Not generated"
+        )
+        markdown_rows.append(
+            f"| {row['input_filename']} | {status_label} | "
+            f"{md_html_link} | {md_document_link} | "
+            f"{md_structural_content_link} | {md_structural_regions_link} |"
+        )
+    page = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Docling manual review</title>
+<style>
+body { font-family: system-ui, sans-serif; margin: 2rem auto; max-width: 90rem; padding: 0 1rem; color: #17212b; }
+table { border-collapse: collapse; width: 100%%; }
+th, td { border-bottom: 1px solid #cbd3da; padding: .65rem; text-align: left; }
+th { background: #eef2f4; }
+a { color: #075ea8; }
+.summary { color: #52606d; }
+</style>
+</head>
+<body>
+<h1>Docling manual review</h1>
+<p class="summary">Completed: %d / %d. Review rendered HTML first, then compare Markdown and structural evidence.</p>
+<table>
+<thead><tr><th>PDF</th><th>Status</th><th>Rendered</th><th>Markdown</th><th>Structural output</th><th>Evidence</th></tr></thead>
+<tbody>%s</tbody>
+</table>
+</body>
+</html>
+""" % (
+        sum(1 for row in rows if row.get("ok")),
+        len(rows),
+        "".join(table_rows),
+    )
+    (review_dir / "index.html").write_text(page, encoding="utf-8")
+    markdown = [
+        "# Docling manual review",
+        "",
+        "| PDF | Status | Rendered | Markdown | Structural output | Evidence |",
+        "| --- | --- | --- | --- | --- | --- |",
+        *markdown_rows,
+        "",
+    ]
+    (output_root / "MANUAL_REVIEW.md").write_text(
+        "\n".join(markdown),
+        encoding="utf-8",
     )
 
 
@@ -388,6 +508,7 @@ def main() -> int:
             json.dumps(rows, indent=2, ensure_ascii=False), encoding="utf-8"
         )
         write_markdown_summary(args.output_root, rows)
+        write_manual_review_index(args.output_root, rows)
 
     return 0
 
