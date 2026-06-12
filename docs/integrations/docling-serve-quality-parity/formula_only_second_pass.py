@@ -40,9 +40,21 @@ NUMBER_ONLY_RE = re.compile(r"^\s*(\(\s*[0-9]+\s*\)\s*)+\s*$")
 # Suspicious repeated single characters like \ T \ T \ T (4+ repeats)
 REPEATED_SINGLE_RE = re.compile(r"(\\ [a-zA-Z]\s*){4,}")
 SPACED_OPERATOR_REPLACEMENTS = (
-    (re.compile(r"(?<![A-Za-z])s\s+o\s+f\s+t\s+m\s+a\s+x(?![A-Za-z])", re.I), r"\operatorname{softmax}"),
+    (
+        re.compile(
+            r"(?<![A-Za-z])s\s+o\s+f\s+t\s+(?:m\s+a\s+x|\\max)(?![A-Za-z])",
+            re.I,
+        ),
+        r"\operatorname{softmax}",
+    ),
     (re.compile(r"(?<![A-Za-z])s\s+i\s+g\s+m\s+o\s+i\s+d(?![A-Za-z])", re.I), r"\operatorname{sigmoid}"),
     (re.compile(r"(?<![A-Za-z])L\s+e\s+a\s+k\s+y\s+R\s+e\s+L\s+U(?![A-Za-z])"), r"\operatorname{LeakyReLU}"),
+    (
+        re.compile(
+            r"(?<![A-Za-z])L\s+e\s+a\s+k\s+y\s+\{\s*\\text\s*\{\s*R\s*e\s*L\s*U\s*\}\s*\}",
+        ),
+        r"\operatorname{LeakyReLU}",
+    ),
     (re.compile(r"(?<![A-Za-z])R\s+e\s+L\s+U(?![A-Za-z])"), r"\operatorname{ReLU}"),
     (re.compile(r"(?<![A-Za-z])L\s+a\s+y\s+e\s+r\s+N\s+o\s+r\s+m(?![A-Za-z])"), r"\operatorname{LayerNorm}"),
     (re.compile(r"(?<![A-Za-z])A\s+t\s+t\s+e\s+n\s+t\s+i\s+o\s+n(?![A-Za-z])"), r"\operatorname{Attention}"),
@@ -50,6 +62,7 @@ SPACED_OPERATOR_REPLACEMENTS = (
     (re.compile(r"(?<![A-Za-z])t\s+a\s+n\s+h(?![A-Za-z])", re.I), r"\operatorname{tanh}"),
     (re.compile(r"(?<![A-Za-z])e\s+x\s+p(?![A-Za-z])", re.I), r"\exp"),
     (re.compile(r"(?<![A-Za-z])M\s+a\s+x\s+P\s+o\s+o\s+l\s+i\s+n\s+g(?![A-Za-z])"), r"\operatorname{MaxPooling}"),
+    (re.compile(r"\{\s*R\s+e\s*\}\s*L\s+U(?![A-Za-z])"), r"\operatorname{ReLU}"),
 )
 # Source bbox area threshold (tiny = likely wrong detection)
 MIN_BBOX_AREA = 50.0  # PDF points^2
@@ -591,7 +604,102 @@ def normalize_formula_candidate(formula_text: str) -> str:
     normalized = formula_text
     for pattern, replacement in SPACED_OPERATOR_REPLACEMENTS:
         normalized = pattern.sub(lambda _match, value=replacement: value, normalized)
+    normalized = re.sub(
+        r"=\s*0\s*(?=\([^()]{1,80}\)\s*\\times\s*W)",
+        "= O ",
+        normalized,
+    )
+    normalized = re.sub(
+        r"_\s*\{\s*_\s*\{\s*([^{}]{1,80})\s*\}\s*\}",
+        lambda match: f"_ {{ {match.group(1).strip()} }}",
+        normalized,
+    )
     return normalized
+
+
+def formula_hallucination_reasons(formula_text: str | None) -> list[str]:
+    """Detect output patterns that are visibly unusable even when TeX is balanced."""
+    text = (formula_text or "").strip()
+    reasons: list[str] = []
+    if not text or NUMBER_ONLY_RE.fullmatch(text):
+        reasons.append("missing_formula_body")
+    if len(text) > 1800:
+        reasons.append("formula_unusually_long")
+    if REPEATED_AND_RE.search(text):
+        reasons.append("repeated_and_hallucination")
+    if REPEATED_SINGLE_RE.search(text):
+        reasons.append("repeated_single_chars")
+
+    atoms = re.findall(
+        r"\\(?:mathfrak|mathrm|mathbf|mathcal|text)\s*\{\s*[^{}]{1,16}\s*\}",
+        text,
+    )
+    if atoms:
+        most_common = max(atoms.count(atom) for atom in set(atoms))
+        if most_common >= 8 and most_common / len(atoms) >= 0.45:
+            reasons.append("repeated_tex_atom_hallucination")
+    return reasons
+
+
+def canonicalize_formula_output(
+    formula_text: str | None,
+    equation_number: int | None = None,
+) -> tuple[str, list[str]]:
+    """Normalize a final formula without inventing mathematical content."""
+    text = normalize_formula_candidate(formula_text or "").strip()
+    repairs: list[str] = []
+    if equation_number is not None:
+        tex_space = r"(?:\s|\\[,;:!]|\\\s)*"
+        digits = tex_space.join(re.escape(char) for char in str(equation_number))
+        number_pattern = re.compile(
+            r"\(" + tex_space + digits + tex_space + r"\)"
+        )
+        trailing_arrays = list(
+            re.finditer(
+                r"(?s)\\begin\s*\{\s*array\s*\}.*?\\end\s*\{\s*array\s*\}",
+                text,
+            )
+        )
+        if trailing_arrays:
+            array_match = trailing_arrays[-1]
+            suffix = text[array_match.end() :]
+            suffix_number = number_pattern.search(suffix)
+            array_text = array_match.group(0)
+            array_payload = re.sub(r"\\(?:begin|end)\s*\{[^}]+\}", "", array_text)
+            array_payload = re.sub(r"[\s{}&\\,;:!]+", "", array_payload)
+            if (
+                suffix_number
+                and not re.sub(
+                    r"(?:\s|\\[,;:!]|\\\s)+",
+                    "",
+                    suffix[: suffix_number.start()],
+                )
+                and
+                len(array_payload) <= 32
+                and not re.search(r"[=<>]|\\(?:frac|sum|int|prod|lim)", array_text)
+            ):
+                prefix = re.sub(
+                    r"(?:(?:\\quad)|(?:\\[,;:!])|(?:\\\s)|\s)+$",
+                    "",
+                    text[: array_match.start()],
+                )
+                text = prefix + " " + suffix[suffix_number.start() :]
+                repairs.append("trimmed_low_information_trailing_array")
+        matches = list(number_pattern.finditer(text))
+        if matches:
+            first = matches[0]
+            tail = text[first.end() :]
+            if formula_hallucination_reasons(tail):
+                text = text[: first.end()].strip()
+                repairs.append("trimmed_hallucinated_suffix")
+            text, removed = number_pattern.subn("", text)
+            if removed > 1:
+                repairs.append("removed_duplicate_equation_numbers")
+        text = re.sub(r"(?:(?:\\quad)|(?:\\[,;:!])|(?:\\\s))\s*$", "", text).strip()
+        text = re.sub(r"(?:\\quad\s*)+$", "", text).strip()
+        if text and not NUMBER_ONLY_RE.fullmatch(text):
+            text = f"{text} \\quad ( {equation_number} )"
+    return re.sub(r"[ \t]+", " ", text).strip(), repairs
 
 
 def _find_markdown_block(md_text: str, formula_text: str, eq_num: int | None) -> str:
