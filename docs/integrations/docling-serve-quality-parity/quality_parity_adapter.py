@@ -609,6 +609,101 @@ def bbox_geometry(prov: dict[str, Any] | None) -> dict[str, float] | None:
     }
 
 
+def _bbox_union(boxes: list[dict[str, float]]) -> dict[str, float] | None:
+    if not boxes:
+        return None
+    left = min(box["l"] for box in boxes)
+    right = max(box["r"] for box in boxes)
+    top = max(box["t"] for box in boxes)
+    bottom = min(box["b"] for box in boxes)
+    return {
+        "l": left,
+        "r": right,
+        "t": top,
+        "b": bottom,
+        "width": right - left,
+        "height": top - bottom,
+    }
+
+
+def _point_inside_bbox(x: float, y: float, bbox: dict[str, Any] | None) -> bool:
+    if not bbox:
+        return False
+    return (
+        float(bbox.get("l", 0)) - 1 <= x <= float(bbox.get("r", 0)) + 1
+        and float(bbox.get("b", 0)) - 1 <= y <= float(bbox.get("t", 0)) + 1
+    )
+
+
+def pdf_source_text_evidence(input_file: Path) -> dict[str, Any]:
+    """Read source text characters with font and geometry evidence."""
+    try:
+        import pypdfium2 as pdfium
+    except ImportError:
+        return {"available": False, "reason": "pypdfium2_unavailable", "pages": {}}
+    try:
+        pdf = pdfium.PdfDocument(str(input_file))
+    except Exception as exc:
+        return {
+            "available": False,
+            "reason": f"pdf_open_failed:{type(exc).__name__}",
+            "pages": {},
+        }
+    pages: dict[int, dict[str, Any]] = {}
+    try:
+        for page_index in range(len(pdf)):
+            page = pdf[page_index]
+            textpage = page.get_textpage()
+            characters: list[dict[str, Any]] = []
+            font_sizes: list[float] = []
+            for char_index in range(textpage.count_chars()):
+                text = textpage.get_text_range(char_index, 1)
+                if not text:
+                    continue
+                text_object = textpage.get_textobj(char_index)
+                if text_object is None:
+                    continue
+                try:
+                    box = textpage.get_charbox(char_index)
+                    font = text_object.get_font()
+                    font_name = font.get_base_name() if font else ""
+                    font_weight = font.get_weight() if font else None
+                    font_size = float(text_object.get_font_size())
+                except Exception:
+                    continue
+                bbox = {
+                    "l": float(box[0]),
+                    "b": float(box[1]),
+                    "r": float(box[2]),
+                    "t": float(box[3]),
+                }
+                characters.append(
+                    {
+                        "index": char_index,
+                        "text": text.replace("\ufffe", ""),
+                        "bbox": bbox,
+                        "font_name": font_name or "",
+                        "font_weight": font_weight,
+                        "font_size": font_size,
+                    }
+                )
+                if text.strip() and font_size > 0:
+                    font_sizes.append(font_size)
+            font_sizes.sort()
+            median_size = (
+                font_sizes[len(font_sizes) // 2]
+                if font_sizes
+                else 0.0
+            )
+            pages[page_index + 1] = {
+                "characters": characters,
+                "median_font_size": median_size,
+            }
+    finally:
+        pdf.close()
+    return {"available": True, "reason": None, "pages": pages}
+
+
 def table_grid(table: dict[str, Any]) -> list[list[str]]:
     cells = ((table.get("data") or {}).get("table_cells") or [])
     max_row = 0
@@ -1302,7 +1397,7 @@ def _polish_footnote_superscripts(document_html: str) -> tuple[str, int]:
     def inline_marker(match: re.Match[str]) -> str:
         nonlocal total
         total += 1
-        return f" {match.group(1)}<sup class=\"docling-footnote-ref\">{match.group(2)}</sup>{match.group(3)}"
+        return f"{match.group(1)}<sup class=\"docling-footnote-ref\">{match.group(2)}</sup>{match.group(3)}"
 
     updated = re.sub(r"(\w)\s+([∗†‡])\s+(\w)", inline_marker, updated)
     return updated, total
@@ -1324,6 +1419,314 @@ def _mark_math_heavy_text(document_html: str) -> tuple[str, int]:
         return paragraph.replace("<p>", '<p class="docling-math-text">', 1)
 
     return re.sub(r"<p>.*?</p>", replace, document_html, flags=re.S), count
+
+
+def _font_semantic_styles(font_name: str, font_weight: Any) -> list[str]:
+    normalized = font_name.lower()
+    styles: list[str] = []
+    try:
+        weight = int(font_weight)
+    except (TypeError, ValueError):
+        weight = 0
+    if (
+        weight >= 600
+        or any(token in normalized for token in ("bold", "black", "demi", "semibold"))
+    ):
+        styles.append("bold")
+    if any(token in normalized for token in ("italic", "oblique", "slanted")):
+        styles.append("italic")
+    return styles
+
+
+def _source_emphasis_runs(source_evidence: dict[str, Any]) -> list[dict[str, Any]]:
+    runs: list[dict[str, Any]] = []
+    for page_no, page in (source_evidence.get("pages") or {}).items():
+        current: dict[str, Any] | None = None
+        for char in page.get("characters") or []:
+            styles = _font_semantic_styles(
+                str(char.get("font_name") or ""),
+                char.get("font_weight"),
+            )
+            text = str(char.get("text") or "")
+            if not styles or text in "\r\n":
+                current = None
+                continue
+            key = (
+                tuple(styles),
+                char.get("font_name"),
+                char.get("font_weight"),
+                round(float(char.get("font_size") or 0.0), 2),
+            )
+            if (
+                current
+                and current["key"] == key
+                and int(char.get("index") or 0) == current["last_index"] + 1
+            ):
+                current["text"] += text
+                current["last_index"] = int(char.get("index") or 0)
+                current["boxes"].append(char["bbox"])
+            else:
+                current = {
+                    "page_no": page_no,
+                    "key": key,
+                    "styles": styles,
+                    "font_name": char.get("font_name"),
+                    "font_weight": char.get("font_weight"),
+                    "font_size": char.get("font_size"),
+                    "text": text,
+                    "last_index": int(char.get("index") or 0),
+                    "boxes": [char["bbox"]],
+                }
+                runs.append(current)
+    result = []
+    for run in runs:
+        text = re.sub(r"\s+", " ", run["text"]).strip()
+        if len(text) < 2 or not re.search(r"[A-Za-z0-9\u3400-\u9fff]", text):
+            continue
+        result.append(
+            {
+                "page_no": run["page_no"],
+                "text": text,
+                "styles": run["styles"],
+                "font_name": run["font_name"],
+                "font_weight": run["font_weight"],
+                "font_size": run["font_size"],
+                "bbox": _bbox_union(run["boxes"]),
+            }
+        )
+    return result
+
+
+def _find_text_span(text: str, target: str) -> tuple[int, int] | None:
+    direct = text.find(target)
+    if direct >= 0:
+        return direct, direct + len(target)
+    target_compact = re.sub(r"\s+", " ", target).strip()
+    if not target_compact:
+        return None
+    pattern = re.compile(r"\s+".join(re.escape(part) for part in target_compact.split()))
+    match = pattern.search(text)
+    return (match.start(), match.end()) if match else None
+
+
+def semantic_emphasis_diagnostics(
+    document_json: Any,
+    source_evidence: dict[str, Any],
+) -> list[dict[str, Any]]:
+    if not source_evidence.get("available"):
+        return []
+    records = structural_text_records(document_json)
+    diagnostics: list[dict[str, Any]] = []
+    used: set[tuple[int, int, int, str]] = set()
+    for run in _source_emphasis_runs(source_evidence):
+        bbox = run.get("bbox") or {}
+        center_x = float(bbox.get("l", 0)) + float(bbox.get("width", 0)) / 2
+        center_y = float(bbox.get("b", 0)) + float(bbox.get("height", 0)) / 2
+        candidates = [
+            record
+            for record in records
+            if record.get("page_no") == run.get("page_no")
+            and _point_inside_bbox(center_x, center_y, record.get("bbox"))
+            and str(record.get("label") or "").lower()
+            not in {
+                "formula",
+                "page_header",
+                "page_footer",
+                "footnote",
+                "section_header",
+                "title",
+                "caption",
+            }
+            and not str(record.get("label") or "").lower().startswith("quarantined_")
+        ]
+        matches = []
+        for record in candidates:
+            span = _find_text_span(str(record.get("text") or ""), str(run.get("text") or ""))
+            if span:
+                matches.append((record, span))
+        if len(matches) != 1:
+            continue
+        record, span = matches[0]
+        key = (
+            int(record.get("reading_order") or 0),
+            span[0],
+            span[1],
+            ",".join(run["styles"]),
+        )
+        if key in used:
+            continue
+        used.add(key)
+        item = {
+            "page_no": run["page_no"],
+            "text": str(record.get("text") or "")[span[0] : span[1]],
+            "start": span[0],
+            "end": span[1],
+            "styles": run["styles"],
+            "font_name": run["font_name"],
+            "font_weight": run["font_weight"],
+            "font_size": run["font_size"],
+            "bbox": run["bbox"],
+            "source": "pdf_text_character_font_evidence",
+            "confidence": "high",
+            "reading_order": record.get("reading_order"),
+            "node_text": record.get("text"),
+        }
+        node = record.get("node")
+        if isinstance(node, dict):
+            formatting = node.get("formatting")
+            if not isinstance(formatting, dict):
+                formatting = {}
+                node["formatting"] = formatting
+            formatting.setdefault("semantic_spans", []).append(
+                {
+                    key: item[key]
+                    for key in (
+                        "text",
+                        "start",
+                        "end",
+                        "styles",
+                        "source",
+                        "confidence",
+                        "font_name",
+                        "font_weight",
+                        "font_size",
+                        "bbox",
+                    )
+                }
+            )
+        diagnostics.append(item)
+    return diagnostics
+
+
+def _styled_html_text(text: str, styles: list[str]) -> str:
+    result = html.escape(text)
+    if "italic" in styles:
+        result = f"<em>{result}</em>"
+    if "bold" in styles:
+        result = f"<strong>{result}</strong>"
+    return result
+
+
+def _styled_markdown_text(text: str, styles: list[str]) -> str:
+    result = text
+    if "italic" in styles:
+        result = f"*{result}*"
+    if "bold" in styles:
+        result = f"**{result}**"
+    return result
+
+
+def _apply_semantic_spans_to_html(
+    document_html: str,
+    diagnostics: list[dict[str, Any]],
+) -> tuple[str, int]:
+    updated = document_html
+    count = 0
+    by_node: dict[tuple[Any, str], list[dict[str, Any]]] = {}
+    for item in diagnostics:
+        by_node.setdefault((item.get("page_no"), str(item.get("node_text") or "")), []).append(item)
+    for (_page_no, node_text), spans in by_node.items():
+        target = _normalized_noise_text(node_text)
+        for match in HTML_TEXT_BLOCK_RE.finditer(updated):
+            visible = _normalized_noise_text(
+                html.unescape(HTML_TAG_RE.sub(" ", match.group("body")))
+            )
+            if visible != target:
+                continue
+            body = match.group("body")
+            changed = 0
+            for item in sorted(spans, key=lambda value: value["start"], reverse=True):
+                source = html.escape(str(item["text"]))
+                if source not in body:
+                    continue
+                body = body.replace(
+                    source,
+                    _styled_html_text(str(item["text"]), item["styles"]),
+                    1,
+                )
+                changed += 1
+            if changed:
+                replacement = (
+                    f"<{match.group('tag')}{match.group('attrs')}>"
+                    f"{body}</{match.group('tag')}>"
+                )
+                updated = updated[: match.start()] + replacement + updated[match.end() :]
+                count += changed
+            break
+    return updated, count
+
+
+def _apply_semantic_spans_to_markdown(
+    document_markdown: str,
+    diagnostics: list[dict[str, Any]],
+) -> tuple[str, int]:
+    updated = document_markdown
+    count = 0
+    by_node: dict[tuple[Any, str], list[dict[str, Any]]] = {}
+    for item in diagnostics:
+        by_node.setdefault((item.get("page_no"), str(item.get("node_text") or "")), []).append(item)
+    for (_page_no, node_text), spans in by_node.items():
+        source_node_text = (
+            node_text
+            if node_text in updated
+            else html.escape(node_text, quote=False)
+        )
+        if not node_text or source_node_text not in updated:
+            continue
+        replacement = source_node_text
+        changed = 0
+        for item in sorted(spans, key=lambda value: value["start"], reverse=True):
+            source = str(item.get("text") or "")
+            source_variant = (
+                source
+                if source in replacement
+                else html.escape(source, quote=False)
+            )
+            source_index = replacement.rfind(source_variant)
+            if source_index < 0:
+                continue
+            replacement = (
+                replacement[:source_index]
+                + _styled_markdown_text(source_variant, item["styles"])
+                + replacement[source_index + len(source_variant):]
+            )
+            changed += 1
+        if changed:
+            updated = updated.replace(source_node_text, replacement, 1)
+            count += changed
+    return updated, count
+
+
+def apply_semantic_emphasis_to_outputs(
+    output_dir: Path,
+    document_json: Any,
+    source_evidence: dict[str, Any],
+) -> dict[str, Any]:
+    diagnostics = semantic_emphasis_diagnostics(document_json, source_evidence)
+    html_count = 0
+    md_count = 0
+    html_path = output_dir / "document.html"
+    if html_path.exists() and diagnostics:
+        updated, html_count = _apply_semantic_spans_to_html(
+            html_path.read_text(encoding="utf-8"),
+            diagnostics,
+        )
+        html_path.write_text(updated, encoding="utf-8")
+    md_path = output_dir / "document.md"
+    if md_path.exists() and diagnostics:
+        updated, md_count = _apply_semantic_spans_to_markdown(
+            md_path.read_text(encoding="utf-8"),
+            diagnostics,
+        )
+        md_path.write_text(updated, encoding="utf-8")
+    return {
+        "source_available": bool(source_evidence.get("available")),
+        "source_reason": source_evidence.get("reason"),
+        "detected_span_count": len(diagnostics),
+        "html_applied_span_count": html_count,
+        "markdown_applied_span_count": md_count,
+        "spans": diagnostics,
+    }
 
 
 def structural_text_records(document_json: Any) -> list[dict[str, Any]]:
@@ -1429,7 +1832,10 @@ FOOTNOTE_CONTENT_NOISE_RE = re.compile(
     r"internship|permission to make|copyright|acm isbn|doi\.org|"
     r"all rights reserved)\b"
 )
-HTML_TEXT_BLOCK_RE = re.compile(r"<(?P<tag>p|li)\b(?P<attrs>[^>]*)>(?P<body>.*?)</(?P=tag)>", re.I | re.S)
+HTML_TEXT_BLOCK_RE = re.compile(
+    r"<(?P<tag>p|li|h[1-6])\b(?P<attrs>[^>]*)>(?P<body>.*?)</(?P=tag)>",
+    re.I | re.S,
+)
 ABRUPT_VISUAL_TEXT_SUFFIX_RE = re.compile(
     r"(?P<fragment>\s+(?:for|with|of|to|in)\s+"
     r"(?P<artifact>[A-Z][A-Z0-9._/-]*(?:\s+[A-Z][A-Z0-9._/-]*){2,}))\s*$"
@@ -2323,7 +2729,489 @@ def _structural_export_records(candidates: list[dict[str, Any]]) -> list[dict[st
     )
 
 
-def _structural_content_html(records: list[dict[str, Any]]) -> str:
+NOTE_MARKER_PREFIX_RE = re.compile(r"^\s*([∗*†‡]|\d{1,2})(?:\s+|$)(.*)$", re.S)
+
+
+def _note_marker_and_body(text: str) -> tuple[str | None, str]:
+    match = NOTE_MARKER_PREFIX_RE.match(text)
+    if not match:
+        return None, text.strip()
+    return match.group(1).replace("∗", "*"), match.group(2).strip()
+
+
+def _same_note_column(left: dict[str, Any], right: dict[str, Any]) -> bool:
+    left_box = left.get("bbox") or {}
+    right_box = right.get("bbox") or {}
+    if not left_box or not right_box:
+        return False
+    return abs(float(left_box.get("l", 0)) - float(right_box.get("l", 0))) <= 32
+
+
+def _vertically_adjacent_note_lines(upper: dict[str, Any], lower: dict[str, Any]) -> bool:
+    upper_box = upper.get("bbox") or {}
+    lower_box = lower.get("bbox") or {}
+    if not upper_box or not lower_box:
+        return False
+    gap = float(upper_box.get("b", 0)) - float(lower_box.get("t", 0))
+    overlap_tolerance = max(
+        float(upper_box.get("height") or abs(float(upper_box.get("t", 0)) - float(upper_box.get("b", 0)))),
+        float(lower_box.get("height") or abs(float(lower_box.get("t", 0)) - float(lower_box.get("b", 0)))),
+        8.0,
+    ) * 0.75
+    return -overlap_tolerance <= gap <= 18
+
+
+def _join_note_text(parts: list[str]) -> str:
+    result = ""
+    for part in parts:
+        part = part.strip()
+        if not part:
+            continue
+        if result.endswith("-") and re.match(r"^[a-z]", part):
+            result = result[:-1] + part
+        else:
+            result = f"{result} {part}".strip()
+    return result
+
+
+def _note_marker_slug(marker: str | None) -> str:
+    return {
+        "*": "star",
+        "†": "dagger",
+        "‡": "double-dagger",
+    }.get(marker or "", marker or "unmarked")
+
+
+def _build_structural_note_groups(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    groups: list[dict[str, Any]] = []
+    footnotes_by_page: dict[Any, list[dict[str, Any]]] = {}
+    for record in records:
+        if record.get("kind") == "footnote":
+            footnotes_by_page.setdefault(record.get("page_no"), []).append(record)
+    for page_no, page_records in footnotes_by_page.items():
+        ordered = sorted(
+            page_records,
+            key=lambda item: (
+                -float((item.get("bbox") or {}).get("t", 0)),
+                float((item.get("bbox") or {}).get("l", 0)),
+                item["index"],
+            ),
+        )
+        pending_unmarked: list[dict[str, Any]] = []
+        current: dict[str, Any] | None = None
+        page_groups: list[dict[str, Any]] = []
+        for record_index, record in enumerate(ordered):
+            marker, body = _note_marker_and_body(str(record.get("text") or ""))
+            if marker:
+                prefix_records: list[dict[str, Any]] = []
+                if (
+                    pending_unmarked
+                    and pending_unmarked[-1].get("text", "").rstrip().endswith("-")
+                    and _same_note_column(pending_unmarked[-1], record)
+                    and _vertically_adjacent_note_lines(pending_unmarked[-1], record)
+                ):
+                    prefix_records = pending_unmarked
+                    pending_unmarked = []
+                elif pending_unmarked:
+                    for pending in pending_unmarked:
+                        page_groups.append(
+                            {
+                                "marker": None,
+                                "parts": [pending],
+                                "reason": "unmarked_note_fragment",
+                            }
+                        )
+                    pending_unmarked = []
+                current = {
+                    "marker": marker,
+                    "parts": prefix_records + [record],
+                    "reason": (
+                        "marker_attached_to_continuation_line"
+                        if prefix_records
+                        else "explicit_marker"
+                    ),
+                }
+                page_groups.append(current)
+                continue
+            next_record = (
+                ordered[record_index + 1]
+                if record_index + 1 < len(ordered)
+                else None
+            )
+            next_marker = (
+                _note_marker_and_body(str(next_record.get("text") or ""))[0]
+                if next_record
+                else None
+            )
+            if (
+                next_record
+                and next_marker
+                and str(record.get("text") or "").rstrip().endswith("-")
+                and _same_note_column(record, next_record)
+                and _vertically_adjacent_note_lines(record, next_record)
+            ):
+                pending_unmarked.append(record)
+                current = None
+                continue
+            if current and _same_note_column(current["parts"][-1], record) and _vertically_adjacent_note_lines(
+                current["parts"][-1],
+                record,
+            ):
+                current["parts"].append(record)
+            else:
+                pending_unmarked.append(record)
+                current = None
+        for pending in pending_unmarked:
+            page_groups.append(
+                {
+                    "marker": None,
+                    "parts": [pending],
+                    "reason": "unmarked_note_fragment",
+                }
+            )
+        marker_counts: dict[str, int] = {}
+        for group in page_groups:
+            marker = group["marker"]
+            marker_key = _note_marker_slug(marker)
+            marker_counts[marker_key] = marker_counts.get(marker_key, 0) + 1
+            ordinal = marker_counts[marker_key]
+            note_id = re.sub(
+                r"[^a-z0-9]+",
+                "-",
+                f"docling-note-p{page_no}-{marker_key}-{ordinal}".lower(),
+            ).strip("-")
+            bodies = []
+            for position, part in enumerate(group["parts"]):
+                part_marker, part_body = _note_marker_and_body(str(part.get("text") or ""))
+                bodies.append(part_body if part_marker else str(part.get("text") or "").strip())
+                part["note_id"] = note_id
+                part["note_marker"] = marker
+                part["note_group_position"] = position
+            groups.append(
+                {
+                    "note_id": note_id,
+                    "page_no": page_no,
+                    "marker": marker,
+                    "text": _join_note_text(bodies),
+                    "source_record_indexes": [part["index"] for part in group["parts"]],
+                    "source_fragments": [part["text"] for part in group["parts"]],
+                    "assembly_reason": group["reason"],
+                    "confidence": (
+                        "high"
+                        if marker and all(part.get("confidence") == "high" for part in group["parts"])
+                        else "unresolved"
+                    ),
+                }
+            )
+    return groups
+
+
+def _pdf_inline_note_references(
+    document_json: Any,
+    source_evidence: dict[str, Any],
+    note_groups: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    records = structural_text_records(document_json)
+    references: list[dict[str, Any]] = []
+    marker_chars = set("*∗†‡0123456789")
+    available_markers: dict[Any, set[str]] = {}
+    for note in note_groups or []:
+        marker = note.get("marker")
+        if marker:
+            available_markers.setdefault(note.get("page_no"), set()).add(str(marker))
+    for page_no, page in (source_evidence.get("pages") or {}).items():
+        median_size = float(page.get("median_font_size") or 0.0)
+        page_characters = page.get("characters") or []
+        small = [
+            char
+            for char in page_characters
+            if str(char.get("text") or "") in marker_chars
+            and median_size > 0
+            and float(char.get("font_size") or 0.0) <= median_size * 0.78
+        ]
+        index = 0
+        while index < len(small):
+            group = [small[index]]
+            while (
+                index + 1 < len(small)
+                and int(small[index + 1]["index"]) == int(group[-1]["index"]) + 1
+                and abs(float(small[index + 1]["font_size"]) - float(group[-1]["font_size"])) < 0.2
+            ):
+                index += 1
+                group.append(small[index])
+            index += 1
+            marker = "".join(str(char["text"]) for char in group).replace("∗", "*")
+            if available_markers and marker not in available_markers.get(page_no, set()):
+                continue
+            bbox = _bbox_union([char["bbox"] for char in group]) or {}
+            center_x = float(bbox.get("l", 0)) + float(bbox.get("width", 0)) / 2
+            center_y = float(bbox.get("b", 0)) + float(bbox.get("height", 0)) / 2
+            candidates = [
+                record
+                for record in records
+                if record.get("page_no") == page_no
+                and _point_inside_bbox(center_x, center_y, record.get("bbox"))
+                and not str(record.get("label") or "").lower().startswith("quarantined_")
+                and str(record.get("label") or "").lower()
+                not in {"page_header", "page_footer", "footnote", "formula"}
+                and marker in str(record.get("text") or "").replace("∗", "*")
+            ]
+            if len(candidates) != 1:
+                continue
+            record = candidates[0]
+            group_indexes = {int(char["index"]) for char in group}
+            neighboring = [
+                char
+                for char in page_characters
+                if int(char.get("index") or 0) not in group_indexes
+                and 0 < min(
+                    abs(int(char.get("index") or 0) - min(group_indexes)),
+                    abs(int(char.get("index") or 0) - max(group_indexes)),
+                ) <= 3
+                and str(char.get("text") or "").strip()
+                and float(char.get("font_size") or 0) > float(group[0].get("font_size") or 0)
+            ]
+            script_position = "small_inline"
+            if neighboring:
+                neighbor = min(
+                    neighboring,
+                    key=lambda char: min(
+                        abs(int(char.get("index") or 0) - min(group_indexes)),
+                        abs(int(char.get("index") or 0) - max(group_indexes)),
+                    ),
+                )
+                neighbor_box = neighbor.get("bbox") or {}
+                neighbor_height = max(
+                    float(neighbor_box.get("t", 0)) - float(neighbor_box.get("b", 0)),
+                    1.0,
+                )
+                if float(bbox.get("b", 0)) > float(neighbor_box.get("b", 0)) + neighbor_height * 0.15:
+                    script_position = "superscript"
+                elif float(bbox.get("t", 0)) < float(neighbor_box.get("t", 0)) - neighbor_height * 0.15:
+                    script_position = "subscript"
+            if script_position == "small_inline":
+                continue
+            references.append(
+                {
+                    "page_no": page_no,
+                    "marker": marker,
+                    "bbox": bbox,
+                    "font_size": group[0].get("font_size"),
+                    "page_median_font_size": median_size,
+                    "script_position": script_position,
+                    "source": "pdf_text_character_size_and_bbox",
+                    "confidence": "high",
+                    "node_text": record.get("text"),
+                    "reading_order": record.get("reading_order"),
+                }
+            )
+    return references
+
+
+def _map_note_references(
+    note_groups: list[dict[str, Any]],
+    references: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    note_lookup: dict[tuple[Any, str], list[dict[str, Any]]] = {}
+    for note in note_groups:
+        if note.get("marker"):
+            note_lookup.setdefault((note.get("page_no"), note["marker"]), []).append(note)
+    mappings: list[dict[str, Any]] = []
+    unresolved: list[dict[str, Any]] = []
+    ref_counts: dict[str, int] = {}
+    for reference in references:
+        matches = note_lookup.get((reference.get("page_no"), reference.get("marker")), [])
+        if len(matches) != 1:
+            unresolved.append(
+                {
+                    **reference,
+                    "reason": (
+                        "note_marker_not_found"
+                        if not matches
+                        else "ambiguous_note_marker"
+                    ),
+                    "candidate_note_ids": [item["note_id"] for item in matches],
+                }
+            )
+            continue
+        note = matches[0]
+        ref_counts[note["note_id"]] = ref_counts.get(note["note_id"], 0) + 1
+        reference_id = f"{note['note_id']}-ref-{ref_counts[note['note_id']]}"
+        mappings.append(
+            {
+                **reference,
+                "note_id": note["note_id"],
+                "reference_id": reference_id,
+                "mapping_evidence": [
+                    "same_page",
+                    "exact_marker",
+                    "unique_note_candidate",
+                    f"pdf_{reference.get('script_position')}_geometry",
+                ],
+            }
+        )
+    return mappings, unresolved
+
+
+def _link_note_references_in_html(
+    document_html: str,
+    mappings: list[dict[str, Any]],
+) -> tuple[str, int]:
+    updated = document_html
+    count = 0
+    by_node: dict[tuple[Any, str], list[dict[str, Any]]] = {}
+    for mapping in mappings:
+        by_node.setdefault(
+            (mapping.get("page_no"), str(mapping.get("node_text") or "")),
+            [],
+        ).append(mapping)
+    for (_page_no, node_text), node_mappings in by_node.items():
+        target = _normalized_noise_text(node_text)
+        for match in HTML_TEXT_BLOCK_RE.finditer(updated):
+            visible = _normalized_noise_text(
+                html.unescape(HTML_TAG_RE.sub("", match.group("body")))
+            ).replace("∗", "*")
+            visible = re.sub(r"\s*([*†‡])\s*", r"\1", visible)
+            normalized_target = re.sub(
+                r"\s*([*†‡])\s*",
+                r"\1",
+                target.replace("∗", "*"),
+            )
+            if visible != normalized_target:
+                continue
+            body = match.group("body")
+            changed = 0
+            for mapping in node_mappings:
+                marker = str(mapping.get("marker") or "")
+                linked = (
+                    f'<sup id="{mapping["reference_id"]}" class="docling-note-ref">'
+                    f'<a href="#{mapping["note_id"]}">{html.escape(marker)}</a></sup>'
+                )
+                marker_source_pattern = r"[∗*]" if marker == "*" else re.escape(html.escape(marker))
+                sup_pattern = re.compile(
+                    r"<sup\b[^>]*>\s*" + marker_source_pattern + r"\s*</sup>"
+                )
+                if sup_pattern.search(body):
+                    body = sup_pattern.sub(linked, body, count=1)
+                    changed += 1
+                    continue
+                marker_pattern = re.compile(
+                    r"(?<![A-Za-z0-9])" + marker_source_pattern + r"(?![A-Za-z0-9])"
+                )
+                marker_matches = list(marker_pattern.finditer(body))
+                if not marker_matches:
+                    continue
+                selected = marker_matches[-1]
+                body = body[: selected.start()] + linked + body[selected.end() :]
+                changed += 1
+            if not changed:
+                break
+            replacement = (
+                f"<{match.group('tag')}{match.group('attrs')}>"
+                f"{body}</{match.group('tag')}>"
+            )
+            updated = updated[: match.start()] + replacement + updated[match.end() :]
+            count += changed
+            break
+    return updated, count
+
+
+def _link_note_references_in_markdown(
+    document_markdown: str,
+    mappings: list[dict[str, Any]],
+) -> tuple[str, int]:
+    def visible_markdown_text(value: str) -> str:
+        visible = re.sub(r"<!--.*?-->", " ", value, flags=re.S)
+        visible = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", visible)
+        visible = re.sub(r"\*\*(.*?)\*\*", r"\1", visible, flags=re.S)
+        visible = re.sub(r"__(.*?)__", r"\1", visible, flags=re.S)
+        visible = re.sub(
+            r"(?<!\*)\*(\S(?:[^*\n]*?\S)?)\*(?!\*)",
+            r"\1",
+            visible,
+        )
+        visible = re.sub(
+            r"(?<!_)_(\S(?:[^_\n]*?\S)?)_(?!_)",
+            r"\1",
+            visible,
+        )
+        visible = html.unescape(HTML_TAG_RE.sub(" ", visible))
+        visible = re.sub(
+            r"^\s{0,3}(?:#{1,6}\s+|[-+]\s+|\d+[.)]\s+)",
+            "",
+            visible,
+        )
+        visible = _normalized_noise_text(visible).replace("∗", "*")
+        return re.sub(r"\s*([*†‡])\s*", r"\1", visible)
+
+    updated = document_markdown
+    count = 0
+    by_node: dict[tuple[Any, str], list[dict[str, Any]]] = {}
+    for mapping in mappings:
+        by_node.setdefault(
+            (mapping.get("page_no"), str(mapping.get("node_text") or "")),
+            [],
+        ).append(mapping)
+    for (_page_no, node_text), node_mappings in by_node.items():
+        normalized_target = _normalized_noise_text(node_text).replace("∗", "*")
+        normalized_target = re.sub(r"\s*([*†‡])\s*", r"\1", normalized_target)
+        block_match = None
+        candidates = list(
+            re.finditer(
+                r"(?P<prefix>\A|\n[ \t]*\n)(?P<body>.*?)(?=\n[ \t]*\n|\Z)",
+                updated,
+                flags=re.S,
+            )
+        )
+        candidates.extend(
+            re.finditer(r"(?m)^(?P<body>[^\n]+)$", updated)
+        )
+        for candidate in candidates:
+            if visible_markdown_text(candidate.group("body")) == normalized_target:
+                block_match = candidate
+                break
+        if block_match is None:
+            continue
+        body = block_match.group("body")
+        replacements: list[tuple[int, int, str]] = []
+        mappings_by_marker: dict[str, list[dict[str, Any]]] = {}
+        for mapping in node_mappings:
+            mappings_by_marker.setdefault(str(mapping.get("marker") or ""), []).append(mapping)
+        for marker, marker_mappings in mappings_by_marker.items():
+            marker_source_pattern = r"[∗*]" if marker == "*" else re.escape(marker)
+            marker_pattern = re.compile(
+                r"(?<![A-Za-z0-9_*])"
+                + marker_source_pattern
+                + r"(?![A-Za-z0-9_*])"
+            )
+            positions = list(marker_pattern.finditer(body))
+            for mapping, position in zip(
+                reversed(marker_mappings),
+                reversed(positions),
+            ):
+                linked = (
+                    f'<sup id="{mapping["reference_id"]}">'
+                    f'<a href="#{mapping["note_id"]}">{html.escape(marker)}</a></sup>'
+                )
+                replacements.append((position.start(), position.end(), linked))
+        if not replacements:
+            continue
+        for start, end, replacement in sorted(replacements, reverse=True):
+            body = body[:start] + replacement + body[end:]
+        updated = (
+            updated[: block_match.start("body")]
+            + body
+            + updated[block_match.end("body") :]
+        )
+        count += len(replacements)
+    return updated, count
+
+
+def _structural_content_html(
+    records: list[dict[str, Any]],
+    note_groups: list[dict[str, Any]],
+    reference_mappings: list[dict[str, Any]],
+) -> str:
     if not records:
         return ""
     labels = {
@@ -2331,8 +3219,13 @@ def _structural_content_html(records: list[dict[str, Any]]) -> str:
         "page_footer": "Page footer",
         "footnote": "Footnote",
     }
+    backlinks: dict[str, list[str]] = {}
+    for mapping in reference_mappings:
+        backlinks.setdefault(mapping["note_id"], []).append(mapping["reference_id"])
     items = []
     for record in records:
+        if record["kind"] == "footnote":
+            continue
         reasons = ", ".join(str(reason) for reason in record.get("reasons") or [])
         items.append(
             '<article class="docling-structural-item" '
@@ -2348,6 +3241,29 @@ def _structural_content_html(records: list[dict[str, Any]]) -> str:
             f'evidence_score={html.escape(str(record.get("evidence_score")))}; '
             f'reasons={html.escape(reasons)}'
             '</small>'
+            '</article>'
+        )
+    for note in note_groups:
+        marker = note.get("marker")
+        backlink_html = " ".join(
+            f'<a class="docling-note-backlink" href="#{reference_id}">Back to reference</a>'
+            for reference_id in backlinks.get(note["note_id"], [])
+        )
+        marker_html = (
+            f'<sup class="docling-note-marker">{html.escape(str(marker))}</sup> '
+            if marker
+            else ""
+        )
+        items.append(
+            '<article class="docling-structural-item docling-structural-note" '
+            f'id="{note["note_id"]}" data-kind="footnote" '
+            f'data-page="{html.escape(str(note.get("page_no")), quote=True)}">'
+            '<header><strong>Footnote</strong>'
+            f'<span>Page {html.escape(str(note.get("page_no") or "unknown"))}</span></header>'
+            f'<p>{marker_html}{html.escape(str(note.get("text") or ""))}</p>'
+            f'<small>assembly={html.escape(str(note.get("assembly_reason")))}; '
+            f'confidence={html.escape(str(note.get("confidence")))}</small>'
+            f'{backlink_html}'
             '</article>'
         )
     return (
@@ -2366,8 +3282,10 @@ def _structural_content_html(records: list[dict[str, Any]]) -> str:
 def _append_structural_content_html(
     document_html: str,
     records: list[dict[str, Any]],
+    note_groups: list[dict[str, Any]],
+    reference_mappings: list[dict[str, Any]],
 ) -> str:
-    appendix = _structural_content_html(records)
+    appendix = _structural_content_html(records, note_groups, reference_mappings)
     if not appendix or f'id="{STRUCTURAL_CONTENT_HTML_ID}"' in document_html:
         return document_html
     style = """
@@ -2397,6 +3315,17 @@ def _append_structural_content_html(
   margin: .5rem 0;
   white-space: pre-wrap;
 }
+.docling-note-ref a,
+.docling-note-backlink {
+  text-decoration: none;
+}
+.docling-note-backlink {
+  display: inline-block;
+  margin-right: .75rem;
+}
+.docling-structural-note:target {
+  outline: 2px solid #2563eb;
+}
 </style>
 """
     if "docling-structural-content-style" not in document_html:
@@ -2409,7 +3338,11 @@ def _append_structural_content_html(
     return document_html + "\n" + appendix
 
 
-def _structural_content_markdown(records: list[dict[str, Any]]) -> str:
+def _structural_content_markdown(
+    records: list[dict[str, Any]],
+    note_groups: list[dict[str, Any]],
+    reference_mappings: list[dict[str, Any]],
+) -> str:
     if not records:
         return ""
     labels = {
@@ -2428,6 +3361,8 @@ def _structural_content_markdown(records: list[dict[str, Any]]) -> str:
         "",
     ]
     for record in records:
+        if record["kind"] == "footnote":
+            continue
         lines.extend(
             [
                 f"### Page {record.get('page_no') or 'unknown'} - {labels[record['kind']]}",
@@ -2443,6 +3378,33 @@ def _structural_content_markdown(records: list[dict[str, Any]]) -> str:
                 "",
             ]
         )
+    backlinks: dict[str, list[str]] = {}
+    for mapping in reference_mappings:
+        backlinks.setdefault(mapping["note_id"], []).append(mapping["reference_id"])
+    for note in note_groups:
+        marker = f"{note['marker']} " if note.get("marker") else ""
+        lines.extend(
+            [
+                f'<a id="{note["note_id"]}"></a>',
+                f"### Page {note.get('page_no') or 'unknown'} - Footnote",
+                "",
+                marker + str(note.get("text") or ""),
+                "",
+            ]
+        )
+        for reference_id in backlinks.get(note["note_id"], []):
+            lines.extend([f"[Back to reference](#{reference_id})", ""])
+        lines.extend(
+            [
+                (
+                    "<!-- note assembly "
+                    f"reason={note.get('assembly_reason')} "
+                    f"confidence={note.get('confidence')} "
+                    f"source_records={','.join(str(value) for value in note.get('source_record_indexes') or [])} -->"
+                ),
+                "",
+            ]
+        )
     lines.append(STRUCTURAL_CONTENT_MD_END)
     return "\n".join(lines) + "\n"
 
@@ -2450,8 +3412,10 @@ def _structural_content_markdown(records: list[dict[str, Any]]) -> str:
 def _append_structural_content_markdown(
     document_markdown: str,
     records: list[dict[str, Any]],
+    note_groups: list[dict[str, Any]],
+    reference_mappings: list[dict[str, Any]],
 ) -> str:
-    appendix = _structural_content_markdown(records)
+    appendix = _structural_content_markdown(records, note_groups, reference_mappings)
     if not appendix or STRUCTURAL_CONTENT_MD_START in document_markdown:
         return document_markdown
     return document_markdown.rstrip() + "\n\n" + appendix
@@ -2480,6 +3444,7 @@ def _markdown_without_structural_content(document_markdown: str) -> str:
 def apply_structural_quarantine_to_outputs(
     output_dir: Path,
     document_json: Any,
+    source_evidence: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Apply generic structural quarantine to JSON, HTML, and Markdown outputs."""
     qc = structural_noise_qc(document_json)
@@ -2489,6 +3454,31 @@ def apply_structural_quarantine_to_outputs(
         if item.get("action") == "quarantine_from_main_text_flow"
     ]
     export_records = _structural_export_records(candidates)
+    note_groups = _build_structural_note_groups(export_records)
+    inline_references = _pdf_inline_note_references(
+        document_json,
+        source_evidence or {"available": False, "pages": {}},
+        note_groups,
+    )
+    reference_mappings, unresolved_references = _map_note_references(
+        note_groups,
+        inline_references,
+    )
+    linked_note_ids = {item["note_id"] for item in reference_mappings}
+    unresolved_notes = [
+        {
+            "note_id": note["note_id"],
+            "page_no": note.get("page_no"),
+            "marker": note.get("marker"),
+            "reason": (
+                "note_content_empty"
+                if not str(note.get("text") or "").strip()
+                else "no_high_confidence_inline_reference"
+            ),
+        }
+        for note in note_groups
+        if note.get("marker") and note["note_id"] not in linked_note_ids
+    ]
 
     json_path = output_dir / "document.json"
     if json_path.exists():
@@ -2518,8 +3508,19 @@ def apply_structural_quarantine_to_outputs(
                 html_text, changed = _replace_exact_paragraph_with_quarantine(html_text, item)
             if changed:
                 html_replacements += 1
-        html_text = _append_structural_content_html(html_text, export_records)
+        html_text, html_reference_link_count = _link_note_references_in_html(
+            html_text,
+            reference_mappings,
+        )
+        html_text = _append_structural_content_html(
+            html_text,
+            export_records,
+            note_groups,
+            reference_mappings,
+        )
         html_path.write_text(html_text, encoding="utf-8")
+    else:
+        html_reference_link_count = 0
 
     md_replacements = 0
     md_path = output_dir / "document.md"
@@ -2549,8 +3550,19 @@ def apply_structural_quarantine_to_outputs(
                 )
             if count:
                 md_replacements += 1
-        md_text = _append_structural_content_markdown(md_text, export_records)
+        md_text, markdown_reference_link_count = _link_note_references_in_markdown(
+            md_text,
+            reference_mappings,
+        )
+        md_text = _append_structural_content_markdown(
+            md_text,
+            export_records,
+            note_groups,
+            reference_mappings,
+        )
         md_path.write_text(md_text, encoding="utf-8")
+    else:
+        markdown_reference_link_count = 0
 
     final_html = html_path.read_text(encoding="utf-8") if html_path.exists() else ""
     final_md = md_path.read_text(encoding="utf-8") if md_path.exists() else ""
@@ -2613,8 +3625,17 @@ def apply_structural_quarantine_to_outputs(
         for item in export_records
         if _markdown_exact_text_pattern(item["text"]).search(final_md)
     )
+    qc["assembled_note_count"] = len(note_groups)
+    qc["note_reference_candidate_count"] = len(inline_references)
+    qc["note_reference_link_count"] = len(reference_mappings)
+    qc["html_note_reference_link_count"] = html_reference_link_count
+    qc["markdown_note_reference_link_count"] = markdown_reference_link_count
+    qc["unresolved_note_reference_count"] = len(unresolved_references)
+    qc["unresolved_note_references"] = unresolved_references
+    qc["unresolved_structural_note_count"] = len(unresolved_notes)
+    qc["unresolved_structural_notes"] = unresolved_notes
     content_sidecar = {
-        "schema_version": 1,
+        "schema_version": 2,
         "description": (
             "High-confidence headers, footers, and footnotes exported outside "
             "the main reading flow."
@@ -2622,6 +3643,10 @@ def apply_structural_quarantine_to_outputs(
         "record_count": len(export_records),
         "counts_by_kind": qc["exported_structural_content_counts_by_kind"],
         "records": export_records,
+        "notes": note_groups,
+        "note_reference_mappings": reference_mappings,
+        "unresolved_note_references": unresolved_references,
+        "unresolved_notes": unresolved_notes,
     }
     content_sidecar_path = output_dir / "structural_content.json"
     content_sidecar_path.write_text(
@@ -3241,6 +4266,12 @@ def run_unified_review_qc(
     html_path = output_dir / "document.html"
     if not html_path.exists():
         return
+    source_text_evidence = pdf_source_text_evidence(args.input_file)
+    semantic_emphasis = apply_semantic_emphasis_to_outputs(
+        output_dir,
+        document_json,
+        source_text_evidence,
+    )
     document_html = html_path.read_text(encoding="utf-8")
     before_href_count = len(re.findall(r"href=\"", document_html))
     document_html, style_injected = _inject_english_review_style(document_html)
@@ -3286,7 +4317,11 @@ def run_unified_review_qc(
         document_json,
         args.input_file,
     )
-    structural_quarantine = apply_structural_quarantine_to_outputs(output_dir, document_json)
+    structural_quarantine = apply_structural_quarantine_to_outputs(
+        output_dir,
+        document_json,
+        source_text_evidence,
+    )
     links_path = output_dir / "links.json"
     links_path.write_text(json.dumps(link_diag, indent=2, ensure_ascii=False), encoding="utf-8")
 
@@ -3315,6 +4350,7 @@ def run_unified_review_qc(
             "header_footer_qc_diagnostics": header_footer_diag,
             "layout_qc_diagnostics": layout_diag,
             "author_affiliation_recovery": author_affiliation_recovery,
+            "semantic_emphasis": semantic_emphasis,
             "structural_quarantine_qc": structural_quarantine,
             "formula_latex_sources": formula_latex_sources,
         }
@@ -3348,6 +4384,7 @@ def run_unified_review_qc(
             "header_footer_qc_diagnostics": header_footer_diag,
             "layout_qc_diagnostics": layout_diag,
             "author_affiliation_recovery": author_affiliation_recovery,
+            "semantic_emphasis": semantic_emphasis,
             "structural_quarantine_qc": structural_quarantine,
             "formula_latex_sources": formula_latex_sources,
         }
@@ -3392,6 +4429,30 @@ def run_unified_review_qc(
             f"enhanced={formula_second_pass_review.get('enhanced_count')}:"
             f"evidence_only={formula_second_pass_review.get('evidence_only_count')}:"
             f"elapsed={formula_second_pass_review.get('elapsed_seconds')}"
+        )
+    if semantic_emphasis.get("detected_span_count") and (
+        semantic_emphasis.get("html_applied_span_count")
+        < semantic_emphasis.get("detected_span_count")
+        or semantic_emphasis.get("markdown_applied_span_count")
+        < semantic_emphasis.get("detected_span_count")
+    ):
+        status["warnings"].append(
+            "semantic_emphasis_partial_application:"
+            f"detected={semantic_emphasis.get('detected_span_count')}:"
+            f"html={semantic_emphasis.get('html_applied_span_count')}:"
+            f"markdown={semantic_emphasis.get('markdown_applied_span_count')}"
+        )
+    for item in structural_quarantine.get("unresolved_note_references") or []:
+        status["warnings"].append(
+            "unresolved_note_reference:"
+            f"page={item.get('page_no')}:marker={item.get('marker')}:"
+            f"reason={item.get('reason')}"
+        )
+    for item in structural_quarantine.get("unresolved_structural_notes") or []:
+        status["warnings"].append(
+            "unresolved_structural_note:"
+            f"page={item.get('page_no')}:marker={item.get('marker')}:"
+            f"reason={item.get('reason')}"
         )
     for item in first_page_footnote_diag:
         status["warnings"].append(

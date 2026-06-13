@@ -1397,6 +1397,248 @@ class EnglishReviewPolishTests(unittest.TestCase):
 
         self.assertEqual(len(records), 1)
 
+    def test_note_group_reorders_marker_attached_to_continuation_line(self) -> None:
+        records = [
+            {
+                "index": 1,
+                "kind": "footnote",
+                "text": "Compared to baseline, performance was signifi-",
+                "page_no": 1,
+                "confidence": "high",
+                "bbox": {"l": 124, "r": 500, "t": 89, "b": 70},
+            },
+            {
+                "index": 2,
+                "kind": "footnote",
+                "text": "1 cantly better in Appendix A.",
+                "page_no": 1,
+                "confidence": "high",
+                "bbox": {"l": 108, "r": 270, "t": 80, "b": 60},
+            },
+        ]
+
+        groups = adapter._build_structural_note_groups(records)
+
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(groups[0]["marker"], "1")
+        self.assertEqual(
+            groups[0]["text"],
+            "Compared to baseline, performance was significantly better in Appendix A.",
+        )
+        self.assertEqual(groups[0]["assembly_reason"], "marker_attached_to_continuation_line")
+
+    def test_note_reference_mapping_requires_unique_same_page_marker(self) -> None:
+        notes = [
+            {"note_id": "note-1", "page_no": 1, "marker": "1"},
+            {"note_id": "note-2", "page_no": 2, "marker": "1"},
+        ]
+        references = [
+            {
+                "page_no": 1,
+                "marker": "1",
+                "node_text": "Body text 1",
+                "confidence": "high",
+            },
+            {
+                "page_no": 3,
+                "marker": "1",
+                "node_text": "Unresolved text 1",
+                "confidence": "high",
+            },
+        ]
+
+        mappings, unresolved = adapter._map_note_references(notes, references)
+
+        self.assertEqual(len(mappings), 1)
+        self.assertEqual(mappings[0]["note_id"], "note-1")
+        self.assertEqual(len(unresolved), 1)
+        self.assertEqual(unresolved[0]["reason"], "note_marker_not_found")
+
+    def test_note_reference_links_html_and_markdown_with_backlink_ids(self) -> None:
+        mappings = [
+            {
+                "page_no": 1,
+                "marker": "1",
+                "node_text": "Body text 1",
+                "note_id": "docling-note-p1-1-1",
+                "reference_id": "docling-note-p1-1-1-ref-1",
+            },
+            {
+                "page_no": 1,
+                "marker": "2",
+                "node_text": "Body text 1 and 2",
+                "note_id": "docling-note-p1-2-1",
+                "reference_id": "docling-note-p1-2-1-ref-1",
+            },
+            {
+                "page_no": 1,
+                "marker": "1",
+                "node_text": "Body text 1 and 2",
+                "note_id": "docling-note-p1-1-1",
+                "reference_id": "docling-note-p1-1-1-ref-2",
+            },
+            {
+                "page_no": 2,
+                "marker": "3",
+                "node_text": "Research & development 3",
+                "note_id": "docling-note-p2-3-1",
+                "reference_id": "docling-note-p2-3-1-ref-1",
+            },
+        ]
+
+        html_text, html_count = adapter._link_note_references_in_html(
+            "<html><body><p>Body text 1</p><p>Body text 1 and 2</p></body></html>",
+            mappings,
+        )
+        markdown, markdown_count = adapter._link_note_references_in_markdown(
+            "Body text 1\n\nBody text 1 and 2\n\nResearch &amp; development 3\n",
+            mappings,
+        )
+
+        self.assertEqual(html_count, 3)
+        self.assertIn('href="#docling-note-p1-1-1"', html_text)
+        self.assertIn('id="docling-note-p1-1-1-ref-1"', html_text)
+        self.assertEqual(markdown_count, 4)
+        self.assertIn('href="#docling-note-p1-1-1"', markdown)
+        self.assertIn('href="#docling-note-p2-3-1"', markdown)
+
+    def test_html_note_links_match_heading_and_inline_emphasis(self) -> None:
+        mappings = [
+            {
+                "page_no": 1,
+                "marker": "*",
+                "node_text": "Author Name *",
+                "note_id": "docling-note-p1-star-1",
+                "reference_id": "docling-note-p1-star-1-ref-1",
+            },
+            {
+                "page_no": 2,
+                "marker": "3",
+                "node_text": "Use BERTBASE. 3",
+                "note_id": "docling-note-p2-3-1",
+                "reference_id": "docling-note-p2-3-1-ref-1",
+            },
+        ]
+
+        html_text, count = adapter._link_note_references_in_html(
+            "<h2>Author Name *</h2><p>Use <strong>BERT</strong>BASE. 3</p>",
+            mappings,
+        )
+
+        self.assertEqual(count, 2)
+        self.assertIn('id="docling-note-p1-star-1-ref-1"', html_text)
+        self.assertIn('id="docling-note-p2-3-1-ref-1"', html_text)
+        self.assertIn("<strong>BERT</strong>BASE", html_text)
+
+    def test_markdown_note_links_ignore_semantic_emphasis_markers(self) -> None:
+        mappings = [
+            {
+                "page_no": 1,
+                "marker": "*",
+                "node_text": "Yelong Shen * Shean Wang *",
+                "note_id": "docling-note-p1-star-1",
+                "reference_id": "docling-note-p1-star-1-ref-1",
+            },
+            {
+                "page_no": 1,
+                "marker": "*",
+                "node_text": "Yelong Shen * Shean Wang *",
+                "note_id": "docling-note-p1-star-1",
+                "reference_id": "docling-note-p1-star-1-ref-2",
+            },
+        ]
+
+        markdown, count = adapter._link_note_references_in_markdown(
+            "**Yelong Shen** * **Shean Wang** *\n",
+            mappings,
+        )
+
+        self.assertEqual(count, 2)
+        self.assertEqual(markdown.count('href="#docling-note-p1-star-1"'), 2)
+        self.assertIn("**Yelong Shen**", markdown)
+        self.assertIn("**Shean Wang**", markdown)
+
+    def test_markdown_note_link_matches_ordered_list_visible_text(self) -> None:
+        mapping = {
+            "page_no": 3,
+            "marker": "1",
+            "node_text": "The codebase is available at GitHub. 1",
+            "note_id": "docling-note-p3-1-1",
+            "reference_id": "docling-note-p3-1-1-ref-1",
+        }
+
+        markdown, count = adapter._link_note_references_in_markdown(
+            "3. Prior contribution.\n4. The codebase is available at GitHub. 1\n",
+            [mapping],
+        )
+
+        self.assertEqual(count, 1)
+        self.assertIn('id="docling-note-p3-1-1-ref-1"', markdown)
+        self.assertIn("4. The codebase", markdown)
+
+    def test_footnote_superscript_polish_does_not_split_adjacent_words(self) -> None:
+        updated, count = adapter._polish_footnote_superscripts(
+            "<p>Yelong Shen ∗ Shean Wang</p>"
+        )
+
+        self.assertEqual(count, 1)
+        self.assertIn("Shen<sup", updated)
+        self.assertIn("</sup>Shean", updated)
+        self.assertNotIn("She n", updated)
+
+    def test_semantic_emphasis_uses_pdf_font_evidence(self) -> None:
+        document = {
+            "texts": [
+                {
+                    "label": "text",
+                    "text": "Normal Important result.",
+                    "formatting": None,
+                    "prov": [
+                        {
+                            "page_no": 1,
+                            "bbox": {"l": 10, "r": 200, "t": 100, "b": 80},
+                        }
+                    ],
+                }
+            ]
+        }
+        source = {
+            "available": True,
+            "pages": {
+                1: {
+                    "median_font_size": 10,
+                    "characters": [
+                        {
+                            "index": index,
+                            "text": char,
+                            "bbox": {"l": 70 + index, "r": 71 + index, "t": 95, "b": 85},
+                            "font_name": "Example-Bold",
+                            "font_weight": 700,
+                            "font_size": 10,
+                        }
+                        for index, char in enumerate("Important")
+                    ],
+                }
+            },
+        }
+
+        diagnostics = adapter.semantic_emphasis_diagnostics(document, source)
+        html_text, html_count = adapter._apply_semantic_spans_to_html(
+            "<html><body><p>Normal Important result.</p></body></html>",
+            diagnostics,
+        )
+        markdown, markdown_count = adapter._apply_semantic_spans_to_markdown(
+            "Normal Important result.\n",
+            diagnostics,
+        )
+
+        self.assertEqual(len(diagnostics), 1)
+        self.assertEqual(document["texts"][0]["formatting"]["semantic_spans"][0]["styles"], ["bold"])
+        self.assertEqual(html_count, 1)
+        self.assertIn("<strong>Important</strong>", html_text)
+        self.assertEqual(markdown_count, 1)
+        self.assertIn("**Important**", markdown)
+
     def test_structural_quarantine_matches_markdown_escaped_punctuation(self) -> None:
         text = "AUTHORIZATION MD.! _ MP-75"
         document = {
