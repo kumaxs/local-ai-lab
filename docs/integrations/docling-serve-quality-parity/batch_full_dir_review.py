@@ -114,6 +114,7 @@ def summarize_success(pdf: Path, job_id: str, output_dir: Path, elapsed: float) 
     second_pass = metadata.get("formula_second_pass") or {}
     alignment = second_pass.get("alignment_diagnostics") or {}
     structural = metadata.get("structural_quarantine_qc") or {}
+    emphasis = metadata.get("semantic_emphasis") or {}
     number_diag = metadata.get("formula_number_qc_diagnostics") or []
     recovered_numbers = metadata.get("formula_number_recovered_html_indexes") or []
     return {
@@ -156,6 +157,13 @@ def summarize_success(pdf: Path, job_id: str, output_dir: Path, elapsed: float) 
             structural.get("exported_structural_content_counts_by_kind") or {}
         ),
         "final_output_structural_residual_count": structural.get("final_output_residual_count"),
+        "semantic_emphasis_detected_count": emphasis.get("detected_span_count"),
+        "semantic_emphasis_html_count": emphasis.get("html_applied_span_count"),
+        "semantic_emphasis_markdown_count": emphasis.get("markdown_applied_span_count"),
+        "assembled_note_count": structural.get("assembled_note_count"),
+        "note_reference_link_count": structural.get("note_reference_link_count"),
+        "unresolved_note_reference_count": structural.get("unresolved_note_reference_count"),
+        "unresolved_structural_note_count": structural.get("unresolved_structural_note_count"),
         "recovered_footnote_count": structural.get("recovered_footnote_count"),
         "unresolved_footnote_count": structural.get("unresolved_footnote_count"),
         "evidence_links": {
@@ -210,6 +218,13 @@ def summarize_failure(
         "exported_structural_content_count": None,
         "exported_structural_content_counts_by_kind": {},
         "final_output_structural_residual_count": None,
+        "semantic_emphasis_detected_count": None,
+        "semantic_emphasis_html_count": None,
+        "semantic_emphasis_markdown_count": None,
+        "assembled_note_count": None,
+        "note_reference_link_count": None,
+        "unresolved_note_reference_count": None,
+        "unresolved_structural_note_count": None,
         "recovered_footnote_count": None,
         "unresolved_footnote_count": None,
         "evidence_links": {},
