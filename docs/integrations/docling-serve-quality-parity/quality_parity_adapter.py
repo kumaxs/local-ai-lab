@@ -2201,6 +2201,265 @@ def recover_first_page_author_affiliations(
     }
 
 
+EMAIL_PREFIX_RE = re.compile(
+    r"^(?P<email>[A-Za-z0-9._%+\-]+\s*@\s*[A-Za-z0-9.\-]+\.[A-Za-z]{2,})"
+    r"(?P<tail>\s+.+)?$",
+    re.S,
+)
+
+
+def _split_email_body_contamination(text: str) -> tuple[str, str | None]:
+    match = EMAIL_PREFIX_RE.match(text.strip())
+    if not match:
+        return text.strip(), None
+    email = re.sub(r"\s+", "", match.group("email"))
+    tail = str(match.group("tail") or "").strip()
+    if (
+        len(tail.split()) < 5
+        or not re.match(r"^[a-z]", tail)
+        or not re.search(r"[.!?]$", tail)
+    ):
+        return text.strip(), None
+    return email, tail
+
+
+def recover_first_page_author_reading_order(
+    output_dir: Path,
+    document_json: Any,
+) -> dict[str, Any]:
+    def comparable_text(value: str) -> str:
+        normalized = _normalized_noise_text(value).replace("∗", "*")
+        return re.sub(r"\s*([*†‡])\s*", r"\1", normalized)
+
+    records = [
+        record
+        for record in structural_text_records(document_json)
+        if record.get("page_no") == 1
+        and isinstance(record.get("text"), str)
+        and record.get("bbox")
+    ]
+    abstract = next(
+        (
+            record
+            for record in records
+            if str(record.get("text") or "").strip().upper() == "ABSTRACT"
+            or str(record.get("text") or "").strip().lower().startswith("abstract.")
+        ),
+        None,
+    )
+    if not abstract:
+        return {"applied": False, "reason": "abstract_anchor_missing"}
+    abstract_top = float((abstract.get("bbox") or {}).get("t", 0))
+    title_candidates = [
+        record
+        for record in records
+        if str(record.get("label") or "").lower() in {"section_header", "title"}
+        and float((record.get("bbox") or {}).get("b", 0)) > abstract_top
+        and str(record.get("text") or "").strip().upper() != "ABSTRACT"
+    ]
+    if not title_candidates:
+        return {"applied": False, "reason": "title_anchor_missing"}
+    title = max(
+        title_candidates,
+        key=lambda record: float((record.get("bbox") or {}).get("t", 0)),
+    )
+    title_bottom = float((title.get("bbox") or {}).get("b", 0))
+    author_records = [
+        record
+        for record in records
+        if abstract_top + 4 < float((record.get("bbox") or {}).get("t", 0)) < title_bottom
+        and record is not abstract
+        and record is not title
+        and str(record.get("label") or "").lower()
+        not in {"page_header", "page_footer", "footnote", "formula", "caption"}
+        and not str(record.get("label") or "").lower().startswith("quarantined_")
+    ]
+    if (
+        len(author_records) < 4
+        or not any("@" in str(record.get("text") or "") for record in author_records)
+    ):
+        return {"applied": False, "reason": "author_region_evidence_insufficient"}
+
+    left_positions = sorted(
+        {
+            round(float((record.get("bbox") or {}).get("l", 0)), 1)
+            for record in author_records
+        }
+    )
+    split_x: float | None = None
+    if len(left_positions) > 1:
+        gaps = [
+            (right - left, (right + left) / 2)
+            for left, right in zip(left_positions, left_positions[1:])
+        ]
+        largest_gap, candidate_split = max(gaps)
+        if largest_gap >= 72:
+            split_x = candidate_split
+    ordered = sorted(
+        author_records,
+        key=lambda record: (
+            1
+            if split_x is not None
+            and float((record.get("bbox") or {}).get("l", 0)) >= split_x
+            else 0,
+            -float((record.get("bbox") or {}).get("t", 0)),
+            float((record.get("bbox") or {}).get("l", 0)),
+        ),
+    )
+
+    html_path = output_dir / "document.html"
+    if not html_path.exists():
+        return {"applied": False, "reason": "document_html_missing"}
+    document_html = html_path.read_text(encoding="utf-8")
+    abstract_target = comparable_text(str(abstract.get("text") or ""))
+    abstract_match = next(
+        (
+            match
+            for match in HTML_TEXT_BLOCK_RE.finditer(document_html)
+            if comparable_text(
+                html.unescape(HTML_TAG_RE.sub("", match.group("body")))
+            )
+            == abstract_target
+        ),
+        None,
+    )
+    if not abstract_match:
+        return {"applied": False, "reason": "abstract_html_anchor_missing"}
+
+    extracted: list[tuple[dict[str, Any], str, str | None]] = []
+    edits: list[tuple[int, int, str]] = []
+    used_html_block_starts: set[int] = set()
+    misplaced_count = 0
+    contamination_count = 0
+    for record in ordered:
+        target = comparable_text(str(record.get("text") or ""))
+        match = next(
+            (
+                candidate
+                for candidate in HTML_TEXT_BLOCK_RE.finditer(document_html)
+                if comparable_text(
+                    html.unescape(HTML_TAG_RE.sub("", candidate.group("body")))
+                )
+                == target
+                and candidate.start() not in used_html_block_starts
+            ),
+            None,
+        )
+        if not match:
+            continue
+        used_html_block_starts.add(match.start())
+        author_text, tail = _split_email_body_contamination(
+            str(record.get("text") or "")
+        )
+        if tail:
+            contamination_count += 1
+            author_block = f"<p>{html.escape(author_text)}</p>"
+            retained = f"<p>{html.escape(tail)}</p>"
+        else:
+            author_block = match.group(0)
+            retained = ""
+        if match.start() > abstract_match.start():
+            misplaced_count += 1
+        extracted.append((record, author_block, tail))
+        edits.append((match.start(), match.end(), retained))
+        node = record.get("node")
+        if isinstance(node, dict):
+            node.setdefault("local_ai_lab_qc", {})["author_reading_order"] = {
+                "source": "first_page_bbox_between_title_and_abstract",
+                "action": "reorder_author_region_before_abstract",
+                "email_body_contamination_split": bool(tail),
+            }
+    if not extracted or (not misplaced_count and not contamination_count):
+        return {"applied": False, "reason": "author_region_already_ordered"}
+    for start, end, replacement in sorted(edits, reverse=True):
+        document_html = document_html[:start] + replacement + document_html[end:]
+    abstract_match = next(
+        (
+            match
+            for match in HTML_TEXT_BLOCK_RE.finditer(document_html)
+            if comparable_text(
+                html.unescape(HTML_TAG_RE.sub("", match.group("body")))
+            )
+            == abstract_target
+        ),
+        None,
+    )
+    if not abstract_match:
+        return {"applied": False, "reason": "abstract_html_anchor_lost"}
+    author_html = (
+        '<section class="docling-author-region-recovery" '
+        'aria-label="Recovered author information">'
+        + "".join(item[1] for item in extracted)
+        + "</section>"
+    )
+    document_html = (
+        document_html[: abstract_match.start()]
+        + author_html
+        + document_html[abstract_match.start() :]
+    )
+    html_path.write_text(document_html, encoding="utf-8")
+
+    markdown_count = 0
+    md_path = output_dir / "document.md"
+    if md_path.exists():
+        markdown = md_path.read_text(encoding="utf-8")
+        recovered_lines: list[str] = []
+
+        def markdown_visible_line(line: str) -> str:
+            visible = re.sub(r"^\s*#{1,6}\s+", "", line)
+            visible = re.sub(r"<[^>]+>", "", visible)
+            visible = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", visible)
+            visible = re.sub(r"(?:\*\*|__|~~|`)", "", visible)
+            return comparable_text(html.unescape(visible))
+
+        for record, _block, tail in extracted:
+            text = str(record.get("text") or "").strip()
+            author_text, _unused = _split_email_body_contamination(text)
+            target = comparable_text(text)
+            lines = markdown.splitlines()
+            line_index = next(
+                (
+                    index
+                    for index, line in enumerate(lines)
+                    if markdown_visible_line(line) == target
+                ),
+                None,
+            )
+            if line_index is not None:
+                original_line = re.sub(
+                    r"^\s*#{1,6}\s+",
+                    "",
+                    lines[line_index],
+                ).strip()
+                lines[line_index] = tail or ""
+                markdown = "\n".join(lines)
+                markdown_count += 1
+                recovered_lines.append(author_text if tail else original_line)
+        abstract_pattern = re.compile(
+            r"(?m)^(?P<line>#{1,6}\s+"
+            + re.escape(str(abstract.get("text") or "").strip())
+            + r"\s*)$"
+        )
+        recovered_block = "\n\n".join(recovered_lines)
+        markdown, inserted = abstract_pattern.subn(
+            recovered_block + "\n\n" + r"\g<line>",
+            markdown,
+            count=1,
+        )
+        if inserted:
+            md_path.write_text(markdown, encoding="utf-8")
+
+    return {
+        "applied": True,
+        "source": "first_page_bbox_between_title_and_abstract",
+        "author_record_count": len(extracted),
+        "misplaced_record_count": misplaced_count,
+        "email_body_contamination_split_count": contamination_count,
+        "markdown_record_replacement_count": markdown_count,
+        "column_split_x": split_x,
+    }
+
+
 def structural_noise_qc(document_json: Any) -> dict[str, Any]:
     """Identify structural regions and quarantine only evidence-rich candidates."""
     records = structural_text_records(document_json)
@@ -2546,17 +2805,11 @@ def structural_noise_qc(document_json: Any) -> dict[str, Any]:
 
 
 def _hidden_quarantine_html(item: dict[str, Any]) -> str:
-    text = str(item.get("text") or "").strip()
-    escaped = html.escape(text)
     return (
-        '<template class="docling-structural-quarantine" '
-        f'data-kind="{html.escape(str(item.get("kind")), quote=True)}" '
-        f'data-page="{html.escape(str(item.get("page_no")), quote=True)}">'
-        '<strong>Structural quarantine:</strong> '
-        f'{html.escape(str(item.get("kind")))}; '
-        f'{html.escape(",".join(item.get("reasons") or []))}'
-        f'<pre>{escaped}</pre>'
-        '</template>'
+        "<!-- local-ai-lab structural quarantine "
+        f"kind={html.escape(str(item.get('kind')), quote=True)} "
+        f"page={html.escape(str(item.get('page_no')), quote=True)} "
+        "evidence=structural_regions.json -->"
     )
 
 
@@ -2782,15 +3035,235 @@ def _note_marker_slug(marker: str | None) -> str:
     }.get(marker or "", marker or "unmarked")
 
 
-def _build_structural_note_groups(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _source_page_text_lines(
+    source_evidence: dict[str, Any],
+    page_no: Any,
+) -> list[dict[str, Any]]:
+    page = (source_evidence.get("pages") or {}).get(page_no) or {}
+    characters = [
+        char
+        for char in page.get("characters") or []
+        if str(char.get("text") or "") not in "\r\n"
+        and char.get("bbox")
+    ]
+    clusters: list[dict[str, Any]] = []
+    for char in sorted(
+        characters,
+        key=lambda item: -float((item.get("bbox") or {}).get("b", 0)),
+    ):
+        baseline = float(char["bbox"].get("b", 0))
+        cluster = next(
+            (
+                item
+                for item in clusters
+                if abs(float(item["baseline"]) - baseline) <= 4.0
+            ),
+            None,
+        )
+        if cluster is None:
+            cluster = {"baseline": baseline, "characters": []}
+            clusters.append(cluster)
+        cluster["characters"].append(char)
+        cluster["baseline"] = sum(
+            float(item["bbox"].get("b", 0))
+            for item in cluster["characters"]
+        ) / len(cluster["characters"])
+
+    lines: list[dict[str, Any]] = []
+    for cluster in clusters:
+        ordered = sorted(
+            cluster["characters"],
+            key=lambda item: float(item["bbox"].get("l", 0)),
+        )
+        segments: list[list[dict[str, Any]]] = []
+        for char in ordered:
+            if not segments:
+                segments.append([char])
+                continue
+            previous = segments[-1][-1]
+            gap = float(char["bbox"].get("l", 0)) - float(previous["bbox"].get("r", 0))
+            median_size = float(page.get("median_font_size") or 8.0)
+            if gap > max(14.0, median_size * 1.6):
+                segments.append([char])
+            else:
+                segments[-1].append(char)
+        for segment in segments:
+            text = "".join(str(char.get("text") or "") for char in segment)
+            text = _normalize_pdf_text_line(text)
+            text = re.sub(
+                r"^([∗*†‡]|\d{1,2})(?=[A-Za-z\u3400-\u9fff])",
+                r"\1 ",
+                text,
+            )
+            if not text:
+                continue
+            lines.append(
+                {
+                    "text": text,
+                    "bbox": _bbox_union([char["bbox"] for char in segment]),
+                    "baseline": cluster["baseline"],
+                    "source": "pdf_text_character_baseline",
+                }
+            )
+    return sorted(
+        lines,
+        key=lambda item: (
+            -float((item.get("bbox") or {}).get("t", 0)),
+            float((item.get("bbox") or {}).get("l", 0)),
+        ),
+    )
+
+
+def _bbox_overlap_ratio(left: dict[str, Any], right: dict[str, Any]) -> float:
+    if not left or not right:
+        return 0.0
+    overlap_width = max(
+        0.0,
+        min(float(left.get("r", 0)), float(right.get("r", 0)))
+        - max(float(left.get("l", 0)), float(right.get("l", 0))),
+    )
+    overlap_height = max(
+        0.0,
+        min(float(left.get("t", 0)), float(right.get("t", 0)))
+        - max(float(left.get("b", 0)), float(right.get("b", 0))),
+    )
+    area = max(
+        float(left.get("width") or 0) * float(left.get("height") or 0),
+        1.0,
+    )
+    return overlap_width * overlap_height / area
+
+
+def _source_footnote_line_records(
+    page_no: Any,
+    page_records: list[dict[str, Any]],
+    source_evidence: dict[str, Any],
+) -> list[dict[str, Any]]:
+    if not any(
+        marker and not body
+        for marker, body in (
+            _note_marker_and_body(str(record.get("text") or ""))
+            for record in page_records
+        )
+    ):
+        return []
+    result: list[dict[str, Any]] = []
+    for line in _source_page_text_lines(source_evidence, page_no):
+        overlaps = [
+            record
+            for record in page_records
+            if _bbox_overlap_ratio(line.get("bbox") or {}, record.get("bbox") or {}) > 0
+        ]
+        if not overlaps:
+            continue
+        text = line["text"]
+        last_word = re.search(r"([A-Za-z]{3,})$", text)
+        if last_word and any(
+            re.search(
+                re.escape(last_word.group(1)) + r"-",
+                str(record.get("text") or ""),
+                flags=re.IGNORECASE,
+            )
+            for record in overlaps
+        ):
+            text += "-"
+        result.append(
+            {
+                "index": min(int(record["index"]) for record in overlaps),
+                "page_no": page_no,
+                "kind": "footnote",
+                "text": text,
+                "bbox": line["bbox"],
+                "confidence": "high",
+                "reasons": ["pdf_text_character_baseline"],
+                "source_record_indexes": sorted(
+                    {int(record["index"]) for record in overlaps}
+                ),
+            }
+        )
+    record_markers = {
+        marker
+        for marker, _body in (
+            _note_marker_and_body(str(record.get("text") or ""))
+            for record in page_records
+        )
+        if marker
+    }
+    source_markers = {
+        marker
+        for marker, _body in (
+            _note_marker_and_body(str(record.get("text") or ""))
+            for record in result
+        )
+        if marker
+    }
+    return result if record_markers.issubset(source_markers) else []
+
+
+def _merge_cross_page_note_continuations(
+    groups: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    removed: set[int] = set()
+    for index, current in enumerate(groups):
+        if (
+            not current.get("marker")
+            or not str(current.get("text") or "").rstrip().endswith("-")
+        ):
+            continue
+        candidates = [
+            (candidate_index, candidate)
+            for candidate_index, candidate in enumerate(groups)
+            if candidate_index not in removed
+            and candidate.get("marker") is None
+            and candidate.get("page_no") == int(current.get("page_no") or 0) + 1
+            and re.match(r"^[a-z]", str(candidate.get("text") or "").lstrip())
+        ]
+        if len(candidates) == 1:
+            candidate_index, next_group = candidates[0]
+            current["text"] = _join_note_text(
+                [str(current.get("text") or ""), str(next_group.get("text") or "")]
+            )
+            current["source_record_indexes"].extend(
+                next_group.get("source_record_indexes") or []
+            )
+            current["source_fragments"].extend(
+                next_group.get("source_fragments") or []
+            )
+            current["source_bboxes"].extend(
+                next_group.get("source_bboxes") or []
+            )
+            current["continuation_pages"] = sorted(
+                {
+                    *(current.get("continuation_pages") or []),
+                    next_group.get("page_no"),
+                }
+            )
+            current["assembly_reason"] += "+cross_page_continuation"
+            removed.add(candidate_index)
+    return [
+        group
+        for index, group in enumerate(groups)
+        if index not in removed
+    ]
+
+
+def _build_structural_note_groups(
+    records: list[dict[str, Any]],
+    source_evidence: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
     groups: list[dict[str, Any]] = []
     footnotes_by_page: dict[Any, list[dict[str, Any]]] = {}
     for record in records:
         if record.get("kind") == "footnote":
             footnotes_by_page.setdefault(record.get("page_no"), []).append(record)
     for page_no, page_records in footnotes_by_page.items():
-        ordered = sorted(
+        source_records = _source_footnote_line_records(
+            page_no,
             page_records,
+            source_evidence or {"pages": {}},
+        )
+        ordered = sorted(
+            source_records or page_records,
             key=lambda item: (
                 -float((item.get("bbox") or {}).get("t", 0)),
                 float((item.get("bbox") or {}).get("l", 0)),
@@ -2895,6 +3368,7 @@ def _build_structural_note_groups(records: list[dict[str, Any]]) -> list[dict[st
                     "text": _join_note_text(bodies),
                     "source_record_indexes": [part["index"] for part in group["parts"]],
                     "source_fragments": [part["text"] for part in group["parts"]],
+                    "source_bboxes": [part.get("bbox") for part in group["parts"]],
                     "assembly_reason": group["reason"],
                     "confidence": (
                         "high"
@@ -2903,7 +3377,7 @@ def _build_structural_note_groups(records: list[dict[str, Any]]) -> list[dict[st
                     ),
                 }
             )
-    return groups
+    return _merge_cross_page_note_continuations(groups)
 
 
 def _pdf_inline_note_references(
@@ -2936,6 +3410,8 @@ def _pdf_inline_note_references(
                 index + 1 < len(small)
                 and int(small[index + 1]["index"]) == int(group[-1]["index"]) + 1
                 and abs(float(small[index + 1]["font_size"]) - float(group[-1]["font_size"])) < 0.2
+                and str(group[-1].get("text") or "").isdigit()
+                and str(small[index + 1].get("text") or "").isdigit()
             ):
                 index += 1
                 group.append(small[index])
@@ -3454,7 +3930,10 @@ def apply_structural_quarantine_to_outputs(
         if item.get("action") == "quarantine_from_main_text_flow"
     ]
     export_records = _structural_export_records(candidates)
-    note_groups = _build_structural_note_groups(export_records)
+    note_groups = _build_structural_note_groups(
+        export_records,
+        source_evidence or {"available": False, "pages": {}},
+    )
     inline_references = _pdf_inline_note_references(
         document_json,
         source_evidence or {"available": False, "pages": {}},
@@ -4317,6 +4796,10 @@ def run_unified_review_qc(
         document_json,
         args.input_file,
     )
+    author_reading_order_recovery = recover_first_page_author_reading_order(
+        output_dir,
+        document_json,
+    )
     structural_quarantine = apply_structural_quarantine_to_outputs(
         output_dir,
         document_json,
@@ -4350,6 +4833,7 @@ def run_unified_review_qc(
             "header_footer_qc_diagnostics": header_footer_diag,
             "layout_qc_diagnostics": layout_diag,
             "author_affiliation_recovery": author_affiliation_recovery,
+            "author_reading_order_recovery": author_reading_order_recovery,
             "semantic_emphasis": semantic_emphasis,
             "structural_quarantine_qc": structural_quarantine,
             "formula_latex_sources": formula_latex_sources,
@@ -4384,6 +4868,7 @@ def run_unified_review_qc(
             "header_footer_qc_diagnostics": header_footer_diag,
             "layout_qc_diagnostics": layout_diag,
             "author_affiliation_recovery": author_affiliation_recovery,
+            "author_reading_order_recovery": author_reading_order_recovery,
             "semantic_emphasis": semantic_emphasis,
             "structural_quarantine_qc": structural_quarantine,
             "formula_latex_sources": formula_latex_sources,
@@ -4573,6 +5058,30 @@ def record_cn_accepted_baseline(
 ) -> None:
     if not is_cn_accepted_path(args):
         return
+    document_json = _load_json_file(output_dir / "document.json")
+    if isinstance(document_json, dict):
+        source_evidence = pdf_source_text_evidence(args.input_file)
+        structural_qc = apply_structural_quarantine_to_outputs(
+            output_dir,
+            document_json,
+            source_evidence,
+        )
+        metadata["cn_structural_qc_applied"] = True
+        metadata["structural_quarantine_qc"] = structural_qc
+        status["quality_signals"]["cn_structural_qc_applied"] = True
+        status["quality_signals"]["structural_quarantine_qc"] = structural_qc
+        metadata.setdefault("generated_outputs", []).extend(
+            [
+                structural_qc["sidecar_path"],
+                structural_qc["content_sidecar_path"],
+            ]
+        )
+        for item in structural_qc.get("unresolved_structural_notes") or []:
+            status["warnings"].append(
+                "unresolved_structural_note:"
+                f"page={item.get('page_no')}:marker={item.get('marker')}:"
+                f"reason={item.get('reason')}"
+            )
     diagnostics = cn_accepted_baseline_diagnostics(output_dir)
     metadata["cn_processing_path"] = CN_ACCEPTED_BASELINE["name"]
     metadata["cn_unified_review_qc_skipped"] = True
