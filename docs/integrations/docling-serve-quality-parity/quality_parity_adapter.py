@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import base64
 import csv
+import difflib
 import html
 import json
 import re
@@ -1776,6 +1777,28 @@ def structural_picture_records(document_json: Any) -> list[dict[str, Any]]:
     return records
 
 
+def structural_table_records(document_json: Any) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    tables = document_json.get("tables") if isinstance(document_json, dict) else None
+    if not isinstance(tables, list):
+        return records
+    for index, node in enumerate(tables, start=1):
+        if not isinstance(node, dict):
+            continue
+        prov = first_prov(node) or {}
+        geometry = bbox_geometry(prov)
+        if geometry:
+            records.append(
+                {
+                    "index": index,
+                    "page_no": prov.get("page_no"),
+                    "bbox": geometry,
+                    "node": node,
+                }
+            )
+    return records
+
+
 def _normalized_noise_text(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
@@ -1921,10 +1944,10 @@ def _picture_annotation_evidence(
     picture_width = float(picture_geometry.get("width", 0.0))
     picture_height = float(picture_geometry.get("height", 0.0))
     expanded = {
-        "l": float(picture_geometry.get("l", 0.0)) - picture_width * 0.1,
-        "r": float(picture_geometry.get("r", 0.0)) + picture_width * 0.1,
-        "t": float(picture_geometry.get("t", 0.0)) + picture_height * 0.45,
-        "b": float(picture_geometry.get("b", 0.0)) - picture_height * 0.1,
+        "l": float(picture_geometry.get("l", 0.0)) - picture_width * 0.3,
+        "r": float(picture_geometry.get("r", 0.0)) + picture_width * 0.3,
+        "t": float(picture_geometry.get("t", 0.0)) + picture_height * 0.9,
+        "b": float(picture_geometry.get("b", 0.0)) - picture_height * 0.15,
     }
     center_x = (float(geometry.get("l", 0.0)) + float(geometry.get("r", 0.0))) / 2
     center_y = (float(geometry.get("t", 0.0)) + float(geometry.get("b", 0.0))) / 2
@@ -1938,6 +1961,170 @@ def _picture_annotation_evidence(
             "region_match": "small_text_in_expanded_picture_annotation_zone",
         }
     return None
+
+
+def _table_annotation_evidence(
+    geometry: dict[str, Any] | None,
+    table: dict[str, Any],
+) -> dict[str, Any] | None:
+    table_geometry = table.get("bbox")
+    overlap = _bbox_intersection_ratio(geometry, table_geometry)
+    if overlap >= 0.8:
+        return {
+            "table_index": table["index"],
+            "overlap_ratio": round(overlap, 4),
+            "region_match": "inside_table_bbox",
+        }
+    if not geometry or not table_geometry:
+        return None
+    if float(geometry.get("height", 999.0)) > 14.0:
+        return None
+    table_width = float(table_geometry.get("width", 0.0))
+    table_height = float(table_geometry.get("height", 0.0))
+    expanded = {
+        "l": float(table_geometry.get("l", 0.0)) - table_width * 0.08,
+        "r": float(table_geometry.get("r", 0.0)) + table_width * 0.08,
+        "t": float(table_geometry.get("t", 0.0)) + table_height * 0.12,
+        "b": float(table_geometry.get("b", 0.0)) - table_height * 0.12,
+    }
+    center_x = (float(geometry.get("l", 0.0)) + float(geometry.get("r", 0.0))) / 2
+    center_y = (float(geometry.get("t", 0.0)) + float(geometry.get("b", 0.0))) / 2
+    if (
+        expanded["l"] <= center_x <= expanded["r"]
+        and expanded["b"] <= center_y <= expanded["t"]
+    ):
+        return {
+            "table_index": table["index"],
+            "overlap_ratio": round(overlap, 4),
+            "region_match": "small_text_in_expanded_table_zone",
+        }
+    return None
+
+
+def _is_semantic_subfigure_label(text: str) -> bool:
+    return bool(re.match(r"^\s*\([A-Za-z0-9]+\)\s+\S", text))
+
+
+def _comparison_token(token: str) -> str:
+    return re.sub(r"[^0-9a-z\u3400-\u9fff]+", "", token.lower())
+
+
+def _tokens_with_spans(text: str) -> list[tuple[str, int, int]]:
+    return [
+        (_comparison_token(match.group()), match.start(), match.end())
+        for match in re.finditer(r"\S+", text)
+        if _comparison_token(match.group())
+    ]
+
+
+def _tokens_match(left: str, right: str) -> bool:
+    if left == right:
+        return True
+    if min(len(left), len(right)) < 4:
+        return False
+    return difflib.SequenceMatcher(None, left, right).ratio() >= 0.78
+
+
+def _source_grounded_visual_suffix(
+    record: dict[str, Any],
+    source_evidence: dict[str, Any] | None,
+    visual_ocr_records: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    if not source_evidence or not source_evidence.get("available"):
+        return None
+    text = str(record.get("text") or "")
+    geometry = record.get("bbox") or {}
+    record_tokens = _tokens_with_spans(text)
+    if len(record_tokens) < 20 or not geometry:
+        return None
+
+    source_lines = [
+        line
+        for line in _source_page_text_lines(source_evidence, record.get("page_no"))
+        if _bbox_intersection_ratio(line.get("bbox"), geometry) >= 0.5
+    ]
+    source_tokens = [
+        token
+        for line in source_lines
+        for token, _start, _end in _tokens_with_spans(str(line.get("text") or ""))
+    ]
+    if len(source_tokens) < 12:
+        return None
+
+    source_cursor = 0
+    last_matched_record_index = -1
+    for record_index, (record_token, _start, _end) in enumerate(record_tokens):
+        matched_source_index: int | None = None
+        for source_index in range(
+            source_cursor,
+            min(len(source_tokens), source_cursor + 5),
+        ):
+            if _tokens_match(record_token, source_tokens[source_index]):
+                matched_source_index = source_index
+                break
+            if (
+                source_index + 1 < len(source_tokens)
+                and record_token
+                == source_tokens[source_index] + source_tokens[source_index + 1]
+            ):
+                matched_source_index = source_index + 1
+                break
+        if matched_source_index is None:
+            break
+        source_cursor = matched_source_index + 1
+        last_matched_record_index = record_index
+
+    if last_matched_record_index < 14:
+        return None
+    matched_prefix_ratio = (last_matched_record_index + 1) / len(record_tokens)
+    if matched_prefix_ratio < 0.75:
+        return None
+    suffix_start = record_tokens[last_matched_record_index][2]
+    suffix = text[suffix_start:]
+    suffix_tokens = [token for token, _start, _end in _tokens_with_spans(suffix)]
+    if len(suffix_tokens) < 3:
+        return None
+
+    all_source_tokens = [
+        token
+        for line in _source_page_text_lines(source_evidence, record.get("page_no"))
+        for token, _start, _end in _tokens_with_spans(str(line.get("text") or ""))
+    ]
+    source_supported_suffix_tokens = {
+        suffix_token
+        for suffix_token in suffix_tokens
+        if any(_tokens_match(suffix_token, source_token) for source_token in all_source_tokens)
+    }
+    if len(source_supported_suffix_tokens) / len(suffix_tokens) >= 0.5:
+        return None
+
+    supporting_fragments: list[str] = []
+    supporting_tokens: set[str] = set()
+    for visual_record in visual_ocr_records:
+        if visual_record.get("page_no") not in {
+            record.get("page_no"),
+            (record.get("page_no") or 0) + 1,
+        }:
+            continue
+        fragment = str(visual_record.get("text") or "")
+        fragment_matched = False
+        for visual_token, _start, _end in _tokens_with_spans(fragment):
+            if any(_tokens_match(suffix_token, visual_token) for suffix_token in suffix_tokens):
+                supporting_tokens.add(visual_token)
+                fragment_matched = True
+        if fragment_matched:
+            supporting_fragments.append(fragment)
+    if len(supporting_tokens) < 2:
+        return None
+    return {
+        "fragment": suffix,
+        "source_line_count": len(source_lines),
+        "matched_prefix_token_count": last_matched_record_index + 1,
+        "matched_prefix_ratio": round(matched_prefix_ratio, 4),
+        "source_supported_suffix_token_count": len(source_supported_suffix_tokens),
+        "supporting_visual_fragments": supporting_fragments[:8],
+        "supporting_visual_token_count": len(supporting_tokens),
+    }
 
 
 def _structural_shadow_record(
@@ -2460,10 +2647,14 @@ def recover_first_page_author_reading_order(
     }
 
 
-def structural_noise_qc(document_json: Any) -> dict[str, Any]:
+def structural_noise_qc(
+    document_json: Any,
+    source_evidence: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Identify structural regions and quarantine only evidence-rich candidates."""
     records = structural_text_records(document_json)
     picture_records = structural_picture_records(document_json)
+    table_records = structural_table_records(document_json)
     page_extents = _page_vertical_extents(records)
     known_structural_records = [
         record
@@ -2471,16 +2662,24 @@ def structural_noise_qc(document_json: Any) -> dict[str, Any]:
         if str(record.get("label") or "").lower() in PAGE_EDGE_LABELS | {"footnote"}
     ]
     picture_annotation_keys: dict[tuple[Any, str], dict[str, Any]] = {}
+    visual_evidence_by_order: dict[int, dict[str, Any]] = {}
+    visual_ocr_records: list[dict[str, Any]] = []
     for record in records:
         record_label = str(record.get("label") or "").lower()
         if record_label != "text" and not record_label.startswith(
             "quarantined_visual_annotation"
         ):
             continue
-        normalized = _normalized_noise_text(str(record.get("text") or ""))
+        record_text = str(record.get("text") or "")
+        normalized = _normalized_noise_text(record_text)
         geometry = record.get("bbox")
         if not normalized or not geometry:
             continue
+        if _is_semantic_subfigure_label(record_text):
+            continue
+        if re.match(r"^\s*[∗*†‡]\s+\S", record_text):
+            continue
+        evidence: dict[str, Any] | None = None
         for picture in picture_records:
             if picture.get("page_no") != record.get("page_no"):
                 continue
@@ -2488,6 +2687,16 @@ def structural_noise_qc(document_json: Any) -> dict[str, Any]:
             if evidence:
                 picture_annotation_keys[(record.get("page_no"), normalized)] = evidence
                 break
+        if not evidence:
+            for table in table_records:
+                if table.get("page_no") != record.get("page_no"):
+                    continue
+                evidence = _table_annotation_evidence(geometry, table)
+                if evidence:
+                    break
+        if evidence:
+            visual_evidence_by_order[int(record["reading_order"])] = evidence
+            visual_ocr_records.append(record)
     normalized_counts: dict[str, int] = {}
     normalized_pages: dict[str, set[Any]] = {}
     for record in records:
@@ -2526,14 +2735,17 @@ def structural_noise_qc(document_json: Any) -> dict[str, Any]:
         if label_l in {"formula", "table", "picture"}:
             continue
 
-        picture_overlap: dict[str, Any] | None = None
-        if label_l == "text" and geometry:
-            for picture in picture_records:
-                if picture.get("page_no") != record.get("page_no"):
-                    continue
-                picture_overlap = _picture_annotation_evidence(geometry, picture)
-                if picture_overlap:
-                    break
+        visual_overlap = (
+            visual_evidence_by_order.get(int(record["reading_order"]))
+            if label_l == "text"
+            else None
+        )
+        picture_overlap = (
+            visual_overlap if visual_overlap and "picture_index" in visual_overlap else None
+        )
+        table_overlap = (
+            visual_overlap if visual_overlap and "table_index" in visual_overlap else None
+        )
         structural_shadow = (
             _structural_shadow_record(record, known_structural_records)
             if label_l not in PAGE_EDGE_LABELS | {"footnote"}
@@ -2541,13 +2753,25 @@ def structural_noise_qc(document_json: Any) -> dict[str, Any]:
         )
         abrupt_visual_suffix = (
             _abrupt_visual_text_suffix(text)
-            if label_l == "text" and not picture_overlap and not structural_shadow
+            if label_l == "text" and not visual_overlap and not structural_shadow
+            else None
+        )
+        source_grounded_suffix = (
+            _source_grounded_visual_suffix(
+                record,
+                source_evidence,
+                visual_ocr_records,
+            )
+            if label_l == "text"
+            and not visual_overlap
+            and not structural_shadow
+            and not abrupt_visual_suffix
             else None
         )
         visual_annotation_shadow = (
             picture_annotation_keys.get((record.get("page_no"), normalized))
             if label_l == "text"
-            and not picture_overlap
+            and not visual_overlap
             and not structural_shadow
             and len(normalized) <= 80
             else None
@@ -2609,12 +2833,72 @@ def structural_noise_qc(document_json: Any) -> dict[str, Any]:
                 }
             continue
 
+        if source_grounded_suffix:
+            suffix = str(source_grounded_suffix["fragment"])
+            candidates.append(
+                {
+                    "index": index,
+                    "kind": "reading_order_table_annotation",
+                    "label": label,
+                    "text": suffix,
+                    "text_preview": suffix.strip()[:300],
+                    "page_no": record.get("page_no"),
+                    "bbox": geometry or None,
+                    "reasons": [
+                        "source_pdf_confirms_body_prefix_boundary",
+                        "suffix_tokens_match_adjacent_visual_ocr",
+                        "fragment_quarantined_without_removing_body_paragraph",
+                    ],
+                    "action": "quarantine_from_main_text_flow",
+                    "confidence": "high",
+                    "evidence_score": 7,
+                    "reading_order": record.get("reading_order"),
+                    "repeated_page_count": repeated_page_count,
+                    "picture_overlap": None,
+                    "table_overlap": None,
+                    "structural_shadow": None,
+                    "match_mode": "fragment",
+                    "source_grounding": {
+                        key: value
+                        for key, value in source_grounded_suffix.items()
+                        if key != "fragment"
+                    },
+                    "evidence": (
+                        f"pages/page_{record.get('page_no')}.png"
+                        if record.get("page_no")
+                        else None
+                    ),
+                }
+            )
+            node = record.get("node")
+            if isinstance(node, dict):
+                node.setdefault("local_ai_lab_qc", {})["structural_fragment_quarantine"] = {
+                    "kind": "reading_order_table_annotation",
+                    "text": suffix,
+                    "action": "quarantine_from_main_text_flow",
+                    "confidence": "high",
+                    "source_grounding": {
+                        key: value
+                        for key, value in source_grounded_suffix.items()
+                        if key != "fragment"
+                    },
+                }
+            continue
+
         if picture_overlap:
             kind = "visual_annotation"
             reasons.extend(
                 [
                     "text_bbox_inside_rendered_picture",
                     "duplicate_visual_ocr_removed_from_linear_reading_flow",
+                ]
+            )
+        elif table_overlap:
+            kind = "table_visual_annotation"
+            reasons.extend(
+                [
+                    "text_bbox_inside_or_adjacent_to_table",
+                    "duplicate_table_ocr_removed_from_linear_reading_flow",
                 ]
             )
         elif visual_annotation_shadow:
@@ -2725,6 +3009,8 @@ def structural_noise_qc(document_json: Any) -> dict[str, Any]:
         score = 0
         if picture_overlap:
             score += 6
+        if table_overlap:
+            score += 6
         if visual_annotation_shadow:
             score += 6
         if structural_shadow:
@@ -2775,6 +3061,7 @@ def structural_noise_qc(document_json: Any) -> dict[str, Any]:
                 "reading_order": record.get("reading_order"),
                 "repeated_page_count": repeated_page_count,
                 "picture_overlap": picture_overlap,
+                "table_overlap": table_overlap,
                 "visual_annotation_shadow": visual_annotation_shadow,
                 "structural_shadow": structural_shadow,
                 "evidence": f"pages/page_{record.get('page_no')}.png" if record.get("page_no") else None,
@@ -3923,7 +4210,7 @@ def apply_structural_quarantine_to_outputs(
     source_evidence: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Apply generic structural quarantine to JSON, HTML, and Markdown outputs."""
-    qc = structural_noise_qc(document_json)
+    qc = structural_noise_qc(document_json, source_evidence)
     candidates = qc["candidates"]
     quarantine_candidates = [
         item for item in candidates

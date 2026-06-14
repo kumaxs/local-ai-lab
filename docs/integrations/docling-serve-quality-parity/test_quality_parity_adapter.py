@@ -5,6 +5,7 @@ import sys
 import unittest
 from argparse import Namespace
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -1158,6 +1159,202 @@ class EnglishReviewPolishTests(unittest.TestCase):
             "small_text_in_expanded_picture_annotation_zone",
         )
         self.assertEqual(document["texts"][1]["label"], "text")
+
+    def test_structural_qc_quarantines_table_ocr_spilling_left_and_above_picture(self) -> None:
+        document = {
+            "pictures": [
+                {
+                    "label": "picture",
+                    "prov": [
+                        {
+                            "page_no": 3,
+                            "bbox": {"l": 74, "r": 276, "t": 718, "b": 643},
+                        }
+                    ],
+                }
+            ],
+            "texts": [
+                {
+                    "label": "text",
+                    "text": "ASCA",
+                    "prov": [
+                        {
+                            "page_no": 3,
+                            "bbox": {"l": 15, "r": 31, "t": 753, "b": 746},
+                        }
+                    ],
+                },
+                {
+                    "label": "text",
+                    "text": "(a) Oversegmented structure annotation",
+                    "prov": [
+                        {
+                            "page_no": 3,
+                            "bbox": {"l": 112, "r": 238, "t": 636, "b": 629},
+                        }
+                    ],
+                },
+            ],
+        }
+
+        qc = adapter.structural_noise_qc(document)
+
+        self.assertEqual(qc["candidate_count"], 1)
+        self.assertEqual(document["texts"][0]["label"], "quarantined_visual_annotation")
+        self.assertEqual(document["texts"][1]["label"], "text")
+
+    def test_structural_qc_quarantines_duplicate_text_inside_table_bbox(self) -> None:
+        document = {
+            "tables": [
+                {
+                    "label": "table",
+                    "prov": [
+                        {
+                            "page_no": 4,
+                            "bbox": {"l": 70, "r": 520, "t": 690, "b": 610},
+                        }
+                    ],
+                }
+            ],
+            "texts": [
+                {
+                    "label": "text",
+                    "text": "AP50 AP75",
+                    "prov": [
+                        {
+                            "page_no": 4,
+                            "bbox": {"l": 400, "r": 470, "t": 675, "b": 668},
+                        }
+                    ],
+                }
+            ],
+        }
+
+        qc = adapter.structural_noise_qc(document)
+
+        self.assertEqual(qc["candidate_count"], 1)
+        self.assertEqual(qc["candidates"][0]["kind"], "table_visual_annotation")
+        self.assertEqual(document["texts"][0]["label"], "quarantined_table_visual_annotation")
+
+    def test_structural_qc_removes_source_disproved_suffix_with_visual_ocr_support(self) -> None:
+        legitimate = (
+            "We split the dataset randomly into train validation and test sets "
+            "at the document level using a standard split. This results in many "
+            "tables for training and fewer tables for testing. An example"
+        )
+        suffix = " sroup Android rohot eel enjoyable embarrassed"
+        body_bbox = {
+            "l": 308,
+            "r": 547,
+            "t": 147,
+            "b": 79,
+            "width": 239,
+            "height": 68,
+        }
+        document = {
+            "pictures": [
+                {
+                    "label": "picture",
+                    "prov": [
+                        {
+                            "page_no": 7,
+                            "bbox": {"l": 58, "r": 280, "t": 719, "b": 569},
+                        }
+                    ],
+                }
+            ],
+            "texts": [
+                {
+                    "label": "text",
+                    "text": legitimate + suffix,
+                    "prov": [{"page_no": 6, "bbox": body_bbox}],
+                },
+                {
+                    "label": "text",
+                    "text": "Android robot",
+                    "prov": [
+                        {
+                            "page_no": 7,
+                            "bbox": {"l": 20, "r": 75, "t": 700, "b": 694},
+                        }
+                    ],
+                },
+                {
+                    "label": "text",
+                    "text": "Feel enjoyable",
+                    "prov": [
+                        {
+                            "page_no": 7,
+                            "bbox": {"l": 18, "r": 70, "t": 682, "b": 676},
+                        }
+                    ],
+                },
+            ],
+        }
+        source_line = {
+            "text": legitimate,
+            "bbox": body_bbox,
+            "source": "pdf_text_character_baseline",
+        }
+
+        with patch.object(adapter, "_source_page_text_lines", return_value=[source_line]):
+            qc = adapter.structural_noise_qc(
+                document,
+                {"available": True, "pages": {6: {}}},
+            )
+
+        suffix_candidate = next(
+            item
+            for item in qc["candidates"]
+            if item["kind"] == "reading_order_table_annotation"
+        )
+        self.assertEqual(suffix_candidate["match_mode"], "fragment")
+        self.assertEqual(suffix_candidate["text"], suffix)
+        self.assertGreaterEqual(
+            suffix_candidate["source_grounding"]["supporting_visual_token_count"],
+            2,
+        )
+        self.assertEqual(document["texts"][0]["label"], "text")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir)
+            (output_dir / "document.html").write_text(
+                (
+                    "<html><body>"
+                    f"<p>{legitimate + suffix}</p>"
+                    "<p>Android robot</p><p>Feel enjoyable</p>"
+                    "</body></html>"
+                ),
+                encoding="utf-8",
+            )
+            (output_dir / "document.md").write_text(
+                f"{legitimate + suffix}\n\nAndroid robot\n\nFeel enjoyable\n",
+                encoding="utf-8",
+            )
+            with patch.object(
+                adapter,
+                "_source_page_text_lines",
+                return_value=[source_line],
+            ):
+                result = adapter.apply_structural_quarantine_to_outputs(
+                    output_dir,
+                    document,
+                    {"available": True, "pages": {6: {}}},
+                )
+            final_html = adapter._visible_html_text(
+                adapter._html_without_structural_content(
+                    (output_dir / "document.html").read_text(encoding="utf-8")
+                )
+            )
+            final_markdown = adapter._markdown_without_structural_content(
+                (output_dir / "document.md").read_text(encoding="utf-8")
+            )
+
+        self.assertEqual(result["final_output_residual_count"], 0)
+        self.assertIn(legitimate, final_html)
+        self.assertIn(legitimate, final_markdown)
+        self.assertNotIn("sroup Android", final_html)
+        self.assertNotIn("sroup Android", final_markdown)
 
     def test_structural_qc_quarantines_same_page_picture_annotation_shadow(self) -> None:
         document = {
