@@ -1328,7 +1328,7 @@ class EnglishReviewPolishTests(unittest.TestCase):
         self.assertEqual(result["html_structural_content_count"], 1)
         self.assertEqual(result["markdown_structural_content_count"], 1)
         self.assertIn("Extracted page-edge notes", final_html)
-        self.assertIn(text, final_html)
+        self.assertIn("Correspondence to: author@example.org", final_html)
         self.assertIn("## Extracted page-edge notes", final_md)
         self.assertIn(text, final_md)
         self.assertNotIn(text, adapter._visible_html_text(
@@ -1427,6 +1427,119 @@ class EnglishReviewPolishTests(unittest.TestCase):
         )
         self.assertEqual(groups[0]["assembly_reason"], "marker_attached_to_continuation_line")
 
+    def test_note_group_uses_source_baselines_to_separate_adjacent_markers(self) -> None:
+        characters = []
+
+        def add_line(text: str, x: float, baseline: float) -> None:
+            for char in text:
+                index = len(characters)
+                characters.append(
+                    {
+                        "index": index,
+                        "text": char,
+                        "font_name": "Times",
+                        "font_weight": 400,
+                        "font_size": 6,
+                        "bbox": {
+                            "l": x,
+                            "r": x + 3,
+                            "b": baseline,
+                            "t": baseline + 6,
+                            "width": 3,
+                            "height": 6,
+                        },
+                    }
+                )
+                x += 3
+
+        add_line("0", 120, 87)
+        add_line("Compared to V1, this draft is improved.", 124, 82)
+        add_line("1 While GPT-3 performs signifi-", 121, 72)
+        add_line("cantly better.", 108, 62)
+        records = [
+            {
+                "index": 1,
+                "kind": "footnote",
+                "text": "0",
+                "page_no": 1,
+                "confidence": "high",
+                "bbox": {"l": 120, "r": 124, "t": 93, "b": 86, "width": 4, "height": 7},
+            },
+            {
+                "index": 2,
+                "kind": "footnote",
+                "text": "Compared to V1, this draft is improved. While GPT-3 performs signifi-",
+                "page_no": 1,
+                "confidence": "high",
+                "bbox": {"l": 120, "r": 500, "t": 89, "b": 68, "width": 380, "height": 21},
+            },
+            {
+                "index": 3,
+                "kind": "footnote",
+                "text": "1 cantly better.",
+                "page_no": 1,
+                "confidence": "high",
+                "bbox": {"l": 108, "r": 270, "t": 78, "b": 60, "width": 162, "height": 18},
+            },
+        ]
+        source = {
+            "pages": {
+                1: {
+                    "median_font_size": 10,
+                    "characters": characters,
+                }
+            }
+        }
+
+        groups = adapter._build_structural_note_groups(records, source)
+
+        self.assertEqual([(item["marker"], item["text"]) for item in groups], [
+            ("0", "Compared to V1, this draft is improved."),
+            ("1", "While GPT-3 performs significantly better."),
+        ])
+
+    def test_note_group_merges_cross_page_two_column_continuation(self) -> None:
+        records = [
+            {
+                "index": 1,
+                "kind": "footnote",
+                "text": "4 Bidirectional Trans-",
+                "page_no": 3,
+                "confidence": "high",
+                "bbox": {"l": 320, "r": 525, "t": 87, "b": 77},
+            },
+            {
+                "index": 2,
+                "kind": "footnote",
+                "text": "5 Another note.",
+                "page_no": 4,
+                "confidence": "high",
+                "bbox": {"l": 320, "r": 520, "t": 108, "b": 98},
+            },
+            {
+                "index": 3,
+                "kind": "footnote",
+                "text": "former continues on the next page.",
+                "page_no": 4,
+                "confidence": "high",
+                "bbox": {"l": 72, "r": 290, "t": 105, "b": 77},
+            },
+        ]
+
+        groups = adapter._build_structural_note_groups(records)
+        note = next(item for item in groups if item.get("marker") == "4")
+
+        self.assertEqual(
+            note["text"],
+            "Bidirectional Transformer continues on the next page.",
+        )
+        self.assertEqual(note["continuation_pages"], [4])
+        self.assertEqual(len(note["source_bboxes"]), 2)
+        self.assertNotIn(
+            "former continues on the next page.",
+            [item["text"] for item in groups if item.get("marker") is None],
+        )
+
     def test_note_reference_mapping_requires_unique_same_page_marker(self) -> None:
         notes = [
             {"note_id": "note-1", "page_no": 1, "marker": "1"},
@@ -1453,6 +1566,44 @@ class EnglishReviewPolishTests(unittest.TestCase):
         self.assertEqual(mappings[0]["note_id"], "note-1")
         self.assertEqual(len(unresolved), 1)
         self.assertEqual(unresolved[0]["reason"], "note_marker_not_found")
+
+    def test_symbol_note_references_are_not_grouped_together(self) -> None:
+        document = {
+            "texts": [
+                {
+                    "label": "text",
+                    "text": "A * B † C",
+                    "prov": [
+                        {
+                            "page_no": 1,
+                            "bbox": {"l": 0, "r": 100, "t": 30, "b": 0},
+                        }
+                    ],
+                }
+            ]
+        }
+        source = {
+            "pages": {
+                1: {
+                    "median_font_size": 10,
+                    "characters": [
+                        {"index": 0, "text": "A", "font_size": 10, "bbox": {"l": 5, "r": 10, "t": 20, "b": 10}},
+                        {"index": 1, "text": "*", "font_size": 6, "bbox": {"l": 11, "r": 14, "t": 22, "b": 16}},
+                        {"index": 2, "text": "B", "font_size": 10, "bbox": {"l": 16, "r": 21, "t": 20, "b": 10}},
+                        {"index": 3, "text": "†", "font_size": 6, "bbox": {"l": 22, "r": 25, "t": 22, "b": 16}},
+                        {"index": 4, "text": "C", "font_size": 10, "bbox": {"l": 27, "r": 32, "t": 20, "b": 10}},
+                    ],
+                }
+            }
+        }
+        notes = [
+            {"page_no": 1, "marker": "*"},
+            {"page_no": 1, "marker": "†"},
+        ]
+
+        references = adapter._pdf_inline_note_references(document, source, notes)
+
+        self.assertEqual([item["marker"] for item in references], ["*", "†"])
 
     def test_note_reference_links_html_and_markdown_with_backlink_ids(self) -> None:
         mappings = [
@@ -1585,6 +1736,56 @@ class EnglishReviewPolishTests(unittest.TestCase):
         self.assertIn("Shen<sup", updated)
         self.assertIn("</sup>Shean", updated)
         self.assertNotIn("She n", updated)
+
+    def test_author_region_reorders_misplaced_author_and_splits_body_tail(self) -> None:
+        document = {
+            "texts": [
+                {"label": "section_header", "text": "TITLE", "prov": [{"page_no": 1, "bbox": {"l": 50, "r": 300, "t": 700, "b": 680}}]},
+                {"label": "section_header", "text": "Petar *", "prov": [{"page_no": 1, "bbox": {"l": 60, "r": 150, "t": 660, "b": 650}}]},
+                {"label": "text", "text": "Department A", "prov": [{"page_no": 1, "bbox": {"l": 60, "r": 180, "t": 640, "b": 630}}]},
+                {"label": "text", "text": "Guillem * Centre B", "prov": [{"page_no": 1, "bbox": {"l": 320, "r": 500, "t": 660, "b": 645}}]},
+                {"label": "text", "text": "Department A", "prov": [{"page_no": 1, "bbox": {"l": 320, "r": 500, "t": 650, "b": 640}}]},
+                {"label": "text", "text": "g@example.org based on its state in every layer.", "prov": [{"page_no": 1, "bbox": {"l": 320, "r": 500, "t": 640, "b": 630}}]},
+                {"label": "section_header", "text": "ABSTRACT", "prov": [{"page_no": 1, "bbox": {"l": 250, "r": 350, "t": 500, "b": 490}}]},
+            ]
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir)
+            (output_dir / "document.html").write_text(
+                "<h1>TITLE</h1><h2>Petar *</h2><p>Department A</p>"
+                "<h2>ABSTRACT</h2><p>Body.</p><p>Guillem * Centre B</p>"
+                "<p>Department A</p>"
+                "<p>g@example.org based on its state in every layer.</p>",
+                encoding="utf-8",
+            )
+            (output_dir / "document.md").write_text(
+                "# TITLE\n\n## Petar <sup><a href=\"#note\">*</a></sup>\n\n"
+                "Department A\n\n## ABSTRACT\n\nBody.\n\n"
+                "**Guillem** <sup><a href=\"#note\">*</a></sup> Centre B\n\n"
+                "Department A\n\n"
+                "g@example.org based on its state in every layer.\n",
+                encoding="utf-8",
+            )
+
+            result = adapter.recover_first_page_author_reading_order(
+                output_dir,
+                document,
+            )
+            html_text = (output_dir / "document.html").read_text(encoding="utf-8")
+            markdown = (output_dir / "document.md").read_text(encoding="utf-8")
+
+        self.assertTrue(result["applied"])
+        self.assertEqual(result["author_record_count"], 5)
+        self.assertEqual(result["markdown_record_replacement_count"], 5)
+        self.assertLess(html_text.index("Guillem"), html_text.index("ABSTRACT"))
+        self.assertLess(html_text.index("g@example.org"), html_text.index("ABSTRACT"))
+        self.assertEqual(html_text.count("Department A"), 2)
+        self.assertLess(markdown.index("**Guillem**"), markdown.index("## ABSTRACT"))
+        self.assertIn('<a href="#note">*</a>', markdown)
+        self.assertGreater(
+            html_text.index("based on its state in every layer."),
+            html_text.index("ABSTRACT"),
+        )
 
     def test_semantic_emphasis_uses_pdf_font_evidence(self) -> None:
         document = {
@@ -1896,9 +2097,9 @@ class EnglishReviewPolishTests(unittest.TestCase):
         )
 
         self.assertTrue(changed)
-        self.assertIn("<template", html)
+        self.assertIn("<!-- local-ai-lab structural quarantine", html)
         self.assertNotIn("<span>arXiv:2506.22084v1 [cs.LG]</span>", html)
-        self.assertIn("publication_template_noise", html)
+        self.assertIn("evidence=structural_regions.json", html)
 
 
 if __name__ == "__main__":
