@@ -896,6 +896,107 @@ def render_page_images_and_crops(
     return counts, warnings, crop_metrics
 
 
+def inject_empty_table_visual_fallbacks(
+    output_dir: Path,
+    document_json: Any,
+    tables: list[dict[str, Any]],
+) -> dict[str, Any]:
+    nodes_by_ref = {
+        str(node.get("self_ref")): node
+        for node in iter_nodes(document_json)
+        if isinstance(node, dict) and node.get("self_ref")
+    }
+    candidates: list[dict[str, Any]] = []
+    for index, table in enumerate(tables, start=1):
+        data = table.get("data") or {}
+        if data.get("table_cells") or data.get("num_rows") or data.get("num_cols"):
+            continue
+        image_path = output_dir / "tables" / f"table_{index}.png"
+        if not image_path.exists():
+            continue
+        caption_texts = []
+        for caption in table.get("captions") or []:
+            reference = str(caption.get("$ref") or "")
+            node = nodes_by_ref.get(reference)
+            text = str((node or {}).get("text") or "").strip()
+            if text:
+                caption_texts.append(text)
+        if not caption_texts:
+            continue
+        candidates.append(
+            {
+                "table_index": index,
+                "image": f"tables/table_{index}.png",
+                "caption": " ".join(caption_texts),
+                "page_no": (first_prov(table) or {}).get("page_no"),
+                "reason": "empty_structural_grid_with_source_bbox_and_caption",
+            }
+        )
+        table.setdefault("local_ai_lab_qc", {})["visual_fallback"] = candidates[-1]
+
+    html_count = 0
+    html_path = output_dir / "document.html"
+    if candidates and html_path.exists():
+        document_html = html_path.read_text(encoding="utf-8")
+        for candidate in candidates:
+            target = _normalized_noise_text(candidate["caption"])
+            for match in re.finditer(
+                r"<table\b[^>]*>(?P<body>.*?)</table>",
+                document_html,
+                flags=re.I | re.S,
+            ):
+                body = match.group("body")
+                visible = _normalized_noise_text(
+                    html.unescape(HTML_TAG_RE.sub(" ", body))
+                )
+                if visible != target:
+                    continue
+                replacement = (
+                    '<figure class="docling-table-visual-fallback">'
+                    f'<img src="{candidate["image"]}" '
+                    f'alt="{html.escape(candidate["caption"], quote=True)}">'
+                    f'<figcaption>{html.escape(candidate["caption"])}</figcaption>'
+                    "</figure>"
+                )
+                document_html = (
+                    document_html[: match.start()]
+                    + replacement
+                    + document_html[match.end() :]
+                )
+                html_count += 1
+                break
+        html_path.write_text(document_html, encoding="utf-8")
+
+    markdown_count = 0
+    md_path = output_dir / "document.md"
+    if candidates and md_path.exists():
+        document_markdown = md_path.read_text(encoding="utf-8")
+        for candidate in candidates:
+            caption_pattern = re.compile(
+                r"(?m)^(?P<caption>"
+                + re.escape(candidate["caption"])
+                + r")\s*$"
+            )
+            replacement = (
+                f'![{candidate["caption"]}]({candidate["image"]})\n\n'
+                r"\g<caption>"
+            )
+            document_markdown, changed = caption_pattern.subn(
+                replacement,
+                document_markdown,
+                count=1,
+            )
+            markdown_count += changed
+        md_path.write_text(document_markdown, encoding="utf-8")
+
+    return {
+        "candidate_count": len(candidates),
+        "html_applied_count": html_count,
+        "markdown_applied_count": markdown_count,
+        "candidates": candidates,
+    }
+
+
 def collect_page_nodes(document_json: Any) -> list[dict[str, Any]]:
     nodes: list[dict[str, Any]] = []
     formula_index = 0
@@ -1966,6 +2067,9 @@ def _picture_annotation_evidence(
 def _table_annotation_evidence(
     geometry: dict[str, Any] | None,
     table: dict[str, Any],
+    *,
+    top_zone: bool = False,
+    page_height: float = 0.0,
 ) -> dict[str, Any] | None:
     table_geometry = table.get("bbox")
     overlap = _bbox_intersection_ratio(geometry, table_geometry)
@@ -1997,6 +2101,26 @@ def _table_annotation_evidence(
             "table_index": table["index"],
             "overlap_ratio": round(overlap, 4),
             "region_match": "small_text_in_expanded_table_zone",
+        }
+    table_data = (table.get("node") or {}).get("data") or {}
+    empty_structural_grid = not (
+        table_data.get("table_cells")
+        or table_data.get("num_rows")
+        or table_data.get("num_cols")
+    )
+    vertical_gap = float(geometry.get("b", 0.0)) - float(
+        table_geometry.get("t", 0.0)
+    )
+    if (
+        empty_structural_grid
+        and top_zone
+        and 0 <= vertical_gap <= max(90.0, page_height * 0.12)
+        and expanded["l"] <= center_x <= expanded["r"]
+    ):
+        return {
+            "table_index": table["index"],
+            "overlap_ratio": round(overlap, 4),
+            "region_match": "small_text_top_edge_adjacent_to_empty_table_bbox",
         }
     return None
 
@@ -2178,6 +2302,15 @@ def _looks_like_author_affiliation_footnote_mislabel(
     if not normalized:
         return False
     if FOOTNOTE_CONTENT_NOISE_RE.search(normalized):
+        return False
+    if (
+        FOOTNOTE_MARKER_RE.search(normalized)
+        and re.search(
+            r"https?://|www\.|\b(?:code|data|dataset|supplement|appendix)\b",
+            normalized,
+            re.I,
+        )
+    ):
         return False
     if re.search(
         r"@|university|institute|department|school|college|academy|laborator|"
@@ -2659,8 +2792,23 @@ def structural_noise_qc(
     known_structural_records = [
         record
         for record in records
-        if str(record.get("label") or "").lower() in PAGE_EDGE_LABELS | {"footnote"}
+        if str(record.get("label") or "")
+        .lower()
+        .removeprefix("quarantined_")
+        in PAGE_EDGE_LABELS | {"footnote"}
     ]
+    footnote_zones: dict[Any, list[dict[str, Any]]] = {}
+    for record in known_structural_records:
+        if (
+            str(record.get("label") or "")
+            .lower()
+            .removeprefix("quarantined_")
+            == "footnote"
+            and record.get("bbox")
+        ):
+            footnote_zones.setdefault(record.get("page_no"), []).append(
+                record["bbox"]
+            )
     picture_annotation_keys: dict[tuple[Any, str], dict[str, Any]] = {}
     visual_evidence_by_order: dict[int, dict[str, Any]] = {}
     visual_ocr_records: list[dict[str, Any]] = []
@@ -2675,6 +2823,10 @@ def structural_noise_qc(
         geometry = record.get("bbox")
         if not normalized or not geometry:
             continue
+        _bottom_zone, record_top_zone, record_page_height = _edge_zone_flags(
+            geometry,
+            page_extents.get(record.get("page_no")),
+        )
         if _is_semantic_subfigure_label(record_text):
             continue
         if re.match(r"^\s*[∗*†‡]\s+\S", record_text):
@@ -2691,9 +2843,48 @@ def structural_noise_qc(
             for table in table_records:
                 if table.get("page_no") != record.get("page_no"):
                     continue
-                evidence = _table_annotation_evidence(geometry, table)
+                evidence = _table_annotation_evidence(
+                    geometry,
+                    table,
+                    top_zone=record_top_zone,
+                    page_height=record_page_height,
+                )
                 if evidence:
                     break
+        if not evidence and record_top_zone and float(geometry.get("height", 999)) <= 14:
+            empty_page_tables = [
+                table
+                for table in table_records
+                if table.get("page_no") == record.get("page_no")
+                and not (
+                    ((table.get("node") or {}).get("data") or {}).get("table_cells")
+                    or ((table.get("node") or {}).get("data") or {}).get("num_rows")
+                    or ((table.get("node") or {}).get("data") or {}).get("num_cols")
+                )
+            ]
+            if len(empty_page_tables) >= 2:
+                left = min(float(table["bbox"].get("l", 0)) for table in empty_page_tables)
+                right = max(float(table["bbox"].get("r", 0)) for table in empty_page_tables)
+                top = max(float(table["bbox"].get("t", 0)) for table in empty_page_tables)
+                widest = max(
+                    float(table["bbox"].get("width", 0))
+                    for table in empty_page_tables
+                )
+                center_x = (
+                    float(geometry.get("l", 0)) + float(geometry.get("r", 0))
+                ) / 2
+                vertical_gap = float(geometry.get("b", 0)) - top
+                if (
+                    left - widest * 0.7 <= center_x <= right + widest * 0.7
+                    and 0 <= vertical_gap <= max(90.0, record_page_height * 0.12)
+                ):
+                    evidence = {
+                        "table_index": empty_page_tables[0]["index"],
+                        "overlap_ratio": 0.0,
+                        "region_match": (
+                            "small_text_top_edge_adjacent_to_empty_table_cluster"
+                        ),
+                    }
         if evidence:
             visual_evidence_by_order[int(record["reading_order"])] = evidence
             visual_ocr_records.append(record)
@@ -2709,6 +2900,8 @@ def structural_noise_qc(
     for index, record in enumerate(records, start=1):
         label = str(record.get("label") or "")
         label_l = label.lower()
+        if label_l.startswith("quarantined_"):
+            label_l = label_l.removeprefix("quarantined_")
         text = str(record.get("text") or "")
         normalized = _normalized_noise_text(text)
         geometry = record.get("bbox") or {}
@@ -2719,6 +2912,24 @@ def structural_noise_qc(
         small_text = bool(
             geometry
             and float(geometry.get("height", 0.0)) <= max(14.0, page_height * 0.018)
+        )
+        adjacent_to_footnote_zone = bool(
+            geometry
+            and any(
+                float(geometry.get("b", 0)) >= float(zone.get("t", 0))
+                and float(geometry.get("b", 0)) - float(zone.get("t", 0))
+                <= max(36.0, page_height * 0.055)
+                and min(
+                    float(geometry.get("r", 0)),
+                    float(zone.get("r", 0)),
+                )
+                - max(
+                    float(geometry.get("l", 0)),
+                    float(zone.get("l", 0)),
+                )
+                > 0
+                for zone in footnote_zones.get(record.get("page_no"), [])
+            )
         )
         reasons: list[str] = []
         kind: str | None = None
@@ -2978,6 +3189,18 @@ def structural_noise_qc(
             reasons.append("small_text_bottom_footnote_marker_candidate")
         elif (
             not body_semantic_label
+            and adjacent_to_footnote_zone
+            and FOOTNOTE_MARKER_RE.search(text)
+        ):
+            kind = kind or "footnote_candidate"
+            reasons.extend(
+                [
+                    "marker_led_line_adjacent_to_labeled_footnote_zone",
+                    "same_column_footnote_cluster",
+                ]
+            )
+        elif (
+            not body_semantic_label
             and geometry
             and bottom_zone
             and text.rstrip().endswith("-")
@@ -2985,6 +3208,20 @@ def structural_noise_qc(
         ):
             kind = kind or "footnote_candidate"
             reasons.append("bottom_region_hyphenated_annotation_candidate")
+
+        if (
+            not body_semantic_label
+            and adjacent_to_footnote_zone
+            and FOOTNOTE_MARKER_RE.search(text)
+            and "same_column_footnote_cluster" not in reasons
+        ):
+            kind = kind or "footnote_candidate"
+            reasons.extend(
+                [
+                    "marker_led_line_adjacent_to_labeled_footnote_zone",
+                    "same_column_footnote_cluster",
+                ]
+            )
 
         if repeated_page_count >= 2 and kind in {"page_header", "page_header_candidate", "page_footer", "page_footer_candidate"}:
             reasons.append("repeated_text")
@@ -3023,6 +3260,8 @@ def structural_noise_qc(
             score += 1
         if FOOTNOTE_MARKER_RE.search(text):
             score += 2
+        if adjacent_to_footnote_zone and "same_column_footnote_cluster" in reasons:
+            score += 4
         if FOOTNOTE_CONTENT_NOISE_RE.search(normalized) or HEADER_FOOTER_NOISE_RE.search(normalized):
             score += 2
         if small_text:
@@ -3271,11 +3510,23 @@ def _structural_export_records(candidates: list[dict[str, Any]]) -> list[dict[st
 
 NOTE_MARKER_PREFIX_RE = re.compile(r"^\s*([∗*†‡]|\d{1,2})(?:\s+|$)(.*)$", re.S)
 BIBLIOGRAPHY_HEADING_RE = re.compile(
-    r"^\s*(?:references|bibliography|参考文献)\s*$",
+    r"^\s*(?:references|bibliography|参考文献)\s*[:：]?\s*$",
     re.I,
 )
 INLINE_CITATION_RE = re.compile(
-    r"\[(?P<body>\s*\d{1,3}(?:\s*(?:[,;]|\u2013|\u2014|-)\s*\d{1,3})*\s*)\]"
+    r"(?:"
+    r"(?P<paired_open>[\[［〔])"
+    r"(?P<body>\s*\d{1,3}(?:\s*(?:[,;，；]|\u2013|\u2014|-)\s*\d{1,3})*\s*)"
+    r"(?P<paired_close>[\]］〕])"
+    r"|"
+    r"(?P<mixed_open>[\(（])"
+    r"(?P<mixed_body>\s*\d{1,3}(?:\s*(?:[,;，；]|\u2013|\u2014|-)\s*\d{1,3})*\s*)"
+    r"(?P<mixed_close>[\]］〕])"
+    r"|"
+    r"(?P<open_only>〔)"
+    r"(?P<open_only_body>\s*\d{1,3})"
+    r"(?=\s|[，。；、])"
+    r")"
 )
 REFERENCE_CONTINUATION_START_RE = re.compile(
     r"^\s*(?:"
@@ -3790,6 +4041,78 @@ def _pdf_inline_note_references(
     return references
 
 
+def _html_inline_note_references(
+    document_json: Any,
+    document_html: str,
+    note_groups: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    available_markers: dict[Any, set[str]] = {}
+    for note in note_groups:
+        marker = str(note.get("marker") or "")
+        if marker:
+            available_markers.setdefault(note.get("page_no"), set()).add(marker)
+    if not available_markers:
+        return []
+
+    records_by_text: dict[str, list[dict[str, Any]]] = {}
+    for record in structural_text_records(document_json):
+        label = str(record.get("label") or "").lower()
+        if label.startswith("quarantined_") or label in {
+            "page_header",
+            "page_footer",
+            "footnote",
+            "formula",
+        }:
+            continue
+        normalized = re.sub(
+            r"\s*([*†‡])\s*",
+            r"\1",
+            _normalized_noise_text(str(record.get("text") or "")).replace(
+                "∗",
+                "*",
+            ),
+        )
+        if normalized:
+            records_by_text.setdefault(normalized, []).append(record)
+
+    references: list[dict[str, Any]] = []
+    sup_re = re.compile(r"<sup\b[^>]*>(?P<body>.*?)</sup>", re.I | re.S)
+    for block in HTML_TEXT_BLOCK_RE.finditer(document_html):
+        visible = re.sub(
+            r"\s*([*†‡])\s*",
+            r"\1",
+            _normalized_noise_text(
+                html.unescape(HTML_TAG_RE.sub("", block.group("body")))
+            ).replace("∗", "*"),
+        )
+        matching_records = records_by_text.get(visible) or []
+        if len(matching_records) != 1:
+            continue
+        record = matching_records[0]
+        page_no = record.get("page_no")
+        for sup in sup_re.finditer(block.group("body")):
+            marker = _normalized_noise_text(
+                html.unescape(HTML_TAG_RE.sub("", sup.group("body")))
+            ).replace("∗", "*")
+            if marker not in available_markers.get(page_no, set()):
+                continue
+            references.append(
+                {
+                    "page_no": page_no,
+                    "marker": marker,
+                    "bbox": None,
+                    "font_size": None,
+                    "page_median_font_size": None,
+                    "script_position": "superscript",
+                    "source": "final_html_sup_element_and_same_page_node",
+                    "confidence": "high",
+                    "node_text": record.get("text"),
+                    "reading_order": record.get("reading_order"),
+                }
+            )
+    return references
+
+
 def _map_note_references(
     note_groups: list[dict[str, Any]],
     references: list[dict[str, Any]],
@@ -4031,11 +4354,40 @@ def _reference_section_records(document_json: Any) -> tuple[
     return heading, result
 
 
-def _explicit_reference_number(text: str) -> tuple[int | None, str]:
-    match = re.match(r"^\s*(?:\[(\d{1,3})\]|(\d{1,3})[.)])\s+(.*)$", text, re.S)
+def _citation_match_body(match: re.Match[str]) -> str:
+    return (
+        match.group("body")
+        or match.group("mixed_body")
+        or match.group("open_only_body")
+        or ""
+    )
+
+
+def _explicit_reference_number(
+    text: str,
+    record: dict[str, Any] | None = None,
+) -> tuple[int | None, str]:
+    node = (record or {}).get("node")
+    marker = str(node.get("marker") or "") if isinstance(node, dict) else ""
+    marker_match = re.fullmatch(r"\s*[\[［〔]?(\d{1,3})[\]］〕.)、]?\s*", marker)
+    if marker_match:
+        return int(marker_match.group(1)), text.strip()
+    original = str(node.get("orig") or "") if isinstance(node, dict) else ""
+    source = original or text
+    match = re.match(
+        r"^\s*(?:"
+        r"[\[［〔](\d{1,3})[\]］〕]|"
+        r"[LlI|](\d{1,3})[」］〕]|"
+        r"(\d{1,3})[.)、]"
+        r")\s*(.*)$",
+        source,
+        re.S,
+    )
     if not match:
         return None, text
-    return int(match.group(1) or match.group(2)), match.group(3).strip()
+    number = int(match.group(1) or match.group(2) or match.group(3))
+    body = match.group(4).strip()
+    return number, body
 
 
 def bibliography_diagnostics(document_json: Any) -> dict[str, Any]:
@@ -4055,7 +4407,7 @@ def bibliography_diagnostics(document_json: Any) -> dict[str, Any]:
     explicit_numbers = [
         number
         for number, _body in (
-            _explicit_reference_number(str(record.get("text") or ""))
+            _explicit_reference_number(str(record.get("text") or ""), record)
             for record in records
         )
         if number is not None
@@ -4063,7 +4415,7 @@ def bibliography_diagnostics(document_json: Any) -> dict[str, Any]:
     explicit_mode = bool(explicit_numbers)
     for list_index, record in enumerate(records):
         text = str(record.get("text") or "")
-        explicit_number, body = _explicit_reference_number(text)
+        explicit_number, body = _explicit_reference_number(text, record)
         previous = references[-1] if references else None
         cross_page_continuation = bool(
             previous
@@ -4140,7 +4492,8 @@ def bibliography_diagnostics(document_json: Any) -> dict[str, Any]:
         text = str(record.get("text") or "")
         for citation_match in INLINE_CITATION_RE.finditer(text):
             raw = citation_match.group(0)
-            numbers = _citation_numbers(citation_match.group("body"))
+            citation_body = _citation_match_body(citation_match)
+            numbers = _citation_numbers(citation_body)
             missing = [number for number in numbers if number not in reference_lookup]
             if not numbers or missing:
                 unresolved.append(
@@ -4180,6 +4533,7 @@ def bibliography_diagnostics(document_json: Any) -> dict[str, Any]:
                 "reading_order": record.get("reading_order"),
                 "node_text": text,
                 "raw_citation": raw,
+                "citation_body": citation_body,
                 "numbers": numbers,
                 "links": links,
                 "confidence": "high",
@@ -4223,7 +4577,7 @@ def bibliography_diagnostics(document_json: Any) -> dict[str, Any]:
 
 def _linked_citation_html(citation: dict[str, Any]) -> str:
     link_lookup = {item["number"]: item for item in citation["links"]}
-    body = citation["raw_citation"][1:-1]
+    body = str(citation.get("citation_body") or "")
 
     def replace_number(match: re.Match[str]) -> str:
         number = int(match.group())
@@ -4356,11 +4710,55 @@ def _link_bibliography_in_html(
             f'aria-label="Back to citation {reference["number"]}">↩</a>'
             for backlink_id in reference.get("backlink_ids") or []
         )
+        reference_body = re.sub(
+            r'^\s*<span\b[^>]*class="docling-reference-number"[^>]*>'
+            r".*?</span>\s*",
+            "",
+            match.group("body"),
+            count=1,
+            flags=re.I | re.S,
+        )
+        reference_body = re.sub(
+            r'\s*<span\b[^>]*class="docling-reference-backlinks"[^>]*>'
+            r".*?</span>\s*$",
+            "",
+            reference_body,
+            count=1,
+            flags=re.I | re.S,
+        )
+        original_marker_present = bool(
+            re.search(
+                r"list-style-type\s*:\s*['\"]?\s*"
+                r"(?:\\?\[|［|〔)\s*"
+                + re.escape(str(reference["number"]))
+                + r"\s*(?:\\?\]|］|〕)",
+                attrs,
+                flags=re.I,
+            )
+            or re.match(
+                r"^\s*(?:"
+                r"[\[［〔]\s*"
+                + re.escape(str(reference["number"]))
+                + r"\s*[\]］〕]|"
+                r"[LlI|]\s*"
+                + re.escape(str(reference["number"]))
+                + r"\s*[」］〕]"
+                r")",
+                html.unescape(HTML_TAG_RE.sub("", reference_body)),
+            )
+        )
+        visible_number = (
+            ""
+            if original_marker_present
+            else (
+                f'<span class="docling-reference-number">'
+                f'[{reference["number"]}]</span> '
+            )
+        )
         body = (
-            f'<span class="docling-reference-number">'
-            f'[{reference["number"]}]</span> '
-            f'{match.group("body")}'
-            f'<span class="docling-reference-backlinks">{backlinks}</span>'
+            visible_number
+            + reference_body
+            + f'<span class="docling-reference-backlinks">{backlinks}</span>'
         )
         reference_replacements.append(
             (
@@ -4375,12 +4773,18 @@ def _link_bibliography_in_html(
     reference_count = len(reference_replacements)
 
     citation_count = 0
+    citation_groups: dict[tuple[Any, str], list[dict[str, Any]]] = {}
     for citation in diagnostics["citations"]:
         if any(
             str(link["reference_id"]) not in anchored_reference_ids
             for link in citation["links"]
         ):
             continue
+        citation_groups.setdefault(
+            (citation.get("reading_order"), str(citation["node_text"])),
+            [],
+        ).append(citation)
+    for (_reading_order, node_text), citations in citation_groups.items():
         candidates = list(HTML_TEXT_BLOCK_RE.finditer(updated))
         candidates.extend(
             re.finditer(
@@ -4408,21 +4812,25 @@ def _link_bibliography_in_html(
             if (
                 not _citation_visible_context_matches(
                     visible,
-                    str(citation["node_text"]),
-                    str(citation["raw_citation"]),
+                    node_text,
+                    str(citations[0]["raw_citation"]),
                 )
-                or citation["raw_citation"] not in match.group("body")
+                or not any(
+                    str(citation["raw_citation"]) in match.group("body")
+                    for citation in citations
+                )
             ):
                 continue
             body = match.group("body")
-            linked = _linked_citation_html(citation)
-            body, changed = re.subn(
-                re.escape(citation["raw_citation"]),
-                lambda _match, value=linked: value,
-                body,
-                count=1,
-            )
-            citation_count += changed
+            for citation in citations:
+                linked = _linked_citation_html(citation)
+                body, changed = re.subn(
+                    re.escape(citation["raw_citation"]),
+                    lambda _match, value=linked: value,
+                    body,
+                    count=1,
+                )
+                citation_count += changed
             replacement = (
                 f"<{match.group('tag')}{match.group('attrs')}>"
                 f"{body}</{match.group('tag')}>"
@@ -4440,7 +4848,8 @@ def _link_bibliography_in_markdown(
         return document_markdown, 0, 0
     updated = document_markdown
     heading_match = re.search(
-        r"(?im)^[ \t]{0,3}#{1,6}[ \t]+(?:references|bibliography|参考文献)[ \t]*$",
+        r"(?im)^[ \t]{0,3}#{1,6}[ \t]+"
+        r"(?:references|bibliography|参考文献)[ \t]*[:：]?[ \t]*$",
         updated,
     )
     reference_matches: list[re.Match[str]] = []
@@ -4496,12 +4905,18 @@ def _link_bibliography_in_markdown(
     reference_count = len(reference_replacements)
 
     citation_count = 0
+    citation_groups: dict[tuple[Any, str], list[dict[str, Any]]] = {}
     for citation in diagnostics["citations"]:
         if any(
             str(link["reference_id"]) not in anchored_reference_ids
             for link in citation["links"]
         ):
             continue
+        citation_groups.setdefault(
+            (citation.get("reading_order"), str(citation["node_text"])),
+            [],
+        ).append(citation)
+    for (_reading_order, node_text), citations in citation_groups.items():
         block_match = None
         candidates = list(
             re.finditer(
@@ -4529,24 +4944,28 @@ def _link_bibliography_in_markdown(
             if (
                 _citation_visible_context_matches(
                     visible,
-                    str(citation["node_text"]),
-                    str(citation["raw_citation"]),
+                    node_text,
+                    str(citations[0]["raw_citation"]),
                 )
-                and citation["raw_citation"] in candidate.group("body")
+                and any(
+                    str(citation["raw_citation"]) in candidate.group("body")
+                    for citation in citations
+                )
             ):
                 block_match = candidate
                 break
         if block_match is None:
             continue
         body = block_match.group("body")
-        linked = _linked_citation_html(citation)
-        body, changed = re.subn(
-            re.escape(citation["raw_citation"]),
-            lambda _match, value=linked: value,
-            body,
-            count=1,
-        )
-        citation_count += changed
+        for citation in citations:
+            linked = _linked_citation_html(citation)
+            body, changed = re.subn(
+                re.escape(citation["raw_citation"]),
+                lambda _match, value=linked: value,
+                body,
+                count=1,
+            )
+            citation_count += changed
         updated = (
             updated[: block_match.start("body")]
             + body
@@ -4816,7 +5235,8 @@ def _without_bibliography_section_html(document_html: str) -> str:
 
 def _without_bibliography_section_markdown(document_markdown: str) -> str:
     heading_match = re.search(
-        r"(?im)^[ \t]{0,3}#{1,6}[ \t]+(?:references|bibliography|参考文献)[ \t]*$",
+        r"(?im)^[ \t]{0,3}#{1,6}[ \t]+"
+        r"(?:references|bibliography|参考文献)[ \t]*[:：]?[ \t]*$",
         document_markdown,
     )
     if not heading_match:
@@ -4855,6 +5275,31 @@ def apply_structural_quarantine_to_outputs(
         source_evidence or {"available": False, "pages": {}},
         note_groups,
     )
+    html_path = output_dir / "document.html"
+    if html_path.exists():
+        html_reference_candidates = _html_inline_note_references(
+            document_json,
+            html_path.read_text(encoding="utf-8"),
+            note_groups,
+        )
+        existing_reference_keys = {
+            (
+                item.get("page_no"),
+                item.get("marker"),
+                item.get("reading_order"),
+            )
+            for item in inline_references
+        }
+        inline_references.extend(
+            item
+            for item in html_reference_candidates
+            if (
+                item.get("page_no"),
+                item.get("marker"),
+                item.get("reading_order"),
+            )
+            not in existing_reference_keys
+        )
     reference_mappings, unresolved_references = _map_note_references(
         note_groups,
         inline_references,
@@ -4881,7 +5326,6 @@ def apply_structural_quarantine_to_outputs(
         json_path.write_text(json.dumps(document_json, indent=2, ensure_ascii=False), encoding="utf-8")
 
     html_replacements = 0
-    html_path = output_dir / "document.html"
     if html_path.exists():
         html_text = html_path.read_text(encoding="utf-8")
         html_text, _style = _inject_english_review_style(html_text)
@@ -6147,6 +6591,11 @@ def restore_review_artifact_layer(
     crop_counts, crop_warnings, formula_crop_diagnostics = render_page_images_and_crops(
         args.input_file, output_dir, tables, formulas, pictures
     )
+    table_visual_fallbacks = inject_empty_table_visual_fallbacks(
+        output_dir,
+        document_json,
+        tables,
+    )
     diagnostics = formula_review_diagnostics(
         formulas,
         output_dir,
@@ -6176,6 +6625,7 @@ def restore_review_artifact_layer(
         )
     metadata.update(crop_counts)
     metadata.update(diagnostics)
+    metadata["table_visual_fallbacks"] = table_visual_fallbacks
     metadata["table_artifact_count"] = len(tables) + len(table_outputs) + crop_counts["table_image_count"]
     metadata["picture_artifact_count"] = crop_counts["picture_artifact_count"]
     metadata["asset_count"] = (
@@ -6219,6 +6669,7 @@ def restore_review_artifact_layer(
             "formula_crop_diagnostics": metadata["formula_crop_diagnostics"],
             "table_artifact_count": metadata["table_artifact_count"],
             "picture_artifact_count": metadata["picture_artifact_count"],
+            "table_visual_fallbacks": table_visual_fallbacks,
             "review_artifact_warnings": review_warnings,
             "unresolved_v1_parity_warnings": UNRESOLVED_V1_PARITY_WARNINGS,
             "cn_section_2_3_diagnostic_summary": metadata[

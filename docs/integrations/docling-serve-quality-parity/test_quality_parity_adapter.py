@@ -2119,6 +2119,165 @@ class EnglishReviewPolishTests(unittest.TestCase):
         self.assertIn('href="#docling-reference-2"', markdown)
         self.assertIn('href="#docling-reference-3"', markdown)
 
+    def test_bibliography_preserves_explicit_marker_order_without_double_number(self) -> None:
+        document = {
+            "texts": [
+                {"label": "text", "text": "See [2].", "prov": [{"page_no": 1}]},
+                {"label": "section_header", "text": "References", "prov": [{"page_no": 2}]},
+                {
+                    "label": "list_item",
+                    "text": "First",
+                    "marker": "[1]",
+                    "enumerated": True,
+                    "orig": "[1] First",
+                    "prov": [{"page_no": 2}],
+                },
+                {
+                    "label": "list_item",
+                    "text": "Third",
+                    "marker": "[3]",
+                    "enumerated": True,
+                    "orig": "[3] Third",
+                    "prov": [{"page_no": 2}],
+                },
+                {
+                    "label": "list_item",
+                    "text": "Second",
+                    "marker": "[2]",
+                    "enumerated": True,
+                    "orig": "[2] Second",
+                    "prov": [{"page_no": 2}],
+                },
+            ]
+        }
+        diagnostics = adapter.bibliography_diagnostics(document)
+        html_text, references, citations = adapter._link_bibliography_in_html(
+            (
+                "<p>See [2].</p><h2>References</h2><ol>"
+                "<li style=\"list-style-type: '[1] ';\">First</li>"
+                "<li style=\"list-style-type: '[3] ';\">Third</li>"
+                "<li style=\"list-style-type: '[2] ';\">Second</li></ol>"
+            ),
+            diagnostics,
+        )
+
+        self.assertEqual([item["number"] for item in diagnostics["references"]], [1, 3, 2])
+        self.assertEqual((references, citations), (3, 1))
+        self.assertNotIn('<span class="docling-reference-number">', html_text)
+        self.assertIn('id="docling-reference-2">Second', html_text)
+        self.assertIn('href="#docling-reference-2"', html_text)
+
+    def test_cn_bibliography_repairs_mixed_and_missing_citation_brackets(self) -> None:
+        document = {
+            "texts": [
+                {
+                    "label": "text",
+                    "text": "DKVMN（8］ 模型以及后续工作〔10 提出了改进。",
+                    "prov": [{"page_no": 1}],
+                },
+                {"label": "section_header", "text": "参考文献：", "prov": [{"page_no": 2}]},
+                {
+                    "label": "list_item",
+                    "text": "［8］ Zhang et al. Dynamic memory.",
+                    "orig": "［8］ Zhang et al. Dynamic memory.",
+                    "prov": [{"page_no": 2}],
+                },
+                {
+                    "label": "list_item",
+                    "text": "［10］ Zong et al. Mastery speed.",
+                    "orig": "［10］ Zong et al. Mastery speed.",
+                    "prov": [{"page_no": 2}],
+                },
+            ]
+        }
+        diagnostics = adapter.bibliography_diagnostics(document)
+        html_text, references, citations = adapter._link_bibliography_in_html(
+            (
+                "<p>DKVMN（8］ 模型以及后续工作〔10 提出了改进。</p>"
+                "<h2>参考文献：</h2><ul>"
+                "<li>［8］ Zhang et al. Dynamic memory.</li>"
+                "<li>［10］ Zong et al. Mastery speed.</li></ul>"
+            ),
+            diagnostics,
+        )
+
+        self.assertEqual(diagnostics["reference_count"], 2)
+        self.assertEqual((references, citations), (2, 2))
+        self.assertNotIn("（8］", html_text)
+        self.assertNotIn("〔10 ", html_text)
+        self.assertNotIn('<span class="docling-reference-number">', html_text)
+        self.assertIn('href="#docling-reference-8">8</a>', html_text)
+        self.assertIn('href="#docling-reference-10">10</a>', html_text)
+
+    def test_html_superscript_note_candidate_tolerates_marker_spacing(self) -> None:
+        document = {
+            "texts": [
+                {
+                    "label": "text",
+                    "text": "Yelong Shen ∗ Shean Wang",
+                    "prov": [{"page_no": 1}],
+                }
+            ]
+        }
+        notes = [{"page_no": 1, "marker": "*", "note_id": "docling-note-p1-star-1"}]
+        candidates = adapter._html_inline_note_references(
+            document,
+            '<p>Yelong Shen<sup class="docling-footnote-ref">∗</sup>Shean Wang</p>',
+            notes,
+        )
+
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0]["marker"], "*")
+        self.assertEqual(candidates[0]["source"], "final_html_sup_element_and_same_page_node")
+
+    def test_empty_table_with_caption_uses_source_crop_as_visible_fallback(self) -> None:
+        document = {
+            "texts": [
+                {
+                    "self_ref": "#/texts/0",
+                    "label": "caption",
+                    "text": "Figure 1. Presented table.",
+                    "prov": [{"page_no": 1}],
+                }
+            ],
+            "tables": [
+                {
+                    "self_ref": "#/tables/0",
+                    "label": "table",
+                    "captions": [{"$ref": "#/texts/0"}],
+                    "data": {"table_cells": [], "num_rows": 0, "num_cols": 0},
+                    "prov": [{"page_no": 1, "bbox": {"l": 10, "r": 100, "t": 100, "b": 50}}],
+                }
+            ],
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir)
+            (output_dir / "tables").mkdir()
+            (output_dir / "tables" / "table_1.png").write_bytes(b"png")
+            (output_dir / "document.html").write_text(
+                "<table><caption><div class=\"caption\">"
+                "Figure 1. Presented table.</div></caption></table>",
+                encoding="utf-8",
+            )
+            (output_dir / "document.md").write_text(
+                "Figure 1. Presented table.\n",
+                encoding="utf-8",
+            )
+
+            result = adapter.inject_empty_table_visual_fallbacks(
+                output_dir,
+                document,
+                document["tables"],
+            )
+            html_text = (output_dir / "document.html").read_text(encoding="utf-8")
+            markdown = (output_dir / "document.md").read_text(encoding="utf-8")
+
+        self.assertEqual(result["html_applied_count"], 1)
+        self.assertEqual(result["markdown_applied_count"], 1)
+        self.assertIn("docling-table-visual-fallback", html_text)
+        self.assertIn("tables/table_1.png", html_text)
+        self.assertIn("![Figure 1. Presented table.](tables/table_1.png)", markdown)
+
     def test_footnote_superscript_polish_does_not_split_adjacent_words(self) -> None:
         updated, count = adapter._polish_footnote_superscripts(
             "<p>Yelong Shen ∗ Shean Wang</p>"
@@ -2342,6 +2501,69 @@ class EnglishReviewPolishTests(unittest.TestCase):
         self.assertEqual(qc["candidate_count"], 1)
         self.assertEqual(document["texts"][0]["label"], "quarantined_footnote_candidate")
         self.assertIn("marker_led_footnote_content_candidate", qc["candidates"][0]["reasons"])
+
+    def test_structural_quarantine_extends_labeled_footnote_cluster_to_marker_line(self) -> None:
+        document = {
+            "texts": [
+                {
+                    "label": "text",
+                    "text": "1 Code and data are available at https://example.org/project",
+                    "prov": [{"page_no": 1, "bbox": {"l": 53, "r": 250, "t": 175, "b": 164}}],
+                },
+                {
+                    "label": "footnote",
+                    "text": "Permission to make copies is granted.",
+                    "prov": [{"page_no": 1, "bbox": {"l": 53, "r": 300, "t": 158, "b": 116}}],
+                },
+            ]
+        }
+
+        qc = adapter.structural_noise_qc(document)
+
+        marker_candidate = next(
+            item for item in qc["candidates"] if item["text"].startswith("1 Code")
+        )
+        self.assertEqual(marker_candidate["action"], "quarantine_from_main_text_flow")
+        self.assertIn("same_column_footnote_cluster", marker_candidate["reasons"])
+        self.assertEqual(document["texts"][0]["label"], "quarantined_footnote_candidate")
+
+    def test_structural_quarantine_removes_top_edge_ocr_adjacent_to_empty_tables(self) -> None:
+        document = {
+            "texts": [
+                {
+                    "label": "text",
+                    "text": "Windermere Area",
+                    "prov": [{"page_no": 2, "bbox": {"l": 10, "r": 85, "t": 770, "b": 760}}],
+                },
+                {
+                    "label": "text",
+                    "text": "Normal body paragraph.",
+                    "prov": [{"page_no": 2, "bbox": {"l": 50, "r": 540, "t": 500, "b": 470}}],
+                },
+            ],
+            "tables": [
+                {
+                    "label": "table",
+                    "data": {"table_cells": [], "num_rows": 0, "num_cols": 0},
+                    "prov": [{"page_no": 2, "bbox": {"l": 60, "r": 150, "t": 706, "b": 668}}],
+                },
+                {
+                    "label": "table",
+                    "data": {"table_cells": [], "num_rows": 0, "num_cols": 0},
+                    "prov": [{"page_no": 2, "bbox": {"l": 170, "r": 270, "t": 706, "b": 668}}],
+                },
+            ],
+        }
+
+        qc = adapter.structural_noise_qc(document)
+
+        self.assertEqual(qc["candidate_count"], 1)
+        self.assertEqual(document["texts"][0]["label"], "quarantined_table_visual_annotation")
+        self.assertEqual(document["texts"][1]["label"], "text")
+        self.assertIn(
+            "text_bbox_inside_or_adjacent_to_table",
+            qc["candidates"][0]["reasons"],
+        )
 
     def test_structural_quarantine_preserves_first_page_affiliation_mislabels(self) -> None:
         document = {
