@@ -3270,6 +3270,25 @@ def _structural_export_records(candidates: list[dict[str, Any]]) -> list[dict[st
 
 
 NOTE_MARKER_PREFIX_RE = re.compile(r"^\s*([∗*†‡]|\d{1,2})(?:\s+|$)(.*)$", re.S)
+BIBLIOGRAPHY_HEADING_RE = re.compile(
+    r"^\s*(?:references|bibliography|参考文献)\s*$",
+    re.I,
+)
+INLINE_CITATION_RE = re.compile(
+    r"\[(?P<body>\s*\d{1,3}(?:\s*(?:[,;]|\u2013|\u2014|-)\s*\d{1,3})*\s*)\]"
+)
+REFERENCE_CONTINUATION_START_RE = re.compile(
+    r"^\s*(?:"
+    r"\d{1,2}(?:st|nd|rd|th)\b|"
+    r"\(?\d{4}\)\.?|"
+    r"\((?:eds?|ed)\.?\)|"
+    r"(?:eds?|pp?)\.\s"
+    r")",
+    re.I,
+)
+REFERENCE_TRAILING_USAGE_PAGES_RE = re.compile(
+    r"(?:^|[^\d])\d{1,3}(?:\s*,\s*\d{1,3})*\s*$"
+)
 
 
 def _note_marker_and_body(text: str) -> tuple[str | None, str]:
@@ -3970,6 +3989,573 @@ def _link_note_references_in_markdown(
     return updated, count
 
 
+def _citation_numbers(citation_body: str) -> list[int]:
+    numbers: list[int] = []
+    parts = re.split(r"\s*[,;]\s*", citation_body.strip())
+    for part in parts:
+        range_match = re.fullmatch(r"(\d{1,3})\s*[\u2013\u2014-]\s*(\d{1,3})", part)
+        if range_match:
+            start, end = (int(range_match.group(1)), int(range_match.group(2)))
+            if start <= end and end - start <= 100:
+                numbers.extend(range(start, end + 1))
+            continue
+        if part.isdigit():
+            numbers.append(int(part))
+    return list(dict.fromkeys(numbers))
+
+
+def _reference_section_records(document_json: Any) -> tuple[
+    dict[str, Any] | None,
+    list[dict[str, Any]],
+]:
+    records = structural_text_records(document_json)
+    heading_index: int | None = None
+    heading: dict[str, Any] | None = None
+    for index, record in enumerate(records):
+        if (
+            str(record.get("label") or "").lower() == "section_header"
+            and BIBLIOGRAPHY_HEADING_RE.fullmatch(str(record.get("text") or ""))
+        ):
+            heading_index = index
+            heading = record
+            break
+    if heading_index is None:
+        return None, []
+    result: list[dict[str, Any]] = []
+    for record in records[heading_index + 1 :]:
+        label = str(record.get("label") or "").lower()
+        if label == "section_header":
+            break
+        if label == "list_item":
+            result.append(record)
+    return heading, result
+
+
+def _explicit_reference_number(text: str) -> tuple[int | None, str]:
+    match = re.match(r"^\s*(?:\[(\d{1,3})\]|(\d{1,3})[.)])\s+(.*)$", text, re.S)
+    if not match:
+        return None, text
+    return int(match.group(1) or match.group(2)), match.group(3).strip()
+
+
+def bibliography_diagnostics(document_json: Any) -> dict[str, Any]:
+    heading, records = _reference_section_records(document_json)
+    if heading is None or not records:
+        return {
+            "available": False,
+            "reason": "reference_section_not_found",
+            "reference_count": 0,
+            "citation_count": 0,
+            "references": [],
+            "citations": [],
+            "unresolved_citations": [],
+        }
+
+    references: list[dict[str, Any]] = []
+    explicit_numbers = [
+        number
+        for number, _body in (
+            _explicit_reference_number(str(record.get("text") or ""))
+            for record in records
+        )
+        if number is not None
+    ]
+    explicit_mode = bool(explicit_numbers)
+    for list_index, record in enumerate(records):
+        text = str(record.get("text") or "")
+        explicit_number, body = _explicit_reference_number(text)
+        previous = references[-1] if references else None
+        cross_page_continuation = bool(
+            previous
+            and record.get("page_no") != previous.get("page_end")
+            and explicit_number is None
+            and REFERENCE_CONTINUATION_START_RE.match(text)
+            and not REFERENCE_TRAILING_USAGE_PAGES_RE.search(
+                str(previous.get("text") or "")
+            )
+        )
+        if cross_page_continuation:
+            previous["text"] = _join_note_text([str(previous["text"]), text])
+            previous["source_texts"].append(text)
+            previous["source_list_indexes"].append(list_index)
+            previous["source_reading_orders"].append(record.get("reading_order"))
+            previous["source_bboxes"].append(record.get("bbox"))
+            previous["page_end"] = record.get("page_no")
+            previous["continuation_count"] += 1
+            node = record.get("node")
+            if isinstance(node, dict):
+                node.setdefault("local_ai_lab_qc", {})["bibliography_reference"] = {
+                    "reference_number": previous["number"],
+                    "role": "cross_page_continuation",
+                    "reference_id": previous["reference_id"],
+                }
+            continue
+        if explicit_mode and explicit_number is None:
+            continue
+        number = explicit_number if explicit_number is not None else len(references) + 1
+        reference_id = f"docling-reference-{number}"
+        entry = {
+            "number": number,
+            "reference_id": reference_id,
+            "text": body,
+            "source_texts": [text],
+            "source_list_indexes": [list_index],
+            "source_reading_orders": [record.get("reading_order")],
+            "source_bboxes": [record.get("bbox")],
+            "page_start": record.get("page_no"),
+            "page_end": record.get("page_no"),
+            "continuation_count": 0,
+            "number_source": "explicit_marker" if explicit_number is not None else "reference_list_order",
+        }
+        references.append(entry)
+        node = record.get("node")
+        if isinstance(node, dict):
+            node.setdefault("local_ai_lab_qc", {})["bibliography_reference"] = {
+                "reference_number": number,
+                "role": "entry_start",
+                "reference_id": reference_id,
+            }
+
+    reference_lookup = {item["number"]: item for item in references}
+    reference_orders = {
+        order
+        for reference in references
+        for order in reference["source_reading_orders"]
+    }
+    citations: list[dict[str, Any]] = []
+    unresolved: list[dict[str, Any]] = []
+    occurrence_counts: dict[int, int] = {}
+    for record in structural_text_records(document_json):
+        if record.get("reading_order") in reference_orders:
+            continue
+        label = str(record.get("label") or "").lower()
+        if label.startswith("quarantined_") or label in {
+            "formula",
+            "table",
+            "page_header",
+            "page_footer",
+            "footnote",
+        }:
+            continue
+        text = str(record.get("text") or "")
+        for citation_match in INLINE_CITATION_RE.finditer(text):
+            raw = citation_match.group(0)
+            numbers = _citation_numbers(citation_match.group("body"))
+            missing = [number for number in numbers if number not in reference_lookup]
+            if not numbers or missing:
+                unresolved.append(
+                    {
+                        "page_no": record.get("page_no"),
+                        "reading_order": record.get("reading_order"),
+                        "node_text": text,
+                        "raw_citation": raw,
+                        "parsed_numbers": numbers,
+                        "missing_reference_numbers": missing,
+                        "reason": (
+                            "citation_syntax_not_supported"
+                            if not numbers
+                            else "reference_number_not_found"
+                        ),
+                    }
+                )
+                continue
+            links = []
+            for number in numbers:
+                occurrence_counts[number] = occurrence_counts.get(number, 0) + 1
+                citation_id = (
+                    f"docling-citation-{number}-{occurrence_counts[number]}"
+                )
+                links.append(
+                    {
+                        "number": number,
+                        "reference_id": reference_lookup[number]["reference_id"],
+                        "citation_id": citation_id,
+                    }
+                )
+                reference_lookup[number].setdefault("backlink_ids", []).append(
+                    citation_id
+                )
+            citation = {
+                "page_no": record.get("page_no"),
+                "reading_order": record.get("reading_order"),
+                "node_text": text,
+                "raw_citation": raw,
+                "numbers": numbers,
+                "links": links,
+                "confidence": "high",
+                "mapping_evidence": [
+                    "reference_section_detected",
+                    "citation_bracket_syntax",
+                    "reference_number_exists",
+                ],
+            }
+            citations.append(citation)
+            node = record.get("node")
+            if isinstance(node, dict):
+                node.setdefault("local_ai_lab_qc", {}).setdefault(
+                    "bibliography_citations",
+                    [],
+                ).append(
+                    {
+                        "raw_citation": raw,
+                        "numbers": numbers,
+                        "reference_ids": [
+                            link["reference_id"] for link in links
+                        ],
+                    }
+                )
+
+    return {
+        "available": True,
+        "reason": None,
+        "heading": heading.get("text"),
+        "heading_page_no": heading.get("page_no"),
+        "numbering_mode": "explicit" if explicit_mode else "reference_list_order",
+        "reference_count": len(references),
+        "citation_count": len(citations),
+        "linked_number_count": sum(len(item["links"]) for item in citations),
+        "unresolved_citation_count": len(unresolved),
+        "references": references,
+        "citations": citations,
+        "unresolved_citations": unresolved,
+    }
+
+
+def _linked_citation_html(citation: dict[str, Any]) -> str:
+    link_lookup = {item["number"]: item for item in citation["links"]}
+    body = citation["raw_citation"][1:-1]
+
+    def replace_number(match: re.Match[str]) -> str:
+        number = int(match.group())
+        link = link_lookup.get(number)
+        if not link:
+            return match.group()
+        return (
+            f'<a id="{link["citation_id"]}" class="docling-citation" '
+            f'href="#{link["reference_id"]}">{number}</a>'
+        )
+
+    return "[" + re.sub(r"\d{1,3}", replace_number, body) + "]"
+
+
+def _citation_visible_context_matches(
+    visible_text: str,
+    node_text: str,
+    raw_citation: str,
+) -> bool:
+    visible = _normalized_noise_text(visible_text)
+    target = _normalized_noise_text(node_text)
+    if visible == target:
+        return True
+    before, separator, after = node_text.partition(raw_citation)
+    if not separator:
+        return False
+    before_words = _normalized_noise_text(before).split()[-6:]
+    after_words = _normalized_noise_text(after).split()[:6]
+    context_checks = [
+        " ".join(words)
+        for words in (before_words, after_words)
+        if len(" ".join(words)) >= 12
+    ]
+    return bool(context_checks) and all(context in visible for context in context_checks)
+
+
+def _link_bibliography_in_html(
+    document_html: str,
+    diagnostics: dict[str, Any],
+) -> tuple[str, int, int]:
+    if not diagnostics.get("available"):
+        return document_html, 0, 0
+    updated = document_html
+    bibliography_style = """
+<style id="docling-bibliography-link-style">
+.docling-citation,
+.docling-reference-backlink {
+  text-decoration: none;
+}
+.docling-reference-entry:target {
+  outline: 2px solid #2563eb;
+  outline-offset: 3px;
+}
+.docling-reference-number {
+  font-weight: 600;
+  margin-right: .35rem;
+}
+.docling-reference-backlinks {
+  display: inline-flex;
+  gap: .35rem;
+  margin-left: .5rem;
+}
+</style>
+"""
+    if "docling-bibliography-link-style" not in updated:
+        if "</head>" in updated:
+            updated = updated.replace(
+                "</head>",
+                bibliography_style + "\n</head>",
+                1,
+            )
+        else:
+            updated = bibliography_style + "\n" + updated
+    heading_match = next(
+        (
+            match
+            for match in HTML_TEXT_BLOCK_RE.finditer(updated)
+            if match.group("tag").lower().startswith("h")
+            and BIBLIOGRAPHY_HEADING_RE.fullmatch(
+                _normalized_noise_text(
+                    html.unescape(HTML_TAG_RE.sub(" ", match.group("body")))
+                )
+            )
+        ),
+        None,
+    )
+    reference_matches: list[re.Match[str]] = []
+    if heading_match:
+        section_end = len(updated)
+        for match in HTML_TEXT_BLOCK_RE.finditer(updated, heading_match.end()):
+            if match.group("tag").lower().startswith("h"):
+                section_end = match.start()
+                break
+        reference_matches = [
+            match
+            for match in HTML_TEXT_BLOCK_RE.finditer(
+                updated,
+                heading_match.end(),
+                section_end,
+            )
+            if match.group("tag").lower() == "li"
+        ]
+
+    reference_replacements: list[tuple[int, int, str]] = []
+    anchored_reference_ids: set[str] = set()
+    for reference in diagnostics["references"]:
+        source_indexes = reference.get("source_list_indexes") or []
+        if not source_indexes:
+            continue
+        source_index = int(source_indexes[0])
+        if source_index >= len(reference_matches):
+            continue
+        match = reference_matches[source_index]
+        attrs = re.sub(r'\s+\bid\s*=\s*"[^"]*"', "", match.group("attrs"))
+        class_match = re.search(r'\bclass\s*=\s*"([^"]*)"', attrs)
+        if class_match:
+            classes = class_match.group(1).split()
+            if "docling-reference-entry" not in classes:
+                classes.append("docling-reference-entry")
+            joined_classes = " ".join(classes)
+            attrs = (
+                attrs[: class_match.start()]
+                + f'class="{joined_classes}"'
+                + attrs[class_match.end() :]
+            )
+        else:
+            attrs += ' class="docling-reference-entry"'
+        backlinks = " ".join(
+            f'<a class="docling-reference-backlink" href="#{backlink_id}" '
+            f'aria-label="Back to citation {reference["number"]}">↩</a>'
+            for backlink_id in reference.get("backlink_ids") or []
+        )
+        body = (
+            f'<span class="docling-reference-number">'
+            f'[{reference["number"]}]</span> '
+            f'{match.group("body")}'
+            f'<span class="docling-reference-backlinks">{backlinks}</span>'
+        )
+        reference_replacements.append(
+            (
+                match.start(),
+                match.end(),
+                f'<li{attrs} id="{reference["reference_id"]}">{body}</li>',
+            )
+        )
+        anchored_reference_ids.add(str(reference["reference_id"]))
+    for start, end, replacement in sorted(reference_replacements, reverse=True):
+        updated = updated[:start] + replacement + updated[end:]
+    reference_count = len(reference_replacements)
+
+    citation_count = 0
+    for citation in diagnostics["citations"]:
+        if any(
+            str(link["reference_id"]) not in anchored_reference_ids
+            for link in citation["links"]
+        ):
+            continue
+        candidates = list(HTML_TEXT_BLOCK_RE.finditer(updated))
+        candidates.extend(
+            re.finditer(
+                r'<(?P<tag>td|th)\b(?P<attrs>[^>]*)>'
+                r'(?P<body>.*?)</(?P=tag)>',
+                updated,
+                flags=re.I | re.S,
+            )
+        )
+        candidates.extend(
+            re.finditer(
+                r'<(?P<tag>div)\b(?P<attrs>[^>]*\bclass="[^"]*\bcaption\b[^"]*"[^>]*)>'
+                r'(?P<body>.*?)</(?P=tag)>',
+                updated,
+                flags=re.I | re.S,
+            )
+        )
+        for match in sorted(candidates, key=lambda item: item.start()):
+            if (
+                match.group("tag").lower() == "li"
+                and "docling-reference-entry" in match.group("attrs")
+            ):
+                continue
+            visible = html.unescape(HTML_TAG_RE.sub("", match.group("body")))
+            if (
+                not _citation_visible_context_matches(
+                    visible,
+                    str(citation["node_text"]),
+                    str(citation["raw_citation"]),
+                )
+                or citation["raw_citation"] not in match.group("body")
+            ):
+                continue
+            body = match.group("body")
+            linked = _linked_citation_html(citation)
+            body, changed = re.subn(
+                re.escape(citation["raw_citation"]),
+                lambda _match, value=linked: value,
+                body,
+                count=1,
+            )
+            citation_count += changed
+            replacement = (
+                f"<{match.group('tag')}{match.group('attrs')}>"
+                f"{body}</{match.group('tag')}>"
+            )
+            updated = updated[: match.start()] + replacement + updated[match.end() :]
+            break
+    return updated, reference_count, citation_count
+
+
+def _link_bibliography_in_markdown(
+    document_markdown: str,
+    diagnostics: dict[str, Any],
+) -> tuple[str, int, int]:
+    if not diagnostics.get("available"):
+        return document_markdown, 0, 0
+    updated = document_markdown
+    heading_match = re.search(
+        r"(?im)^[ \t]{0,3}#{1,6}[ \t]+(?:references|bibliography|参考文献)[ \t]*$",
+        updated,
+    )
+    reference_matches: list[re.Match[str]] = []
+    if heading_match:
+        next_heading = re.search(
+            r"(?m)^[ \t]{0,3}#{1,6}[ \t]+.+$",
+            updated[heading_match.end() :],
+        )
+        section_end = (
+            heading_match.end() + next_heading.start()
+            if next_heading
+            else len(updated)
+        )
+        reference_line_re = re.compile(
+            r"(?m)^(?P<indent>[ \t]*)(?P<marker>[-+]|\d+[.)])\s+"
+            r"(?P<body>[^\n]+)$"
+        )
+        reference_matches = list(
+            reference_line_re.finditer(
+                updated,
+                heading_match.end(),
+                section_end,
+            )
+        )
+
+    reference_replacements: list[tuple[int, int, str]] = []
+    anchored_reference_ids: set[str] = set()
+    for reference in diagnostics["references"]:
+        source_indexes = reference.get("source_list_indexes") or []
+        if not source_indexes:
+            continue
+        source_index = int(source_indexes[0])
+        if source_index >= len(reference_matches):
+            continue
+        match = reference_matches[source_index]
+        backlinks = " ".join(
+            f'<a href="#{backlink_id}" aria-label="Back to citation '
+            f'{reference["number"]}">↩</a>'
+            for backlink_id in reference.get("backlink_ids") or []
+        )
+        reference_replacements.append(
+            (
+                match.start(),
+                match.end(),
+                f'{match.group("indent")}{reference["number"]}. '
+                f'<a id="{reference["reference_id"]}"></a>'
+                f'{match.group("body")} {backlinks}',
+            )
+        )
+        anchored_reference_ids.add(str(reference["reference_id"]))
+    for start, end, replacement in sorted(reference_replacements, reverse=True):
+        updated = updated[:start] + replacement + updated[end:]
+    reference_count = len(reference_replacements)
+
+    citation_count = 0
+    for citation in diagnostics["citations"]:
+        if any(
+            str(link["reference_id"]) not in anchored_reference_ids
+            for link in citation["links"]
+        ):
+            continue
+        block_match = None
+        candidates = list(
+            re.finditer(
+                r"(?P<prefix>\A|\n[ \t]*\n)(?P<body>.*?)(?=\n[ \t]*\n|\Z)",
+                updated,
+                flags=re.S,
+            )
+        )
+        candidates.extend(
+            re.finditer(r"(?m)^(?P<body>[^\n]+)$", updated)
+        )
+        candidates.extend(
+            re.finditer(r"(?P<body>(?<=\|)[^|\n]+(?=\|))", updated)
+        )
+        for candidate in sorted(candidates, key=lambda item: item.start("body")):
+            visible = html.unescape(HTML_TAG_RE.sub("", candidate.group("body")))
+            visible = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", visible)
+            visible = re.sub(r"\*\*(.*?)\*\*", r"\1", visible, flags=re.S)
+            visible = re.sub(r"__(.*?)__", r"\1", visible, flags=re.S)
+            visible = re.sub(
+                r"^[ \t]*(?:[-+]|\d+[.)])\s+",
+                "",
+                visible,
+            )
+            if (
+                _citation_visible_context_matches(
+                    visible,
+                    str(citation["node_text"]),
+                    str(citation["raw_citation"]),
+                )
+                and citation["raw_citation"] in candidate.group("body")
+            ):
+                block_match = candidate
+                break
+        if block_match is None:
+            continue
+        body = block_match.group("body")
+        linked = _linked_citation_html(citation)
+        body, changed = re.subn(
+            re.escape(citation["raw_citation"]),
+            lambda _match, value=linked: value,
+            body,
+            count=1,
+        )
+        citation_count += changed
+        updated = (
+            updated[: block_match.start("body")]
+            + body
+            + updated[block_match.end("body") :]
+        )
+
+    return updated, reference_count, citation_count
+
+
 def _structural_content_html(
     records: list[dict[str, Any]],
     note_groups: list[dict[str, Any]],
@@ -4204,6 +4790,49 @@ def _markdown_without_structural_content(document_markdown: str) -> str:
     )
 
 
+def _without_bibliography_section_html(document_html: str) -> str:
+    heading_match = next(
+        (
+            match
+            for match in HTML_TEXT_BLOCK_RE.finditer(document_html)
+            if match.group("tag").lower().startswith("h")
+            and BIBLIOGRAPHY_HEADING_RE.fullmatch(
+                _normalized_noise_text(
+                    html.unescape(HTML_TAG_RE.sub("", match.group("body")))
+                )
+            )
+        ),
+        None,
+    )
+    if not heading_match:
+        return document_html
+    section_end = len(document_html)
+    for match in HTML_TEXT_BLOCK_RE.finditer(document_html, heading_match.end()):
+        if match.group("tag").lower().startswith("h"):
+            section_end = match.start()
+            break
+    return document_html[: heading_match.start()] + document_html[section_end:]
+
+
+def _without_bibliography_section_markdown(document_markdown: str) -> str:
+    heading_match = re.search(
+        r"(?im)^[ \t]{0,3}#{1,6}[ \t]+(?:references|bibliography|参考文献)[ \t]*$",
+        document_markdown,
+    )
+    if not heading_match:
+        return document_markdown
+    next_heading = re.search(
+        r"(?m)^[ \t]{0,3}#{1,6}[ \t]+.+$",
+        document_markdown[heading_match.end() :],
+    )
+    section_end = (
+        heading_match.end() + next_heading.start()
+        if next_heading
+        else len(document_markdown)
+    )
+    return document_markdown[: heading_match.start()] + document_markdown[section_end:]
+
+
 def apply_structural_quarantine_to_outputs(
     output_dir: Path,
     document_json: Any,
@@ -4230,6 +4859,7 @@ def apply_structural_quarantine_to_outputs(
         note_groups,
         inline_references,
     )
+    bibliography = bibliography_diagnostics(document_json)
     linked_note_ids = {item["note_id"] for item in reference_mappings}
     unresolved_notes = [
         {
@@ -4252,7 +4882,7 @@ def apply_structural_quarantine_to_outputs(
 
     html_replacements = 0
     html_path = output_dir / "document.html"
-    if html_path.exists() and quarantine_candidates:
+    if html_path.exists():
         html_text = html_path.read_text(encoding="utf-8")
         html_text, _style = _inject_english_review_style(html_text)
         quarantine_style = """
@@ -4262,7 +4892,7 @@ def apply_structural_quarantine_to_outputs(
 }
 </style>
 """
-        if "docling-structural-quarantine-style" not in html_text:
+        if quarantine_candidates and "docling-structural-quarantine-style" not in html_text:
             if "</head>" in html_text:
                 html_text = html_text.replace("</head>", quarantine_style + "\n</head>", 1)
             else:
@@ -4278,6 +4908,11 @@ def apply_structural_quarantine_to_outputs(
             html_text,
             reference_mappings,
         )
+        (
+            html_text,
+            html_bibliography_entry_count,
+            html_citation_link_count,
+        ) = _link_bibliography_in_html(html_text, bibliography)
         html_text = _append_structural_content_html(
             html_text,
             export_records,
@@ -4287,10 +4922,12 @@ def apply_structural_quarantine_to_outputs(
         html_path.write_text(html_text, encoding="utf-8")
     else:
         html_reference_link_count = 0
+        html_bibliography_entry_count = 0
+        html_citation_link_count = 0
 
     md_replacements = 0
     md_path = output_dir / "document.md"
-    if md_path.exists() and quarantine_candidates:
+    if md_path.exists():
         md_text = md_path.read_text(encoding="utf-8")
         for item in quarantine_candidates:
             text = str(item.get("text") or "").strip()
@@ -4320,6 +4957,11 @@ def apply_structural_quarantine_to_outputs(
             md_text,
             reference_mappings,
         )
+        (
+            md_text,
+            markdown_bibliography_entry_count,
+            markdown_citation_link_count,
+        ) = _link_bibliography_in_markdown(md_text, bibliography)
         md_text = _append_structural_content_markdown(
             md_text,
             export_records,
@@ -4329,11 +4971,45 @@ def apply_structural_quarantine_to_outputs(
         md_path.write_text(md_text, encoding="utf-8")
     else:
         markdown_reference_link_count = 0
+        markdown_bibliography_entry_count = 0
+        markdown_citation_link_count = 0
 
     final_html = html_path.read_text(encoding="utf-8") if html_path.exists() else ""
     final_md = md_path.read_text(encoding="utf-8") if md_path.exists() else ""
     body_html = _html_without_structural_content(final_html)
     body_md = _markdown_without_structural_content(final_md)
+    html_without_references = _without_bibliography_section_html(body_html)
+    markdown_without_references = _without_bibliography_section_markdown(body_md)
+    unlinked_html_surface = re.sub(
+        r'<a\b[^>]*class="docling-citation"[^>]*>\d+</a>',
+        "linked-citation",
+        html_without_references,
+        flags=re.I,
+    )
+    unlinked_markdown_surface = re.sub(
+        r'<a\b[^>]*class="docling-citation"[^>]*>\d+</a>',
+        "linked-citation",
+        markdown_without_references,
+        flags=re.I,
+    )
+    mapped_citation_texts = {
+        str(item["raw_citation"])
+        for item in bibliography.get("citations") or []
+    }
+    visible_unlinked_html_citations = [
+        match.group(0)
+        for match in INLINE_CITATION_RE.finditer(
+            _visible_html_text(unlinked_html_surface)
+        )
+        if match.group(0) in mapped_citation_texts
+    ]
+    visible_unlinked_markdown_citations = [
+        match.group(0)
+        for match in INLINE_CITATION_RE.finditer(
+            _normalized_markdown_text(unlinked_markdown_surface)
+        )
+        if match.group(0) in mapped_citation_texts
+    ]
     markdown_without_comments = re.sub(
         r"<!--.*?-->",
         " ",
@@ -4400,6 +5076,63 @@ def apply_structural_quarantine_to_outputs(
     qc["unresolved_note_references"] = unresolved_references
     qc["unresolved_structural_note_count"] = len(unresolved_notes)
     qc["unresolved_structural_notes"] = unresolved_notes
+    qc["bibliography_reference_count"] = bibliography.get("reference_count", 0)
+    qc["bibliography_citation_count"] = bibliography.get("citation_count", 0)
+    qc["bibliography_linked_number_count"] = bibliography.get(
+        "linked_number_count",
+        0,
+    )
+    qc["html_bibliography_entry_count"] = html_bibliography_entry_count
+    qc["html_citation_link_count"] = html_citation_link_count
+    qc["markdown_bibliography_entry_count"] = markdown_bibliography_entry_count
+    qc["markdown_citation_link_count"] = markdown_citation_link_count
+    qc["html_visible_unlinked_citation_count"] = len(
+        visible_unlinked_html_citations
+    )
+    qc["markdown_visible_unlinked_citation_count"] = len(
+        visible_unlinked_markdown_citations
+    )
+    qc["unresolved_citation_count"] = bibliography.get(
+        "unresolved_citation_count",
+        0,
+    )
+    qc["unresolved_citations"] = bibliography.get("unresolved_citations", [])
+    html_reference_ids = set(
+        re.findall(r'\bid="(docling-reference-\d+)"', final_html)
+    )
+    html_reference_targets = set(
+        re.findall(r'\bhref="#(docling-reference-\d+)"', final_html)
+    )
+    markdown_reference_ids = set(
+        re.findall(r'\bid="(docling-reference-\d+)"', final_md)
+    )
+    markdown_reference_targets = set(
+        re.findall(r'\bhref="#(docling-reference-\d+)"', final_md)
+    )
+    qc["html_broken_bibliography_target_count"] = len(
+        html_reference_targets - html_reference_ids
+    )
+    qc["markdown_broken_bibliography_target_count"] = len(
+        markdown_reference_targets - markdown_reference_ids
+    )
+    bibliography["output_validation"] = {
+        "html_reference_anchor_count": html_bibliography_entry_count,
+        "markdown_reference_anchor_count": markdown_bibliography_entry_count,
+        "html_linked_citation_occurrence_count": html_citation_link_count,
+        "markdown_linked_citation_occurrence_count": markdown_citation_link_count,
+        "html_visible_unlinked_citation_count": len(
+            visible_unlinked_html_citations
+        ),
+        "markdown_visible_unlinked_citation_count": len(
+            visible_unlinked_markdown_citations
+        ),
+        "html_broken_reference_target_count": len(
+            html_reference_targets - html_reference_ids
+        ),
+        "markdown_broken_reference_target_count": len(
+            markdown_reference_targets - markdown_reference_ids
+        ),
+    }
     content_sidecar = {
         "schema_version": 2,
         "description": (
@@ -4420,6 +5153,12 @@ def apply_structural_quarantine_to_outputs(
         encoding="utf-8",
     )
     qc["content_sidecar_path"] = content_sidecar_path.name
+    bibliography_sidecar_path = output_dir / "bibliography_links.json"
+    bibliography_sidecar_path.write_text(
+        json.dumps(bibliography, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    qc["bibliography_sidecar_path"] = bibliography_sidecar_path.name
     sidecar_path = output_dir / "structural_regions.json"
     sidecar_path.write_text(json.dumps(qc, indent=2, ensure_ascii=False), encoding="utf-8")
     qc["sidecar_path"] = sidecar_path.name

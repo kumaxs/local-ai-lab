@@ -1924,6 +1924,201 @@ class EnglishReviewPolishTests(unittest.TestCase):
         self.assertIn('id="docling-note-p3-1-1-ref-1"', markdown)
         self.assertIn("4. The codebase", markdown)
 
+    def test_bibliography_links_merge_cross_page_continuation_without_offset(self) -> None:
+        document = {
+            "texts": [
+                {
+                    "label": "text",
+                    "text": "Prior work [1] and related systems [2,3] are compared.",
+                    "prov": [{"page_no": 1, "bbox": {"l": 50, "r": 500, "t": 500, "b": 470}}],
+                },
+                {
+                    "label": "text",
+                    "text": "An unresolved citation [4] remains visible.",
+                    "prov": [{"page_no": 1, "bbox": {"l": 50, "r": 500, "t": 460, "b": 430}}],
+                },
+                {
+                    "label": "section_header",
+                    "text": "References",
+                    "prov": [{"page_no": 2, "bbox": {"l": 50, "r": 200, "t": 700, "b": 680}}],
+                },
+                {
+                    "label": "list_item",
+                    "text": "Alpha, A.: First reference. Journal (2020) 1",
+                    "prov": [{"page_no": 2, "bbox": {"l": 50, "r": 500, "t": 650, "b": 620}}],
+                },
+                {
+                    "label": "list_item",
+                    "text": "Beta, B.: A reference split across pages. In: Proceedings of the",
+                    "prov": [{"page_no": 2, "bbox": {"l": 50, "r": 500, "t": 100, "b": 70}}],
+                },
+                {
+                    "label": "list_item",
+                    "text": "23rd Conference. pp. 10-20 (2021) 1",
+                    "prov": [{"page_no": 3, "bbox": {"l": 50, "r": 500, "t": 700, "b": 670}}],
+                },
+                {
+                    "label": "list_item",
+                    "text": "Gamma, C.: Third reference. Journal (2022) 1",
+                    "prov": [{"page_no": 3, "bbox": {"l": 50, "r": 500, "t": 650, "b": 620}}],
+                },
+            ]
+        }
+
+        diagnostics = adapter.bibliography_diagnostics(document)
+
+        self.assertTrue(diagnostics["available"])
+        self.assertEqual(diagnostics["reference_count"], 3)
+        self.assertEqual(diagnostics["references"][1]["continuation_count"], 1)
+        self.assertEqual(diagnostics["references"][2]["number"], 3)
+        self.assertEqual(diagnostics["citation_count"], 2)
+        self.assertEqual(diagnostics["linked_number_count"], 3)
+        self.assertEqual(diagnostics["unresolved_citation_count"], 1)
+        self.assertEqual(
+            diagnostics["unresolved_citations"][0]["missing_reference_numbers"],
+            [4],
+        )
+        self.assertEqual(
+            document["texts"][5]["local_ai_lab_qc"]["bibliography_reference"]["role"],
+            "cross_page_continuation",
+        )
+
+    def test_bibliography_links_html_markdown_and_backlinks(self) -> None:
+        document = {
+            "texts": [
+                {
+                    "label": "text",
+                    "text": "Compare [1,2].",
+                    "prov": [{"page_no": 1, "bbox": {"l": 50, "r": 200, "t": 500, "b": 480}}],
+                },
+                {
+                    "label": "section_header",
+                    "text": "References",
+                    "prov": [{"page_no": 2, "bbox": {"l": 50, "r": 200, "t": 700, "b": 680}}],
+                },
+                {
+                    "label": "list_item",
+                    "text": "Alpha, A.: First reference. (2020) 1",
+                    "prov": [{"page_no": 2, "bbox": {"l": 50, "r": 500, "t": 650, "b": 620}}],
+                },
+                {
+                    "label": "list_item",
+                    "text": "Beta, B.: Second reference. (2021) 1",
+                    "prov": [{"page_no": 2, "bbox": {"l": 50, "r": 500, "t": 610, "b": 580}}],
+                },
+            ]
+        }
+        diagnostics = adapter.bibliography_diagnostics(document)
+        html_text, html_references, html_citations = adapter._link_bibliography_in_html(
+            (
+                "<html><head></head><body><p>Compare [1,2].</p>"
+                "<h2>References</h2><ul>"
+                "<li>Alpha, A.: First reference. (2020) 1</li>"
+                "<li>Beta, B.: Second reference. (2021) 1</li>"
+                "</ul></body></html>"
+            ),
+            diagnostics,
+        )
+        markdown, md_references, md_citations = adapter._link_bibliography_in_markdown(
+            (
+                "Compare [1,2].\n\n## References\n\n"
+                "- Alpha, A.: First reference. (2020) 1\n"
+                "- Beta, B.: Second reference. (2021) 1\n"
+            ),
+            diagnostics,
+        )
+
+        self.assertEqual((html_references, html_citations), (2, 1))
+        self.assertIn('href="#docling-reference-1"', html_text)
+        self.assertIn('href="#docling-reference-2"', html_text)
+        self.assertIn('id="docling-reference-1"', html_text)
+        self.assertIn('href="#docling-citation-1-1"', html_text)
+        self.assertEqual((md_references, md_citations), (2, 1))
+        self.assertIn('href="#docling-reference-1"', markdown)
+        self.assertIn('2. <a id="docling-reference-2"></a>', markdown)
+        self.assertIn('href="#docling-citation-2-1"', markdown)
+
+    def test_bibliography_links_cross_page_editor_continuation_and_table_cells(self) -> None:
+        document = {
+            "texts": [
+                {
+                    "label": "list_item",
+                    "text": "Baseline [1]",
+                    "prov": [{"page_no": 1}],
+                },
+                {
+                    "label": "section_header",
+                    "text": "References",
+                    "prov": [{"page_no": 1}],
+                },
+                {
+                    "label": "list_item",
+                    "text": "Alpha, A.: First reference. (2020)",
+                    "prov": [{"page_no": 1}],
+                },
+                {
+                    "label": "list_item",
+                    "text": "Yim, M.: A reference ending with editors",
+                    "prov": [{"page_no": 1}],
+                },
+                {
+                    "label": "list_item",
+                    "text": "(eds.) Document Analysis and Recognition. (2021)",
+                    "prov": [{"page_no": 2}],
+                },
+                {
+                    "label": "list_item",
+                    "text": "Zhang, Z.: Final reference. (2022)",
+                    "prov": [{"page_no": 2}],
+                },
+                {
+                    "label": "table_cell",
+                    "text": "Model [2,3]",
+                    "prov": [],
+                },
+            ]
+        }
+        diagnostics = adapter.bibliography_diagnostics(document)
+
+        self.assertEqual(diagnostics["reference_count"], 3)
+        self.assertEqual(diagnostics["references"][1]["source_list_indexes"], [1, 2])
+        self.assertEqual(diagnostics["references"][2]["number"], 3)
+
+        html_text, html_references, html_citations = adapter._link_bibliography_in_html(
+            (
+                "<h2>References</h2><ol>"
+                "<li>Alpha, A.: First reference. (2020)</li>"
+                "<li>Yim, M.: A reference ending with editors</li>"
+                "<li>(eds.) Document Analysis and Recognition. (2021)</li>"
+                "<li>Zhang, Z.: Final reference. (2022)</li></ol>"
+                "<ul><li>Baseline [1]</li></ul>"
+                "<table><tr><th>Model [2,3]</th></tr></table>"
+            ),
+            diagnostics,
+        )
+        markdown, md_references, md_citations = adapter._link_bibliography_in_markdown(
+            (
+                "## References\n\n"
+                "1. Alpha, A.: First reference. (2020)\n"
+                "2. Yim, M.: A reference ending with editors\n"
+                "- (eds.) Document Analysis and Recognition. (2021)\n"
+                "3. Zhang, Z.: Final reference. (2022)\n\n"
+                "- Baseline [1]\n\n"
+                "| Model [2,3] |\n| --- |\n"
+            ),
+            diagnostics,
+        )
+
+        self.assertEqual((html_references, html_citations), (3, 2))
+        self.assertIn('id="docling-reference-3"', html_text)
+        self.assertIn('href="#docling-reference-1"', html_text)
+        self.assertIn('href="#docling-reference-2"', html_text)
+        self.assertIn('href="#docling-reference-3"', html_text)
+        self.assertEqual((md_references, md_citations), (3, 2))
+        self.assertIn('href="#docling-reference-1"', markdown)
+        self.assertIn('href="#docling-reference-2"', markdown)
+        self.assertIn('href="#docling-reference-3"', markdown)
+
     def test_footnote_superscript_polish_does_not_split_adjacent_words(self) -> None:
         updated, count = adapter._polish_footnote_superscripts(
             "<p>Yelong Shen ∗ Shean Wang</p>"
