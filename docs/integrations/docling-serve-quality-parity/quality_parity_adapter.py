@@ -3528,6 +3528,25 @@ INLINE_CITATION_RE = re.compile(
     r"(?=\s|[，。；、])"
     r")"
 )
+MALFORMED_CITATION_TOKEN_RE = re.compile(
+    r"(?:"
+    r"(?P<bracketed>[\[［〔【「]\s*[0-9OoIl|!！\"'“”]{1,3}\s*[\]］〕】」）)]?)"
+    r"|"
+    r"(?P<suffix>[!！\"'“”]\s*\d{1,2}\s*[\]］〕】」）)]?)"
+    r"|"
+    r"(?P<open>[\[［〔【「]\s*\d{1,3}(?=\s|[A-Za-z\u3400-\u9fff，。；、]))"
+    r")"
+)
+AUTHOR_CITATION_ALIAS_RE = re.compile(
+    r"(?P<alias>[A-Z][A-Za-z-]{1,24}|[\u3400-\u9fff]{2,5})"
+    r"\s*等人\s*(?P<raw>[】］〕」]|[【「\[]?\s*[0-9OoIl|!！\"'“”]{0,3})"
+)
+MODEL_CITATION_ALIAS_RE = re.compile(
+    r"(?<![A-Za-z0-9])"
+    r"(?P<alias>[A-Z][A-Z0-9]*(?:[-.][A-Z0-9]+)*[A-Z0-9])"
+    r"\s*(?P<raw>(?:[\[［〔【「]?\s*[0-9OoIl|!！\"'“”]{1,3}\s*[\]］〕】」）)]?)|(?:[+＋]\s*)?)"
+    r"(?=\s*模型|模型|[，、,])"
+)
 REFERENCE_CONTINUATION_START_RE = re.compile(
     r"^\s*(?:"
     r"\d{1,2}(?:st|nd|rd|th)\b|"
@@ -3689,6 +3708,40 @@ def _bbox_overlap_ratio(left: dict[str, Any], right: dict[str, Any]) -> float:
         1.0,
     )
     return overlap_width * overlap_height / area
+
+
+def _script_marker_record_distance(
+    marker_bbox: dict[str, Any],
+    record_bbox: dict[str, Any] | None,
+) -> float | None:
+    """Return a small distance when a PDF script marker hugs a text record."""
+    if not marker_bbox or not record_bbox:
+        return None
+    marker_l = float(marker_bbox.get("l", 0))
+    marker_r = float(marker_bbox.get("r", marker_l))
+    marker_b = float(marker_bbox.get("b", 0))
+    marker_t = float(marker_bbox.get("t", marker_b))
+    marker_cy = marker_b + max(marker_t - marker_b, 0.0) / 2
+    record_l = float(record_bbox.get("l", 0))
+    record_r = float(record_bbox.get("r", record_l))
+    record_b = float(record_bbox.get("b", 0))
+    record_t = float(record_bbox.get("t", record_b))
+    if marker_cy < record_b - 4 or marker_cy > record_t + 10:
+        return None
+    if marker_r < record_l:
+        dx = record_l - marker_r
+    elif marker_l > record_r:
+        dx = marker_l - record_r
+    else:
+        dx = 0.0
+    if dx > 18:
+        return None
+    dy = 0.0
+    if marker_cy < record_b:
+        dy = record_b - marker_cy
+    elif marker_cy > record_t:
+        dy = marker_cy - record_t
+    return dx + dy
 
 
 def _source_footnote_line_records(
@@ -3979,19 +4032,6 @@ def _pdf_inline_note_references(
             bbox = _bbox_union([char["bbox"] for char in group]) or {}
             center_x = float(bbox.get("l", 0)) + float(bbox.get("width", 0)) / 2
             center_y = float(bbox.get("b", 0)) + float(bbox.get("height", 0)) / 2
-            candidates = [
-                record
-                for record in records
-                if record.get("page_no") == page_no
-                and _point_inside_bbox(center_x, center_y, record.get("bbox"))
-                and not str(record.get("label") or "").lower().startswith("quarantined_")
-                and str(record.get("label") or "").lower()
-                not in {"page_header", "page_footer", "footnote", "formula"}
-                and marker in str(record.get("text") or "").replace("∗", "*")
-            ]
-            if len(candidates) != 1:
-                continue
-            record = candidates[0]
             group_indexes = {int(char["index"]) for char in group}
             neighboring = [
                 char
@@ -4024,6 +4064,39 @@ def _pdf_inline_note_references(
                     script_position = "subscript"
             if script_position == "small_inline":
                 continue
+            eligible_records = [
+                record
+                for record in records
+                if record.get("page_no") == page_no
+                and not str(record.get("label") or "").lower().startswith("quarantined_")
+                and str(record.get("label") or "").lower()
+                not in {"page_header", "page_footer", "footnote", "formula"}
+            ]
+            candidates = [
+                record
+                for record in eligible_records
+                if _point_inside_bbox(center_x, center_y, record.get("bbox"))
+                and marker in str(record.get("text") or "").replace("∗", "*")
+            ]
+            anchor_mode = "replace_existing_marker"
+            anchor_distance = None
+            if len(candidates) == 1:
+                record = candidates[0]
+            else:
+                nearby: list[tuple[float, dict[str, Any]]] = []
+                for record in eligible_records:
+                    if marker in str(record.get("text") or "").replace("∗", "*"):
+                        continue
+                    distance = _script_marker_record_distance(bbox, record.get("bbox"))
+                    if distance is not None and distance <= 24:
+                        nearby.append((distance, record))
+                nearby.sort(key=lambda item: item[0])
+                if not nearby:
+                    continue
+                if len(nearby) > 1 and abs(nearby[0][0] - nearby[1][0]) < 4:
+                    continue
+                anchor_distance, record = nearby[0]
+                anchor_mode = "append_missing_marker"
             references.append(
                 {
                     "page_no": page_no,
@@ -4034,6 +4107,8 @@ def _pdf_inline_note_references(
                     "script_position": script_position,
                     "source": "pdf_text_character_size_and_bbox",
                     "confidence": "high",
+                    "anchor_mode": anchor_mode,
+                    "anchor_distance": anchor_distance,
                     "node_text": record.get("text"),
                     "reading_order": record.get("reading_order"),
                 }
@@ -4113,6 +4188,85 @@ def _html_inline_note_references(
     return references
 
 
+def _first_page_publication_note_references(
+    document_json: Any,
+    note_groups: list[dict[str, Any]],
+    existing_references: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    existing_keys = {
+        (reference.get("page_no"), str(reference.get("marker") or ""))
+        for reference in existing_references
+    }
+    first_page_notes = [
+        note for note in note_groups
+        if note.get("page_no") == 1 and note.get("marker")
+    ]
+    marker_counts: dict[str, int] = {}
+    for note in first_page_notes:
+        marker = str(note.get("marker") or "")
+        marker_counts[marker] = marker_counts.get(marker, 0) + 1
+    publication_note_re = re.compile(
+        r"\b(?:code|data|dataset|supplement|artifact|repository|github|"
+        r"available\s+at|source\s+code)\b",
+        re.I,
+    )
+    candidates = [
+        note for note in first_page_notes
+        if marker_counts.get(str(note.get("marker") or "")) == 1
+        and (1, str(note.get("marker") or "")) not in existing_keys
+        and publication_note_re.search(str(note.get("text") or ""))
+    ]
+    if not candidates:
+        return []
+    records = [
+        record for record in structural_text_records(document_json)
+        if record.get("page_no") == 1
+        and not str(record.get("label") or "").lower().startswith("quarantined_")
+        and str(record.get("label") or "").lower()
+        not in {"page_header", "page_footer", "footnote", "formula"}
+        and str(record.get("text") or "").strip()
+    ]
+    if not records:
+        return []
+    abstract_order = next(
+        (
+            record.get("reading_order")
+            for record in records
+            if str(record.get("label") or "").lower() == "section_header"
+            and _normalized_noise_text(str(record.get("text") or "")).upper() == "ABSTRACT"
+        ),
+        None,
+    )
+    anchor_pool = [
+        record for record in records
+        if abstract_order is None or int(record.get("reading_order") or 0) < int(abstract_order)
+    ] or records
+    anchor = max(
+        anchor_pool,
+        key=lambda record: (
+            float((record.get("bbox") or {}).get("t", 0)),
+            -int(record.get("reading_order") or 0),
+        ),
+    )
+    return [
+        {
+            "page_no": 1,
+            "marker": str(note.get("marker") or ""),
+            "bbox": None,
+            "font_size": None,
+            "page_median_font_size": None,
+            "script_position": "missing_inline_marker",
+            "source": "first_page_publication_note_fallback",
+            "confidence": "medium",
+            "anchor_mode": "append_missing_marker",
+            "anchor_distance": None,
+            "node_text": anchor.get("text"),
+            "reading_order": anchor.get("reading_order"),
+        }
+        for note in candidates
+    ]
+
+
 def _map_note_references(
     note_groups: list[dict[str, Any]],
     references: list[dict[str, Any]],
@@ -4151,7 +4305,11 @@ def _map_note_references(
                     "same_page",
                     "exact_marker",
                     "unique_note_candidate",
-                    f"pdf_{reference.get('script_position')}_geometry",
+                    (
+                        "first_page_publication_note_fallback"
+                        if reference.get("source") == "first_page_publication_note_fallback"
+                        else f"pdf_{reference.get('script_position')}_geometry"
+                    ),
                 ],
             }
         )
@@ -4204,11 +4362,14 @@ def _link_note_references_in_html(
                     r"(?<![A-Za-z0-9])" + marker_source_pattern + r"(?![A-Za-z0-9])"
                 )
                 marker_matches = list(marker_pattern.finditer(body))
-                if not marker_matches:
+                if marker_matches:
+                    selected = marker_matches[-1]
+                    body = body[: selected.start()] + linked + body[selected.end() :]
+                    changed += 1
                     continue
-                selected = marker_matches[-1]
-                body = body[: selected.start()] + linked + body[selected.end() :]
-                changed += 1
+                if mapping.get("anchor_mode") == "append_missing_marker":
+                    body = body.rstrip() + linked
+                    changed += 1
             if not changed:
                 break
             replacement = (
@@ -4299,6 +4460,16 @@ def _link_note_references_in_markdown(
                     f'<a href="#{mapping["note_id"]}">{html.escape(marker)}</a></sup>'
                 )
                 replacements.append((position.start(), position.end(), linked))
+            missing_marker_mappings = marker_mappings[: max(0, len(marker_mappings) - len(positions))]
+            for mapping in missing_marker_mappings:
+                if mapping.get("anchor_mode") != "append_missing_marker":
+                    continue
+                linked = (
+                    f'<sup id="{mapping["reference_id"]}">'
+                    f'<a href="#{mapping["note_id"]}">{html.escape(marker)}</a></sup>'
+                )
+                end = len(body.rstrip())
+                replacements.append((end, end, linked))
         if not replacements:
             continue
         for start, end, replacement in sorted(replacements, reverse=True):
@@ -4325,6 +4496,186 @@ def _citation_numbers(citation_body: str) -> list[int]:
         if part.isdigit():
             numbers.append(int(part))
     return list(dict.fromkeys(numbers))
+
+
+def _ocr_citation_digit_text(raw: str) -> str:
+    replacements = {
+        "!": "1",
+        "！": "1",
+        '"': "1",
+        "'": "1",
+        "“": "1",
+        "”": "1",
+        "|": "1",
+        "I": "1",
+        "l": "1",
+        "O": "0",
+        "o": "0",
+        "〇": "0",
+        "S": "5",
+        "s": "5",
+        "Ｂ": "8",
+        "B": "8",
+    }
+    return "".join(
+        replacements.get(char, char)
+        for char in raw
+        if char.isdigit() or char in replacements
+    )
+
+
+def _numbers_from_malformed_citation(
+    raw: str,
+    reference_lookup: dict[int, dict[str, Any]],
+    semantic_number: int | None = None,
+) -> list[int]:
+    digit_text = _ocr_citation_digit_text(raw)
+    candidates: list[int] = []
+    if digit_text.isdigit():
+        candidates.append(int(digit_text))
+        if len(digit_text) == 2:
+            candidates.append(int(digit_text[::-1]))
+    if semantic_number is not None:
+        has_clear_bracketed_number = bool(
+            re.search(r"[\[［〔【「]\s*\d{1,3}\s*[\]］〕】」）)]", raw)
+        )
+        if (
+            not has_clear_bracketed_number
+            or not candidates
+            or candidates[0] not in reference_lookup
+        ):
+            candidates.insert(0, semantic_number)
+    result = [
+        number
+        for number in candidates
+        if number in reference_lookup
+    ]
+    return list(dict.fromkeys(result[:1]))
+
+
+def _reference_alias_index(
+    references: list[dict[str, Any]],
+) -> dict[str, int]:
+    aliases: dict[str, set[int]] = {}
+
+    def add(alias: str, number: int) -> None:
+        normalized = re.sub(r"[\s.]+", "", alias).upper()
+        if len(normalized) < 2:
+            return
+        aliases.setdefault(normalized, set()).add(number)
+
+    stopwords = {"BASED", "AIDED", "DRIVEN", "ENHANCED", "WITH", "AND", "OF", "THE"}
+    for reference in references:
+        number = int(reference["number"])
+        text = str(reference.get("text") or "")
+        chinese_author = re.match(r"\s*([\u3400-\u9fff]{2,5})[，,、]", text)
+        if chinese_author:
+            add(chinese_author.group(1), number)
+        english_author = re.match(r"\s*([A-Z][A-Za-z-]{1,24})\b", text)
+        if english_author:
+            add(english_author.group(1), number)
+        for acronym in re.findall(
+            r"(?<![A-Za-z0-9])([A-Z][A-Z0-9]*(?:[-.][A-Z0-9]+)+)(?![A-Za-z0-9])",
+            text,
+        ):
+            add(acronym, number)
+        for phrase in re.findall(
+            r"([A-Z][A-Za-z-]+(?:\s+[A-Za-z-]+){0,6}\s+knowledge\s+tracing)",
+            text,
+            flags=re.I,
+        ):
+            words = re.findall(r"[A-Za-z]+", phrase)
+            acronym = "".join(
+                word[0].upper()
+                for word in words
+                if word.upper() not in stopwords
+            )
+            add(acronym, number)
+    return {
+        alias: next(iter(numbers))
+        for alias, numbers in aliases.items()
+        if len(numbers) == 1
+    }
+
+
+def _citation_candidates_for_text(
+    text: str,
+    reference_lookup: dict[int, dict[str, Any]],
+    alias_lookup: dict[str, int],
+) -> list[dict[str, Any]]:
+    candidates: list[dict[str, Any]] = []
+    occupied: list[tuple[int, int]] = []
+
+    def overlaps(start: int, end: int) -> bool:
+        return any(start < existing_end and end > existing_start for existing_start, existing_end in occupied)
+
+    def add_candidate(
+        start: int,
+        end: int,
+        raw: str,
+        numbers: list[int],
+        evidence: list[str],
+    ) -> None:
+        if not raw or not numbers or overlaps(start, end):
+            return
+        candidates.append(
+            {
+                "start": start,
+                "end": end,
+                "raw_citation": raw,
+                "citation_body": ",".join(str(number) for number in numbers),
+                "numbers": numbers,
+                "mapping_evidence": evidence,
+            }
+        )
+        occupied.append((start, end))
+
+    for match in INLINE_CITATION_RE.finditer(text):
+        raw = match.group(0)
+        body = _citation_match_body(match)
+        add_candidate(
+            match.start(),
+            match.end(),
+            raw,
+            _citation_numbers(body),
+            ["reference_section_detected", "citation_bracket_syntax", "reference_number_exists"],
+        )
+    for match in MALFORMED_CITATION_TOKEN_RE.finditer(text):
+        raw = match.group(0)
+        add_candidate(
+            match.start(),
+            match.end(),
+            raw,
+            _numbers_from_malformed_citation(raw, reference_lookup),
+            ["reference_section_detected", "ocr_malformed_citation_token", "reference_number_exists"],
+        )
+    for match in AUTHOR_CITATION_ALIAS_RE.finditer(text):
+        alias = re.sub(r"[\s.]+", "", match.group("alias")).upper()
+        semantic_number = alias_lookup.get(alias)
+        raw = match.group("raw") or ""
+        if semantic_number is None or not raw.strip():
+            continue
+        add_candidate(
+            match.start("raw"),
+            match.end("raw"),
+            raw,
+            _numbers_from_malformed_citation(raw, reference_lookup, semantic_number),
+            ["reference_section_detected", "unique_author_alias", "reference_number_exists"],
+        )
+    for match in MODEL_CITATION_ALIAS_RE.finditer(text):
+        alias = re.sub(r"[\s.]+", "", match.group("alias")).upper()
+        semantic_number = alias_lookup.get(alias)
+        raw = match.group("raw") or ""
+        if semantic_number is None or not raw.strip():
+            continue
+        add_candidate(
+            match.start("raw"),
+            match.end("raw"),
+            raw,
+            _numbers_from_malformed_citation(raw, reference_lookup, semantic_number),
+            ["reference_section_detected", "unique_model_alias", "reference_number_exists"],
+        )
+    return sorted(candidates, key=lambda item: (item["start"], item["end"]))
 
 
 def _reference_section_records(document_json: Any) -> tuple[
@@ -4469,15 +4820,31 @@ def bibliography_diagnostics(document_json: Any) -> dict[str, Any]:
             }
 
     reference_lookup = {item["number"]: item for item in references}
+    alias_lookup = _reference_alias_index(references)
     reference_orders = {
         order
         for reference in references
         for order in reference["source_reading_orders"]
     }
+    all_text_records = structural_text_records(document_json)
+    if heading.get("reading_order") is not None:
+        in_reference_section = False
+        for record in all_text_records:
+            if record.get("reading_order") == heading.get("reading_order"):
+                in_reference_section = True
+                reference_orders.add(record.get("reading_order"))
+                continue
+            if in_reference_section and str(record.get("label") or "").lower() == "section_header":
+                break
+            if in_reference_section and str(record.get("label") or "").lower() in {
+                "section_header",
+                "list_item",
+            }:
+                reference_orders.add(record.get("reading_order"))
     citations: list[dict[str, Any]] = []
     unresolved: list[dict[str, Any]] = []
     occurrence_counts: dict[int, int] = {}
-    for record in structural_text_records(document_json):
+    for record in all_text_records:
         if record.get("reading_order") in reference_orders:
             continue
         label = str(record.get("label") or "").lower()
@@ -4490,10 +4857,14 @@ def bibliography_diagnostics(document_json: Any) -> dict[str, Any]:
         }:
             continue
         text = str(record.get("text") or "")
-        for citation_match in INLINE_CITATION_RE.finditer(text):
-            raw = citation_match.group(0)
-            citation_body = _citation_match_body(citation_match)
-            numbers = _citation_numbers(citation_body)
+        for citation_candidate in _citation_candidates_for_text(
+            text,
+            reference_lookup,
+            alias_lookup,
+        ):
+            raw = citation_candidate["raw_citation"]
+            citation_body = citation_candidate["citation_body"]
+            numbers = citation_candidate["numbers"]
             missing = [number for number in numbers if number not in reference_lookup]
             if not numbers or missing:
                 unresolved.append(
@@ -4537,11 +4908,7 @@ def bibliography_diagnostics(document_json: Any) -> dict[str, Any]:
                 "numbers": numbers,
                 "links": links,
                 "confidence": "high",
-                "mapping_evidence": [
-                    "reference_section_detected",
-                    "citation_bracket_syntax",
-                    "reference_number_exists",
-                ],
+                "mapping_evidence": citation_candidate["mapping_evidence"],
             }
             citations.append(citation)
             node = record.get("node")
@@ -5300,6 +5667,28 @@ def apply_structural_quarantine_to_outputs(
             )
             not in existing_reference_keys
         )
+    existing_reference_keys = {
+        (
+            item.get("page_no"),
+            item.get("marker"),
+            item.get("reading_order"),
+        )
+        for item in inline_references
+    }
+    inline_references.extend(
+        item
+        for item in _first_page_publication_note_references(
+            document_json,
+            note_groups,
+            inline_references,
+        )
+        if (
+            item.get("page_no"),
+            item.get("marker"),
+            item.get("reading_order"),
+        )
+        not in existing_reference_keys
+    )
     reference_mappings, unresolved_references = _map_note_references(
         note_groups,
         inline_references,
