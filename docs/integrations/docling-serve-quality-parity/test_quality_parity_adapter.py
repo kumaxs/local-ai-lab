@@ -1802,6 +1802,120 @@ class EnglishReviewPolishTests(unittest.TestCase):
 
         self.assertEqual([item["marker"] for item in references], ["*", "†"])
 
+    def test_pdf_note_reference_can_anchor_missing_text_marker_by_geometry(self) -> None:
+        document = {
+            "texts": [
+                {
+                    "label": "title",
+                    "text": "Graph neural retrieval",
+                    "prov": [
+                        {
+                            "page_no": 1,
+                            "bbox": {"l": 10, "r": 110, "t": 28, "b": 10},
+                        }
+                    ],
+                }
+            ]
+        }
+        source = {
+            "available": True,
+            "pages": {
+                1: {
+                    "median_font_size": 10,
+                    "characters": [
+                        {"index": 0, "text": "l", "font_size": 10, "bbox": {"l": 102, "r": 106, "t": 22, "b": 12}},
+                        {"index": 1, "text": "1", "font_size": 6, "bbox": {"l": 112, "r": 115, "t": 28, "b": 22}},
+                    ],
+                }
+            },
+        }
+        notes = [{"page_no": 1, "marker": "1", "note_id": "docling-note-p1-1-1"}]
+
+        references = adapter._pdf_inline_note_references(document, source, notes)
+        mappings, unresolved = adapter._map_note_references(notes, references)
+        html_text, html_count = adapter._link_note_references_in_html(
+            "<h1>Graph neural retrieval</h1>",
+            mappings,
+        )
+        markdown, markdown_count = adapter._link_note_references_in_markdown(
+            "# Graph neural retrieval\n",
+            mappings,
+        )
+
+        self.assertEqual(len(references), 1)
+        self.assertEqual(references[0]["anchor_mode"], "append_missing_marker")
+        self.assertEqual(len(unresolved), 0)
+        self.assertEqual(html_count, 1)
+        self.assertIn('href="#docling-note-p1-1-1"', html_text)
+        self.assertEqual(markdown_count, 1)
+        self.assertIn('href="#docling-note-p1-1-1"', markdown)
+
+    def test_first_page_publication_note_fallback_links_unique_code_note_to_title(self) -> None:
+        document = {
+            "texts": [
+                {
+                    "label": "section_header",
+                    "text": "Retrieving Complex Tables",
+                    "prov": [{"page_no": 1, "bbox": {"l": 80, "r": 500, "t": 710, "b": 675}}],
+                },
+                {
+                    "label": "text",
+                    "text": "Author One, Author Two",
+                    "prov": [{"page_no": 1, "bbox": {"l": 150, "r": 450, "t": 665, "b": 645}}],
+                },
+                {
+                    "label": "section_header",
+                    "text": "ABSTRACT",
+                    "prov": [{"page_no": 1, "bbox": {"l": 50, "r": 120, "t": 600, "b": 590}}],
+                },
+            ]
+        }
+        notes = [
+            {
+                "page_no": 1,
+                "marker": "1",
+                "note_id": "docling-note-p1-1-1",
+                "text": "Code and data are available at https://example.org/repo",
+            }
+        ]
+
+        references = adapter._first_page_publication_note_references(document, notes, [])
+        mappings, unresolved = adapter._map_note_references(notes, references)
+        html_text, count = adapter._link_note_references_in_html(
+            "<h1>Retrieving Complex Tables</h1><p>Author One, Author Two</p><h2>ABSTRACT</h2>",
+            mappings,
+        )
+
+        self.assertEqual(len(references), 1)
+        self.assertEqual(references[0]["source"], "first_page_publication_note_fallback")
+        self.assertEqual(references[0]["node_text"], "Retrieving Complex Tables")
+        self.assertEqual(len(unresolved), 0)
+        self.assertEqual(count, 1)
+        self.assertIn('href="#docling-note-p1-1-1"', html_text)
+
+    def test_first_page_publication_note_fallback_does_not_guess_generic_notes(self) -> None:
+        document = {
+            "texts": [
+                {
+                    "label": "section_header",
+                    "text": "Paper Title",
+                    "prov": [{"page_no": 1, "bbox": {"l": 80, "r": 500, "t": 710, "b": 675}}],
+                }
+            ]
+        }
+        notes = [
+            {
+                "page_no": 1,
+                "marker": "1",
+                "note_id": "docling-note-p1-1-1",
+                "text": "These authors contributed equally.",
+            }
+        ]
+
+        references = adapter._first_page_publication_note_references(document, notes, [])
+
+        self.assertEqual(references, [])
+
     def test_note_reference_links_html_and_markdown_with_backlink_ids(self) -> None:
         mappings = [
             {
@@ -2208,6 +2322,65 @@ class EnglishReviewPolishTests(unittest.TestCase):
         self.assertNotIn('<span class="docling-reference-number">', html_text)
         self.assertIn('href="#docling-reference-8">8</a>', html_text)
         self.assertIn('href="#docling-reference-10">10</a>', html_text)
+
+    def test_cn_bibliography_links_ocr_malformed_author_and_model_citations(self) -> None:
+        document = {
+            "texts": [
+                {
+                    "label": "section_header",
+                    "text": "1.2 时间相关表示",
+                    "prov": [{"page_no": 1}],
+                },
+                {
+                    "label": "text",
+                    "text": (
+                        "TCN-KT［\"！ 模型融合了基础信息。CKT！12模型建模历史知识点。"
+                        "MAFKT! 3］模型描述多尺度关系。李浩君等人「51使用双向GRU。"
+                    ),
+                    "prov": [{"page_no": 1}],
+                },
+                {
+                    "label": "text",
+                    "text": "GKT 10 模型利用图结构。Tong等人］利用空间关系。郑浩东等人【20使用知识图。",
+                    "prov": [{"page_no": 1}],
+                },
+                {"label": "section_header", "text": "参考文献：", "prov": [{"page_no": 2}]},
+                {"label": "list_item", "text": "［11］ 王璨，刘朝晖，等.TCN-KT：个人基础与遗忘融合的时间卷积知识追踪模型［J］.", "orig": "［11］ 王璨，刘朝晖，等.TCN-KT：个人基础与遗忘融合的时间卷积知识追踪模型［J］.", "prov": [{"page_no": 2}]},
+                {"label": "list_item", "text": "［12］ Shen Shuanghong. Convolutional knowledge tracing.", "orig": "［12］ Shen Shuanghong. Convolutional knowledge tracing.", "prov": [{"page_no": 2}]},
+                {"label": "list_item", "text": "［13］ 段建设，等. MAFKT：多尺度注意力融合知识追踪模型.", "orig": "［13］ 段建设，等. MAFKT：多尺度注意力融合知识追踪模型.", "prov": [{"page_no": 2}]},
+                {"label": "list_item", "text": "［15］ 李浩君，方璇，戴海容. 基于自注意力机制和双向 GRU 神经网络的深度知识追踪优化模型.", "orig": "［15］ 李浩君，方璇，戴海容. 基于自注意力机制和双向 GRU 神经网络的深度知识追踪优化模型.", "prov": [{"page_no": 2}]},
+                {"label": "list_item", "text": "［16］ Nakagawa. Graph-based knowledge tracing.", "orig": "［16］ Nakagawa. Graph-based knowledge tracing.", "prov": [{"page_no": 2}]},
+                {"label": "list_item", "text": "［19］ Tong Shiwei. Structure-based knowledge tracing.", "orig": "［19］ Tong Shiwei. Structure-based knowledge tracing.", "prov": [{"page_no": 2}]},
+                {"label": "list_item", "text": "［20］ 郑浩东，马华，谢颖超，等. 融合遗忘因素与记忆门的图神经网络知识追踪模型.", "orig": "［20］ 郑浩东，马华，谢颖超，等. 融合遗忘因素与记忆门的图神经网络知识追踪模型.", "prov": [{"page_no": 2}]},
+            ]
+        }
+
+        diagnostics = adapter.bibliography_diagnostics(document)
+        html_text, _references, citations = adapter._link_bibliography_in_html(
+            (
+                "<h2>1.2 时间相关表示</h2>"
+                "<p>TCN-KT［\"！ 模型融合了基础信息。CKT！12模型建模历史知识点。"
+                "MAFKT! 3］模型描述多尺度关系。李浩君等人「51使用双向GRU。</p>"
+                "<p>GKT 10 模型利用图结构。Tong等人］利用空间关系。郑浩东等人【20使用知识图。</p>"
+                "<h2>参考文献：</h2><ul>"
+                "<li>［11］ 王璨，刘朝晖，等.TCN-KT：个人基础与遗忘融合的时间卷积知识追踪模型［J］.</li>"
+                "<li>［12］ Shen Shuanghong. Convolutional knowledge tracing.</li>"
+                "<li>［13］ 段建设，等. MAFKT：多尺度注意力融合知识追踪模型.</li>"
+                "<li>［15］ 李浩君，方璇，戴海容. 基于自注意力机制和双向 GRU 神经网络的深度知识追踪优化模型.</li>"
+                "<li>［16］ Nakagawa. Graph-based knowledge tracing.</li>"
+                "<li>［19］ Tong Shiwei. Structure-based knowledge tracing.</li>"
+                "<li>［20］ 郑浩东，马华，谢颖超，等. 融合遗忘因素与记忆门的图神经网络知识追踪模型.</li>"
+                "</ul>"
+            ),
+            diagnostics,
+        )
+
+        self.assertEqual(diagnostics["citation_count"], 7)
+        self.assertEqual(citations, 7)
+        for number in [11, 12, 13, 15, 16, 19, 20]:
+            self.assertIn(f'href="#docling-reference-{number}">{number}</a>', html_text)
+        self.assertIn("1.2 时间相关表示", html_text)
+        self.assertNotIn('href="#docling-reference-1">1</a>.2', html_text)
 
     def test_html_superscript_note_candidate_tolerates_marker_spacing(self) -> None:
         document = {
