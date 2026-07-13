@@ -3513,6 +3513,11 @@ BIBLIOGRAPHY_HEADING_RE = re.compile(
     r"^\s*(?:references|bibliography|参考文献)\s*[:：]?\s*$",
     re.I,
 )
+GENERAL_BRACKET_CITATION_RE = re.compile(
+    r"(?P<open>[\[［〔\(（])"
+    r"(?P<body>[^\]］〕\)）\n]{1,160})"
+    r"(?P<close>[\]］〕\)）])"
+)
 INLINE_CITATION_RE = re.compile(
     r"(?:"
     r"(?P<paired_open>[\[［〔])"
@@ -3546,6 +3551,19 @@ MODEL_CITATION_ALIAS_RE = re.compile(
     r"(?P<alias>[A-Z][A-Z0-9]*(?:[-.][A-Z0-9]+)*[A-Z0-9])"
     r"\s*(?P<raw>(?:[\[［〔【「]?\s*[0-9OoIl|!！\"'“”]{1,3}\s*[\]］〕】」）)]?)|(?:[+＋]\s*)?)"
     r"(?=\s*模型|模型|[，、,])"
+)
+AUTHOR_YEAR_CITATION_RE = re.compile(
+    r"(?P<open>[\[［〔])"
+    r"(?P<body>"
+    r"[A-Z][A-Za-z'’.-]{1,40}"
+    r"(?:\s+et\s+al\.)?"
+    r"\s*,\s*(?:19|20)\d{2}"
+    r"(?:\s*[;,]\s*"
+    r"[A-Z][A-Za-z'’.-]{1,40}"
+    r"(?:\s+et\s+al\.)?"
+    r"\s*,\s*(?:19|20)\d{2})*"
+    r")"
+    r"(?P<close>[\]］〕])"
 )
 REFERENCE_CONTINUATION_START_RE = re.compile(
     r"^\s*(?:"
@@ -4485,9 +4503,11 @@ def _link_note_references_in_markdown(
 
 def _citation_numbers(citation_body: str) -> list[int]:
     numbers: list[int] = []
-    parts = re.split(r"\s*[,;]\s*", citation_body.strip())
+    parts = re.split(r"\s*[,;，；、]\s*", citation_body.strip())
     for part in parts:
-        range_match = re.fullmatch(r"(\d{1,3})\s*[\u2013\u2014-]\s*(\d{1,3})", part)
+        if not part:
+            return []
+        range_match = re.fullmatch(r"(\d{1,3})\s*(?:[\u2013\u2014~～-])\s*(\d{1,3})", part)
         if range_match:
             start, end = (int(range_match.group(1)), int(range_match.group(2)))
             if start <= end and end - start <= 100:
@@ -4495,6 +4515,8 @@ def _citation_numbers(citation_body: str) -> list[int]:
             continue
         if part.isdigit():
             numbers.append(int(part))
+            continue
+        return []
     return list(dict.fromkeys(numbers))
 
 
@@ -4598,10 +4620,107 @@ def _reference_alias_index(
     }
 
 
+def _reference_author_year_index(
+    references: list[dict[str, Any]],
+) -> dict[tuple[str, str], int]:
+    keys: dict[tuple[str, str], set[int]] = {}
+    for reference in references:
+        number = int(reference["number"])
+        text = str(reference.get("text") or "")
+        author_match = re.match(
+            r"\s*(?:[A-Z]\.\s+)?([A-Z][A-Za-z'’.-]{1,40})\b",
+            text,
+        )
+        year_match = re.search(r"\b((?:19|20)\d{2})\b", text)
+        if not author_match or not year_match:
+            continue
+        key = (author_match.group(1).replace("’", "'").upper(), year_match.group(1))
+        keys.setdefault(key, set()).add(number)
+    return {
+        key: next(iter(numbers))
+        for key, numbers in keys.items()
+        if len(numbers) == 1
+    }
+
+
+def _author_year_numbers(
+    citation_body: str,
+    author_year_lookup: dict[tuple[str, str], int],
+) -> list[int]:
+    numbers: list[int] = []
+    for part in re.split(r"\s*;\s*", citation_body):
+        match = re.fullmatch(
+            r"\s*([A-Z][A-Za-z'’.-]{1,40})(?:\s+et\s+al\.)?\s*,\s*((?:19|20)\d{2})\s*",
+            part,
+        )
+        if not match:
+            return []
+        key = (match.group(1).replace("’", "'").upper(), match.group(2))
+        number = author_year_lookup.get(key)
+        if number is None:
+            return []
+        numbers.append(number)
+    return list(dict.fromkeys(numbers))
+
+
+def _general_bracket_citation_numbers(
+    body: str,
+    reference_lookup: dict[int, dict[str, Any]],
+    author_year_lookup: dict[tuple[str, str], int],
+) -> tuple[list[int], list[str], str] | None:
+    cleaned = _normalized_noise_text(body)
+    if not cleaned:
+        return None
+    numeric_numbers = _citation_numbers(cleaned)
+    if numeric_numbers and all(number in reference_lookup for number in numeric_numbers):
+        return (
+            numeric_numbers,
+            [
+                "reference_section_detected",
+                "general_bracket_numeric_citation",
+                "reference_number_exists",
+            ],
+            cleaned,
+        )
+    author_year_numbers = _author_year_numbers(cleaned, author_year_lookup)
+    if author_year_numbers:
+        return (
+            author_year_numbers,
+            [
+                "reference_section_detected",
+                "author_year_citation",
+                "unique_author_year_reference",
+            ],
+            cleaned,
+        )
+    return None
+
+
+def _numeric_bracket_context_allows_citation(
+    text: str,
+    start: int,
+    end: int,
+) -> bool:
+    before = text[max(0, start - 12) : start]
+    after = text[end : min(len(text), end + 12)]
+    previous = before.rstrip()[-1:] if before.rstrip() else ""
+    following = after.lstrip()[:1] if after.lstrip() else ""
+    if previous.isdigit():
+        return False
+    if re.search(r"(?:[A-Za-z]\s*[∈∊∋=<>≤≥]|[=<>≤≥∈∊∋]\s*)$", before):
+        return False
+    if previous.isalpha() and re.match(r"^\s*[,;，；、)\]］〕）}]", after):
+        return False
+    if previous in "([{（｛,;，；:：=+-*/×÷" and following.isdigit():
+        return False
+    return True
+
+
 def _citation_candidates_for_text(
     text: str,
     reference_lookup: dict[int, dict[str, Any]],
     alias_lookup: dict[str, int],
+    author_year_lookup: dict[tuple[str, str], int] | None = None,
 ) -> list[dict[str, Any]]:
     candidates: list[dict[str, Any]] = []
     occupied: list[tuple[int, int]] = []
@@ -4615,6 +4734,7 @@ def _citation_candidates_for_text(
         raw: str,
         numbers: list[int],
         evidence: list[str],
+        display_body: str | None = None,
     ) -> None:
         if not raw or not numbers or overlaps(start, end):
             return
@@ -4623,16 +4743,53 @@ def _citation_candidates_for_text(
                 "start": start,
                 "end": end,
                 "raw_citation": raw,
-                "citation_body": ",".join(str(number) for number in numbers),
+                "citation_body": display_body or ",".join(str(number) for number in numbers),
                 "numbers": numbers,
                 "mapping_evidence": evidence,
             }
         )
         occupied.append((start, end))
 
+    for match in GENERAL_BRACKET_CITATION_RE.finditer(text):
+        open_char = match.group("open")
+        close_char = match.group("close")
+        body = match.group("body")
+        parsed = _general_bracket_citation_numbers(
+            body,
+            reference_lookup,
+            author_year_lookup or {},
+        )
+        if parsed is None:
+            continue
+        numbers, evidence, display_body = parsed
+        if (
+            "general_bracket_numeric_citation" in evidence
+            and not _numeric_bracket_context_allows_citation(
+                text,
+                match.start(),
+                match.end(),
+            )
+        ):
+            continue
+        if open_char in "(（" and close_char in ")）" and "author_year_citation" in evidence:
+            continue
+        add_candidate(
+            match.start(),
+            match.end(),
+            match.group(0),
+            numbers,
+            evidence,
+            display_body,
+        )
     for match in INLINE_CITATION_RE.finditer(text):
         raw = match.group(0)
         body = _citation_match_body(match)
+        if not _numeric_bracket_context_allows_citation(
+            text,
+            match.start(),
+            match.end(),
+        ):
+            continue
         add_candidate(
             match.start(),
             match.end(),
@@ -4640,8 +4797,31 @@ def _citation_candidates_for_text(
             _citation_numbers(body),
             ["reference_section_detected", "citation_bracket_syntax", "reference_number_exists"],
         )
+    for match in AUTHOR_YEAR_CITATION_RE.finditer(text):
+        body = match.group("body")
+        numbers = _author_year_numbers(body, author_year_lookup or {})
+        add_candidate(
+            match.start(),
+            match.end(),
+            match.group(0),
+            numbers,
+            ["reference_section_detected", "author_year_citation", "unique_author_year_reference"],
+            body,
+        )
     for match in MALFORMED_CITATION_TOKEN_RE.finditer(text):
         raw = match.group(0)
+        if (
+            match.end() < len(text)
+            and text[match.end()].isalpha()
+            and re.search(r"[A-Za-z]", raw)
+        ):
+            continue
+        if not _numeric_bracket_context_allows_citation(
+            text,
+            match.start(),
+            match.end(),
+        ):
+            continue
         add_candidate(
             match.start(),
             match.end(),
@@ -4821,6 +5001,7 @@ def bibliography_diagnostics(document_json: Any) -> dict[str, Any]:
 
     reference_lookup = {item["number"]: item for item in references}
     alias_lookup = _reference_alias_index(references)
+    author_year_lookup = _reference_author_year_index(references)
     reference_orders = {
         order
         for reference in references
@@ -4861,6 +5042,7 @@ def bibliography_diagnostics(document_json: Any) -> dict[str, Any]:
             text,
             reference_lookup,
             alias_lookup,
+            author_year_lookup,
         ):
             raw = citation_candidate["raw_citation"]
             citation_body = citation_candidate["citation_body"]
@@ -4945,18 +5127,60 @@ def bibliography_diagnostics(document_json: Any) -> dict[str, Any]:
 def _linked_citation_html(citation: dict[str, Any]) -> str:
     link_lookup = {item["number"]: item for item in citation["links"]}
     body = str(citation.get("citation_body") or "")
+    raw = str(citation.get("raw_citation") or "")
+    open_wrapper = "["
+    close_wrapper = "]"
+    wrapper_match = GENERAL_BRACKET_CITATION_RE.fullmatch(raw)
+    if wrapper_match:
+        open_wrapper = wrapper_match.group("open")
+        close_wrapper = wrapper_match.group("close")
+    if "author_year_citation" in (citation.get("mapping_evidence") or []):
+        linked_parts: list[str] = []
+        parts = re.split(r"(\s*;\s*)", body)
+        number_index = 0
+        for part in parts:
+            if re.fullmatch(r"\s*[;,]\s*", part):
+                linked_parts.append(part)
+                continue
+            if not part:
+                continue
+            number = (
+                citation["numbers"][number_index]
+                if number_index < len(citation.get("numbers") or [])
+                else None
+            )
+            number_index += 1
+            link = link_lookup.get(number)
+            if not link:
+                linked_parts.append(html.escape(part))
+                continue
+            linked_parts.append(
+                f'<a id="{link["citation_id"]}" class="docling-citation" '
+                f'href="#{link["reference_id"]}">{html.escape(part.strip())}</a>'
+            )
+        return html.escape(open_wrapper) + "".join(linked_parts) + html.escape(close_wrapper)
+
+    used_numbers: set[int] = set()
 
     def replace_number(match: re.Match[str]) -> str:
         number = int(match.group())
         link = link_lookup.get(number)
         if not link:
             return match.group()
+        used_numbers.add(number)
         return (
             f'<a id="{link["citation_id"]}" class="docling-citation" '
             f'href="#{link["reference_id"]}">{number}</a>'
         )
 
-    return "[" + re.sub(r"\d{1,3}", replace_number, body) + "]"
+    linked_body = re.sub(r"\d{1,3}", replace_number, body)
+    hidden_targets = "".join(
+        f'<a id="{link["citation_id"]}" class="docling-citation docling-citation-hidden-target" '
+        f'href="#{link["reference_id"]}" aria-label="Reference {number}"></a>'
+        for number, link in link_lookup.items()
+        if number not in used_numbers
+    )
+    return html.escape(open_wrapper) + linked_body + hidden_targets + html.escape(close_wrapper)
 
 
 def _citation_visible_context_matches(
@@ -5001,6 +5225,12 @@ def _link_bibliography_in_html(
 .docling-reference-number {
   font-weight: 600;
   margin-right: .35rem;
+}
+.docling-citation-hidden-target {
+  display: inline-block;
+  width: 0;
+  height: 0;
+  overflow: hidden;
 }
 .docling-reference-backlinks {
   display: inline-flex;
@@ -5814,13 +6044,13 @@ def apply_structural_quarantine_to_outputs(
     html_without_references = _without_bibliography_section_html(body_html)
     markdown_without_references = _without_bibliography_section_markdown(body_md)
     unlinked_html_surface = re.sub(
-        r'<a\b[^>]*class="docling-citation"[^>]*>\d+</a>',
+        r'<a\b[^>]*class="docling-citation\b[^"]*"[^>]*>.*?</a>',
         "linked-citation",
         html_without_references,
         flags=re.I,
     )
     unlinked_markdown_surface = re.sub(
-        r'<a\b[^>]*class="docling-citation"[^>]*>\d+</a>',
+        r'<a\b[^>]*class="docling-citation\b[^"]*"[^>]*>.*?</a>',
         "linked-citation",
         markdown_without_references,
         flags=re.I,
@@ -5829,19 +6059,13 @@ def apply_structural_quarantine_to_outputs(
         str(item["raw_citation"])
         for item in bibliography.get("citations") or []
     }
+    visible_html_surface = _visible_html_text(unlinked_html_surface)
+    visible_markdown_surface = _normalized_markdown_text(unlinked_markdown_surface)
     visible_unlinked_html_citations = [
-        match.group(0)
-        for match in INLINE_CITATION_RE.finditer(
-            _visible_html_text(unlinked_html_surface)
-        )
-        if match.group(0) in mapped_citation_texts
+        raw for raw in mapped_citation_texts if raw and raw in visible_html_surface
     ]
     visible_unlinked_markdown_citations = [
-        match.group(0)
-        for match in INLINE_CITATION_RE.finditer(
-            _normalized_markdown_text(unlinked_markdown_surface)
-        )
-        if match.group(0) in mapped_citation_texts
+        raw for raw in mapped_citation_texts if raw and raw in visible_markdown_surface
     ]
     markdown_without_comments = re.sub(
         r"<!--.*?-->",

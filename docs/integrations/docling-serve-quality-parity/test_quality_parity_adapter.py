@@ -2323,6 +2323,51 @@ class EnglishReviewPolishTests(unittest.TestCase):
         self.assertIn('href="#docling-reference-8">8</a>', html_text)
         self.assertIn('href="#docling-reference-10">10</a>', html_text)
 
+    def test_bibliography_links_general_bracket_numeric_ranges(self) -> None:
+        document = {
+            "texts": [
+                {
+                    "label": "text",
+                    "text": (
+                        "相关研究[1~3]覆盖早期方法，增量实验［1～3］补充说明，DKVMN（8）模型随后出现。"
+                        "其中 i∈[1,t] 且 h∈［1,N］，O'=10[11] 不是文献引用。"
+                    ),
+                    "prov": [{"page_no": 1}],
+                },
+                {"label": "section_header", "text": "参考文献：", "prov": [{"page_no": 2}]},
+                {"label": "list_item", "text": "［1］ First range reference.", "orig": "［1］ First range reference.", "prov": [{"page_no": 2}]},
+                {"label": "list_item", "text": "［2］ Middle range reference.", "orig": "［2］ Middle range reference.", "prov": [{"page_no": 2}]},
+                {"label": "list_item", "text": "［3］ Last range reference.", "orig": "［3］ Last range reference.", "prov": [{"page_no": 2}]},
+                {"label": "list_item", "text": "［8］ DKVMN reference.", "orig": "［8］ DKVMN reference.", "prov": [{"page_no": 2}]},
+            ]
+        }
+
+        diagnostics = adapter.bibliography_diagnostics(document)
+        html_text, references, citations = adapter._link_bibliography_in_html(
+            (
+                "<p>相关研究[1~3]覆盖早期方法，增量实验［1～3］补充说明，DKVMN（8）模型随后出现。"
+                "其中 i∈[1,t] 且 h∈［1,N］，O'=10[11] 不是文献引用。</p>"
+                "<h2>参考文献：</h2><ul>"
+                "<li>［1］ First range reference.</li>"
+                "<li>［2］ Middle range reference.</li>"
+                "<li>［3］ Last range reference.</li>"
+                "<li>［8］ DKVMN reference.</li>"
+                "</ul>"
+            ),
+            diagnostics,
+        )
+
+        self.assertEqual(diagnostics["citation_count"], 3)
+        self.assertEqual((references, citations), (4, 3))
+        self.assertIn('href="#docling-reference-1">1</a>~<a', html_text)
+        self.assertIn('href="#docling-reference-2" aria-label="Reference 2"></a>', html_text)
+        self.assertIn('href="#docling-reference-3">3</a>', html_text)
+        self.assertIn('href="#docling-reference-8">8</a>', html_text)
+        self.assertIn("i∈[1,t]", html_text)
+        self.assertIn("h∈［1,N］", html_text)
+        self.assertIn("O'=10[11]", html_text)
+        self.assertIn("general_bracket_numeric_citation", diagnostics["citations"][0]["mapping_evidence"])
+
     def test_cn_bibliography_links_ocr_malformed_author_and_model_citations(self) -> None:
         document = {
             "texts": [
@@ -2381,6 +2426,59 @@ class EnglishReviewPolishTests(unittest.TestCase):
             self.assertIn(f'href="#docling-reference-{number}">{number}</a>', html_text)
         self.assertIn("1.2 时间相关表示", html_text)
         self.assertNotIn('href="#docling-reference-1">1</a>.2', html_text)
+
+    def test_bibliography_links_author_year_citations_without_malformed_digit_split(self) -> None:
+        document = {
+            "texts": [
+                {
+                    "label": "text",
+                    "text": (
+                        "Representations are discussed in [Olah, 2014]. "
+                        "Sequence models are trained as in [Graves, 2013], "
+                        "then attention follows [Bahdanau et al., 2015]."
+                    ),
+                    "prov": [{"page_no": 1}],
+                },
+                {"label": "section_header", "text": "References", "prov": [{"page_no": 2}]},
+                {
+                    "label": "list_item",
+                    "text": "D. Bahdanau, K. Cho, and Y. Bengio. Neural machine translation. In ICLR, 2015.",
+                    "prov": [{"page_no": 2}],
+                },
+                {
+                    "label": "list_item",
+                    "text": "A. Graves. Generating sequences with recurrent neural networks. arXiv:1308.0850, 2013.",
+                    "prov": [{"page_no": 2}],
+                },
+                {
+                    "label": "list_item",
+                    "text": "C. Olah. Deep learning, NLP, and representations. Blog, 2014.",
+                    "prov": [{"page_no": 2}],
+                },
+            ]
+        }
+
+        diagnostics = adapter.bibliography_diagnostics(document)
+        html_text, references, citations = adapter._link_bibliography_in_html(
+            (
+                "<p>Representations are discussed in [Olah, 2014]. "
+                "Sequence models are trained as in [Graves, 2013], "
+                "then attention follows [Bahdanau et al., 2015].</p>"
+                "<h2>References</h2><ol>"
+                "<li>D. Bahdanau, K. Cho, and Y. Bengio. Neural machine translation. In ICLR, 2015.</li>"
+                "<li>A. Graves. Generating sequences with recurrent neural networks. arXiv:1308.0850, 2013.</li>"
+                "<li>C. Olah. Deep learning, NLP, and representations. Blog, 2014.</li>"
+                "</ol>"
+            ),
+            diagnostics,
+        )
+
+        self.assertEqual(diagnostics["citation_count"], 3)
+        self.assertEqual((references, citations), (3, 3))
+        self.assertIn('href="#docling-reference-3">Olah, 2014</a>', html_text)
+        self.assertIn('href="#docling-reference-2">Graves, 2013</a>', html_text)
+        self.assertIn('href="#docling-reference-1">Bahdanau et al., 2015</a>', html_text)
+        self.assertNotIn("[1]ah, 2014", html_text)
 
     def test_html_superscript_note_candidate_tolerates_marker_spacing(self) -> None:
         document = {
