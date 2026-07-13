@@ -18,10 +18,11 @@ class EnglishReviewPolishTests(unittest.TestCase):
     def test_cn_apply_all_uses_same_formula_policy_as_english(self) -> None:
         args = Namespace(
             input_file=Path("/tmp/CN.pdf"),
-            cn_ocr_parity=True,
+            cn_ocr_parity=False,
             formula_second_pass_policy="apply-all",
         )
 
+        self.assertTrue(adapter.effective_cn_ocr_parity(args))
         self.assertTrue(adapter.is_cn_accepted_path(args))
         self.assertEqual(adapter.effective_formula_second_pass_policy(args), "apply-all")
 
@@ -34,6 +35,34 @@ class EnglishReviewPolishTests(unittest.TestCase):
 
         self.assertFalse(adapter.is_cn_accepted_path(args))
         self.assertEqual(adapter.effective_formula_second_pass_policy(args), "apply-all")
+
+    def test_cn_baseline_rejects_final_output_with_too_few_visible_cn_chars(self) -> None:
+        formulas = [
+            {"label": "formula", "text": rf"x_{{{number}}} = y \quad ( {number} )"}
+            for number in range(1, 25)
+        ]
+        document = {
+            "texts": [
+                {"label": "text", "text": "中" * adapter.CN_ACCEPTED_BASELINE["minimum_cn_character_count"]},
+                *formulas,
+            ]
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir)
+            (output_dir / "document.json").write_text(
+                adapter.json.dumps(document, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            (output_dir / "document.md").write_text("abc\n", encoding="utf-8")
+            (output_dir / "document.html").write_text(
+                "<html><body><p>abc</p></body></html>",
+                encoding="utf-8",
+            )
+            diagnostics = adapter.cn_accepted_baseline_diagnostics(output_dir)
+
+        self.assertFalse(diagnostics["ok"])
+        self.assertIn("final_markdown_cn_character_count=0", diagnostics["reasons"])
+        self.assertIn("final_html_cn_character_count=0", diagnostics["reasons"])
 
     def test_cn_accepted_baseline_diagnostics(self) -> None:
         formulas = [
@@ -52,6 +81,10 @@ class EnglishReviewPolishTests(unittest.TestCase):
                 *formulas,
             ]
         }
+        final_text = (
+            "获取历史时刻知识状态的权重为"
+            + "知识状态与习题嵌入表示" * 1000
+        )
 
         with tempfile.TemporaryDirectory() as temp_dir:
             output_dir = Path(temp_dir)
@@ -60,7 +93,11 @@ class EnglishReviewPolishTests(unittest.TestCase):
                 encoding="utf-8",
             )
             (output_dir / "document.md").write_text(
-                "获取历史时刻知识状态的权重为",
+                final_text,
+                encoding="utf-8",
+            )
+            (output_dir / "document.html").write_text(
+                f"<html><body><p>{final_text}</p></body></html>",
                 encoding="utf-8",
             )
 
