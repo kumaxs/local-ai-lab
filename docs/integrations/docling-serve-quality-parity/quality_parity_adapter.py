@@ -641,7 +641,7 @@ def pdf_source_text_evidence(input_file: Path) -> dict[str, Any]:
     try:
         import pypdfium2 as pdfium
     except ImportError:
-        return {"available": False, "reason": "pypdfium2_unavailable", "pages": {}}
+        return _pdf_source_text_evidence_pymupdf(input_file)
     try:
         pdf = pdfium.PdfDocument(str(input_file))
     except Exception as exc:
@@ -703,6 +703,73 @@ def pdf_source_text_evidence(input_file: Path) -> dict[str, Any]:
     finally:
         pdf.close()
     return {"available": True, "reason": None, "pages": pages}
+
+
+def _pdf_source_text_evidence_pymupdf(input_file: Path) -> dict[str, Any]:
+    try:
+        import fitz
+    except ImportError:
+        return {"available": False, "reason": "pypdfium2_and_pymupdf_unavailable", "pages": {}}
+    try:
+        pdf = fitz.open(str(input_file))
+    except Exception as exc:
+        return {
+            "available": False,
+            "reason": f"pdf_open_failed:{type(exc).__name__}",
+            "pages": {},
+        }
+    pages: dict[int, dict[str, Any]] = {}
+    try:
+        for page_index, page in enumerate(pdf):
+            page_height = float(page.rect.height)
+            characters: list[dict[str, Any]] = []
+            font_sizes: list[float] = []
+            char_index = 0
+            text_dict = page.get_text("dict")
+            for block in text_dict.get("blocks") or []:
+                for line in block.get("lines") or []:
+                    for span in line.get("spans") or []:
+                        span_text = str(span.get("text") or "")
+                        if not span_text:
+                            continue
+                        x0, y0, x1, y1 = [float(value) for value in span.get("bbox") or (0, 0, 0, 0)]
+                        if x1 <= x0 or y1 <= y0:
+                            continue
+                        char_width = (x1 - x0) / max(len(span_text), 1)
+                        font_size = float(span.get("size") or 0.0)
+                        flags = int(span.get("flags") or 0)
+                        font_weight = 700 if flags & 16 else None
+                        font_name = str(span.get("font") or "")
+                        for offset, char in enumerate(span_text):
+                            left = x0 + char_width * offset
+                            right = x0 + char_width * (offset + 1)
+                            bbox = {
+                                "l": left,
+                                "b": page_height - y1,
+                                "r": right,
+                                "t": page_height - y0,
+                            }
+                            characters.append(
+                                {
+                                    "index": char_index,
+                                    "text": char,
+                                    "bbox": bbox,
+                                    "font_name": font_name,
+                                    "font_weight": font_weight,
+                                    "font_size": font_size,
+                                }
+                            )
+                            char_index += 1
+                        if span_text.strip() and font_size > 0:
+                            font_sizes.append(font_size)
+            font_sizes.sort()
+            pages[page_index + 1] = {
+                "characters": characters,
+                "median_font_size": font_sizes[len(font_sizes) // 2] if font_sizes else 0.0,
+            }
+    finally:
+        pdf.close()
+    return {"available": True, "reason": "pymupdf_font_fallback", "pages": pages}
 
 
 def table_grid(table: dict[str, Any]) -> list[list[str]]:
@@ -1532,7 +1599,7 @@ def _font_semantic_styles(font_name: str, font_weight: Any) -> list[str]:
         weight = 0
     if (
         weight >= 600
-        or any(token in normalized for token in ("bold", "black", "demi", "semibold"))
+        or any(token in normalized for token in ("bold", "black", "demi", "semibold", "medi"))
     ):
         styles.append("bold")
     if any(token in normalized for token in ("italic", "oblique", "slanted")):
@@ -1718,6 +1785,53 @@ def _styled_markdown_text(text: str, styles: list[str]) -> str:
     return result
 
 
+def _non_overlapping_semantic_spans(spans: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    selected: list[dict[str, Any]] = []
+    for item in sorted(
+        spans,
+        key=lambda value: (
+            int(value.get("start") or 0),
+            -(int(value.get("end") or 0) - int(value.get("start") or 0)),
+        ),
+    ):
+        start = int(item.get("start") or 0)
+        end = int(item.get("end") or 0)
+        if end <= start:
+            continue
+        styles = set(item.get("styles") or [])
+        covered = False
+        for existing in selected:
+            existing_start = int(existing.get("start") or 0)
+            existing_end = int(existing.get("end") or 0)
+            existing_styles = set(existing.get("styles") or [])
+            if (
+                existing_start <= start
+                and end <= existing_end
+                and styles.issubset(existing_styles)
+            ):
+                covered = True
+                break
+            if max(start, existing_start) < min(end, existing_end):
+                covered = True
+                break
+        if not covered:
+            selected.append(item)
+    return selected
+
+
+def _flatten_nested_markdown_bold(text: str) -> str:
+    previous = None
+    updated = text
+    pattern = re.compile(r"\*\*([^*\n]*?)\*\*([^*\n]+?)\*\*([^*\n]*?)\*\*")
+    while previous != updated:
+        previous = updated
+        updated = pattern.sub(
+            lambda match: f"**{match.group(1)}{match.group(2)}{match.group(3)}**",
+            updated,
+        )
+    return updated
+
+
 def _apply_semantic_spans_to_html(
     document_html: str,
     diagnostics: list[dict[str, Any]],
@@ -1737,7 +1851,11 @@ def _apply_semantic_spans_to_html(
                 continue
             body = match.group("body")
             changed = 0
-            for item in sorted(spans, key=lambda value: value["start"], reverse=True):
+            for item in sorted(
+                _non_overlapping_semantic_spans(spans),
+                key=lambda value: value["start"],
+                reverse=True,
+            ):
                 source = html.escape(str(item["text"]))
                 if source not in body:
                     continue
@@ -1777,7 +1895,11 @@ def _apply_semantic_spans_to_markdown(
             continue
         replacement = source_node_text
         changed = 0
-        for item in sorted(spans, key=lambda value: value["start"], reverse=True):
+        for item in sorted(
+            _non_overlapping_semantic_spans(spans),
+            key=lambda value: value["start"],
+            reverse=True,
+        ):
             source = str(item.get("text") or "")
             source_variant = (
                 source
@@ -1796,7 +1918,7 @@ def _apply_semantic_spans_to_markdown(
         if changed:
             updated = updated.replace(source_node_text, replacement, 1)
             count += changed
-    return updated, count
+    return _flatten_nested_markdown_bold(updated), count
 
 
 def apply_semantic_emphasis_to_outputs(
@@ -4863,7 +4985,8 @@ def _author_year_numbers(
     author_year_lookup: dict[tuple[str, str], int],
 ) -> list[int]:
     numbers: list[int] = []
-    for part in re.split(r"\s*;\s*", citation_body):
+
+    def lookup_numbers_for_part(part: str) -> list[int]:
         year_matches = list(re.finditer(r"\b((?:19|20)\d{2}[a-z]?)\b", part))
         if not year_matches:
             return []
@@ -4873,7 +4996,17 @@ def _author_year_numbers(
         author_part = re.sub(r"[^A-Za-z'’.-]+", " ", author_part).strip()
         if not author_part:
             return []
-        aliases = [" ".join(author_part.split()[-width:]) for width in range(1, min(3, len(author_part.split())) + 1)]
+        author_tokens = re.findall(r"[A-Za-z'’.-]{2,40}", author_part)
+        aliases = [
+            " ".join(author_part.split()[-width:])
+            for width in range(1, min(3, len(author_part.split())) + 1)
+        ]
+        for token in author_tokens:
+            if token.lower().rstrip(".") not in {"and", "et", "al"}:
+                aliases.insert(0, token)
+                break
+        aliases = list(dict.fromkeys(aliases))
+        result: list[int] = []
         for year_match in year_matches:
             year = year_match.group(1).lower()
             matched_number = None
@@ -4884,7 +5017,21 @@ def _author_year_numbers(
                     break
             if matched_number is None:
                 return []
-            numbers.append(matched_number)
+            result.append(matched_number)
+        return result
+
+    for part in re.split(r"\s*;\s*", citation_body):
+        subparts = re.split(
+            r",\s*(?=[A-Z][A-Za-z'’.-]{1,40}"
+            r"(?:\s+(?:et\s+al\.?|and|&|[A-Z][A-Za-z'’.-]{1,40})){0,8}"
+            r"\s*,\s*(?:19|20)\d{2}[a-z]?\b)",
+            part,
+        )
+        for subpart in subparts:
+            part_numbers = lookup_numbers_for_part(subpart)
+            if not part_numbers:
+                return []
+            numbers.extend(part_numbers)
     return list(dict.fromkeys(numbers))
 
 
@@ -5420,7 +5567,12 @@ def _linked_citation_html(citation: dict[str, Any]) -> str:
                 f'href="#{link["reference_id"]}">{html.escape(raw)}</a>'
             )
         linked_parts: list[str] = []
-        parts = re.split(r"(\s*;\s*)", body)
+        parts = re.split(
+            r"(\s*;\s*|\s*,\s*(?=[A-Z][A-Za-z'’.-]{1,40}"
+            r"(?:\s+(?:et\s+al\.?|and|&|[A-Z][A-Za-z'’.-]{1,40})){0,8}"
+            r"\s*,\s*(?:19|20)\d{2}[a-z]?\b))",
+            body,
+        )
         visible_part_count = sum(1 for part in parts if part and not re.fullmatch(r"\s*[;,]\s*", part))
         number_index = 0
         for part in parts:
