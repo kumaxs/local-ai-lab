@@ -2086,6 +2086,14 @@ ABRUPT_VISUAL_TEXT_SUFFIX_RE = re.compile(
     r"(?P<fragment>\s+(?:for|with|of|to|in)\s+"
     r"(?P<artifact>[A-Z][A-Z0-9._/-]*(?:\s+[A-Z][A-Z0-9._/-]*){2,}))\s*$"
 )
+DIAGRAM_LABEL_TOKEN_RE = re.compile(
+    r"(?i)\b("
+    r"add\s*&\s*norm|attention|embedding|softmax|matmul|masked|multi-head|"
+    r"feed\s+forward|linear|concat|scale|scaled\s+dot-product|probabilities|"
+    r"inputs?|outputs?|queries?|keys?|values?|[qkv]"
+    r")\b"
+)
+PRIVATE_USE_MATH_GLYPH_RE = re.compile(r"[\uf8e0-\uf8ff]")
 
 
 def _is_bottom_footnote_region(geometry: dict[str, Any] | None) -> bool:
@@ -2146,6 +2154,126 @@ def _bbox_intersection_ratio(
         - max(float(inner.get("b", 0.0)), float(outer.get("b", 0.0))),
     )
     return overlap_width * overlap_height / area
+
+
+def _record_center(geometry: dict[str, Any] | None) -> tuple[float, float] | None:
+    if not geometry:
+        return None
+    return (
+        (float(geometry.get("l", 0.0)) + float(geometry.get("r", 0.0))) / 2,
+        (float(geometry.get("t", 0.0)) + float(geometry.get("b", 0.0))) / 2,
+    )
+
+
+def _diagram_label_score(text: str) -> int:
+    normalized = _normalized_noise_text(text)
+    if not normalized:
+        return 0
+    score = len(DIAGRAM_LABEL_TOKEN_RE.findall(normalized))
+    if re.fullmatch(r"(?i)n\s*x|n×|nx|\d+|[qkv]", normalized):
+        score += 1
+    return score
+
+
+def _looks_like_visual_diagram_label(text: str, geometry: dict[str, Any] | None) -> bool:
+    normalized = _normalized_noise_text(text)
+    if not normalized or not geometry:
+        return False
+    token_count = len(re.findall(r"[A-Za-z0-9]+", normalized))
+    if token_count > 14 or len(normalized) > 140:
+        return False
+    height = float(geometry.get("height", 999.0))
+    width = float(geometry.get("width", 0.0))
+    if height > 18.0 or width > 180.0:
+        return False
+    return _diagram_label_score(normalized) > 0
+
+
+def _visual_diagram_cluster_evidence(
+    record: dict[str, Any],
+    records: list[dict[str, Any]],
+    picture_records: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    text = str(record.get("text") or "")
+    geometry = record.get("bbox")
+    if not _looks_like_visual_diagram_label(text, geometry):
+        return None
+    page_no = record.get("page_no")
+    reading_order = record.get("reading_order")
+    if page_no is None or reading_order is None:
+        return None
+    center = _record_center(geometry)
+    if not center:
+        return None
+    nearby_diagram_labels = [text]
+    nearby_caption = None
+    for other in records:
+        if other is record or other.get("page_no") != page_no:
+            continue
+        other_order = other.get("reading_order")
+        if other_order is None or abs(int(other_order) - int(reading_order)) > 80:
+            continue
+        other_label = str(other.get("label") or "").lower().removeprefix("quarantined_")
+        other_text = str(other.get("text") or "")
+        if (
+            other_label == "caption"
+            and re.search(r"(?i)\b(?:figure|fig\.)\s*\d+", other_text)
+        ):
+            nearby_caption = other
+        if _looks_like_visual_diagram_label(other_text, other.get("bbox")):
+            nearby_diagram_labels.append(other_text)
+    nearby_picture = None
+    for picture in picture_records:
+        if picture.get("page_no") != page_no:
+            continue
+        picture_geometry = picture.get("bbox")
+        picture_center = _record_center(picture_geometry)
+        if not picture_center or not picture_geometry:
+            continue
+        horizontal_gap = max(
+            0.0,
+            max(float(picture_geometry.get("l", 0.0)) - center[0], center[0] - float(picture_geometry.get("r", 0.0))),
+        )
+        vertical_inside = (
+            float(picture_geometry.get("b", 0.0)) - 80.0
+            <= center[1]
+            <= float(picture_geometry.get("t", 0.0)) + 80.0
+        )
+        if vertical_inside and horizontal_gap <= 220.0:
+            nearby_picture = picture
+            break
+    if len(nearby_diagram_labels) >= 3 and (nearby_caption or nearby_picture):
+        return {
+            "picture_index": nearby_picture.get("index") if nearby_picture else None,
+            "caption_reading_order": nearby_caption.get("reading_order") if nearby_caption else None,
+            "region_match": "diagram_label_cluster_near_figure",
+            "supporting_label_count": len(nearby_diagram_labels),
+            "supporting_labels": nearby_diagram_labels[:8],
+        }
+    return None
+
+
+def _private_use_math_noise_prefix(text: str) -> str | None:
+    match = re.match(r"^\s*((?:[\uf8e0-\uf8ff]\s*){1,})", text)
+    if not match:
+        return None
+    prefix = match.group(1)
+    if len(PRIVATE_USE_MATH_GLYPH_RE.findall(prefix)) < 1:
+        return None
+    return prefix
+
+
+def _looks_like_private_use_math_noise(text: str) -> bool:
+    normalized = _normalized_noise_text(text)
+    if not normalized:
+        return False
+    glyphs = PRIVATE_USE_MATH_GLYPH_RE.findall(normalized)
+    non_space = re.sub(r"\s+", "", normalized)
+    if len(glyphs) < 2 and not (len(glyphs) == 1 and len(non_space) <= 2):
+        return False
+    if not non_space:
+        return False
+    return len(glyphs) / max(len(non_space), 1) >= 0.45
 
 
 def _picture_annotation_evidence(
@@ -2407,6 +2535,35 @@ def _abrupt_visual_text_suffix(text: str) -> str | None:
     if len(artifact) < 18:
         return None
     return match.group("fragment")
+
+
+def _diagram_visual_text_suffix(text: str) -> str | None:
+    if len(text) < 80:
+        return None
+    stripped = text.rstrip()
+    if stripped.endswith((".", "!", "?", ":", ";")):
+        return None
+    tokens = list(re.finditer(r"\S+", stripped))
+    if len(tokens) < 10:
+        return None
+    visual_start_index: int | None = None
+    visual_token_count = 0
+    for index in range(len(tokens) - 1, -1, -1):
+        token = tokens[index].group().strip("()[]{}.,;:")
+        if _diagram_label_score(token) > 0 or re.fullmatch(r"(?i)opt|u|[qkv]", token):
+            visual_start_index = tokens[index].start()
+            visual_token_count += 1
+            continue
+        break
+    if visual_start_index is None or visual_token_count < 4:
+        return None
+    suffix = stripped[visual_start_index:]
+    if _diagram_label_score(suffix) < 3:
+        return None
+    prefix = stripped[:visual_start_index].rstrip()
+    if len(prefix.split()) < 12:
+        return None
+    return text[visual_start_index:]
 
 
 def _looks_like_author_affiliation_footnote_mislabel(
@@ -3236,6 +3393,14 @@ def structural_noise_qc(
             if label_l == "text" and not visual_overlap and not structural_shadow
             else None
         )
+        diagram_visual_suffix = (
+            _diagram_visual_text_suffix(text)
+            if label_l == "text"
+            and not visual_overlap
+            and not structural_shadow
+            and not abrupt_visual_suffix
+            else None
+        )
         source_grounded_suffix = (
             _source_grounded_visual_suffix(
                 record,
@@ -3246,6 +3411,7 @@ def structural_noise_qc(
             and not visual_overlap
             and not structural_shadow
             and not abrupt_visual_suffix
+            and not diagram_visual_suffix
             else None
         )
         visual_annotation_shadow = (
@@ -3255,6 +3421,22 @@ def structural_noise_qc(
             and not structural_shadow
             and len(normalized) <= 80
             else None
+        )
+        visual_diagram_cluster = (
+            _visual_diagram_cluster_evidence(record, records, picture_records)
+            if label_l == "text"
+            and not structural_shadow
+            else None
+        )
+        private_use_math_prefix = (
+            _private_use_math_noise_prefix(text)
+            if label_l in {"caption", "text", "visual_annotation"}
+            else None
+        )
+        private_use_math_standalone = (
+            _looks_like_private_use_math_noise(text)
+            if label_l in {"caption", "text", "visual_annotation"}
+            else False
         )
 
         if _looks_like_author_affiliation_footnote_mislabel(
@@ -3308,6 +3490,89 @@ def structural_noise_qc(
                 node.setdefault("local_ai_lab_qc", {})["structural_fragment_quarantine"] = {
                     "kind": "reading_order_annotation",
                     "text": abrupt_visual_suffix,
+                    "action": "quarantine_from_main_text_flow",
+                    "confidence": "high",
+                }
+            continue
+
+        if diagram_visual_suffix:
+            candidates.append(
+                {
+                    "index": index,
+                    "kind": "reading_order_visual_annotation",
+                    "label": label,
+                    "text": diagram_visual_suffix,
+                    "text_preview": diagram_visual_suffix.strip()[:300],
+                    "page_no": record.get("page_no"),
+                    "bbox": geometry or None,
+                    "reasons": [
+                        "terminal_diagram_label_sequence",
+                        "fragment_quarantined_without_removing_body_paragraph",
+                    ],
+                    "action": "quarantine_from_main_text_flow",
+                    "confidence": "high",
+                    "evidence_score": 7,
+                    "reading_order": record.get("reading_order"),
+                    "repeated_page_count": repeated_page_count,
+                    "picture_overlap": None,
+                    "structural_shadow": None,
+                    "match_mode": "fragment",
+                    "evidence": (
+                        f"pages/page_{record.get('page_no')}.png"
+                        if record.get("page_no")
+                        else None
+                    ),
+                }
+            )
+            node = record.get("node")
+            if isinstance(node, dict):
+                node.setdefault("local_ai_lab_qc", {})["structural_fragment_quarantine"] = {
+                    "kind": "reading_order_visual_annotation",
+                    "text": diagram_visual_suffix,
+                    "action": "quarantine_from_main_text_flow",
+                    "confidence": "high",
+                }
+            continue
+
+        if private_use_math_prefix or private_use_math_standalone:
+            noise_text = private_use_math_prefix or text
+            candidates.append(
+                {
+                    "index": index,
+                    "kind": "math_font_noise_fragment",
+                    "label": label,
+                    "text": noise_text,
+                    "text_preview": noise_text.strip()[:300],
+                    "page_no": record.get("page_no"),
+                    "bbox": geometry or None,
+                    "reasons": [
+                        (
+                            "private_use_math_font_glyph_prefix"
+                            if private_use_math_prefix
+                            else "private_use_math_font_glyph_fragment"
+                        ),
+                        "fragment_quarantined_without_removing_body_paragraph",
+                    ],
+                    "action": "quarantine_from_main_text_flow",
+                    "confidence": "high",
+                    "evidence_score": 7,
+                    "reading_order": record.get("reading_order"),
+                    "repeated_page_count": repeated_page_count,
+                    "picture_overlap": picture_overlap,
+                    "structural_shadow": structural_shadow,
+                    "match_mode": "fragment",
+                    "evidence": (
+                        f"pages/page_{record.get('page_no')}.png"
+                        if record.get("page_no")
+                        else None
+                    ),
+                }
+            )
+            node = record.get("node")
+            if isinstance(node, dict):
+                node.setdefault("local_ai_lab_qc", {})["structural_fragment_quarantine"] = {
+                    "kind": "math_font_noise_fragment",
+                    "text": noise_text,
                     "action": "quarantine_from_main_text_flow",
                     "confidence": "high",
                 }
@@ -3386,6 +3651,14 @@ def structural_noise_qc(
             reasons.extend(
                 [
                     "same_page_duplicate_of_picture_annotation",
+                    "duplicate_visual_ocr_removed_from_linear_reading_flow",
+                ]
+            )
+        elif visual_diagram_cluster:
+            kind = "visual_annotation"
+            reasons.extend(
+                [
+                    "diagram_label_cluster_near_figure",
                     "duplicate_visual_ocr_removed_from_linear_reading_flow",
                 ]
             )
@@ -3536,6 +3809,8 @@ def structural_noise_qc(
             score += 6
         if visual_annotation_shadow:
             score += 6
+        if visual_diagram_cluster:
+            score += 6
         if structural_shadow:
             score += 6
         if label_l in PAGE_EDGE_LABELS or label_l == "footnote":
@@ -3590,6 +3865,7 @@ def structural_noise_qc(
                 "picture_overlap": picture_overlap,
                 "table_overlap": table_overlap,
                 "visual_annotation_shadow": visual_annotation_shadow,
+                "visual_diagram_cluster": visual_diagram_cluster,
                 "structural_shadow": structural_shadow,
                 "evidence": f"pages/page_{record.get('page_no')}.png" if record.get("page_no") else None,
             }
@@ -3679,6 +3955,47 @@ def _replace_html_fragment_with_quarantine(
     return document_html, False
 
 
+def _replace_private_use_math_noise_blocks_html(document_html: str) -> tuple[str, int]:
+    replacements: list[tuple[int, int, str]] = []
+    for match in HTML_TEXT_BLOCK_RE.finditer(document_html):
+        tag = match.group("tag").lower()
+        if tag in {"script", "style", "template"}:
+            continue
+        visible = html.unescape(HTML_TAG_RE.sub(" ", match.group("body")))
+        if not _looks_like_private_use_math_noise(visible):
+            continue
+        item = {
+            "kind": "math_font_noise_fragment",
+            "page_no": "unknown",
+            "reasons": ["private_use_math_font_glyph_output_sweep"],
+        }
+        replacements.append((match.start(), match.end(), _hidden_quarantine_html(item)))
+    if not replacements:
+        return document_html, 0
+    updated = document_html
+    for start, end, replacement in reversed(replacements):
+        updated = updated[:start] + replacement + updated[end:]
+    return updated, len(replacements)
+
+
+def _replace_private_use_math_noise_blocks_markdown(md_text: str) -> tuple[str, int]:
+    blocks = re.split(r"(\n\s*\n)", md_text)
+    replaced = 0
+    for index, block in enumerate(blocks):
+        if not block.strip() or block.startswith("<!--"):
+            continue
+        if not _looks_like_private_use_math_noise(block):
+            continue
+        blocks[index] = (
+            "<!-- local-ai-lab structural quarantine "
+            "kind=math_font_noise_fragment page=unknown "
+            "reasons=private_use_math_font_glyph_output_sweep "
+            "evidence=metadata.json -->"
+        )
+        replaced += 1
+    return "".join(blocks), replaced
+
+
 def _visible_html_text(document_html: str) -> str:
     visible = re.sub(
         r"<(?:template|style|script)\b.*?</(?:template|style|script)>",
@@ -3731,6 +4048,29 @@ def _markdown_fragment_pattern(text: str) -> re.Pattern[str]:
     return re.compile(r"\s+".join(parts))
 
 
+def _replace_markdown_quarantine_text(
+    md_text: str,
+    text: str,
+    replacement: str,
+    *,
+    fragment: bool,
+) -> tuple[str, int]:
+    pattern_factory = _markdown_fragment_pattern if fragment else _markdown_exact_text_pattern
+    variants = [text]
+    escaped = html.escape(text, quote=False)
+    if escaped != text:
+        variants.append(escaped)
+    for variant in variants:
+        md_text, count = pattern_factory(variant).subn(
+            replacement,
+            md_text,
+            count=1,
+        )
+        if count:
+            return md_text, count
+    return md_text, 0
+
+
 def _normalized_markdown_text(text: str) -> str:
     text = re.sub(r"\\([\\`*{}\[\]()#+\-.!_|>])", r"\1", text)
     return _normalized_noise_text(text)
@@ -3749,6 +4089,10 @@ def _exportable_structural_kind(kind: str) -> str | None:
         return "page_header"
     if "page_footer" in normalized:
         return "page_footer"
+    if "visual_annotation" in normalized:
+        return "visual_annotation"
+    if "math_font_noise" in normalized:
+        return "math_font_noise"
     return None
 
 
@@ -6120,6 +6464,8 @@ def _structural_content_html(
         "page_header": "Page header",
         "page_footer": "Page footer",
         "footnote": "Footnote",
+        "visual_annotation": "Figure or visual-region text",
+        "math_font_noise": "Math-font noise",
     }
     backlinks: dict[str, list[str]] = {}
     for mapping in reference_mappings:
@@ -6134,7 +6480,7 @@ def _structural_content_html(
             f'data-kind="{html.escape(record["kind"], quote=True)}" '
             f'data-page="{html.escape(str(record.get("page_no")), quote=True)}">'
             '<header>'
-            f'<strong>{labels[record["kind"]]}</strong>'
+            f'<strong>{labels.get(record["kind"], record["kind"])}</strong>'
             f'<span>Page {html.escape(str(record.get("page_no") or "unknown"))}</span>'
             '</header>'
             f'<p>{html.escape(record["text"])}</p>'
@@ -6172,9 +6518,9 @@ def _structural_content_html(
         f'<section id="{STRUCTURAL_CONTENT_HTML_ID}" '
         'class="docling-structural-content" role="doc-endnotes" '
         'aria-labelledby="docling-structural-content-title">'
-        '<h2 id="docling-structural-content-title">Extracted page-edge notes</h2>'
+        '<h2 id="docling-structural-content-title">Extracted structural and visual notes</h2>'
         '<p class="docling-structural-content-note">'
-        'High-confidence headers, footers, and footnotes isolated from the main reading flow.'
+        'High-confidence headers, footers, footnotes, and visual-region text isolated from the main reading flow.'
         '</p>'
         + "".join(items)
         + '</section>'
@@ -6251,15 +6597,17 @@ def _structural_content_markdown(
         "page_header": "Page header",
         "page_footer": "Page footer",
         "footnote": "Footnote",
+        "visual_annotation": "Figure or visual-region text",
+        "math_font_noise": "Math-font noise",
     }
     lines = [
         STRUCTURAL_CONTENT_MD_START,
         "",
         "---",
         "",
-        "## Extracted page-edge notes",
+        "## Extracted structural and visual notes",
         "",
-        "High-confidence headers, footers, and footnotes isolated from the main reading flow.",
+        "High-confidence headers, footers, footnotes, and visual-region text isolated from the main reading flow.",
         "",
     ]
     for record in records:
@@ -6267,7 +6615,7 @@ def _structural_content_markdown(
             continue
         lines.extend(
             [
-                f"### Page {record.get('page_no') or 'unknown'} - {labels[record['kind']]}",
+                f"### Page {record.get('page_no') or 'unknown'} - {labels.get(record['kind'], record['kind'])}",
                 "",
                 record["text"],
                 "",
@@ -6504,6 +6852,8 @@ def apply_structural_quarantine_to_outputs(
                 html_text, changed = _replace_exact_paragraph_with_quarantine(html_text, item)
             if changed:
                 html_replacements += 1
+        html_text, private_use_sweep_count = _replace_private_use_math_noise_blocks_html(html_text)
+        html_replacements += private_use_sweep_count
         html_text, html_reference_link_count = _link_note_references_in_html(
             html_text,
             reference_mappings,
@@ -6543,20 +6893,16 @@ def apply_structural_quarantine_to_outputs(
                 f"reasons={','.join(item.get('reasons') or [])} "
                 "evidence=metadata.json -->\n\n"
             )
-            if item.get("match_mode") == "fragment":
-                md_text, count = _markdown_fragment_pattern(text).subn(
-                    replacement,
-                    md_text,
-                    count=1,
-                )
-            else:
-                md_text, count = _markdown_exact_text_pattern(text).subn(
-                    replacement,
-                    md_text,
-                    count=1,
-                )
+            md_text, count = _replace_markdown_quarantine_text(
+                md_text,
+                text,
+                replacement,
+                fragment=item.get("match_mode") == "fragment",
+            )
             if count:
                 md_replacements += 1
+        md_text, private_use_sweep_count = _replace_private_use_math_noise_blocks_markdown(md_text)
+        md_replacements += private_use_sweep_count
         md_text, markdown_reference_link_count = _link_note_references_in_markdown(
             md_text,
             reference_mappings,
@@ -8908,14 +9254,20 @@ def _cn_accepted_formula_source_texts(
     return formula_texts, source_map
 
 
-def _patch_formula_json_nodes(output_dir: Path, formula_texts: dict[int, str]) -> list[int]:
+def _patch_formula_json_nodes(
+    output_dir: Path,
+    formula_texts: dict[int, str],
+    *,
+    candidate_source: str = "cn_final_polish",
+    prefer_index_anchor: bool = False,
+) -> list[int]:
     json_path = output_dir / "document.json"
     document = _load_json_file(json_path)
     if not isinstance(document, dict):
         return []
     patched: list[int] = []
     for index, formula in enumerate(extract_label_nodes(document, "formula"), start=1):
-        formula_no = _formula_number_for_node(index, formula)
+        formula_no = index if prefer_index_anchor else _formula_number_for_node(index, formula)
         if formula_no not in formula_texts and index in formula_texts:
             formula_no = index
         if formula_no not in formula_texts:
@@ -8926,7 +9278,7 @@ def _patch_formula_json_nodes(output_dir: Path, formula_texts: dict[int, str]) -
         formula["local_ai_lab_formula_second_pass"] = {
             "anchor_id": f"formula-{index}",
             "status": "replaced" if not safety_reasons else "final_output_unsafe",
-            "candidate_source": "cn_final_polish",
+            "candidate_source": candidate_source,
             "fallback_reason": ",".join(safety_reasons) or None,
         }
         if old_text == new_text:
@@ -9143,10 +9495,36 @@ def _repair_formula_visible_order(
     return html_text, repaired
 
 
+def _deduplicated_missing_formula_indexes(
+    html_text: str,
+    missing_indexes: list[int],
+    patched_indexes: list[int],
+    formula_texts: dict[int, str],
+) -> list[int]:
+    deduplicated: list[int] = []
+    patched_by_text: dict[str, list[int]] = {}
+    for index in patched_indexes:
+        normalized = _normalized_noise_text(formula_texts.get(index, ""))
+        if normalized:
+            patched_by_text.setdefault(normalized, []).append(index)
+    for index in missing_indexes:
+        normalized = _normalized_noise_text(formula_texts.get(index, ""))
+        if not normalized:
+            continue
+        source_indexes = patched_by_text.get(normalized) or []
+        if any(f'data-formula-index="{source_index}"' in html_text for source_index in source_indexes):
+            deduplicated.append(index)
+    return deduplicated
+
+
 def _patch_html_formula_blocks(
     output_dir: Path,
     sidecar_dir: Path,
     formula_texts: dict[int, str],
+    *,
+    status_label: str = "cn_final_polish",
+    complete_missing_sequence: bool = True,
+    allow_formula_number_match: bool = True,
 ) -> dict[str, Any]:
     html_path = output_dir / "document.html"
     if not html_path.exists():
@@ -9172,7 +9550,7 @@ def _patch_html_formula_blocks(
         safety_reasons = _formula_output_safety_reasons(formula_text)
         entry = {
             "formula_no": formula_no,
-            "status": "cn_final_polish" if not safety_reasons else "final_output_unsafe",
+            "status": status_label if not safety_reasons else "final_output_unsafe",
             "markdown_after": f"$${formula_text}$$",
             "route_a_text": formula_text,
             "fallback_reason": ",".join(safety_reasons) or None,
@@ -9207,7 +9585,7 @@ def _patch_html_formula_blocks(
         entry = {
             "formula_no": formula_no,
             "status": (
-                "cn_final_polish"
+                status_label
                 if not _formula_output_safety_reasons(formula_text)
                 else "final_output_unsafe"
             ),
@@ -9217,7 +9595,7 @@ def _patch_html_formula_blocks(
         }
         replacement = (
             _render_second_pass_formula_html(entry, output_dir, sidecar_dir)
-            if entry["status"] == "cn_final_polish"
+            if entry["status"] == status_label
             else _render_formula_fallback_html(entry, output_dir, sidecar_dir)
         )
         match = original_by_index.get(formula_no)
@@ -9231,11 +9609,16 @@ def _patch_html_formula_blocks(
                 patch_sources[formula_no] = str(source)
         else:
             patch_sources[formula_no] = "data-formula-index"
-        if match is None:
+        if match is None and allow_formula_number_match:
             old_text_probe = _find_formula_html_block_by_number(original_blocks, used_original_starts, formula_no)
             if old_text_probe is not None:
                 match = old_text_probe
                 patch_sources[formula_no] = "formula-number"
+        if match is None and 0 < formula_no <= len(original_blocks):
+            order_probe = original_blocks[formula_no - 1]
+            if order_probe.start() not in used_original_starts:
+                match = order_probe
+                patch_sources[formula_no] = "formula-order"
         if match is None:
             missing_indexes.append(formula_no)
             continue
@@ -9252,7 +9635,7 @@ def _patch_html_formula_blocks(
         safety_reasons = _formula_output_safety_reasons(formula_text)
         entry = {
             "formula_no": formula_no,
-            "status": "cn_final_polish" if not safety_reasons else "final_output_unsafe",
+            "status": status_label if not safety_reasons else "final_output_unsafe",
             "markdown_after": f"$${formula_text}$$",
             "route_a_text": formula_text,
             "fallback_reason": ",".join(safety_reasons) or None,
@@ -9275,13 +9658,16 @@ def _patch_html_formula_blocks(
         else:
             still_missing.append(formula_no)
     missing_indexes = still_missing
-    html_text, sequence_completion_indexes = _complete_cn_formula_html_sequence(
-        html_text,
-        output_dir,
-        sidecar_dir,
-        formula_texts,
-        formula_anchors,
-    )
+    if complete_missing_sequence:
+        html_text, sequence_completion_indexes = _complete_cn_formula_html_sequence(
+            html_text,
+            output_dir,
+            sidecar_dir,
+            formula_texts,
+            formula_anchors,
+        )
+    else:
+        sequence_completion_indexes = []
     if sequence_completion_indexes:
         html_text, injected_now = _ensure_formula_second_pass_html_assets(html_text)
         assets_injected = assets_injected or injected_now
@@ -9306,11 +9692,21 @@ def _patch_html_formula_blocks(
         html_text,
         formula_anchors,
     )
+    deduplicated_missing_indexes = _deduplicated_missing_formula_indexes(
+        html_text,
+        missing_indexes,
+        patched_indexes,
+        formula_texts,
+    )
+    missing_indexes = [
+        index for index in missing_indexes if index not in deduplicated_missing_indexes
+    ]
     html_path.write_text(html_text, encoding="utf-8")
     return {
         "ok": not missing_indexes,
         "patched_indexes": patched_indexes,
         "missing_indexes": sorted(set(missing_indexes)),
+        "deduplicated_missing_indexes": deduplicated_missing_indexes,
         "patch_sources": patch_sources,
         "sequence_completion_indexes": sequence_completion_indexes,
         "removed_original_duplicate_indexes": removed_original_duplicates,
@@ -9441,6 +9837,109 @@ def apply_cn_final_document_polish(
     }
 
 
+def _current_formula_display_texts(output_dir: Path) -> tuple[dict[int, str], dict[int, str]]:
+    document = _load_json_file(output_dir / "document.json")
+    if not isinstance(document, dict):
+        return {}, {}
+    formula_texts: dict[int, str] = {}
+    source_map: dict[int, str] = {}
+    for index, formula in enumerate(extract_label_nodes(document, "formula"), start=1):
+        raw_text = str(formula.get("text") or "").strip()
+        if not raw_text:
+            continue
+        eq_numbers = _compact_formula_numbers(raw_text)
+        eq_number = eq_numbers[0] if eq_numbers else None
+        normalized = normalize_formula_candidate(raw_text)
+        if eq_number is not None:
+            normalized, _repairs = canonicalize_formula_output(normalized, eq_number)
+        formula_texts[index] = normalized or raw_text
+        source_map[index] = "current_formula_json"
+    return formula_texts, source_map
+
+
+def apply_current_formula_display_fallback(
+    output_dir: Path,
+    metadata: dict[str, Any],
+    status: dict[str, Any],
+    args: argparse.Namespace,
+    *,
+    reason: str,
+) -> dict[str, Any]:
+    def write_state() -> None:
+        (output_dir / "metadata.json").write_text(
+            json.dumps(metadata, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+        (output_dir / "status.json").write_text(
+            json.dumps(status, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+
+    if args.input_file.name == "CN.pdf":
+        result = {"ok": True, "applied": False, "reason": "skip_cn_accepted_formula_path"}
+        metadata["current_formula_display_fallback"] = result
+        status["quality_signals"]["current_formula_display_fallback"] = result
+        write_state()
+        return result
+    html_path = output_dir / "document.html"
+    if html_path.exists() and "docling-formula-second-pass" in html_path.read_text(encoding="utf-8"):
+        result = {"ok": True, "applied": False, "reason": "formula_second_pass_blocks_already_present"}
+        metadata["current_formula_display_fallback"] = result
+        status["quality_signals"]["current_formula_display_fallback"] = result
+        write_state()
+        return result
+    formula_texts, source_map = _current_formula_display_texts(output_dir)
+    if not formula_texts:
+        result = {"ok": True, "applied": False, "reason": "no_formula_candidates"}
+        metadata["current_formula_display_fallback"] = result
+        status["quality_signals"]["current_formula_display_fallback"] = result
+        write_state()
+        return result
+    sidecar_dir = output_dir / "formula_display_fallback"
+    sidecar_dir.mkdir(parents=True, exist_ok=True)
+    json_patched = _patch_formula_json_nodes(
+        output_dir,
+        formula_texts,
+        candidate_source="current_formula_display_fallback",
+        prefer_index_anchor=True,
+    )
+    markdown_patched = _patch_markdown_formula_blocks(output_dir, formula_texts)
+    html_patch = _patch_html_formula_blocks(
+        output_dir,
+        sidecar_dir,
+        formula_texts,
+        status_label="current_formula_display_fallback",
+        complete_missing_sequence=False,
+        allow_formula_number_match=False,
+    )
+    unsafe_indexes = [
+        formula_no
+        for formula_no, formula_text in formula_texts.items()
+        if _formula_output_safety_reasons(formula_text)
+    ]
+    result = {
+        "ok": bool(html_patch.get("ok")),
+        "applied": True,
+        "reason": reason,
+        "formula_count": len(formula_texts),
+        "formula_texts": sorted(formula_texts),
+        "candidate_sources": source_map,
+        "unsafe_formula_indexes": unsafe_indexes,
+        "document_json_patched": json_patched,
+        "document_md_patched": markdown_patched,
+        "document_html_patch": html_patch,
+    }
+    metadata["current_formula_display_fallback"] = result
+    status["quality_signals"]["current_formula_display_fallback"] = result
+    status["warnings"].append(
+        "current_formula_display_fallback:"
+        f"{reason}:patched={len(html_patch.get('patched_indexes') or [])}:"
+        f"unsafe={len(unsafe_indexes)}"
+    )
+    if result["ok"] and status.get("success_class") == "failure":
+        status["success_class"] = "degraded_success"
+    write_state()
+    return result
+
+
 def run_optional_formula_second_pass(
     output_dir: Path,
     metadata: dict[str, Any],
@@ -9460,6 +9959,13 @@ def run_optional_formula_second_pass(
             "preserve_accepted_cn_0854aa1_path"
         )
     if policy == "off":
+        apply_current_formula_display_fallback(
+            output_dir,
+            metadata,
+            status,
+            args,
+            reason="formula_second_pass_policy_off",
+        )
         return
 
     def write_updated_contract_state() -> None:
@@ -9504,10 +10010,23 @@ def run_optional_formula_second_pass(
             write_updated_contract_state()
             return
         message = "formula_second_pass_route_b_dir_required"
-        metadata["formula_second_pass"] = {"ok": False, "error": message}
+        fallback_result = apply_current_formula_display_fallback(
+            output_dir,
+            metadata,
+            status,
+            args,
+            reason=message,
+        )
+        metadata["formula_second_pass"] = {
+            "ok": bool(fallback_result.get("ok")),
+            "error": message,
+            "fallback": "current_formula_display_fallback",
+        }
         status["warnings"].append(message)
-        status["ok"] = False
-        status["success_class"] = "degraded_failure"
+        status["quality_signals"]["formula_second_pass"] = metadata["formula_second_pass"]
+        if not fallback_result.get("ok"):
+            status["ok"] = False
+            status["success_class"] = "degraded_failure"
         write_updated_contract_state()
         return
 

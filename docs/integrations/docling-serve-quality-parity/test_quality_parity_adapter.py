@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import sys
 import unittest
@@ -959,6 +960,60 @@ class EnglishReviewPolishTests(unittest.TestCase):
         self.assertIn("% display_tex:", text)
         self.assertIn("&", text)
 
+    def test_current_formula_display_fallback_replaces_final_html_formula_block(self) -> None:
+        document = {
+            "texts": [
+                {
+                    "label": "formula",
+                    "text": (
+                        r"A t t e n t i o n ( Q , K , V ) = s o f t m a x "
+                        r"( \frac { Q K ^ { T } } { \sqrt { d _ { k } } } ) V \quad ( 1 )"
+                    ),
+                }
+            ]
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir)
+            (output_dir / "document.json").write_text(
+                adapter.json.dumps(document),
+                encoding="utf-8",
+            )
+            (output_dir / "document.html").write_text(
+                (
+                    "<html><body><div><math><mi>A</mi>"
+                    '<annotation data-formula-index="1">raw</annotation>'
+                    "</math></div></body></html>"
+                ),
+                encoding="utf-8",
+            )
+            (output_dir / "document.md").write_text(
+                (
+                    r"$$A t t e n t i o n ( Q , K , V ) = s o f t m a x "
+                    r"( \frac { Q K ^ { T } } { \sqrt { d _ { k } } } ) V \quad ( 1 )$$"
+                    "\n"
+                ),
+                encoding="utf-8",
+            )
+            metadata = {}
+            status = {"quality_signals": {}, "warnings": [], "success_class": "degraded_success"}
+            args = Namespace(input_file=Path("attention.pdf"))
+
+            result = adapter.apply_current_formula_display_fallback(
+                output_dir,
+                metadata,
+                status,
+                args,
+                reason="test_no_route_b",
+            )
+            html_text = (output_dir / "document.html").read_text(encoding="utf-8")
+            md_text = (output_dir / "document.md").read_text(encoding="utf-8")
+
+        self.assertTrue(result["applied"])
+        self.assertIn("docling-formula-second-pass", html_text)
+        self.assertIn(r"\operatorname{Attention}", html_text)
+        self.assertIn(r"\operatorname{Attention}", md_text)
+        self.assertIn("current_formula_display_fallback", status["quality_signals"])
+
     def test_header_footer_qc_flags_page_edge_noise(self) -> None:
         document = {
             "texts": [
@@ -1524,15 +1579,15 @@ class EnglishReviewPolishTests(unittest.TestCase):
         self.assertEqual(content["records"][0]["kind"], "footnote")
         self.assertEqual(result["html_structural_content_count"], 1)
         self.assertEqual(result["markdown_structural_content_count"], 1)
-        self.assertIn("Extracted page-edge notes", final_html)
+        self.assertIn("Extracted structural and visual notes", final_html)
         self.assertIn("Correspondence to: author@example.org", final_html)
-        self.assertIn("## Extracted page-edge notes", final_md)
+        self.assertIn("## Extracted structural and visual notes", final_md)
         self.assertIn(text, final_md)
         self.assertNotIn(text, adapter._visible_html_text(
             adapter._html_without_structural_content(final_html)
         ))
 
-    def test_structural_content_exports_only_high_confidence_page_edge_material(self) -> None:
+    def test_structural_content_exports_high_confidence_structural_and_visual_material(self) -> None:
         candidates = [
             {
                 "kind": "page_header",
@@ -1568,9 +1623,9 @@ class EnglishReviewPolishTests(unittest.TestCase):
 
         records = adapter._structural_export_records(candidates)
 
-        self.assertEqual(len(records), 1)
-        self.assertEqual(records[0]["kind"], "page_header")
+        self.assertEqual([record["kind"] for record in records], ["page_header", "visual_annotation"])
         self.assertEqual(records[0]["text"], "Repeated conference header")
+        self.assertEqual(records[1]["text"], "Figure OCR noise")
 
     def test_structural_content_deduplicates_same_page_shadow(self) -> None:
         candidates = [
@@ -2974,11 +3029,155 @@ class EnglishReviewPolishTests(unittest.TestCase):
             markdown = (output_dir / "document.md").read_text(encoding="utf-8")
 
         self.assertEqual(result["markdown_quarantine_replacement_count"], 1)
+        markdown_body = adapter._markdown_without_structural_content(markdown)
         self.assertNotIn(
             "AUTHORIZATION MD",
-            adapter.re.sub(r"<!--.*?-->", "", markdown),
+            adapter.re.sub(r"<!--.*?-->", "", markdown_body),
         )
         self.assertEqual(result["final_output_residual_count"], 0)
+
+    def test_structural_quarantine_removes_figure_diagram_label_clusters(self) -> None:
+        document = {
+            "texts": [
+                {
+                    "label": "text",
+                    "text": "Nx",
+                    "prov": [{"page_no": 1, "bbox": {"l": 15, "r": 28, "t": 605, "b": 597}}],
+                },
+                {
+                    "label": "text",
+                    "text": "Encoding Add & Norm Feed Forward Add & Norm Multi-Head Attention Input Embedding",
+                    "prov": [{"page_no": 1, "bbox": {"l": 9, "r": 47, "t": 533, "b": 523}}],
+                },
+                {
+                    "label": "text",
+                    "text": "Inputs Output Probabilities Softmax",
+                    "prov": [{"page_no": 1, "bbox": {"l": 67, "r": 92, "t": 479, "b": 471}}],
+                },
+                {
+                    "label": "caption",
+                    "text": "Figure 1: The Transformer - model architecture.",
+                    "prov": [{"page_no": 1, "bbox": {"l": 108, "r": 504, "t": 390, "b": 370}}],
+                },
+            ],
+            "pictures": [
+                {
+                    "label": "picture",
+                    "prov": [{"page_no": 1, "bbox": {"l": 195, "r": 417, "t": 719, "b": 398}}],
+                }
+            ],
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir)
+            (output_dir / "document.html").write_text(
+                "<html><body><p>Nx</p>"
+                "<p>Encoding Add &amp; Norm Feed Forward Add &amp; Norm Multi-Head Attention Input Embedding</p>"
+                "<p>Inputs Output Probabilities Softmax</p>"
+                "<figure><figcaption>Figure 1: The Transformer - model architecture.</figcaption></figure>"
+                "</body></html>",
+                encoding="utf-8",
+            )
+            (output_dir / "document.md").write_text(
+                "Nx\n\nEncoding Add &amp; Norm Feed Forward Add &amp; Norm Multi-Head Attention Input Embedding\n\n"
+                "Inputs Output Probabilities Softmax\n\nFigure 1: The Transformer - model architecture.\n",
+                encoding="utf-8",
+            )
+
+            result = adapter.apply_structural_quarantine_to_outputs(output_dir, document)
+            body_html = adapter._html_without_structural_content(
+                (output_dir / "document.html").read_text(encoding="utf-8")
+            )
+            markdown = adapter._markdown_without_structural_content(
+                (output_dir / "document.md").read_text(encoding="utf-8")
+            )
+            content = json.loads((output_dir / "structural_content.json").read_text(encoding="utf-8"))
+
+        self.assertGreaterEqual(result["html_quarantine_replacement_count"], 3)
+        self.assertGreaterEqual(result["markdown_quarantine_replacement_count"], 3)
+        self.assertNotIn("<p>Nx</p>", body_html)
+        self.assertNotIn("Encoding Add", body_html)
+        self.assertNotIn("Encoding Add", markdown)
+        self.assertIn("Figure 1: The Transformer", body_html)
+        self.assertTrue(any(item["kind"] == "visual_annotation" for item in content["records"]))
+
+    def test_structural_quarantine_removes_private_use_math_caption_prefix(self) -> None:
+        text = "   Figure 1: Left: Schematic depiction of a model."
+        document = {
+            "texts": [
+                {
+                    "label": "caption",
+                    "text": text,
+                    "prov": [{"page_no": 1, "bbox": {"l": 108, "r": 506, "t": 553, "b": 500}}],
+                }
+            ],
+            "pictures": [
+                {
+                    "label": "picture",
+                    "prov": [{"page_no": 1, "bbox": {"l": 113, "r": 501, "t": 704, "b": 565}}],
+                }
+            ],
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir)
+            (output_dir / "document.html").write_text(
+                f"<html><body><p>{text}</p></body></html>",
+                encoding="utf-8",
+            )
+            (output_dir / "document.md").write_text(text + "\n", encoding="utf-8")
+
+            result = adapter.apply_structural_quarantine_to_outputs(output_dir, document)
+            body_html = adapter._html_without_structural_content(
+                (output_dir / "document.html").read_text(encoding="utf-8")
+            )
+            markdown = adapter._markdown_without_structural_content(
+                (output_dir / "document.md").read_text(encoding="utf-8")
+            )
+            content = json.loads((output_dir / "structural_content.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(result["final_output_residual_count"], 0)
+        self.assertNotIn("", body_html)
+        self.assertNotIn("", markdown)
+        self.assertIn("Figure 1: Left", body_html)
+        self.assertTrue(any(item["kind"] == "math_font_noise" for item in content["records"]))
+
+    def test_structural_quarantine_removes_standalone_private_use_math_noise(self) -> None:
+        text = ""
+        document = {
+            "texts": [
+                {
+                    "label": "quarantined_visual_annotation",
+                    "text": text,
+                    "prov": [{"page_no": 1, "bbox": {"l": 132, "r": 153, "t": 558, "b": 548}}],
+                }
+            ],
+            "pictures": [
+                {
+                    "label": "picture",
+                    "prov": [{"page_no": 1, "bbox": {"l": 113, "r": 501, "t": 704, "b": 565}}],
+                }
+            ],
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir)
+            (output_dir / "document.html").write_text(
+                f"<html><body><p>{text}</p><p>Figure 1: Model.</p></body></html>",
+                encoding="utf-8",
+            )
+            (output_dir / "document.md").write_text(text + "\n\nFigure 1: Model.\n", encoding="utf-8")
+
+            result = adapter.apply_structural_quarantine_to_outputs(output_dir, document)
+            body_html = adapter._html_without_structural_content(
+                (output_dir / "document.html").read_text(encoding="utf-8")
+            )
+            markdown = adapter._markdown_without_structural_content(
+                (output_dir / "document.md").read_text(encoding="utf-8")
+            )
+            content = json.loads((output_dir / "structural_content.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(result["final_output_residual_count"], 0)
+        self.assertNotIn(text, body_html)
+        self.assertNotIn(text, markdown)
+        self.assertTrue(any(item["kind"] == "math_font_noise" for item in content["records"]))
 
     def test_structural_quarantine_does_not_relabel_formula_nodes(self) -> None:
         document = {
