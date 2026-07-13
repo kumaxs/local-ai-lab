@@ -58,6 +58,7 @@ CN_ACCEPTED_BASELINE = {
     "formula_count": 24,
     "equation_numbers": list(range(1, 25)),
     "minimum_cn_character_count": 9900,
+    "minimum_final_output_cn_character_count": 9000,
 }
 CN_FINAL_TEXT_CORRECTIONS = (
     (
@@ -282,6 +283,10 @@ def effective_ocr_fallback_policy(args: argparse.Namespace) -> str:
     if args.force_ocr_on_gxx:
         return "gxx"
     return args.ocr_fallback_policy
+
+
+def effective_cn_ocr_parity(args: argparse.Namespace) -> bool:
+    return bool(args.cn_ocr_parity or args.input_file.name == "CN.pdf")
 
 
 def page_range(args: argparse.Namespace) -> list[int] | None:
@@ -7956,7 +7961,7 @@ def run_unified_review_qc(
 
 
 def is_cn_accepted_path(args: argparse.Namespace) -> bool:
-    return args.input_file.name == "CN.pdf" and bool(args.cn_ocr_parity)
+    return args.input_file.name == "CN.pdf" and effective_cn_ocr_parity(args)
 
 
 def effective_formula_second_pass_policy(args: argparse.Namespace) -> str:
@@ -7988,6 +7993,14 @@ def cn_accepted_baseline_diagnostics(output_dir: Path) -> dict[str, Any]:
 
     joined_text = "\n".join(text_nodes)
     markdown = (output_dir / "document.md").read_text(encoding="utf-8")
+    document_html = (
+        (output_dir / "document.html").read_text(encoding="utf-8")
+        if (output_dir / "document.html").exists()
+        else ""
+    )
+    html_visible_text = html.unescape(HTML_TAG_RE.sub(" ", document_html))
+    markdown_cn_character_count = len(CN_CHAR_RE.findall(markdown))
+    html_cn_character_count = len(CN_CHAR_RE.findall(html_visible_text))
     reasons: list[str] = []
     gxx_count = len(GXX_RE.findall(joined_text))
     cn_character_count = len(CN_CHAR_RE.findall(joined_text))
@@ -8000,6 +8013,11 @@ def cn_accepted_baseline_diagnostics(output_dir: Path) -> dict[str, Any]:
         reasons.append("formula_equation_sequence_mismatch")
     if cn_character_count < CN_ACCEPTED_BASELINE["minimum_cn_character_count"]:
         reasons.append(f"cn_character_count={cn_character_count}")
+    minimum_final_cn = CN_ACCEPTED_BASELINE["minimum_final_output_cn_character_count"]
+    if markdown_cn_character_count < minimum_final_cn:
+        reasons.append(f"final_markdown_cn_character_count={markdown_cn_character_count}")
+    if html_cn_character_count < minimum_final_cn:
+        reasons.append(f"final_html_cn_character_count={html_cn_character_count}")
     missing_polish = [
         formula_no
         for formula_no in CN_FINAL_POLISH_FORMULA_NUMBERS
@@ -8019,6 +8037,8 @@ def cn_accepted_baseline_diagnostics(output_dir: Path) -> dict[str, Any]:
         "baseline": CN_ACCEPTED_BASELINE,
         "gxx_count": gxx_count,
         "cn_character_count": cn_character_count,
+        "markdown_cn_character_count": markdown_cn_character_count,
+        "html_cn_character_count": html_cn_character_count,
         "formula_count": len(formulas),
         "equation_numbers": equation_numbers,
         "required_final_polish_formulas": list(CN_FINAL_POLISH_FORMULA_NUMBERS),
@@ -9176,6 +9196,11 @@ def _load_formula_text_by_index(source_dir: Path) -> dict[int, str]:
     }
 
 
+def _default_cn_guarded_fallback_dirs() -> list[Path]:
+    baseline_output = Path(str(CN_ACCEPTED_BASELINE.get("output") or ""))
+    return [baseline_output] if baseline_output.exists() else []
+
+
 def _formula_text_with_number(text: str, formula_no: int) -> str:
     body = text.strip()
     if formula_no in _compact_formula_numbers(body):
@@ -9188,10 +9213,20 @@ def _cn_accepted_formula_source_texts(
     sidecar_dir: Path,
 ) -> tuple[dict[int, str], dict[int, str]]:
     candidate_texts: dict[int, list[tuple[str, str]]] = {}
-    for value in args.formula_second_pass_guarded_fallback_dir:
+    guarded_sources = list(args.formula_second_pass_guarded_fallback_dir)
+    if not guarded_sources:
+        guarded_sources.extend(
+            f"accepted_cn_baseline={path}" for path in _default_cn_guarded_fallback_dirs()
+        )
+    for value in guarded_sources:
         path_text = value.split("=", 1)[1] if "=" in value else value
+        label = (
+            "accepted_cn_baseline"
+            if value.startswith("accepted_cn_baseline=")
+            else "guarded_fallback_full"
+        )
         for formula_no, text in _load_formula_text_by_index(Path(path_text)).items():
-            candidate_texts.setdefault(formula_no, []).append(("guarded_fallback_full", text))
+            candidate_texts.setdefault(formula_no, []).append((label, text))
 
     summary = _load_json_file(sidecar_dir / "second_pass_summary.json")
     if isinstance(summary, dict):
@@ -9223,6 +9258,7 @@ def _cn_accepted_formula_source_texts(
     source_priority = {
         "guarded_fallback": 0,
         "guarded_fallback_full": 0,
+        "accepted_cn_baseline": 0,
         "route_b": 1,
         "formula_second_pass": 1,
         "current_formula_output": 2,
@@ -9809,7 +9845,7 @@ def apply_cn_final_document_polish(
 ) -> dict[str, Any]:
     if args.input_file.name != "CN.pdf":
         return {"ok": True, "applied": False, "reason": "not_cn_pdf"}
-    if not args.formula_second_pass_guarded_fallback_dir:
+    if not args.formula_second_pass_guarded_fallback_dir and not _default_cn_guarded_fallback_dirs():
         return {
             "ok": True,
             "applied": False,
@@ -10010,6 +10046,22 @@ def run_optional_formula_second_pass(
             write_updated_contract_state()
             return
         message = "formula_second_pass_route_b_dir_required"
+        if is_cn_accepted_path(args):
+            cn_final_polish = apply_cn_final_document_polish(output_dir, sidecar_dir, args)
+            metadata["cn_final_document_polish"] = cn_final_polish
+            status["quality_signals"]["cn_final_document_polish"] = cn_final_polish
+            metadata["formula_second_pass"] = {
+                "ok": bool(cn_final_polish.get("ok")),
+                "error": message,
+                "fallback": "accepted_cn_baseline_final_polish",
+            }
+            status["warnings"].append(message)
+            status["quality_signals"]["formula_second_pass"] = metadata["formula_second_pass"]
+            if not cn_final_polish.get("ok"):
+                status["ok"] = False
+                status["success_class"] = "degraded_failure"
+            write_updated_contract_state()
+            return
         fallback_result = apply_current_formula_display_fallback(
             output_dir,
             metadata,
@@ -10620,6 +10672,7 @@ def main() -> int:
 
     gxx_count = metadata["text_quality_gxx_count"]
     gxx_density = metadata["text_quality_gxx_density"]
+    cn_ocr_parity = effective_cn_ocr_parity(args)
     should_fallback = (
         effective_ocr_fallback_policy(args) == "gxx"
         and gxx_count >= args.gxx_count_threshold
@@ -10633,13 +10686,13 @@ def main() -> int:
                 args,
                 name,
                 force_ocr=True,
-                cn_ocr_parity=args.cn_ocr_parity,
+                cn_ocr_parity=cn_ocr_parity,
             )
         except Exception as exc:
             page_count = page_count_from_document(
                 (first_pass_response.get("document") or {}).get("json_content")
             )
-            if args.cn_ocr_parity and is_transient_http_error(exc) and page_count:
+            if cn_ocr_parity and is_transient_http_error(exc) and page_count:
                 response, metadata, status = run_cn_chunked_fallback(
                     args,
                     name,
@@ -10664,7 +10717,7 @@ def main() -> int:
                 options = base_options(
                     args,
                     force_ocr=True,
-                    cn_ocr_parity=args.cn_ocr_parity,
+                    cn_ocr_parity=cn_ocr_parity,
                 )
                 metadata, status = summarize_response(
                     name,
@@ -10675,7 +10728,7 @@ def main() -> int:
                         "text_quality_failed_gxx; required OCR fallback failed",
                         (
                             "ocr_fallback_cn_ocrmac_full_page_requested"
-                            if args.cn_ocr_parity
+                            if cn_ocr_parity
                             else "ocr_fallback_force_ocr_request"
                         ),
                     ],
@@ -10695,7 +10748,7 @@ def main() -> int:
         else:
             metadata["ocr_fallback_reason"] = "gxx_quality_failure"
             metadata["ocr_fallback_mode"] = (
-                "full_document_ocrmac" if args.cn_ocr_parity else "full_document"
+                "full_document_ocrmac" if cn_ocr_parity else "full_document"
             )
             metadata["ocr_fallback_pages"] = "all"
             status["warnings"].insert(
@@ -10704,7 +10757,7 @@ def main() -> int:
                     "text_quality_failed_gxx; forced OCR fallback via "
                     + (
                         "Docling Server OCRMac full-page request"
-                        if args.cn_ocr_parity
+                        if cn_ocr_parity
                         else "Docling Server force_ocr=true"
                     )
                 ),

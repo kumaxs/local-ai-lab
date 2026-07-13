@@ -70,7 +70,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--cn-ocr-parity",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=True,
         help="Forward CN OCRMac parity fallback options to each adapter invocation.",
     )
     parser.add_argument(
