@@ -3518,6 +3518,12 @@ GENERAL_BRACKET_CITATION_RE = re.compile(
     r"(?P<body>[^\]］〕\)）\n]{1,160})"
     r"(?P<close>[\]］〕\)）])"
 )
+MISSING_OPEN_BRACKET_RANGE_CITATION_RE = re.compile(
+    r"(?<![A-Za-z0-9])"
+    r"(?P<body>\d{1,3}\s*(?:[\u2013\u2014~～-])\s*\d{1,3}"
+    r"(?:\s*[,;，；、]\s*\d{1,3}\s*(?:[\u2013\u2014~～-])?\s*\d{0,3})*)"
+    r"(?P<close>[\]］〕])"
+)
 INLINE_CITATION_RE = re.compile(
     r"(?:"
     r"(?P<paired_open>[\[［〔])"
@@ -4780,6 +4786,32 @@ def _citation_candidates_for_text(
             numbers,
             evidence,
             display_body,
+        )
+    for match in MISSING_OPEN_BRACKET_RANGE_CITATION_RE.finditer(text):
+        body = match.group("body")
+        numbers = _citation_numbers(_normalized_noise_text(body))
+        if (
+            not numbers
+            or any(number not in reference_lookup for number in numbers)
+            or not _numeric_bracket_context_allows_citation(
+                text,
+                match.start(),
+                match.end(),
+            )
+        ):
+            continue
+        add_candidate(
+            match.start(),
+            match.end(),
+            match.group(0),
+            numbers,
+            [
+                "reference_section_detected",
+                "ocr_missing_open_citation_bracket",
+                "general_bracket_numeric_citation",
+                "reference_number_exists",
+            ],
+            _normalized_noise_text(body),
         )
     for match in INLINE_CITATION_RE.finditer(text):
         raw = match.group(0)
