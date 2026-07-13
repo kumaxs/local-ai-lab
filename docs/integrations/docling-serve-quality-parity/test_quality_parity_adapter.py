@@ -402,6 +402,24 @@ class EnglishReviewPolishTests(unittest.TestCase):
         self.assertIn(sources[13], {"formula_second_pass", "guarded_fallback_full"})
         self.assertEqual(adapter._compact_formula_numbers(texts[1]), [1])
 
+    def test_cn_default_sources_prefer_clean_route_b_for_first_formulas(self) -> None:
+        if not adapter._default_cn_route_b_dirs() or not adapter._default_cn_guarded_fallback_dirs():
+            self.skipTest("local CN default formula sources are not available")
+        args = Namespace(formula_second_pass_guarded_fallback_dir=[])
+
+        texts, sources = adapter._cn_accepted_formula_source_texts(
+            args,
+            Path("/tmp/nonexistent-sidecar"),
+        )
+
+        self.assertEqual(sources[1], "route_b")
+        self.assertEqual(sources[2], "route_b")
+        self.assertNotIn(r"_ { \, _ { p } }", texts[1])
+        self.assertEqual(
+            texts[2],
+            r"q ^ { \prime } _ { t } = O ( q _ { t } ) \times W _ { q } \quad ( 2 )",
+        )
+
     def test_formula_final_canonicalization_trims_noise_and_duplicate_number(self) -> None:
         text, repairs = formula_second_pass.canonicalize_formula_output(
             r"x = y \quad ( 9 ) \quad ( 9 ) "
