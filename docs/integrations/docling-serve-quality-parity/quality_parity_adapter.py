@@ -2780,6 +2780,138 @@ def recover_first_page_author_reading_order(
     }
 
 
+def recover_first_page_abstract_reading_order(
+    output_dir: Path,
+    document_json: Any,
+) -> dict[str, Any]:
+    records = [
+        record
+        for record in structural_text_records(document_json)
+        if record.get("page_no") == 1
+        and isinstance(record.get("text"), str)
+        and record.get("bbox")
+    ]
+    abstract_heading = next(
+        (
+            record
+            for record in records
+            if str(record.get("label") or "").lower() == "section_header"
+            and str(record.get("text") or "").strip().upper() == "ABSTRACT"
+        ),
+        None,
+    )
+    if not abstract_heading:
+        return {"applied": False, "reason": "abstract_heading_missing"}
+    abstract_body = next(
+        (
+            record
+            for record in records
+            if str(record.get("label") or "").lower() == "text"
+            and (record.get("reading_order") or 0) > (abstract_heading.get("reading_order") or 0)
+            and float((record.get("bbox") or {}).get("l", 0))
+            <= float((abstract_heading.get("bbox") or {}).get("l", 0)) + 48
+        ),
+        None,
+    )
+    frontmatter_records = [
+        record
+        for record in records
+        if str(record.get("label") or "").lower() == "section_header"
+        and (
+            str(record.get("text") or "").strip().upper()
+            in {"CCS CONCEPTS", "KEYWORDS"}
+            or str(record.get("text") or "").strip().lower().startswith("acmreference")
+            or re.match(r"^\s*1\s+introduction\b", str(record.get("text") or ""), flags=re.I)
+        )
+    ]
+    if not abstract_body or not frontmatter_records:
+        return {"applied": False, "reason": "abstract_body_or_frontmatter_missing"}
+    if not any(
+        (record.get("reading_order") or 0) < (abstract_heading.get("reading_order") or 0)
+        for record in frontmatter_records
+    ):
+        return {"applied": False, "reason": "abstract_already_before_frontmatter"}
+
+    def comparable(value: str) -> str:
+        return _normalized_noise_text(html.unescape(HTML_TAG_RE.sub("", value)))
+
+    html_path = output_dir / "document.html"
+    if not html_path.exists():
+        return {"applied": False, "reason": "document_html_missing"}
+    document_html = html_path.read_text(encoding="utf-8")
+
+    def find_block(text: str) -> re.Match[str] | None:
+        target = _normalized_noise_text(text)
+        return next(
+            (
+                match
+                for match in HTML_TEXT_BLOCK_RE.finditer(document_html)
+                if comparable(match.group("body")) == target
+            ),
+            None,
+        )
+
+    heading_match = find_block(str(abstract_heading.get("text") or ""))
+    body_match = find_block(str(abstract_body.get("text") or ""))
+    front_matches = [
+        find_block(str(record.get("text") or ""))
+        for record in frontmatter_records
+    ]
+    front_matches = [match for match in front_matches if match is not None]
+    if not heading_match or not body_match or not front_matches:
+        return {"applied": False, "reason": "html_blocks_missing"}
+    insertion_match = min(front_matches, key=lambda match: match.start())
+    if heading_match.start() < insertion_match.start():
+        return {"applied": False, "reason": "html_abstract_already_before_frontmatter"}
+    moving = [(heading_match.start(), heading_match.end()), (body_match.start(), body_match.end())]
+    moving = sorted(moving)
+    block_html = "".join(document_html[start:end] for start, end in moving)
+    updated = document_html
+    for start, end in sorted(moving, reverse=True):
+        updated = updated[:start] + "" + updated[end:]
+    insertion_index = insertion_match.start()
+    removed_before = sum(end - start for start, end in moving if end <= insertion_index)
+    insertion_index -= removed_before
+    updated = updated[:insertion_index] + block_html + updated[insertion_index:]
+    html_path.write_text(updated, encoding="utf-8")
+
+    markdown_count = 0
+    md_path = output_dir / "document.md"
+    if md_path.exists():
+        markdown = md_path.read_text(encoding="utf-8")
+        heading_pattern = re.compile(
+            r"(?m)^#{1,6}\s+" + re.escape(str(abstract_heading.get("text") or "").strip()) + r"\s*$"
+        )
+        heading_md = heading_pattern.search(markdown)
+        body_text = str(abstract_body.get("text") or "").strip()
+        front_pattern = re.compile(
+            r"(?m)^#{1,6}\s+(?:CCS CONCEPTS|KEYWORDS|ACMReference Format:|1 INTRODUCTION)\s*$",
+            re.I,
+        )
+        front_md = front_pattern.search(markdown)
+        body_pos = markdown.find(body_text)
+        if heading_md and body_pos != -1 and front_md and heading_md.start() > front_md.start():
+            body_end = body_pos + len(body_text)
+            moving_start = heading_md.start()
+            moving_end = body_end
+            moving_md = markdown[moving_start:moving_end].strip() + "\n\n"
+            markdown = markdown[:moving_start] + markdown[moving_end:]
+            insert_at = front_md.start()
+            if moving_end <= insert_at:
+                insert_at -= moving_end - moving_start
+            markdown = markdown[:insert_at] + moving_md + markdown[insert_at:]
+            md_path.write_text(markdown, encoding="utf-8")
+            markdown_count = 1
+
+    return {
+        "applied": True,
+        "source": "first_page_heading_bbox_and_final_html_order",
+        "html_moved_block_count": 2,
+        "markdown_moved": bool(markdown_count),
+        "frontmatter_heading_count": len(frontmatter_records),
+    }
+
+
 def structural_noise_qc(
     document_json: Any,
     source_evidence: dict[str, Any] | None = None,
@@ -2928,6 +3060,21 @@ def structural_noise_qc(
                     float(zone.get("l", 0)),
                 )
                 > 0
+                for zone in footnote_zones.get(record.get("page_no"), [])
+            )
+        )
+        near_footnote_zone = bool(
+            geometry
+            and any(
+                min(float(geometry.get("r", 0)), float(zone.get("r", 0)))
+                - max(float(geometry.get("l", 0)), float(zone.get("l", 0)))
+                > 0
+                and (
+                    abs(float(geometry.get("b", 0)) - float(zone.get("t", 0)))
+                    <= max(24.0, page_height * 0.04)
+                    or abs(float(zone.get("b", 0)) - float(geometry.get("t", 0)))
+                    <= max(24.0, page_height * 0.04)
+                )
                 for zone in footnote_zones.get(record.get("page_no"), [])
             )
         )
@@ -3201,6 +3348,23 @@ def structural_noise_qc(
             )
         elif (
             not body_semantic_label
+            and near_footnote_zone
+            and small_text
+            and (
+                FOOTNOTE_CONTENT_NOISE_RE.search(normalized)
+                or re.match(r"^\s*(?:please note|note that)\b", normalized, flags=re.I)
+                or (len(normalized) <= 180 and re.search(r"https?://|github\.com", normalized, flags=re.I))
+            )
+        ):
+            kind = kind or "footnote_candidate"
+            reasons.extend(
+                [
+                    "same_column_footnote_continuation",
+                    "small_text_adjacent_to_labeled_footnote_zone",
+                ]
+            )
+        elif (
+            not body_semantic_label
             and geometry
             and bottom_zone
             and text.rstrip().endswith("-")
@@ -3261,6 +3425,8 @@ def structural_noise_qc(
         if FOOTNOTE_MARKER_RE.search(text):
             score += 2
         if adjacent_to_footnote_zone and "same_column_footnote_cluster" in reasons:
+            score += 4
+        if "same_column_footnote_continuation" in reasons:
             score += 4
         if FOOTNOTE_CONTENT_NOISE_RE.search(normalized) or HEADER_FOOTER_NOISE_RE.search(normalized):
             score += 2
@@ -3559,17 +3725,28 @@ MODEL_CITATION_ALIAS_RE = re.compile(
     r"(?=\s*模型|模型|[，、,])"
 )
 AUTHOR_YEAR_CITATION_RE = re.compile(
-    r"(?P<open>[\[［〔])"
+    r"(?P<open>[\[［〔\(（])"
     r"(?P<body>"
-    r"[A-Z][A-Za-z'’.-]{1,40}"
-    r"(?:\s+et\s+al\.)?"
-    r"\s*,\s*(?:19|20)\d{2}"
-    r"(?:\s*[;,]\s*"
-    r"[A-Z][A-Za-z'’.-]{1,40}"
-    r"(?:\s+et\s+al\.)?"
-    r"\s*,\s*(?:19|20)\d{2})*"
+    r"[A-Z][A-Za-z'’.-]{1,40}(?:\s+[A-Z][A-Za-z'’.-]{1,40}){0,3}"
+    r"(?:\s+(?:et\s+al\.|and\s+[A-Z][A-Za-z'’.-]{1,40}"
+    r"(?:\s+[A-Z][A-Za-z'’.-]{1,40}){0,3}))?"
+    r"\s*,\s*(?:19|20)\d{2}[a-z]?"
+    r"(?:\s*,\s*(?:19|20)\d{2}[a-z]?)*"
+    r"(?:\s*;\s*"
+    r"[A-Z][A-Za-z'’.-]{1,40}(?:\s+[A-Z][A-Za-z'’.-]{1,40}){0,3}"
+    r"(?:\s+(?:et\s+al\.|and\s+[A-Z][A-Za-z'’.-]{1,40}"
+    r"(?:\s+[A-Z][A-Za-z'’.-]{1,40}){0,3}))?"
+    r"\s*,\s*(?:19|20)\d{2}[a-z]?"
+    r"(?:\s*,\s*(?:19|20)\d{2}[a-z]?)*"
+    r")*"
     r")"
-    r"(?P<close>[\]］〕])"
+    r"(?P<close>[\]］〕\)）])"
+)
+NARRATIVE_AUTHOR_YEAR_CITATION_RE = re.compile(
+    r"(?<![A-Za-z0-9])"
+    r"(?P<author>[A-Z][A-Za-z'’.-]{1,40}"
+    r"(?:\s+(?:et\s+al\.|and\s+[A-Z][A-Za-z'’.-]{1,40}))?)"
+    r"\s*\((?P<year>(?:19|20)\d{2}[a-z]?)\)"
 )
 REFERENCE_CONTINUATION_START_RE = re.compile(
     r"^\s*(?:"
@@ -4630,18 +4807,50 @@ def _reference_author_year_index(
     references: list[dict[str, Any]],
 ) -> dict[tuple[str, str], int]:
     keys: dict[tuple[str, str], set[int]] = {}
+
+    def add(alias: str, year: str, number: int) -> None:
+        normalized = re.sub(r"[^A-Za-z'’-]+", " ", alias).strip()
+        if not normalized:
+            return
+        tokens = normalized.split()
+        if not tokens:
+            return
+        candidate = " ".join(tokens).replace("’", "'").upper()
+        if len(candidate) < 2:
+            return
+        keys.setdefault((candidate, year.lower()), set()).add(number)
+
+    def author_aliases(reference_text: str, year_start: int) -> list[str]:
+        leading = reference_text[:year_start]
+        leading = re.sub(r"^\s*(?:[\[［〔]?\d{1,3}[\]］〕.)、]?\s*)", "", leading)
+        first_author = re.split(r"\s+(?:and|&)\s+|;", leading, maxsplit=1)[0]
+        first_author = first_author.split(",", 1)[0]
+        first_author = re.sub(r"\b[A-Z]\.\s*", " ", first_author)
+        first_author = re.sub(r"\b[A-Z]\s+", " ", first_author)
+        words = re.findall(r"[A-Z][A-Za-z'’.-]{1,40}", first_author)
+        aliases: list[str] = []
+        if words:
+            for width in range(1, min(3, len(words)) + 1):
+                aliases.append(" ".join(words[-width:]))
+        old_match = re.match(
+            r"\s*(?:[A-Z]\.\s+)?([A-Z][A-Za-z'’.-]{1,40})\b",
+            reference_text,
+        )
+        if old_match:
+            aliases.append(old_match.group(1))
+        return list(dict.fromkeys(aliases))
+
     for reference in references:
         number = int(reference["number"])
         text = str(reference.get("text") or "")
-        author_match = re.match(
-            r"\s*(?:[A-Z]\.\s+)?([A-Z][A-Za-z'’.-]{1,40})\b",
-            text,
-        )
-        year_match = re.search(r"\b((?:19|20)\d{2})\b", text)
-        if not author_match or not year_match:
+        years = list(re.finditer(r"\b((?:19|20)\d{2}[a-z]?)\b", text))
+        if not years:
             continue
-        key = (author_match.group(1).replace("’", "'").upper(), year_match.group(1))
-        keys.setdefault(key, set()).add(number)
+        aliases = author_aliases(text, years[0].start())
+        for year_match in years:
+            year = year_match.group(1)
+            for alias in aliases:
+                add(alias, year, number)
     return {
         key: next(iter(numbers))
         for key, numbers in keys.items()
@@ -4655,17 +4864,27 @@ def _author_year_numbers(
 ) -> list[int]:
     numbers: list[int] = []
     for part in re.split(r"\s*;\s*", citation_body):
-        match = re.fullmatch(
-            r"\s*([A-Z][A-Za-z'’.-]{1,40})(?:\s+et\s+al\.)?\s*,\s*((?:19|20)\d{2})\s*",
-            part,
-        )
-        if not match:
+        year_matches = list(re.finditer(r"\b((?:19|20)\d{2}[a-z]?)\b", part))
+        if not year_matches:
             return []
-        key = (match.group(1).replace("’", "'").upper(), match.group(2))
-        number = author_year_lookup.get(key)
-        if number is None:
+        author_part = part[: year_matches[0].start()].strip(" ,")
+        author_part = re.sub(r"\bet\s+al\.?\s*$", "", author_part, flags=re.I).strip()
+        author_part = re.split(r"\s+(?:and|&)\s+", author_part, maxsplit=1)[0]
+        author_part = re.sub(r"[^A-Za-z'’.-]+", " ", author_part).strip()
+        if not author_part:
             return []
-        numbers.append(number)
+        aliases = [" ".join(author_part.split()[-width:]) for width in range(1, min(3, len(author_part.split())) + 1)]
+        for year_match in year_matches:
+            year = year_match.group(1).lower()
+            matched_number = None
+            for alias in aliases:
+                key = (alias.replace("’", "'").upper(), year)
+                matched_number = author_year_lookup.get(key)
+                if matched_number is not None:
+                    break
+            if matched_number is None:
+                return []
+            numbers.append(matched_number)
     return list(dict.fromkeys(numbers))
 
 
@@ -4711,11 +4930,12 @@ def _numeric_bracket_context_allows_citation(
     after = text[end : min(len(text), end + 12)]
     previous = before.rstrip()[-1:] if before.rstrip() else ""
     following = after.lstrip()[:1] if after.lstrip() else ""
-    if previous.isdigit():
+    immediate_previous = text[start - 1 : start] if start > 0 else ""
+    if immediate_previous.isdigit():
         return False
     if re.search(r"(?:[A-Za-z]\s*[∈∊∋=<>≤≥]|[=<>≤≥∈∊∋]\s*)$", before):
         return False
-    if previous.isalpha() and re.match(r"^\s*[,;，；、)\]］〕）}]", after):
+    if immediate_previous.isalpha() and re.match(r"^\s*[,;，；、)\]］〕）}]", after):
         return False
     if previous in "([{（｛,;，；:：=+-*/×÷" and following.isdigit():
         return False
@@ -4777,8 +4997,6 @@ def _citation_candidates_for_text(
             )
         ):
             continue
-        if open_char in "(（" and close_char in ")）" and "author_year_citation" in evidence:
-            continue
         add_candidate(
             match.start(),
             match.end(),
@@ -4838,6 +5056,22 @@ def _citation_candidates_for_text(
             match.group(0),
             numbers,
             ["reference_section_detected", "author_year_citation", "unique_author_year_reference"],
+            body,
+        )
+    for match in NARRATIVE_AUTHOR_YEAR_CITATION_RE.finditer(text):
+        body = f"{match.group('author')}, {match.group('year')}"
+        numbers = _author_year_numbers(body, author_year_lookup or {})
+        add_candidate(
+            match.start(),
+            match.end(),
+            match.group(0),
+            numbers,
+            [
+                "reference_section_detected",
+                "author_year_citation",
+                "narrative_author_year_citation",
+                "unique_author_year_reference",
+            ],
             body,
         )
     for match in MALFORMED_CITATION_TOKEN_RE.finditer(text):
@@ -4910,9 +5144,12 @@ def _reference_section_records(document_json: Any) -> tuple[
     result: list[dict[str, Any]] = []
     for record in records[heading_index + 1 :]:
         label = str(record.get("label") or "").lower()
-        if label == "section_header":
+        text = str(record.get("text") or "")
+        explicit_number, _body = _explicit_reference_number(text, record)
+        numbered_reference_heading = label == "section_header" and explicit_number is not None
+        if label == "section_header" and not numbered_reference_heading:
             break
-        if label == "list_item":
+        if label == "list_item" or numbered_reference_heading:
             result.append(record)
     return heading, result
 
@@ -5047,9 +5284,16 @@ def bibliography_diagnostics(document_json: Any) -> dict[str, Any]:
                 in_reference_section = True
                 reference_orders.add(record.get("reading_order"))
                 continue
-            if in_reference_section and str(record.get("label") or "").lower() == "section_header":
+            label = str(record.get("label") or "").lower()
+            explicit_number, _body = _explicit_reference_number(str(record.get("text") or ""), record)
+            numbered_reference_heading = label == "section_header" and explicit_number is not None
+            if (
+                in_reference_section
+                and label == "section_header"
+                and not numbered_reference_heading
+            ):
                 break
-            if in_reference_section and str(record.get("label") or "").lower() in {
+            if in_reference_section and label in {
                 "section_header",
                 "list_item",
             }:
@@ -5167,8 +5411,17 @@ def _linked_citation_html(citation: dict[str, Any]) -> str:
         open_wrapper = wrapper_match.group("open")
         close_wrapper = wrapper_match.group("close")
     if "author_year_citation" in (citation.get("mapping_evidence") or []):
+        if "narrative_author_year_citation" in (citation.get("mapping_evidence") or []):
+            link = citation["links"][0] if citation.get("links") else None
+            if not link:
+                return html.escape(raw)
+            return (
+                f'<a id="{link["citation_id"]}" class="docling-citation" '
+                f'href="#{link["reference_id"]}">{html.escape(raw)}</a>'
+            )
         linked_parts: list[str] = []
         parts = re.split(r"(\s*;\s*)", body)
+        visible_part_count = sum(1 for part in parts if part and not re.fullmatch(r"\s*[;,]\s*", part))
         number_index = 0
         for part in parts:
             if re.fullmatch(r"\s*[;,]\s*", part):
@@ -5186,9 +5439,26 @@ def _linked_citation_html(citation: dict[str, Any]) -> str:
             if not link:
                 linked_parts.append(html.escape(part))
                 continue
+            hidden_targets = ""
+            extra_numbers = (
+                citation.get("numbers", [])[number_index:]
+                if visible_part_count == 1
+                else []
+            )
+            for extra_number in extra_numbers:
+                extra_link = link_lookup.get(extra_number)
+                if extra_link:
+                    hidden_targets += (
+                        f'<a id="{extra_link["citation_id"]}" '
+                        f'class="docling-citation docling-citation-hidden-target" '
+                        f'href="#{extra_link["reference_id"]}" '
+                        f'aria-label="Reference {extra_number}"></a>'
+                    )
+                    number_index += 1
             linked_parts.append(
                 f'<a id="{link["citation_id"]}" class="docling-citation" '
                 f'href="#{link["reference_id"]}">{html.escape(part.strip())}</a>'
+                f"{hidden_targets}"
             )
         return html.escape(open_wrapper) + "".join(linked_parts) + html.escape(close_wrapper)
 
@@ -5295,20 +5565,17 @@ def _link_bibliography_in_html(
     )
     reference_matches: list[re.Match[str]] = []
     if heading_match:
-        section_end = len(updated)
         for match in HTML_TEXT_BLOCK_RE.finditer(updated, heading_match.end()):
-            if match.group("tag").lower().startswith("h"):
-                section_end = match.start()
-                break
-        reference_matches = [
-            match
-            for match in HTML_TEXT_BLOCK_RE.finditer(
-                updated,
-                heading_match.end(),
-                section_end,
+            tag = match.group("tag").lower()
+            visible = _normalized_noise_text(
+                html.unescape(HTML_TAG_RE.sub(" ", match.group("body")))
             )
-            if match.group("tag").lower() == "li"
-        ]
+            explicit_number, _body = _explicit_reference_number(visible)
+            numbered_reference_heading = tag.startswith("h") and explicit_number is not None
+            if tag.startswith("h") and not numbered_reference_heading:
+                break
+            if tag == "li" or numbered_reference_heading:
+                reference_matches.append(match)
 
     reference_replacements: list[tuple[int, int, str]] = []
     anchored_reference_ids: set[str] = set()
@@ -5389,11 +5656,12 @@ def _link_bibliography_in_html(
             + reference_body
             + f'<span class="docling-reference-backlinks">{backlinks}</span>'
         )
+        tag = match.group("tag")
         reference_replacements.append(
             (
                 match.start(),
                 match.end(),
-                f'<li{attrs} id="{reference["reference_id"]}">{body}</li>',
+                f'<{tag}{attrs} id="{reference["reference_id"]}">{body}</{tag}>',
             )
         )
         anchored_reference_ids.add(str(reference["reference_id"]))
@@ -5602,6 +5870,91 @@ def _link_bibliography_in_markdown(
         )
 
     return updated, reference_count, citation_count
+
+
+APPENDIX_REFERENCE_RE = re.compile(r"\bAppendix\s+(?P<label>[A-Z](?:\.\d+){0,3})\b")
+APPENDIX_HEADING_RE = re.compile(r"^\s*(?:Appendix\s+)?(?P<label>[A-Z](?:\.\d+){0,3})\b")
+
+
+def _appendix_anchor_id(label: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", label.lower()).strip("-")
+    return f"docling-appendix-{slug}"
+
+
+def _link_appendix_references_in_html(document_html: str) -> tuple[str, int]:
+    heading_replacements: list[tuple[int, int, str]] = []
+    anchors: dict[str, str] = {}
+    for match in HTML_TEXT_BLOCK_RE.finditer(document_html):
+        tag = match.group("tag").lower()
+        if not tag.startswith("h"):
+            continue
+        visible = _normalized_noise_text(
+            html.unescape(HTML_TAG_RE.sub(" ", match.group("body")))
+        )
+        heading_match = APPENDIX_HEADING_RE.match(visible)
+        if not heading_match:
+            continue
+        label = heading_match.group("label")
+        anchor_id = _appendix_anchor_id(label)
+        anchors.setdefault(label, anchor_id)
+        attrs = match.group("attrs")
+        if re.search(r'\bid\s*=', attrs):
+            continue
+        heading_replacements.append(
+            (
+                match.start(),
+                match.end(),
+                f'<{match.group("tag")}{attrs} id="{anchor_id}">{match.group("body")}</{match.group("tag")}>',
+            )
+        )
+    if not anchors:
+        return document_html, 0
+    updated = document_html
+    for start, end, replacement in sorted(heading_replacements, reverse=True):
+        updated = updated[:start] + replacement + updated[end:]
+    link_replacements: list[tuple[int, int, str]] = []
+    count = 0
+    for match in HTML_TEXT_BLOCK_RE.finditer(updated):
+        tag = match.group("tag").lower()
+        if tag.startswith("h") or tag in {"script", "style"}:
+            continue
+        body = match.group("body")
+        protected: list[str] = []
+
+        def protect_anchor(anchor_match: re.Match[str]) -> str:
+            protected.append(anchor_match.group(0))
+            return f"@@DOCLING_ANCHOR_{len(protected) - 1}@@"
+
+        working_body = re.sub(
+            r"<a\b[^>]*>.*?</a>",
+            protect_anchor,
+            body,
+            flags=re.I | re.S,
+        )
+
+        def replace(reference_match: re.Match[str]) -> str:
+            nonlocal count
+            label = reference_match.group("label")
+            anchor_id = anchors.get(label)
+            if not anchor_id:
+                return reference_match.group(0)
+            count += 1
+            return f'<a class="docling-internal-reference" href="#{anchor_id}">{html.escape(reference_match.group(0))}</a>'
+
+        new_body = APPENDIX_REFERENCE_RE.sub(replace, working_body)
+        for index, anchor_html in enumerate(protected):
+            new_body = new_body.replace(f"@@DOCLING_ANCHOR_{index}@@", anchor_html)
+        if new_body != body:
+            link_replacements.append(
+                (
+                    match.start("body"),
+                    match.end("body"),
+                    new_body,
+                )
+            )
+    for start, end, replacement in sorted(link_replacements, reverse=True):
+        updated = updated[:start] + replacement + updated[end:]
+    return updated, count
 
 
 def _structural_content_html(
@@ -6008,6 +6361,9 @@ def apply_structural_quarantine_to_outputs(
             html_bibliography_entry_count,
             html_citation_link_count,
         ) = _link_bibliography_in_html(html_text, bibliography)
+        html_text, html_internal_reference_link_count = _link_appendix_references_in_html(
+            html_text
+        )
         html_text = _append_structural_content_html(
             html_text,
             export_records,
@@ -6019,6 +6375,7 @@ def apply_structural_quarantine_to_outputs(
         html_reference_link_count = 0
         html_bibliography_entry_count = 0
         html_citation_link_count = 0
+        html_internal_reference_link_count = 0
 
     md_replacements = 0
     md_path = output_dir / "document.md"
@@ -6173,6 +6530,7 @@ def apply_structural_quarantine_to_outputs(
     )
     qc["html_bibliography_entry_count"] = html_bibliography_entry_count
     qc["html_citation_link_count"] = html_citation_link_count
+    qc["html_internal_reference_link_count"] = html_internal_reference_link_count
     qc["markdown_bibliography_entry_count"] = markdown_bibliography_entry_count
     qc["markdown_citation_link_count"] = markdown_citation_link_count
     qc["html_visible_unlinked_citation_count"] = len(
@@ -6915,6 +7273,10 @@ def run_unified_review_qc(
         output_dir,
         document_json,
     )
+    abstract_reading_order_recovery = recover_first_page_abstract_reading_order(
+        output_dir,
+        document_json,
+    )
     structural_quarantine = apply_structural_quarantine_to_outputs(
         output_dir,
         document_json,
@@ -6949,6 +7311,7 @@ def run_unified_review_qc(
             "layout_qc_diagnostics": layout_diag,
             "author_affiliation_recovery": author_affiliation_recovery,
             "author_reading_order_recovery": author_reading_order_recovery,
+            "abstract_reading_order_recovery": abstract_reading_order_recovery,
             "semantic_emphasis": semantic_emphasis,
             "structural_quarantine_qc": structural_quarantine,
             "formula_latex_sources": formula_latex_sources,
@@ -6984,6 +7347,7 @@ def run_unified_review_qc(
             "layout_qc_diagnostics": layout_diag,
             "author_affiliation_recovery": author_affiliation_recovery,
             "author_reading_order_recovery": author_reading_order_recovery,
+            "abstract_reading_order_recovery": abstract_reading_order_recovery,
             "semantic_emphasis": semantic_emphasis,
             "structural_quarantine_qc": structural_quarantine,
             "formula_latex_sources": formula_latex_sources,
@@ -8557,6 +8921,39 @@ def _remove_numbered_original_formula_duplicates(
     return html_text, sorted(removed)
 
 
+def _remove_adjacent_original_formula_duplicates(
+    html_text: str,
+    formula_numbers: set[int],
+) -> tuple[str, int]:
+    edits: list[tuple[int, int]] = []
+    second_pass_ranges = [
+        formula_range
+        for formula_no in formula_numbers
+        for formula_range in _find_existing_second_pass_formula_ranges(html_text, formula_no)
+    ]
+    second_pass_ranges.sort()
+    if not second_pass_ranges:
+        return html_text, 0
+    for original in _original_formula_visible_ranges(html_text):
+        previous = next(
+            (
+                formula_range
+                for formula_range in reversed(second_pass_ranges)
+                if formula_range[1] <= original.start()
+            ),
+            None,
+        )
+        if previous is None:
+            continue
+        between = html_text[previous[1] : original.start()]
+        if HTML_TAG_RE.sub("", between).strip():
+            continue
+        edits.append((original.start(), original.end()))
+    for start, end in sorted(edits, reverse=True):
+        html_text = html_text[:start] + html_text[end:]
+    return html_text, len(edits)
+
+
 def _repair_formula_visible_order(
     html_text: str,
     formula_anchors: dict[int, dict[str, Any]],
@@ -8749,6 +9146,10 @@ def _patch_html_formula_blocks(
         html_text,
         set(formula_texts),
     )
+    html_text, adjacent_original_duplicate_count = _remove_adjacent_original_formula_duplicates(
+        html_text,
+        set(formula_texts),
+    )
     html_text, visible_order_repairs = _repair_formula_visible_order(
         html_text,
         formula_anchors,
@@ -8761,6 +9162,7 @@ def _patch_html_formula_blocks(
         "patch_sources": patch_sources,
         "sequence_completion_indexes": sequence_completion_indexes,
         "removed_original_duplicate_indexes": removed_original_duplicates,
+        "removed_adjacent_original_duplicate_count": adjacent_original_duplicate_count,
         "visible_order_repair_indexes": visible_order_repairs,
         "text_corrections": text_corrections,
         "rendering_assets_injected": assets_injected,
