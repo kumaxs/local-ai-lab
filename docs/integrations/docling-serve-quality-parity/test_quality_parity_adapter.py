@@ -2538,6 +2538,50 @@ class EnglishReviewPolishTests(unittest.TestCase):
         self.assertIn('href="#docling-reference-6">Radford et al. (2018)</a>', html_text)
         self.assertIn('href="#docling-reference-4">Peters et al. (2018a)</a>', html_text)
 
+    def test_bibliography_links_comma_separated_author_year_citations(self) -> None:
+        document = {
+            "texts": [
+                {
+                    "label": "text",
+                    "text": (
+                        "RNNs were widely used for NLP "
+                        "[Hochreiter and Schmidhuber, 1997, Sutskever et al., 2014]."
+                    ),
+                    "prov": [{"page_no": 1}],
+                },
+                {"label": "section_header", "text": "References", "prov": [{"page_no": 2}]},
+                {
+                    "label": "list_item",
+                    "text": "S. Hochreiter and J. Schmidhuber. Long short-term memory. Neural computation, 1997.",
+                    "prov": [{"page_no": 2}],
+                },
+                {
+                    "label": "list_item",
+                    "text": "I. Sutskever, O. Vinyals, and Q. V. Le. Sequence to sequence learning. 2014.",
+                    "prov": [{"page_no": 2}],
+                },
+            ]
+        }
+
+        diagnostics = adapter.bibliography_diagnostics(document)
+        html_text, references, citations = adapter._link_bibliography_in_html(
+            (
+                "<p>RNNs were widely used for NLP "
+                "[Hochreiter and Schmidhuber, 1997, Sutskever et al., 2014].</p>"
+                "<h2>References</h2><ol>"
+                "<li>S. Hochreiter and J. Schmidhuber. Long short-term memory. Neural computation, 1997.</li>"
+                "<li>I. Sutskever, O. Vinyals, and Q. V. Le. Sequence to sequence learning. 2014.</li>"
+                "</ol>"
+            ),
+            diagnostics,
+        )
+
+        self.assertEqual(diagnostics["citation_count"], 1)
+        self.assertEqual(diagnostics["linked_number_count"], 2)
+        self.assertEqual((references, citations), (2, 1))
+        self.assertIn('href="#docling-reference-1">Hochreiter and Schmidhuber, 1997</a>', html_text)
+        self.assertIn('href="#docling-reference-2">Sutskever et al., 2014</a>', html_text)
+
     def test_bibliography_allows_numeric_citation_after_year_with_space(self) -> None:
         document = {
             "texts": [
@@ -2855,6 +2899,39 @@ class EnglishReviewPolishTests(unittest.TestCase):
         self.assertIn("<strong>Important</strong>", html_text)
         self.assertEqual(markdown_count, 1)
         self.assertIn("**Important**", markdown)
+
+    def test_semantic_emphasis_treats_medium_font_as_bold(self) -> None:
+        self.assertIn("bold", adapter._font_semantic_styles("NimbusRomNo9L-Medi", None))
+        self.assertIn("bold", adapter._font_semantic_styles("Example-Medium", None))
+
+    def test_semantic_emphasis_avoids_nested_markdown_spans(self) -> None:
+        diagnostics = [
+            {
+                "page_no": 1,
+                "node_text": "From RNNs to Transformers body.",
+                "text": "From RNNs to Transformers",
+                "start": 0,
+                "end": 25,
+                "styles": ["bold"],
+            },
+            {
+                "page_no": 1,
+                "node_text": "From RNNs to Transformers body.",
+                "text": "RNN",
+                "start": 5,
+                "end": 8,
+                "styles": ["bold"],
+            },
+        ]
+
+        markdown, count = adapter._apply_semantic_spans_to_markdown(
+            "From RNNs to Transformers body.\n",
+            diagnostics,
+        )
+
+        self.assertEqual(count, 1)
+        self.assertIn("**From RNNs to Transformers** body.", markdown)
+        self.assertNotIn("**From **RNN**s", markdown)
 
     def test_structural_quarantine_matches_markdown_escaped_punctuation(self) -> None:
         text = "AUTHORIZATION MD.! _ MP-75"
