@@ -9201,6 +9201,11 @@ def _default_cn_guarded_fallback_dirs() -> list[Path]:
     return [baseline_output] if baseline_output.exists() else []
 
 
+def _default_cn_route_b_dirs() -> list[Path]:
+    route_b_output = Path(".runtime/review/docling-vlm-full-dir-review-2026-06-01/CN")
+    return [route_b_output] if route_b_output.exists() else []
+
+
 def _formula_text_with_number(text: str, formula_no: int) -> str:
     body = text.strip()
     if formula_no in _compact_formula_numbers(body):
@@ -9227,6 +9232,10 @@ def _cn_accepted_formula_source_texts(
         )
         for formula_no, text in _load_formula_text_by_index(Path(path_text)).items():
             candidate_texts.setdefault(formula_no, []).append((label, text))
+
+    for route_b_dir in _default_cn_route_b_dirs():
+        for formula_no, text in _load_formula_text_by_index(route_b_dir).items():
+            candidate_texts.setdefault(formula_no, []).append(("route_b", text))
 
     summary = _load_json_file(sidecar_dir / "second_pass_summary.json")
     if isinstance(summary, dict):
