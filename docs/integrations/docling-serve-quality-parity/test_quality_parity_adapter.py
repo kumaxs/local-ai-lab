@@ -2330,6 +2330,7 @@ class EnglishReviewPolishTests(unittest.TestCase):
                     "label": "text",
                     "text": (
                         "相关研究[1~3]覆盖早期方法，增量实验［1～3］补充说明，DKVMN（8）模型随后出现。"
+                        "引言综述依托智慧教育平台1~3］。"
                         "其中 i∈[1,t] 且 h∈［1,N］，O'=10[11] 不是文献引用。"
                     ),
                     "prov": [{"page_no": 1}],
@@ -2346,6 +2347,7 @@ class EnglishReviewPolishTests(unittest.TestCase):
         html_text, references, citations = adapter._link_bibliography_in_html(
             (
                 "<p>相关研究[1~3]覆盖早期方法，增量实验［1～3］补充说明，DKVMN（8）模型随后出现。"
+                "引言综述依托智慧教育平台1~3］。"
                 "其中 i∈[1,t] 且 h∈［1,N］，O'=10[11] 不是文献引用。</p>"
                 "<h2>参考文献：</h2><ul>"
                 "<li>［1］ First range reference.</li>"
@@ -2357,12 +2359,13 @@ class EnglishReviewPolishTests(unittest.TestCase):
             diagnostics,
         )
 
-        self.assertEqual(diagnostics["citation_count"], 3)
-        self.assertEqual((references, citations), (4, 3))
+        self.assertEqual(diagnostics["citation_count"], 4)
+        self.assertEqual((references, citations), (4, 4))
         self.assertIn('href="#docling-reference-1">1</a>~<a', html_text)
         self.assertIn('href="#docling-reference-2" aria-label="Reference 2"></a>', html_text)
         self.assertIn('href="#docling-reference-3">3</a>', html_text)
         self.assertIn('href="#docling-reference-8">8</a>', html_text)
+        self.assertIn("ocr_missing_open_citation_bracket", diagnostics["citations"][3]["mapping_evidence"])
         self.assertIn("i∈[1,t]", html_text)
         self.assertIn("h∈［1,N］", html_text)
         self.assertIn("O'=10[11]", html_text)
