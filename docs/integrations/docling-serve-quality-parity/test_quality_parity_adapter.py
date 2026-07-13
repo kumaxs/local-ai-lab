@@ -2483,6 +2483,151 @@ class EnglishReviewPolishTests(unittest.TestCase):
         self.assertIn('href="#docling-reference-1">Bahdanau et al., 2015</a>', html_text)
         self.assertNotIn("[1]ah, 2014", html_text)
 
+    def test_bibliography_links_parenthetical_and_narrative_author_year_citations(self) -> None:
+        document = {
+            "texts": [
+                {
+                    "label": "text",
+                    "text": (
+                        "Pre-training helps (Dai and Le, 2015; Peters et al., 2018a; "
+                        "Radford et al., 2018; Howard and Ruder, 2018). "
+                        "Paraphrase results follow (Dolan and Brockett, 2005). "
+                        "Unlike Radford et al. (2018), this is bidirectional; "
+                        "Peters et al. (2018a) remains feature-based."
+                    ),
+                    "prov": [{"page_no": 1}],
+                },
+                {"label": "section_header", "text": "References", "prov": [{"page_no": 2}]},
+                {"label": "list_item", "text": "Andrew M Dai and Quoc V Le. 2015. Semi-supervised sequence learning.", "prov": [{"page_no": 2}]},
+                {"label": "list_item", "text": "William B Dolan and Chris Brockett. 2005. Automatically constructing a corpus.", "prov": [{"page_no": 2}]},
+                {"label": "list_item", "text": "Jeremy Howard and Sebastian Ruder. 2018. Universal language model fine-tuning.", "prov": [{"page_no": 2}]},
+                {"label": "list_item", "text": "Matthew Peters, Mark Neumann, and Luke Zettlemoyer. 2018a. Deep contextualized word representations.", "prov": [{"page_no": 2}]},
+                {"label": "list_item", "text": "Matthew Peters, Mark Neumann, and Luke Zettlemoyer. 2018b. Dissecting contextual word embeddings.", "prov": [{"page_no": 2}]},
+                {"label": "list_item", "text": "Alec Radford, Karthik Narasimhan, Tim Salimans, and Ilya Sutskever. 2018. Improving language understanding.", "prov": [{"page_no": 2}]},
+            ]
+        }
+
+        diagnostics = adapter.bibliography_diagnostics(document)
+        html_text, references, citations = adapter._link_bibliography_in_html(
+            (
+                "<p>Pre-training helps (Dai and Le, 2015; Peters et al., 2018a; "
+                "Radford et al., 2018; Howard and Ruder, 2018). "
+                "Paraphrase results follow (Dolan and Brockett, 2005). "
+                "Unlike Radford et al. (2018), this is bidirectional; "
+                "Peters et al. (2018a) remains feature-based.</p>"
+                "<h2>References</h2><ol>"
+                "<li>Andrew M Dai and Quoc V Le. 2015. Semi-supervised sequence learning.</li>"
+                "<li>William B Dolan and Chris Brockett. 2005. Automatically constructing a corpus.</li>"
+                "<li>Jeremy Howard and Sebastian Ruder. 2018. Universal language model fine-tuning.</li>"
+                "<li>Matthew Peters, Mark Neumann, and Luke Zettlemoyer. 2018a. Deep contextualized word representations.</li>"
+                "<li>Matthew Peters, Mark Neumann, and Luke Zettlemoyer. 2018b. Dissecting contextual word embeddings.</li>"
+                "<li>Alec Radford, Karthik Narasimhan, Tim Salimans, and Ilya Sutskever. 2018. Improving language understanding.</li>"
+                "</ol>"
+            ),
+            diagnostics,
+        )
+
+        self.assertEqual(diagnostics["citation_count"], 4)
+        self.assertEqual(diagnostics["linked_number_count"], 7)
+        self.assertEqual((references, citations), (6, 4))
+        self.assertIn('href="#docling-reference-1">Dai and Le, 2015</a>', html_text)
+        self.assertIn('href="#docling-reference-4">Peters et al., 2018a</a>', html_text)
+        self.assertIn('href="#docling-reference-6">Radford et al., 2018</a>', html_text)
+        self.assertIn('href="#docling-reference-3">Howard and Ruder, 2018</a>', html_text)
+        self.assertIn('href="#docling-reference-2">Dolan and Brockett, 2005</a>', html_text)
+        self.assertIn('href="#docling-reference-6">Radford et al. (2018)</a>', html_text)
+        self.assertIn('href="#docling-reference-4">Peters et al. (2018a)</a>', html_text)
+
+    def test_bibliography_allows_numeric_citation_after_year_with_space(self) -> None:
+        document = {
+            "texts": [
+                {"label": "text", "text": "It started in 1952 [2], but O'=10[11] is an index.", "prov": [{"page_no": 1}]},
+                {"label": "section_header", "text": "References", "prov": [{"page_no": 2}]},
+                {"label": "list_item", "text": "[2] The chemical basis of morphogenesis.", "orig": "[2] The chemical basis of morphogenesis.", "prov": [{"page_no": 2}]},
+                {"label": "list_item", "text": "[11] A separate reference.", "orig": "[11] A separate reference.", "prov": [{"page_no": 2}]},
+            ]
+        }
+
+        diagnostics = adapter.bibliography_diagnostics(document)
+        html_text, references, citations = adapter._link_bibliography_in_html(
+            (
+                "<p>It started in 1952 [2], but O'=10[11] is an index.</p>"
+                "<h2>References</h2><ul>"
+                "<li>[2] The chemical basis of morphogenesis.</li>"
+                "<li>[11] A separate reference.</li></ul>"
+            ),
+            diagnostics,
+        )
+
+        self.assertEqual(diagnostics["citation_count"], 1)
+        self.assertEqual((references, citations), (2, 1))
+        self.assertIn('href="#docling-reference-2">2</a>', html_text)
+        self.assertIn("O'=10[11]", html_text)
+
+    def test_bibliography_keeps_numbered_section_headers_inside_references(self) -> None:
+        document = {
+            "texts": [
+                {"label": "text", "text": "Later tools [24] and software [26] were shared [27,28].", "prov": [{"page_no": 1}]},
+                {"label": "section_header", "text": "References", "prov": [{"page_no": 2}]},
+                {"label": "list_item", "text": "1. Early reference.", "orig": "1. Early reference.", "prov": [{"page_no": 2}]},
+                {"label": "section_header", "text": "24. GCG software suite", "prov": [{"page_no": 3}]},
+                {"label": "section_header", "text": "26. Sequence manipulation suites", "prov": [{"page_no": 3}]},
+                {"label": "section_header", "text": "27. Software-sharing movement", "prov": [{"page_no": 3}]},
+                {"label": "section_header", "text": "28. Open software culture", "prov": [{"page_no": 3}]},
+            ]
+        }
+
+        diagnostics = adapter.bibliography_diagnostics(document)
+        html_text, references, citations = adapter._link_bibliography_in_html(
+            (
+                "<p>Later tools [24] and software [26] were shared [27,28].</p>"
+                "<h2>References</h2>"
+                "<li>1. Early reference.</li>"
+                "<h2>24. GCG software suite</h2>"
+                "<h2>26. Sequence manipulation suites</h2>"
+                "<h2>27. Software-sharing movement</h2>"
+                "<h2>28. Open software culture</h2>"
+            ),
+            diagnostics,
+        )
+
+        self.assertEqual([item["number"] for item in diagnostics["references"]], [1, 24, 26, 27, 28])
+        self.assertEqual(diagnostics["citation_count"], 3)
+        self.assertEqual(diagnostics["linked_number_count"], 4)
+        self.assertEqual((references, citations), (5, 3))
+        self.assertIn('id="docling-reference-24"', html_text)
+        self.assertIn('href="#docling-reference-26">26</a>', html_text)
+
+    def test_appendix_mentions_link_to_existing_appendix_heading(self) -> None:
+        html_text, count = adapter._link_appendix_references_in_html(
+            (
+                '<p>Prior work <a href="#docling-reference-1">Wang et al., 2018a</a>. '
+                "Detailed descriptions are included in Appendix B.1.</p>"
+                "<h2>B.1 Detailed Descriptions for the GLUE Benchmark Experiments.</h2>"
+            )
+        )
+
+        self.assertEqual(count, 1)
+        self.assertIn('id="docling-appendix-b-1"', html_text)
+        self.assertIn('<a href="#docling-reference-1">Wang et al., 2018a</a>', html_text)
+        self.assertIn('href="#docling-appendix-b-1">Appendix B.1</a>', html_text)
+
+    def test_formula_second_pass_removes_adjacent_original_mathml_duplicate(self) -> None:
+        html_text, count = adapter._remove_adjacent_original_formula_duplicates(
+            (
+                '<div class="docling-formula-second-pass" data-formula-index="2">'
+                "<div>Formula 2</div></div>\n"
+                '<div><math display="block"><mi>q</mi></math></div>'
+                "<p>Body text</p>"
+                '<div><math display="block"><mi>x</mi></math></div>'
+            ),
+            {2},
+        )
+
+        self.assertEqual(count, 1)
+        self.assertNotIn("<mi>q</mi>", html_text)
+        self.assertIn("<mi>x</mi>", html_text)
+
     def test_html_superscript_note_candidate_tolerates_marker_spacing(self) -> None:
         document = {
             "texts": [
@@ -2611,6 +2756,52 @@ class EnglishReviewPolishTests(unittest.TestCase):
             html_text.index("based on its state in every layer."),
             html_text.index("ABSTRACT"),
         )
+
+    def test_first_page_abstract_reorders_before_two_column_frontmatter(self) -> None:
+        document = {
+            "texts": [
+                {"label": "title", "text": "Title", "prov": [{"page_no": 1, "bbox": {"l": 75, "r": 530, "t": 700, "b": 670}}]},
+                {"label": "section_header", "text": "CCS CONCEPTS", "prov": [{"page_no": 1, "bbox": {"l": 318, "r": 400, "t": 543, "b": 534}}]},
+                {"label": "section_header", "text": "KEYWORDS", "prov": [{"page_no": 1, "bbox": {"l": 318, "r": 380, "t": 483, "b": 474}}]},
+                {"label": "section_header", "text": "1 INTRODUCTION", "prov": [{"page_no": 1, "bbox": {"l": 318, "r": 420, "t": 346, "b": 337}}]},
+                {"label": "section_header", "text": "ABSTRACT", "prov": [{"page_no": 1, "bbox": {"l": 54, "r": 112, "t": 543, "b": 534}}]},
+                {
+                    "label": "text",
+                    "text": "Large language models are evaluated on structured table data.",
+                    "prov": [{"page_no": 1, "bbox": {"l": 54, "r": 296, "t": 528, "b": 280}}],
+                },
+                {
+                    "label": "text",
+                    "text": "∗ Contribution note.",
+                    "prov": [{"page_no": 1, "bbox": {"l": 54, "r": 296, "t": 255, "b": 239}}],
+                },
+            ]
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir)
+            (output_dir / "document.html").write_text(
+                "<h1>Title</h1><h2>CCS CONCEPTS</h2><p>Concepts</p>"
+                "<h2>KEYWORDS</h2><p>tables</p><h2>1 INTRODUCTION</h2><p>Intro.</p>"
+                "<h2>ABSTRACT</h2><p>Large language models are evaluated on structured table data.</p>"
+                "<p>∗ Contribution note.</p>",
+                encoding="utf-8",
+            )
+            (output_dir / "document.md").write_text(
+                "# Title\n\n## CCS CONCEPTS\n\nConcepts\n\n## KEYWORDS\n\ntables\n\n"
+                "## 1 INTRODUCTION\n\nIntro.\n\n## ABSTRACT\n\n"
+                "Large language models are evaluated on structured table data.\n\n"
+                "∗ Contribution note.\n",
+                encoding="utf-8",
+            )
+
+            result = adapter.recover_first_page_abstract_reading_order(output_dir, document)
+            html_text = (output_dir / "document.html").read_text(encoding="utf-8")
+            markdown = (output_dir / "document.md").read_text(encoding="utf-8")
+
+        self.assertTrue(result["applied"])
+        self.assertLess(html_text.index("ABSTRACT"), html_text.index("CCS CONCEPTS"))
+        self.assertLess(markdown.index("## ABSTRACT"), markdown.index("## CCS CONCEPTS"))
+        self.assertGreater(html_text.index("∗ Contribution note."), html_text.index("1 INTRODUCTION"))
 
     def test_semantic_emphasis_uses_pdf_font_evidence(self) -> None:
         document = {
@@ -2800,6 +2991,30 @@ class EnglishReviewPolishTests(unittest.TestCase):
         self.assertEqual(marker_candidate["action"], "quarantine_from_main_text_flow")
         self.assertIn("same_column_footnote_cluster", marker_candidate["reasons"])
         self.assertEqual(document["texts"][0]["label"], "quarantined_footnote_candidate")
+
+    def test_structural_quarantine_extends_labeled_footnote_cluster_to_unmarked_continuation(self) -> None:
+        document = {
+            "texts": [
+                {
+                    "label": "footnote",
+                    "text": "1 Please find code at https://example.com/repo.",
+                    "prov": [{"page_no": 1, "bbox": {"l": 50, "r": 290, "t": 230, "b": 214}}],
+                },
+                {
+                    "label": "text",
+                    "text": "Please note that the private preview may be replaced by an official one at https://github.com/example/project.",
+                    "prov": [{"page_no": 1, "bbox": {"l": 50, "r": 290, "t": 211, "b": 198}}],
+                },
+            ]
+        }
+
+        qc = adapter.structural_noise_qc(document)
+        continuation = next(item for item in qc["candidates"] if item["text"].startswith("Please note"))
+
+        self.assertEqual(continuation["kind"], "footnote_candidate")
+        self.assertEqual(continuation["confidence"], "high")
+        self.assertIn("same_column_footnote_continuation", continuation["reasons"])
+        self.assertEqual(document["texts"][1]["label"], "quarantined_footnote_candidate")
 
     def test_structural_quarantine_removes_top_edge_ocr_adjacent_to_empty_tables(self) -> None:
         document = {
