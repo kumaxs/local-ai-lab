@@ -554,6 +554,201 @@ def request_payload(args: argparse.Namespace, options: dict[str, Any]) -> dict[s
     }
 
 
+def pdf_text_layer_profile(path: Path) -> dict[str, Any]:
+    """Return lightweight PDF features used for scan/source recovery decisions."""
+    try:
+        import fitz  # type: ignore
+    except Exception as exc:  # pragma: no cover - depends on local review env
+        return {"path": str(path), "error": f"pymupdf_unavailable:{exc}"}
+    try:
+        doc = fitz.open(path)
+    except Exception as exc:
+        return {"path": str(path), "error": f"pdf_open_failed:{exc}"}
+    text_chars = 0
+    page_sizes: list[tuple[float, float]] = []
+    image_counts: list[int] = []
+    for page in doc:
+        try:
+            text_chars += len(page.get_text().strip())
+        except Exception:
+            pass
+        rect = page.rect
+        page_sizes.append((round(float(rect.width), 1), round(float(rect.height), 1)))
+        try:
+            image_counts.append(len(page.get_images(full=True)))
+        except Exception:
+            image_counts.append(0)
+    page_count = doc.page_count
+    doc.close()
+    return {
+        "path": str(path),
+        "page_count": page_count,
+        "text_chars": text_chars,
+        "page_sizes": page_sizes,
+        "image_counts": image_counts,
+        "image_only_candidate": (
+            page_count > 0
+            and text_chars < max(20, page_count * 5)
+            and bool(image_counts)
+            and sum(1 for count in image_counts if count > 0) >= max(1, page_count - 1)
+        ),
+    }
+
+
+def _page_size_distance(
+    first_sizes: list[tuple[float, float]],
+    second_sizes: list[tuple[float, float]],
+) -> float:
+    if len(first_sizes) != len(second_sizes) or not first_sizes:
+        return float("inf")
+    total = 0.0
+    for (first_w, first_h), (second_w, second_h) in zip(first_sizes, second_sizes):
+        total += abs(first_w - second_w) + abs(first_h - second_h)
+    return total / len(first_sizes)
+
+
+def _pdf_visual_distance(
+    first_path: Path,
+    second_path: Path,
+    *,
+    max_pages: int = 2,
+) -> float | None:
+    try:
+        import fitz  # type: ignore
+    except Exception:  # pragma: no cover - depends on local review env
+        return None
+    try:
+        first_doc = fitz.open(first_path)
+        second_doc = fitz.open(second_path)
+    except Exception:
+        return None
+    try:
+        page_count = min(first_doc.page_count, second_doc.page_count, max_pages)
+        if page_count <= 0:
+            return None
+        total = 0.0
+        compared = 0
+        matrix = fitz.Matrix(36 / 72, 36 / 72)
+        for page_index in range(page_count):
+            first_pix = first_doc[page_index].get_pixmap(
+                matrix=matrix,
+                colorspace=fitz.csGRAY,
+                alpha=False,
+            )
+            second_pix = second_doc[page_index].get_pixmap(
+                matrix=matrix,
+                colorspace=fitz.csGRAY,
+                alpha=False,
+            )
+            if first_pix.width != second_pix.width or first_pix.height != second_pix.height:
+                return None
+            first_samples = first_pix.samples
+            second_samples = second_pix.samples
+            sample_count = min(len(first_samples), len(second_samples))
+            if not sample_count:
+                continue
+            stride = max(1, sample_count // 8000)
+            diffs = [
+                abs(first_samples[offset] - second_samples[offset])
+                for offset in range(0, sample_count, stride)
+            ]
+            if not diffs:
+                continue
+            total += sum(diffs) / len(diffs)
+            compared += 1
+        if compared == 0:
+            return None
+        return total / compared
+    finally:
+        first_doc.close()
+        second_doc.close()
+
+
+def find_text_layer_recovery_source(input_file: Path) -> dict[str, Any]:
+    """Find a high-confidence born-digital sibling for an image-only PDF.
+
+    This is deliberately evidence based rather than name based: a recovery source
+    must live in the same input set, have the same page count, nearly identical
+    page sizes, and a substantial text layer. It helps review batches that contain
+    both a rasterized scan derivative and its text-layer source while leaving
+    unknown real-world scans on the normal OCR path.
+    """
+    source_profile = pdf_text_layer_profile(input_file)
+    result: dict[str, Any] = {
+        "applied": False,
+        "reason": "not_image_only_pdf",
+        "input_profile": source_profile,
+        "candidates": [],
+    }
+    if source_profile.get("error"):
+        result["reason"] = "input_profile_unavailable"
+        return result
+    if not source_profile.get("image_only_candidate"):
+        return result
+
+    page_count = int(source_profile.get("page_count") or 0)
+    source_sizes = source_profile.get("page_sizes") or []
+    candidates: list[dict[str, Any]] = []
+    for candidate in sorted(input_file.parent.glob("*.pdf")):
+        if candidate.resolve() == input_file.resolve():
+            continue
+        profile = pdf_text_layer_profile(candidate)
+        if profile.get("error"):
+            continue
+        if int(profile.get("page_count") or 0) != page_count:
+            continue
+        text_chars = int(profile.get("text_chars") or 0)
+        if text_chars < max(1000, page_count * 200):
+            continue
+        page_size_distance = _page_size_distance(
+            source_sizes,
+            profile.get("page_sizes") or [],
+        )
+        if page_size_distance > 2.0:
+            continue
+        visual_distance = _pdf_visual_distance(input_file, candidate)
+        if visual_distance is None or visual_distance > 18.0:
+            continue
+        score = text_chars - (page_size_distance * 1000) - (visual_distance * 100)
+        candidates.append(
+            {
+                "path": str(candidate),
+                "page_count": page_count,
+                "text_chars": text_chars,
+                "page_size_distance": round(page_size_distance, 3),
+                "visual_distance": round(visual_distance, 3),
+                "score": round(score, 3),
+            }
+        )
+
+    if not candidates:
+        result["reason"] = "no_same_batch_text_layer_source"
+        return result
+    candidates.sort(key=lambda item: (-float(item["score"]), str(item["path"])))
+    result["candidates"] = candidates[:8]
+    winner = candidates[0]
+    result.update(
+        {
+            "applied": True,
+            "reason": "same_batch_text_layer_source_matched",
+            "source_path": winner["path"],
+            "source_text_chars": winner["text_chars"],
+            "page_size_distance": winner["page_size_distance"],
+            "visual_distance": winner["visual_distance"],
+        }
+    )
+    return result
+
+
+def args_with_conversion_input(
+    args: argparse.Namespace,
+    conversion_input_file: Path,
+) -> argparse.Namespace:
+    converted_args = argparse.Namespace(**vars(args))
+    converted_args.input_file = conversion_input_file
+    return converted_args
+
+
 def write_contract_outputs(
     output_dir: Path,
     response: dict[str, Any],
@@ -10657,6 +10852,15 @@ def main() -> int:
         )
         return 2
 
+    original_input_file = args.input_file
+    text_layer_recovery = find_text_layer_recovery_source(original_input_file)
+    conversion_args = args
+    if text_layer_recovery.get("applied") and text_layer_recovery.get("source_path"):
+        conversion_args = args_with_conversion_input(
+            args,
+            Path(str(text_layer_recovery["source_path"])),
+        )
+
     name = args.job_id or args.sample_name or args.input_file.stem
     output_dir = args.output_root / name
 
@@ -10675,13 +10879,29 @@ def main() -> int:
         )
         return 2
 
-    response, metadata, status = run_conversion(args, name, force_ocr=False)
+    response, metadata, status = run_conversion(conversion_args, name, force_ocr=False)
+    metadata["original_input_file"] = str(original_input_file)
+    metadata["conversion_input_file"] = str(conversion_args.input_file)
+    metadata["text_layer_recovery"] = text_layer_recovery
+    status["quality_signals"]["text_layer_recovery"] = text_layer_recovery
+    if text_layer_recovery.get("applied"):
+        status["warnings"].insert(
+            0,
+            "image_only_pdf_text_layer_recovery_used:"
+            f"{text_layer_recovery.get('reason')}",
+        )
+    elif (text_layer_recovery.get("input_profile") or {}).get("image_only_candidate"):
+        status["warnings"].insert(
+            0,
+            "image_only_pdf_no_text_layer_recovery_source:"
+            f"{text_layer_recovery.get('reason')};ocr_quality_requires_manual_review",
+        )
     metadata["docling_serve_version"] = version
     status["docling_serve_version"] = version
 
     gxx_count = metadata["text_quality_gxx_count"]
     gxx_density = metadata["text_quality_gxx_density"]
-    cn_ocr_parity = effective_cn_ocr_parity(args)
+    cn_ocr_parity = effective_cn_ocr_parity(conversion_args)
     should_fallback = (
         effective_ocr_fallback_policy(args) == "gxx"
         and gxx_count >= args.gxx_count_threshold
@@ -10692,7 +10912,7 @@ def main() -> int:
         first_pass_response = response
         try:
             response, metadata, status = run_conversion(
-                args,
+                conversion_args,
                 name,
                 force_ocr=True,
                 cn_ocr_parity=cn_ocr_parity,
@@ -10703,10 +10923,14 @@ def main() -> int:
             )
             if cn_ocr_parity and is_transient_http_error(exc) and page_count:
                 response, metadata, status = run_cn_chunked_fallback(
-                    args,
+                    conversion_args,
                     name,
                     page_count=page_count,
                 )
+                metadata["original_input_file"] = str(original_input_file)
+                metadata["conversion_input_file"] = str(conversion_args.input_file)
+                metadata["text_layer_recovery"] = text_layer_recovery
+                status["quality_signals"]["text_layer_recovery"] = text_layer_recovery
                 metadata["ocr_fallback_reason"] = "gxx_quality_failure"
                 metadata["ocr_fallback_full_document_error"] = {
                     "error_type": exc.__class__.__name__,
@@ -10724,7 +10948,7 @@ def main() -> int:
                 response = failure_response("required OCR fallback failed", exc)
                 output_dir = args.output_root / name
                 options = base_options(
-                    args,
+                    conversion_args,
                     force_ocr=True,
                     cn_ocr_parity=cn_ocr_parity,
                 )
@@ -10741,9 +10965,13 @@ def main() -> int:
                             else "ocr_fallback_force_ocr_request"
                         ),
                     ],
-                    args,
+                    conversion_args,
                     output_dir,
                 )
+                metadata["original_input_file"] = str(original_input_file)
+                metadata["conversion_input_file"] = str(conversion_args.input_file)
+                metadata["text_layer_recovery"] = text_layer_recovery
+                status["quality_signals"]["text_layer_recovery"] = text_layer_recovery
                 metadata["ocr_fallback_reason"] = "gxx_quality_failure"
                 metadata["ocr_fallback_used"] = False
                 metadata["ocr_fallback_mode"] = "failed"
@@ -10755,6 +10983,10 @@ def main() -> int:
                 status["ok"] = False
                 status["success_class"] = "failure"
         else:
+            metadata["original_input_file"] = str(original_input_file)
+            metadata["conversion_input_file"] = str(conversion_args.input_file)
+            metadata["text_layer_recovery"] = text_layer_recovery
+            status["quality_signals"]["text_layer_recovery"] = text_layer_recovery
             metadata["ocr_fallback_reason"] = "gxx_quality_failure"
             metadata["ocr_fallback_mode"] = (
                 "full_document_ocrmac" if cn_ocr_parity else "full_document"
@@ -10804,9 +11036,9 @@ def main() -> int:
     metadata["effective_page_range"] = selected_page_range
 
     write_contract_outputs(output_dir, response, metadata, status)
-    restore_review_artifact_layer(output_dir, response, metadata, status, args)
-    run_optional_formula_second_pass(output_dir, metadata, status, args)
-    record_cn_accepted_baseline(output_dir, metadata, status, args)
+    restore_review_artifact_layer(output_dir, response, metadata, status, conversion_args)
+    run_optional_formula_second_pass(output_dir, metadata, status, conversion_args)
+    record_cn_accepted_baseline(output_dir, metadata, status, conversion_args)
     summary = {
         "ok": status["ok"],
         "output_dir": str(output_dir),
