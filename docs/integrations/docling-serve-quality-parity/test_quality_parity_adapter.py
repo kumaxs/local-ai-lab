@@ -15,6 +15,73 @@ import formula_only_second_pass as formula_second_pass  # noqa: E402
 
 
 class EnglishReviewPolishTests(unittest.TestCase):
+    def test_image_only_pdf_finds_same_batch_text_layer_recovery_source(self) -> None:
+        try:
+            import fitz  # type: ignore
+        except Exception as exc:
+            self.skipTest(f"PyMuPDF unavailable: {exc}")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / "born-digital.pdf"
+            scan = root / "rasterized-scan.pdf"
+            other = root / "wrong-page-count.pdf"
+
+            doc = fitz.open()
+            for page_no in range(2):
+                page = doc.new_page(width=300, height=400)
+                for line_no in range(30):
+                    page.insert_text(
+                        (36, 30 + line_no * 11),
+                        (
+                            f"Recoverable source page {page_no + 1} line {line_no}. "
+                            "citation formula reference paragraph with text layer."
+                        ),
+                        fontsize=8,
+                    )
+            doc.save(source)
+            doc.close()
+
+            src_doc = fitz.open(source)
+            scan_doc = fitz.open()
+            for page in src_doc:
+                pix = page.get_pixmap(matrix=fitz.Matrix(1.2, 1.2), alpha=False)
+                new_page = scan_doc.new_page(width=page.rect.width, height=page.rect.height)
+                new_page.insert_image(page.rect, pixmap=pix)
+            scan_doc.save(scan)
+            scan_doc.close()
+            src_doc.close()
+
+            wrong_doc = fitz.open()
+            wrong_doc.new_page(width=300, height=400).insert_text((36, 80), "wrong " * 300)
+            wrong_doc.save(other)
+            wrong_doc.close()
+
+            recovery = adapter.find_text_layer_recovery_source(scan)
+
+        self.assertTrue(recovery["applied"])
+        self.assertEqual(Path(recovery["source_path"]).name, "born-digital.pdf")
+        self.assertEqual(recovery["reason"], "same_batch_text_layer_source_matched")
+        self.assertLessEqual(recovery["page_size_distance"], 2.0)
+
+    def test_non_image_only_pdf_does_not_use_text_layer_recovery(self) -> None:
+        try:
+            import fitz  # type: ignore
+        except Exception as exc:
+            self.skipTest(f"PyMuPDF unavailable: {exc}")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source = Path(temp_dir) / "normal.pdf"
+            doc = fitz.open()
+            doc.new_page(width=300, height=400).insert_text((36, 80), "normal text " * 300)
+            doc.save(source)
+            doc.close()
+
+            recovery = adapter.find_text_layer_recovery_source(source)
+
+        self.assertFalse(recovery["applied"])
+        self.assertEqual(recovery["reason"], "not_image_only_pdf")
+
     def test_cn_apply_all_uses_same_formula_policy_as_english(self) -> None:
         args = Namespace(
             input_file=Path("/tmp/CN.pdf"),
