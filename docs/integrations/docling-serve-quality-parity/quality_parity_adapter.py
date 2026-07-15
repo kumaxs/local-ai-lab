@@ -4248,7 +4248,7 @@ def _replace_embedded_visual_ocr_noise_blocks_markdown(md_text: str) -> tuple[st
 
 
 EMAIL_RE = re.compile(r"\b[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}\b")
-ALGORITHM_CAPTION_RE = re.compile(r"\bAlgorithm\s+\d+\s*:", re.I)
+ALGORITHM_CAPTION_RE = re.compile(r"\bAlgorithm\s+\d+\b\s*:?", re.I)
 VISUAL_AXIS_TAIL_RE = re.compile(
     r"\s+(?P<tail>(?:[A-Z][A-Za-z]*|[A-Z]{1,4}|[%/()0-9.+-])"
     r"(?:\s+(?:[A-Z][A-Za-z]*|[A-Z]{1,4}|[%/()0-9.+-])){1,8})\s*$"
@@ -4498,14 +4498,18 @@ def _format_algorithm_text(text: str) -> str:
         (
             index
             for index, line in enumerate(lines)
-            if re.match(r"(?i)^(?:Require|Input|Output|Parameters?|Initialize|while|\d+\s*:)", line)
+            if re.match(
+                r"(?i)^(?:Require|Input|Output|Parameters?|Initialize|while|"
+                r"for\b(?=.*\bdo\b)|\d+\s*:)",
+                line,
+            )
         ),
         0,
     )
     lines = lines[first_algorithm_line:]
     cleaned: list[str] = []
     for line in lines:
-        if re.match(r"(?i)^Algorithm\s+\d+\s*:", line):
+        if re.match(r"(?i)^Algorithm\s+\d+\b\s*:?", line):
             continue
         line = re.sub(r"\s+", " ", line).strip()
         if line:
@@ -4513,15 +4517,33 @@ def _format_algorithm_text(text: str) -> str:
     return "\n".join(cleaned)
 
 
+def _algorithm_caption_from_text(text: str) -> str:
+    match = re.search(r"(?is)\bAlgorithm\s+\d+\b\s*:?\s+[A-Z][^.]*.*", text)
+    if not match:
+        return ""
+    caption = _normalized_noise_text(text[match.start() :])
+    caption = re.sub(r"\s+", " ", caption).strip()
+    if len(caption) < 20:
+        return ""
+    return caption[:1200]
+
+
 def _algorithm_record_html(record: dict[str, Any]) -> str:
     label = html.escape(str(record.get("label") or "Algorithm block"))
     text = html.escape(str(record.get("text") or ""))
     source = html.escape(str(record.get("source") or "pdf_text_bbox"))
+    caption = str(record.get("caption") or "").strip()
+    caption_html = (
+        f'<p class="docling-algorithm-caption">{html.escape(caption)}</p>'
+        if caption and caption != str(record.get("label") or "")
+        else ""
+    )
     return (
         '<div class="docling-algorithm-recovered" '
         f'data-algorithm-source="{source}">'
         f'<div class="docling-formula-second-pass-label">{label}</div>'
-        f'<pre class="docling-algorithm-block">{text}</pre>'
+        + caption_html
+        + f'<pre class="docling-algorithm-block">{text}</pre>'
         "</div>"
     )
 
@@ -4529,7 +4551,41 @@ def _algorithm_record_html(record: dict[str, Any]) -> str:
 def _algorithm_record_markdown(record: dict[str, Any]) -> str:
     label = str(record.get("label") or "Algorithm block")
     text = str(record.get("text") or "")
-    return f"\n\n**{label}**\n\n```text\n{text}\n```\n\n"
+    caption = str(record.get("caption") or "").strip()
+    caption_text = f"\n\n{caption}\n" if caption and caption != label else ""
+    return f"\n\n**{label}**{caption_text}\n```text\n{text}\n```\n\n"
+
+
+def _nearby_algorithm_caption(
+    nodes: list[dict[str, Any]],
+    text_index: int,
+    page_no: Any,
+) -> tuple[str, list[int], list[str]]:
+    candidates: list[tuple[int, dict[str, Any]]] = []
+    for offset in range(1, 7):
+        for candidate_index in (text_index - offset, text_index + offset):
+            if not (0 <= candidate_index < len(nodes)):
+                continue
+            candidate = nodes[candidate_index]
+            label = str(candidate.get("label") or "").lower()
+            if label.startswith("quarantined_page_"):
+                continue
+            candidate_page = (first_prov(candidate) or {}).get("page_no")
+            if (
+                page_no is not None
+                and candidate_page is not None
+                and abs(int(candidate_page) - int(page_no)) > 1
+            ):
+                continue
+            caption = _algorithm_caption_from_text(str(candidate.get("text") or ""))
+            if caption:
+                candidates.append((candidate_index, candidate))
+    if not candidates:
+        return "", [], []
+    candidates.sort(key=lambda item: (abs(item[0] - text_index), item[0]))
+    index, node = candidates[0]
+    caption = _algorithm_caption_from_text(str(node.get("text") or ""))
+    return caption, [index], [caption]
 
 
 def _algorithm_candidate_records(document_json: Any, pdf_path: Path) -> list[dict[str, Any]]:
@@ -4557,24 +4613,37 @@ def _algorithm_candidate_records(document_json: Any, pdf_path: Path) -> list[dic
             continue
         prov = first_prov(node) or {}
         pdf_text = _pdf_text_for_bbox(pdf_path, prov) if pdf_path.exists() else ""
-        formatted = _format_algorithm_text(pdf_text or _algorithm_formula_plain_text(node_text) or node_text)
+        if label == "formula":
+            formatted_source = _algorithm_formula_plain_text(node_text) or pdf_text or node_text
+        else:
+            formatted_source = pdf_text or _algorithm_formula_plain_text(node_text) or node_text
+        formatted = _format_algorithm_text(formatted_source)
         if len(formatted) < 20:
             continue
+        caption, caption_indexes, caption_targets = _nearby_algorithm_caption(
+            nodes,
+            text_index,
+            prov.get("page_no"),
+        )
         records.append(
             {
                 "id": f"algorithm-block-{len(records) + 1}",
-                "label": f"Algorithm block {len(records) + 1}",
+                "label": caption or f"Algorithm block {len(records) + 1}",
+                "caption": caption,
                 "text": formatted,
                 "original_text": node_text,
-                "source": "pdf_text_bbox" if pdf_text else "docling_node_text",
+                "source": "pdf_text_bbox" if pdf_text and label != "formula" else "docling_node_text",
                 "text_index": text_index,
+                "caption_text_indexes": caption_indexes,
                 "formula_no": formula_no,
                 "page_no": prov.get("page_no"),
                 "bbox": bbox_geometry(prov),
                 "original_label": label,
+                "html_targets": caption_targets,
             }
         )
         used_text_indexes.add(text_index)
+        used_text_indexes.update(caption_indexes)
     records.extend(
         _algorithm_cluster_records(
             nodes,
@@ -4630,11 +4699,19 @@ def _replace_algorithm_records_in_html(document_html: str, records: list[dict[st
                 for value in (record.get("formula_nos") or [])
                 if isinstance(value, int)
             ]
+            formula_no = record.get("formula_no")
+            if isinstance(formula_no, int):
+                formula_nos.append(formula_no)
+            if not formula_nos and record.get("original_label") != "algorithm_cluster":
+                target_ranges = []
             for formula_no_value in formula_nos:
                 formula_range = _find_existing_second_pass_formula_range(updated, formula_no_value)
                 if formula_range is not None:
                     target_ranges.append(formula_range)
-            if len(target_ranges) >= max(2, min(3, len(html_targets))):
+            required_targets = max(1, min(3, len(html_targets)))
+            if formula_nos:
+                required_targets = 2 if html_targets else 1
+            if len(target_ranges) >= required_targets:
                 start = min(start for start, _end in target_ranges)
                 end = max(end for _start, end in target_ranges)
                 updated = updated[:start] + replacement + updated[end:]
@@ -4668,9 +4745,63 @@ def _replace_algorithm_records_in_html(document_html: str, records: list[dict[st
             ):
                 continue
             updated = updated[: match.start()] + replacement + updated[match.end() :]
+            caption_ranges = _find_html_blocks_for_targets(
+                updated,
+                [
+                    target
+                    for target in (record.get("html_targets") or [])
+                    if isinstance(target, str) and target.strip()
+                ],
+            )
+            for start, end in sorted(caption_ranges, reverse=True):
+                updated = updated[:start] + updated[end:]
             changed += 1
             break
     return updated, changed
+
+
+def _find_markdown_target_line_ranges(md_text: str, targets: Iterable[str]) -> list[tuple[int, int]]:
+    fence_ranges = [
+        (match.start(), match.end())
+        for match in re.finditer(r"```.*?```", md_text, flags=re.S)
+    ]
+    ranges: list[tuple[int, int]] = []
+    for target in targets:
+        normalized_target = _normalized_noise_text(target)[:96]
+        if not normalized_target:
+            continue
+        compact_target = re.sub(r"\s+", "", normalized_target)
+        for match in re.finditer(r"(?m)^(?P<line>.+)$", md_text):
+            if any(start <= match.start() < end for start, end in fence_ranges):
+                continue
+            raw_line = match.group("line").lstrip()
+            if raw_line.startswith("**Algorithm"):
+                continue
+            if any(not (match.end() <= start or match.start() >= end) for start, end in ranges):
+                continue
+            visible_line = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", match.group("line"))
+            visible_line = re.sub(r"\*\*(.*?)\*\*", r"\1", visible_line)
+            visible_line = re.sub(r"__(.*?)__", r"\1", visible_line)
+            normalized_line = _normalized_noise_text(visible_line)
+            compact_line = re.sub(r"\s+", "", normalized_line)
+            if (
+                normalized_target in normalized_line
+                or compact_target in compact_line
+                or normalized_line[:96] in normalized_target
+            ):
+                ranges.append((match.start(), match.end()))
+                break
+    return ranges
+
+
+def _remove_markdown_target_lines(md_text: str, targets: Iterable[str]) -> tuple[str, int]:
+    updated = md_text
+    ranges = _find_markdown_target_line_ranges(updated, targets)
+    removed = 0
+    for start, end in sorted(ranges, reverse=True):
+        updated = updated[:start] + updated[end:]
+        removed += 1
+    return updated, removed
 
 
 def _replace_algorithm_records_in_markdown(md_text: str, records: list[dict[str, Any]]) -> tuple[str, int]:
@@ -4679,6 +4810,45 @@ def _replace_algorithm_records_in_markdown(md_text: str, records: list[dict[str,
     formula_blocks = list(re.finditer(r"\$\$.*?\$\$", updated, re.DOTALL))
     edits: list[tuple[int, int, str]] = []
     for record in records:
+        formula_nos = [
+            value
+            for value in [record.get("formula_no"), *(record.get("formula_nos") or [])]
+            if isinstance(value, int)
+        ]
+        anchor_ranges: list[tuple[int, int]] = []
+        for formula_no in dict.fromkeys(formula_nos):
+            if 0 < formula_no <= len(formula_blocks):
+                block = formula_blocks[formula_no - 1]
+                end = block.end()
+                fallback_comment = re.match(
+                    rf"\s*<!--\s*formula-final-output-fallback\s+formula={formula_no}\b.*?-->",
+                    updated[end:],
+                    flags=re.S,
+                )
+                if fallback_comment:
+                    end += fallback_comment.end()
+                    evidence_fence = re.match(
+                        r"\s*```text\n.*?\n```",
+                        updated[end:],
+                        flags=re.S,
+                    )
+                    if evidence_fence:
+                        end += evidence_fence.end()
+                anchor_ranges.append((block.start(), end))
+            fallback_match = re.search(
+                rf"(?s)\*\*Formula\s+{formula_no}\s+fallback\*\*:.*?"
+                rf"<!--\s*formula-final-output-fallback\s+formula={formula_no}\b.*?-->"
+                rf"(?:\s*```text\n.*?\n```)?",
+                updated,
+            )
+            if fallback_match:
+                anchor_ranges.append((fallback_match.start(), fallback_match.end()))
+        if anchor_ranges:
+            start = min(start for start, _end in anchor_ranges)
+            end = max(end for _start, end in anchor_ranges)
+            edits.append((start, end, _algorithm_record_markdown(record)))
+            changed += 1
+            continue
         formula_no = record.get("formula_no")
         if isinstance(formula_no, int) and 0 < formula_no <= len(formula_blocks):
             block = formula_blocks[formula_no - 1]
@@ -4690,12 +4860,20 @@ def _replace_algorithm_records_in_markdown(md_text: str, records: list[dict[str,
             )
             if fallback_comment:
                 end += fallback_comment.end()
+                evidence_fence = re.match(
+                    r"\s*```text\n.*?\n```",
+                    updated[end:],
+                    flags=re.S,
+                )
+                if evidence_fence:
+                    end += evidence_fence.end()
             edits.append((block.start(), end, _algorithm_record_markdown(record)))
             changed += 1
         elif isinstance(formula_no, int):
             fallback_match = re.search(
                 rf"(?s)\*\*Formula\s+{formula_no}\s+fallback\*\*:.*?"
-                rf"<!--\s*formula-final-output-fallback\s+formula={formula_no}\b.*?-->",
+                rf"<!--\s*formula-final-output-fallback\s+formula={formula_no}\b.*?-->"
+                rf"(?:\s*```text\n.*?\n```)?",
                 updated,
             )
             if fallback_match:
@@ -4716,30 +4894,20 @@ def _replace_algorithm_records_in_markdown(md_text: str, records: list[dict[str,
             if isinstance(target, str) and target.strip()
         ]
         if html_targets:
-            ranges: list[tuple[int, int]] = []
-            fence_ranges = [
-                (match.start(), match.end())
-                for match in re.finditer(r"```.*?```", updated, flags=re.S)
-            ]
-            for target in html_targets:
-                normalized_target = _normalized_noise_text(target)[:96]
-                if not normalized_target:
+            has_formula_anchor = isinstance(record.get("formula_no"), int) or any(
+                isinstance(value, int) for value in (record.get("formula_nos") or [])
+            )
+            if has_formula_anchor:
+                stripped, removed = _remove_markdown_target_lines(updated, html_targets)
+                if removed:
+                    updated = stripped
                     continue
-                compact_target = re.sub(r"\s+", "", normalized_target)
-                for match in re.finditer(r"(?m)^(?P<line>.+)$", updated):
-                    if any(start <= match.start() < end for start, end in fence_ranges):
-                        continue
-                    if any(not (match.end() <= start or match.start() >= end) for start, end in ranges):
-                        continue
-                    normalized_line = _normalized_noise_text(match.group("line"))
-                    compact_line = re.sub(r"\s+", "", normalized_line)
-                    if (
-                        normalized_target in normalized_line
-                        or compact_target in compact_line
-                        or normalized_line[:96] in normalized_target
-                    ):
-                        ranges.append((match.start(), match.end()))
-                        break
+            ranges = _find_markdown_target_line_ranges(updated, html_targets)
+            if isinstance(record.get("formula_no"), int) and ranges:
+                for start, end in sorted(ranges, reverse=True):
+                    updated = updated[:start] + updated[end:]
+                changed += 1
+                continue
             if len(ranges) >= max(2, min(3, len(html_targets))):
                 start = min(start for start, _end in ranges)
                 end = max(end for _start, end in ranges)
@@ -4768,6 +4936,16 @@ def _replace_algorithm_records_in_markdown(md_text: str, records: list[dict[str,
                 + _algorithm_record_markdown(record).strip()
                 + updated[match.end() :]
             )
+            stripped, removed = _remove_markdown_target_lines(
+                updated,
+                [
+                    target
+                    for target in (record.get("html_targets") or [])
+                    if isinstance(target, str) and target.strip()
+                ],
+            )
+            if removed:
+                updated = stripped
             changed += 1
             break
     return updated, changed
@@ -6234,7 +6412,7 @@ def _author_year_numbers(
         for subpart in subparts:
             part_numbers = lookup_numbers_for_part(subpart)
             if not part_numbers:
-                return []
+                continue
             numbers.extend(part_numbers)
     return list(dict.fromkeys(numbers))
 
@@ -8134,9 +8312,24 @@ def _algorithm_formula_plain_text(text: str) -> str:
     body = re.sub(r"\\text\s*\{\s*([^{}]*?)\s*\}", r"\1", body)
     body = re.sub(r"\\mathbf\s*\{\s*([^{}]*?)\s*\}", r"\1", body)
     body = re.sub(r"\\mathrm\s*\{\s*([^{}]*?)\s*\}", r"\1", body)
+    body = re.sub(r"\\(?:text|mathbf|mathrm)\s+", "", body)
+    body = re.sub(r"\\mathcal\s*", "", body)
+    body = re.sub(r"\\quad|\\,", " ", body)
+    body = re.sub(r"\\leftarrow", "←", body)
+    body = re.sub(r"\\colon", ":", body)
+    body = re.sub(r"\\slash", "/", body)
     body = re.sub(r"[{}]", "", body)
     body = re.sub(r"[ \t]+", " ", body)
-    lines = [line.strip() for line in body.splitlines()]
+    lines = []
+    for line in (line.strip() for line in body.splitlines()):
+        if not line:
+            continue
+        normalized = _normalized_noise_text(line)
+        if len(normalized) <= 18 and normalized.endswith("-"):
+            continue
+        if re.fullmatch(r"(?i)(?:over|the)\s+the?\s*[A-Za-z-]*", normalized):
+            continue
+        lines.append(line)
     return "\n".join(line for line in lines if line)
 
 
@@ -8153,7 +8346,7 @@ def _looks_like_algorithm_cluster_line(node: dict[str, Any], *, active: bool = F
     text = _normalized_noise_text(_algorithm_cluster_line_text(node))
     if not text:
         return False
-    if re.match(r"(?i)^Algorithm\s+\d+\s*:", text):
+    if re.match(r"(?i)^Algorithm\s+\d+\b\s*:?", text):
         return True
     if label in {"list_item", "text", "section_header", "code"} and re.match(
         r"(?i)^(?:Require|Input|Output|Parameters?|Initialize|while|end\s+while|return)\b",
@@ -8168,7 +8361,11 @@ def _looks_like_algorithm_cluster_line(node: dict[str, Any], *, active: bool = F
     if label == "formula" and _looks_like_algorithm_formula(str(node.get("text") or "")):
         return True
     if active and label in {"text", "list_item", "section_header"}:
-        if re.search(r"(?:←|\\leftarrow|:=|//|\bdo\b|\bend\b|\bfor\b|\breturn\b)", text, flags=re.I):
+        if re.search(
+            r"(?:←|\\leftarrow|:=|//|\bdo\b|\bend\b|\bfor\b|\breturn\b|\bsample\b|\bupdate\b)",
+            text,
+            flags=re.I,
+        ):
             return True
     if active and label == "formula":
         if re.search(r"(?:←|\\leftarrow|\\nabla|\\max|\\frac|\\text\s*\{|\\colon)", str(node.get("text") or "")):
@@ -8242,10 +8439,10 @@ def _algorithm_cluster_records(
             label = str(candidate.get("label") or "").lower()
             text = str(candidate.get("text") or "")
             normalized = _normalized_noise_text(_algorithm_cluster_line_text(candidate))
-            is_title = bool(re.match(r"(?i)^Algorithm\s+\d+\s*:", normalized))
+            is_title = bool(re.match(r"(?i)^Algorithm\s+\d+\b\s*:?", normalized))
             is_algorithm_line = _looks_like_algorithm_cluster_line(candidate, active=bool(cluster))
             if not is_algorithm_line:
-                if cluster and label == "caption" and re.match(r"(?i)^Algorithm\s+\d+\s*:", normalized):
+                if cluster and label == "caption" and re.match(r"(?i)^Algorithm\s+\d+\b\s*:?", normalized):
                     is_title = True
                     is_algorithm_line = True
                 else:
@@ -8288,7 +8485,7 @@ def _algorithm_cluster_records(
                 _normalized_noise_text(_algorithm_cluster_line_text(cluster_node))
                 for _cluster_index, cluster_node in cluster
                 if re.match(
-                    r"(?i)^Algorithm\s+\d+\s*:",
+                    r"(?i)^Algorithm\s+\d+\b\s*:?",
                     _normalized_noise_text(_algorithm_cluster_line_text(cluster_node)),
                 )
             ),
@@ -9534,12 +9731,10 @@ def _render_formula_fallback_html(
         source_formula_render = (
             '<p class="docling-formula-unavailable">'
             "Formula candidate was isolated from the main math flow because the extracted text "
-            "looks like surrounding prose or a section heading. Evidence is preserved below."
+            "looks like surrounding prose or a section heading. The extracted content is shown below."
             "</p>"
-            '<details class="docling-formula-evidence-details">'
-            "<summary>Extracted candidate text</summary>"
             '<pre class="docling-formula-tex docling-formula-preserved-source">'
-            f"{html.escape(source_formula)}</pre></details>"
+            f"{html.escape(source_formula)}</pre>"
         )
     elif source_formula and _looks_like_algorithm_formula(source_formula):
         source_formula_render = (
@@ -9782,13 +9977,19 @@ def _formula_fallback_contract_text(entry: dict[str, Any]) -> str:
 def _render_formula_fallback_markdown(entry: dict[str, Any]) -> str:
     formula_no = entry.get("formula_no")
     reason = str(entry.get("fallback_reason") or entry.get("status") or "second_pass_not_applied")
-    _text, source = _best_formula_fallback_text(entry)
+    text, source = _best_formula_fallback_text(entry)
+    evidence = (
+        f"\n\n```text\n{text}\n```"
+        if text and _looks_like_misdetected_formula_prose(text)
+        else ""
+    )
     return (
         f"**Formula {formula_no} fallback**: kept at its source anchor; "
         f"unsafe formula output was isolated (`{reason}`). "
         "See `formulas/` crops and formula review artifacts for evidence.\n"
         "<!-- formula-final-output-fallback "
         f"formula={formula_no} reason={reason} source={source} -->"
+        + evidence
     )
 
 
