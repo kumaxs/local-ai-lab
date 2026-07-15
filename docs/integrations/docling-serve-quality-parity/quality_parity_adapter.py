@@ -4454,6 +4454,373 @@ def _quarantine_visual_axis_tail_markdown(md_text: str) -> tuple[str, int]:
     return "".join(blocks), changed
 
 
+def _pdf_text_for_bbox(pdf_path: Path, prov: dict[str, Any], padding: float = 5.0) -> str:
+    try:
+        import fitz  # type: ignore
+    except Exception:
+        return ""
+    bbox = prov.get("bbox") if isinstance(prov, dict) else None
+    page_no = prov.get("page_no") if isinstance(prov, dict) else None
+    if not isinstance(bbox, dict) or not isinstance(page_no, int):
+        return ""
+    try:
+        doc = fitz.open(pdf_path)
+    except Exception:
+        return ""
+    try:
+        if not (1 <= page_no <= len(doc)):
+            return ""
+        page = doc[page_no - 1]
+        height = float(page.rect.height)
+        rect = fitz.Rect(
+            float(bbox.get("l", 0)) - padding,
+            height - float(bbox.get("t", height)) - padding,
+            float(bbox.get("r", 0)) + padding,
+            height - float(bbox.get("b", 0)) + padding,
+        )
+        blocks = page.get_text("blocks", clip=rect, sort=True)
+        return "\n".join(str(block[4]).strip() for block in blocks if str(block[4]).strip())
+    except Exception:
+        return ""
+    finally:
+        doc.close()
+
+
+def _format_algorithm_text(text: str) -> str:
+    text = html.unescape(HTML_TAG_RE.sub(" ", text))
+    text = text.replace("\x00", "").replace("\x01", "")
+    text = re.sub(r"[ \t]+\n", "\n", text)
+    text = re.sub(r"\n[ \t]+", "\n", text)
+    text = re.sub(r"[ \t]{2,}", " ", text)
+    text = ALGORITHM_LINE_BREAK_RE.sub("\n", text)
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    first_algorithm_line = next(
+        (
+            index
+            for index, line in enumerate(lines)
+            if re.match(r"(?i)^(?:Require|Input|Output|Parameters?|Initialize|while|\d+\s*:)", line)
+        ),
+        0,
+    )
+    lines = lines[first_algorithm_line:]
+    cleaned: list[str] = []
+    for line in lines:
+        if re.match(r"(?i)^Algorithm\s+\d+\s*:", line):
+            continue
+        line = re.sub(r"\s+", " ", line).strip()
+        if line:
+            cleaned.append(line)
+    return "\n".join(cleaned)
+
+
+def _algorithm_record_html(record: dict[str, Any]) -> str:
+    label = html.escape(str(record.get("label") or "Algorithm block"))
+    text = html.escape(str(record.get("text") or ""))
+    source = html.escape(str(record.get("source") or "pdf_text_bbox"))
+    return (
+        '<div class="docling-algorithm-recovered" '
+        f'data-algorithm-source="{source}">'
+        f'<div class="docling-formula-second-pass-label">{label}</div>'
+        f'<pre class="docling-algorithm-block">{text}</pre>'
+        "</div>"
+    )
+
+
+def _algorithm_record_markdown(record: dict[str, Any]) -> str:
+    label = str(record.get("label") or "Algorithm block")
+    text = str(record.get("text") or "")
+    return f"\n\n**{label}**\n\n```text\n{text}\n```\n\n"
+
+
+def _algorithm_candidate_records(document_json: Any, pdf_path: Path) -> list[dict[str, Any]]:
+    if not isinstance(document_json, dict):
+        return []
+    records: list[dict[str, Any]] = []
+    nodes = [node for node in (document_json.get("texts") or []) if isinstance(node, dict)]
+    used_text_indexes: set[int] = set()
+    formula_index = 0
+    for text_index, node in enumerate(nodes):
+        label = str(node.get("label") or "").lower()
+        node_text = str(node.get("text") or "")
+        formula_no: int | None = None
+        if label == "formula":
+            formula_index += 1
+            formula_no = formula_index
+        algorithm_like = (
+            label == "code"
+            and re.search(r"(?i)\b(?:Require|Input|Output|while)\b", node_text)
+        ) or (
+            label == "formula"
+            and _looks_like_algorithm_formula(node_text)
+        )
+        if not algorithm_like:
+            continue
+        prov = first_prov(node) or {}
+        pdf_text = _pdf_text_for_bbox(pdf_path, prov) if pdf_path.exists() else ""
+        formatted = _format_algorithm_text(pdf_text or _algorithm_formula_plain_text(node_text) or node_text)
+        if len(formatted) < 20:
+            continue
+        records.append(
+            {
+                "id": f"algorithm-block-{len(records) + 1}",
+                "label": f"Algorithm block {len(records) + 1}",
+                "text": formatted,
+                "original_text": node_text,
+                "source": "pdf_text_bbox" if pdf_text else "docling_node_text",
+                "text_index": text_index,
+                "formula_no": formula_no,
+                "page_no": prov.get("page_no"),
+                "bbox": bbox_geometry(prov),
+                "original_label": label,
+            }
+        )
+        used_text_indexes.add(text_index)
+    records.extend(
+        _algorithm_cluster_records(
+            nodes,
+            used_text_indexes,
+            len(records) + 1,
+        )
+    )
+    return records
+
+
+def _find_html_blocks_for_targets(document_html: str, targets: list[str]) -> list[tuple[int, int]]:
+    ranges: list[tuple[int, int]] = []
+    used_ranges: list[tuple[int, int]] = []
+    block_re = re.compile(
+        r"(?is)<(?P<tag>p|li|figcaption|h[1-6])\b[^>]*>.*?</(?P=tag)>",
+    )
+    for target_text in targets:
+        normalized_target = _normalized_noise_text(target_text)[:96]
+        if not normalized_target:
+            continue
+        compact_target = re.sub(r"\s+", "", normalized_target)
+        for match in block_re.finditer(document_html):
+            if any(not (match.end() <= start or match.start() >= end) for start, end in used_ranges):
+                continue
+            visible = html.unescape(HTML_TAG_RE.sub(" ", match.group(0)))
+            normalized_visible = _normalized_noise_text(visible)
+            compact_visible = re.sub(r"\s+", "", normalized_visible)
+            if (
+                normalized_target in normalized_visible
+                or compact_target in compact_visible
+                or normalized_visible[:96] in normalized_target
+            ):
+                ranges.append((match.start(), match.end()))
+                used_ranges.append((match.start(), match.end()))
+                break
+    return ranges
+
+
+def _replace_algorithm_records_in_html(document_html: str, records: list[dict[str, Any]]) -> tuple[str, int]:
+    updated = document_html
+    changed = 0
+    for record in records:
+        replacement = _algorithm_record_html(record)
+        html_targets = [
+            target
+            for target in (record.get("html_targets") or [])
+            if isinstance(target, str) and target.strip()
+        ]
+        if html_targets:
+            target_ranges = _find_html_blocks_for_targets(updated, html_targets)
+            formula_nos = [
+                value
+                for value in (record.get("formula_nos") or [])
+                if isinstance(value, int)
+            ]
+            for formula_no_value in formula_nos:
+                formula_range = _find_existing_second_pass_formula_range(updated, formula_no_value)
+                if formula_range is not None:
+                    target_ranges.append(formula_range)
+            if len(target_ranges) >= max(2, min(3, len(html_targets))):
+                start = min(start for start, _end in target_ranges)
+                end = max(end for _start, end in target_ranges)
+                updated = updated[:start] + replacement + updated[end:]
+                changed += 1
+                continue
+        formula_no = record.get("formula_no")
+        if isinstance(formula_no, int):
+            formula_range = _find_existing_second_pass_formula_range(updated, formula_no)
+            if formula_range is not None:
+                updated = updated[: formula_range[0]] + replacement + updated[formula_range[1] :]
+                changed += 1
+                continue
+        original_text = str(record.get("text") or "")
+        original_node_text = str(record.get("original_text") or "")
+        targets = [
+            _normalized_noise_text(value)[:80]
+            for value in (original_text, original_node_text)
+            if _normalized_noise_text(value)
+        ]
+        for match in re.finditer(
+            r"<pre(?P<attrs>[^>]*)>\s*<code[^>]*>(?P<body>.*?)</code>\s*</pre>",
+            updated,
+            flags=re.I | re.S,
+        ):
+            visible = html.unescape(HTML_TAG_RE.sub(" ", match.group("body")))
+            normalized_visible = _normalized_noise_text(visible)
+            compact_visible = re.sub(r"\s+", "", normalized_visible)
+            if not any(
+                target in normalized_visible or re.sub(r"\s+", "", target) in compact_visible
+                for target in targets
+            ):
+                continue
+            updated = updated[: match.start()] + replacement + updated[match.end() :]
+            changed += 1
+            break
+    return updated, changed
+
+
+def _replace_algorithm_records_in_markdown(md_text: str, records: list[dict[str, Any]]) -> tuple[str, int]:
+    updated = md_text
+    changed = 0
+    formula_blocks = list(re.finditer(r"\$\$.*?\$\$", updated, re.DOTALL))
+    edits: list[tuple[int, int, str]] = []
+    for record in records:
+        formula_no = record.get("formula_no")
+        if isinstance(formula_no, int) and 0 < formula_no <= len(formula_blocks):
+            block = formula_blocks[formula_no - 1]
+            end = block.end()
+            fallback_comment = re.match(
+                rf"\s*<!--\s*formula-final-output-fallback\s+formula={formula_no}\b.*?-->",
+                updated[end:],
+                flags=re.S,
+            )
+            if fallback_comment:
+                end += fallback_comment.end()
+            edits.append((block.start(), end, _algorithm_record_markdown(record)))
+            changed += 1
+        elif isinstance(formula_no, int):
+            fallback_match = re.search(
+                rf"(?s)\*\*Formula\s+{formula_no}\s+fallback\*\*:.*?"
+                rf"<!--\s*formula-final-output-fallback\s+formula={formula_no}\b.*?-->",
+                updated,
+            )
+            if fallback_match:
+                edits.append(
+                    (
+                        fallback_match.start(),
+                        fallback_match.end(),
+                        _algorithm_record_markdown(record),
+                    )
+                )
+                changed += 1
+    for start, end, replacement in sorted(edits, reverse=True):
+        updated = updated[:start] + replacement + updated[end:]
+    for record in records:
+        html_targets = [
+            target
+            for target in (record.get("html_targets") or [])
+            if isinstance(target, str) and target.strip()
+        ]
+        if html_targets:
+            ranges: list[tuple[int, int]] = []
+            fence_ranges = [
+                (match.start(), match.end())
+                for match in re.finditer(r"```.*?```", updated, flags=re.S)
+            ]
+            for target in html_targets:
+                normalized_target = _normalized_noise_text(target)[:96]
+                if not normalized_target:
+                    continue
+                compact_target = re.sub(r"\s+", "", normalized_target)
+                for match in re.finditer(r"(?m)^(?P<line>.+)$", updated):
+                    if any(start <= match.start() < end for start, end in fence_ranges):
+                        continue
+                    if any(not (match.end() <= start or match.start() >= end) for start, end in ranges):
+                        continue
+                    normalized_line = _normalized_noise_text(match.group("line"))
+                    compact_line = re.sub(r"\s+", "", normalized_line)
+                    if (
+                        normalized_target in normalized_line
+                        or compact_target in compact_line
+                        or normalized_line[:96] in normalized_target
+                    ):
+                        ranges.append((match.start(), match.end()))
+                        break
+            if len(ranges) >= max(2, min(3, len(html_targets))):
+                start = min(start for start, _end in ranges)
+                end = max(end for _start, end in ranges)
+                updated = updated[:start] + _algorithm_record_markdown(record).strip() + updated[end:]
+                changed += 1
+                continue
+        if isinstance(record.get("formula_no"), int):
+            continue
+        targets = [
+            _normalized_noise_text(value)[:80]
+            for value in (str(record.get("text") or ""), str(record.get("original_text") or ""))
+            if _normalized_noise_text(value)
+        ]
+        if not targets:
+            continue
+        for match in re.finditer(r"```(?:text|)\n(?P<body>.*?)\n```", updated, flags=re.S):
+            visible = _normalized_noise_text(match.group("body"))
+            compact_visible = re.sub(r"\s+", "", visible)
+            if not any(
+                target in visible or re.sub(r"\s+", "", target) in compact_visible
+                for target in targets
+            ):
+                continue
+            updated = (
+                updated[: match.start()]
+                + _algorithm_record_markdown(record).strip()
+                + updated[match.end() :]
+            )
+            changed += 1
+            break
+    return updated, changed
+
+
+def recover_algorithm_blocks_in_outputs(
+    output_dir: Path,
+    document_json: Any,
+    pdf_path: Path,
+    metadata: dict[str, Any],
+    status: dict[str, Any],
+) -> dict[str, Any]:
+    records = _algorithm_candidate_records(document_json, pdf_path)
+    html_changed = 0
+    md_changed = 0
+    html_path = output_dir / "document.html"
+    if records and html_path.exists():
+        html_text, html_changed = _replace_algorithm_records_in_html(
+            html_path.read_text(encoding="utf-8"),
+            records,
+        )
+        if html_changed:
+            html_path.write_text(html_text, encoding="utf-8")
+    md_path = output_dir / "document.md"
+    if records and md_path.exists():
+        md_text, md_changed = _replace_algorithm_records_in_markdown(
+            md_path.read_text(encoding="utf-8"),
+            records,
+        )
+        if md_changed:
+            md_path.write_text(md_text, encoding="utf-8")
+    if records:
+        (output_dir / "algorithm_blocks.json").write_text(
+            json.dumps(records, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+    result = {
+        "ok": True,
+        "candidate_count": len(records),
+        "html_replacement_count": html_changed,
+        "markdown_replacement_count": md_changed,
+        "output": str(output_dir / "algorithm_blocks.json") if records else None,
+    }
+    metadata["algorithm_block_recovery"] = result
+    status["quality_signals"]["algorithm_block_recovery"] = result
+    if records:
+        status["warnings"].append(
+            "algorithm_block_recovery:"
+            f"candidates={len(records)}:html={html_changed}:markdown={md_changed}"
+        )
+    return result
+
+
 def _visible_html_text(document_html: str) -> str:
     visible = re.sub(
         r"<(?:template|style|script)\b.*?</(?:template|style|script)>",
@@ -4684,6 +5051,22 @@ REFERENCE_CONTINUATION_START_RE = re.compile(
 REFERENCE_TRAILING_USAGE_PAGES_RE = re.compile(
     r"(?:^|[^\d])\d{1,3}(?:\s*,\s*\d{1,3})*\s*$"
 )
+
+
+def _looks_like_reference_entry(text: str) -> bool:
+    normalized = _normalized_noise_text(text)
+    if len(normalized) < 24:
+        return False
+    if not re.search(r"\b(?:19|20)\d{2}[a-z]?\b", normalized):
+        return False
+    return bool(
+        re.match(
+            r"^\s*(?:[A-Z][A-Za-z'’¨¸.-]{1,40}|[\u3400-\u9fff]{2,5})"
+            r"(?:\s*,|\s+and\s+|\s*&\s+)",
+            normalized,
+        )
+        or re.search(r"\b(?:CoRR|arXiv|ICML|NIPS|IEEE|Journal|Proceedings|Conference)\b", normalized)
+    )
 
 
 def _note_marker_and_body(text: str) -> tuple[str | None, str]:
@@ -6117,7 +6500,9 @@ def _reference_section_records(document_json: Any) -> tuple[
         numbered_reference_heading = label == "section_header" and explicit_number is not None
         if label == "section_header" and not numbered_reference_heading:
             break
-        if label == "list_item" or numbered_reference_heading:
+        if label == "list_item" or numbered_reference_heading or (
+            label == "text" and _looks_like_reference_entry(text)
+        ):
             result.append(record)
     return heading, result
 
@@ -6261,10 +6646,14 @@ def bibliography_diagnostics(document_json: Any) -> dict[str, Any]:
                 and not numbered_reference_heading
             ):
                 break
-            if in_reference_section and label in {
-                "section_header",
-                "list_item",
-            }:
+            text = str(record.get("text") or "")
+            if in_reference_section and (
+                label in {
+                    "section_header",
+                    "list_item",
+                }
+                or (label == "text" and _looks_like_reference_entry(text))
+            ):
                 reference_orders.add(record.get("reading_order"))
     citations: list[dict[str, Any]] = []
     unresolved: list[dict[str, Any]] = []
@@ -6568,7 +6957,9 @@ def _link_bibliography_in_html(
             numbered_reference_heading = tag.startswith("h") and explicit_number is not None
             if tag.startswith("h") and not numbered_reference_heading:
                 break
-            if tag == "li" or numbered_reference_heading:
+            if tag == "li" or numbered_reference_heading or (
+                tag == "p" and _looks_like_reference_entry(visible)
+            ):
                 reference_matches.append(match)
 
     reference_replacements: list[tuple[int, int, str]] = []
@@ -6757,16 +7148,18 @@ def _link_bibliography_in_markdown(
             else len(updated)
         )
         reference_line_re = re.compile(
-            r"(?m)^(?P<indent>[ \t]*)(?P<marker>[-+]|\d+[.)])\s+"
-            r"(?P<body>[^\n]+)$"
+            r"(?m)^(?P<indent>[ \t]*)(?:(?P<marker>[-+]|\d+[.)])\s+)?"
+            r"(?P<body>[^\n#][^\n]+)$"
         )
-        reference_matches = list(
-            reference_line_re.finditer(
+        reference_matches = [
+            match
+            for match in reference_line_re.finditer(
                 updated,
                 heading_match.end(),
                 section_end,
             )
-        )
+            if match.group("marker") or _looks_like_reference_entry(match.group("body"))
+        ]
 
     reference_replacements: list[tuple[int, int, str]] = []
     anchored_reference_ids: set[str] = set()
@@ -7694,11 +8087,39 @@ def _unwrap_single_formula_array(formula_text: str) -> tuple[str, bool]:
     return display, display != formula_text
 
 
+def _repair_array_row_wrappers(formula_text: str) -> tuple[str, bool]:
+    body = formula_text.strip()
+    if not re.search(r"\\begin\s*\{\s*array\s*\}", body):
+        return formula_text, False
+    repaired = re.sub(r"\{\s*(\\quad)\s*\}", r"\1", body)
+    repaired = re.sub(
+        r"(&\s*)\{\s*(?=\\(?:quad|mathbb|frac|sum|text|widehat|theta|alpha|beta|sigma|mu|sqrt))",
+        r"\1",
+        repaired,
+    )
+    repaired = re.sub(
+        r"(\\\\\s*&\s*)\{\s*(?=\\(?:quad|mathbb|frac|sum|text|widehat|theta|alpha|beta|sigma|mu|sqrt))",
+        r"\1",
+        repaired,
+    )
+    repaired = re.sub(r"\s*\}\s*(?=\\\\|\\end\s*\{\s*array\s*\})", " ", repaired)
+    repaired = re.sub(r"\s+", " ", repaired).strip()
+    return repaired, repaired != formula_text
+
+
 def _looks_like_algorithm_formula(text: str) -> bool:
     body = text.strip()
     if not re.search(r"\\begin\s*\{\s*array\s*\}", body):
         return False
-    return bool(ALGORITHM_FORMULA_RE.search(body) or len(re.findall(r"\\\\", body)) >= 4)
+    return bool(
+        ALGORITHM_FORMULA_RE.search(body)
+        or re.search(
+            r"(?:\{\s*)?\d+\s*\\colon\s*(?:\\text\s*\{\s*)?"
+            r"(?:for|end|Process|In|while|if|return|/|\\slash)",
+            body,
+            flags=re.I,
+        )
+    )
 
 
 def _algorithm_formula_plain_text(text: str) -> str:
@@ -7719,10 +8140,205 @@ def _algorithm_formula_plain_text(text: str) -> str:
     return "\n".join(line for line in lines if line)
 
 
+def _algorithm_cluster_line_text(node: dict[str, Any]) -> str:
+    label = str(node.get("label") or "").lower()
+    text = str(node.get("text") or "")
+    if label == "formula":
+        return _algorithm_formula_plain_text(text) or text
+    return text
+
+
+def _looks_like_algorithm_cluster_line(node: dict[str, Any], *, active: bool = False) -> bool:
+    label = str(node.get("label") or "").lower()
+    text = _normalized_noise_text(_algorithm_cluster_line_text(node))
+    if not text:
+        return False
+    if re.match(r"(?i)^Algorithm\s+\d+\s*:", text):
+        return True
+    if label in {"list_item", "text", "section_header", "code"} and re.match(
+        r"(?i)^(?:Require|Input|Output|Parameters?|Initialize|while|end\s+while|return)\b",
+        text,
+    ):
+        return True
+    if label == "list_item" and re.match(
+        r"(?i)^\d+\s*:\s*(?:for|end|Process|In|Train|Add|Modify|return|while|if|N\b)",
+        text,
+    ):
+        return True
+    if label == "formula" and _looks_like_algorithm_formula(str(node.get("text") or "")):
+        return True
+    if active and label in {"text", "list_item", "section_header"}:
+        if re.search(r"(?:←|\\leftarrow|:=|//|\bdo\b|\bend\b|\bfor\b|\breturn\b)", text, flags=re.I):
+            return True
+    if active and label == "formula":
+        if re.search(r"(?:←|\\leftarrow|\\nabla|\\max|\\frac|\\text\s*\{|\\colon)", str(node.get("text") or "")):
+            return True
+    return False
+
+
+def _merge_bbox_geometry(nodes: list[dict[str, Any]]) -> dict[str, Any] | None:
+    bboxes: list[dict[str, Any]] = []
+    for node in nodes:
+        prov = first_prov(node) or {}
+        bbox = bbox_geometry(prov)
+        if bbox:
+            bboxes.append(bbox)
+    if not bboxes:
+        return None
+    left = min(float(bbox.get("l", 0)) for bbox in bboxes)
+    right = max(float(bbox.get("r", 0)) for bbox in bboxes)
+    top = max(float(bbox.get("t", 0)) for bbox in bboxes)
+    bottom = min(float(bbox.get("b", 0)) for bbox in bboxes)
+    width = max(0.0, right - left)
+    height = max(0.0, top - bottom)
+    result = {
+        "l": left,
+        "r": right,
+        "t": top,
+        "b": bottom,
+        "width": width,
+        "height": height,
+    }
+    if height:
+        result["aspect_width_over_height"] = width / height
+    return result
+
+
+def _algorithm_cluster_records(
+    nodes: list[dict[str, Any]],
+    used_text_indexes: set[int],
+    start_record_no: int,
+) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    index = 0
+    formula_index_by_text_index: dict[int, int] = {}
+    formula_no = 0
+    for text_index, node in enumerate(nodes):
+        if not isinstance(node, dict):
+            continue
+        if str(node.get("label") or "").lower() == "formula":
+            formula_no += 1
+            formula_index_by_text_index[text_index] = formula_no
+    while index < len(nodes):
+        node = nodes[index]
+        if not isinstance(node, dict) or index in used_text_indexes:
+            index += 1
+            continue
+        if not _looks_like_algorithm_cluster_line(node):
+            index += 1
+            continue
+        start = index
+        page_no = (first_prov(node) or {}).get("page_no")
+        cluster: list[tuple[int, dict[str, Any]]] = []
+        saw_title = False
+        saw_body_signal = False
+        while index < len(nodes):
+            candidate = nodes[index]
+            if not isinstance(candidate, dict) or index in used_text_indexes:
+                break
+            candidate_page = (first_prov(candidate) or {}).get("page_no")
+            if page_no is not None and candidate_page != page_no:
+                break
+            label = str(candidate.get("label") or "").lower()
+            text = str(candidate.get("text") or "")
+            normalized = _normalized_noise_text(_algorithm_cluster_line_text(candidate))
+            is_title = bool(re.match(r"(?i)^Algorithm\s+\d+\s*:", normalized))
+            is_algorithm_line = _looks_like_algorithm_cluster_line(candidate, active=bool(cluster))
+            if not is_algorithm_line:
+                if cluster and label == "caption" and re.match(r"(?i)^Algorithm\s+\d+\s*:", normalized):
+                    is_title = True
+                    is_algorithm_line = True
+                else:
+                    break
+            cluster.append((index, candidate))
+            saw_title = saw_title or is_title
+            saw_body_signal = saw_body_signal or bool(
+                re.search(
+                    r"(?i)\b(?:Require|Input|Output|while|return|for|Process|Train|Initialize)\b|←|\\leftarrow",
+                    normalized + " " + text,
+                )
+            )
+            if re.match(r"(?i)^return\b", normalized):
+                next_node = nodes[index + 1] if index + 1 < len(nodes) else None
+                if not (
+                    isinstance(next_node, dict)
+                    and _looks_like_algorithm_cluster_line(next_node, active=True)
+                ):
+                    index += 1
+                    break
+            index += 1
+        if len(cluster) < 3 or not saw_body_signal:
+            index = max(start + 1, index)
+            continue
+        text_lines = [
+            _algorithm_cluster_line_text(cluster_node)
+            for _cluster_index, cluster_node in cluster
+        ]
+        formatted = _format_algorithm_text("\n".join(text_lines))
+        if len(formatted) < 40:
+            index = max(start + 1, index)
+            continue
+        formula_nos = [
+            formula_index_by_text_index[cluster_index]
+            for cluster_index, _cluster_node in cluster
+            if cluster_index in formula_index_by_text_index
+        ]
+        title_text = next(
+            (
+                _normalized_noise_text(_algorithm_cluster_line_text(cluster_node))
+                for _cluster_index, cluster_node in cluster
+                if re.match(
+                    r"(?i)^Algorithm\s+\d+\s*:",
+                    _normalized_noise_text(_algorithm_cluster_line_text(cluster_node)),
+                )
+            ),
+            "",
+        )
+        label = title_text if title_text else f"Algorithm block {start_record_no + len(records)}"
+        records.append(
+            {
+                "id": f"algorithm-block-{start_record_no + len(records)}",
+                "label": label,
+                "text": formatted,
+                "original_text": "\n".join(str(cluster_node.get("text") or "") for _, cluster_node in cluster),
+                "source": "docling_algorithm_cluster",
+                "text_indexes": [cluster_index for cluster_index, _cluster_node in cluster],
+                "formula_nos": formula_nos,
+                "formula_no": None,
+                "page_no": page_no,
+                "bbox": _merge_bbox_geometry([cluster_node for _, cluster_node in cluster]),
+                "original_label": "algorithm_cluster",
+                "html_targets": [str(cluster_node.get("text") or "") for _, cluster_node in cluster],
+            }
+        )
+    return records
+
+
+def _strip_balanced_array_group(formula_text: str) -> tuple[str, bool]:
+    body = formula_text.strip()
+    match = re.match(
+        r"(?s)^\{\s*(?P<array>\\begin\s*\{\s*array\s*\}.*\\end\s*\{\s*array\s*\})\s*\}(?P<suffix>.*)$",
+        body,
+    )
+    if not match:
+        return formula_text, False
+    suffix = match.group("suffix").strip()
+    display = f"{match.group('array').strip()} {suffix}".strip()
+    return display, display != formula_text
+
+
 def sanitize_formula_display_text(formula_text: str) -> tuple[str, list[str]]:
     """Return a MathJax-display-safe formula body plus evidence-backed reasons."""
     reasons: list[str] = []
     display_text = formula_text
+    ungrouped, group_changed = _strip_balanced_array_group(display_text)
+    if group_changed:
+        display_text = ungrouped
+        reasons.append("removed_balanced_outer_formula_group")
+    repaired_array, repaired_changed = _repair_array_row_wrappers(display_text)
+    if repaired_changed:
+        display_text = repaired_array
+        reasons.append("repaired_array_row_wrappers")
     unwrapped, changed = _unwrap_single_formula_array(display_text)
     if changed:
         display_text = unwrapped
@@ -8914,7 +9530,18 @@ def _render_formula_fallback_html(
         else ""
     )
     source_formula_render = ""
-    if source_formula and _looks_like_algorithm_formula(source_formula):
+    if source_formula and _looks_like_misdetected_formula_prose(source_formula):
+        source_formula_render = (
+            '<p class="docling-formula-unavailable">'
+            "Formula candidate was isolated from the main math flow because the extracted text "
+            "looks like surrounding prose or a section heading. Evidence is preserved below."
+            "</p>"
+            '<details class="docling-formula-evidence-details">'
+            "<summary>Extracted candidate text</summary>"
+            '<pre class="docling-formula-tex docling-formula-preserved-source">'
+            f"{html.escape(source_formula)}</pre></details>"
+        )
+    elif source_formula and _looks_like_algorithm_formula(source_formula):
         source_formula_render = (
             '<pre class="docling-algorithm-block docling-formula-preserved-source">'
             f"{html.escape(_algorithm_formula_plain_text(source_formula))}</pre>"
@@ -9083,7 +9710,7 @@ def _formula_output_safety_reasons(text: str) -> list[str]:
     if re.match(r"^\s*\\begin\s*\{\s*array\s*\}", body):
         relation_count = len(re.findall(r"(?<![<>])=(?!=)", body))
         row_count = len(re.findall(r"\\\\", body))
-        if relation_count <= 1 and row_count <= 1:
+        if relation_count <= 1 and row_count == 0:
             reasons.append("unnecessary_single_formula_array")
     for integral in re.finditer(
         r"\\int\s*_\s*\{\s*(?P<lower>[^{}]{1,32})\s*\}"
@@ -9099,6 +9726,20 @@ def _formula_output_safety_reasons(text: str) -> list[str]:
     if len(numbers) != len(set(numbers)):
         reasons.append("duplicate_equation_number")
     return list(dict.fromkeys(reasons))
+
+
+def _looks_like_misdetected_formula_prose(text: str) -> bool:
+    body = text.strip()
+    if not body:
+        return False
+    spaced_letters = len(re.findall(r"(?<![A-Za-z])[A-Za-z](?![A-Za-z])", body))
+    words = re.findall(r"[A-Za-z]{3,}", body)
+    math_tokens = len(re.findall(r"\\(?:frac|sum|sqrt|int|alpha|beta|theta|mathbb|widehat)|[=←≤≥]", body))
+    has_section_marker = bool(re.search(r"\b\d+\s*\.\s*\d+\b|[A-Z]\s+D\s+A\s+M|U\s+P\s+D\s+A\s+T\s+E", body))
+    return (
+        spaced_letters >= 18
+        and (has_section_marker or len(words) >= 8 or spaced_letters > max(math_tokens * 8, 40))
+    )
 
 
 def _formula_candidate_rank(text: str, equation_number: int | None) -> tuple[int, int, int]:
@@ -9136,6 +9777,39 @@ def _formula_fallback_contract_text(entry: dict[str, Any]) -> str:
     formula_no = entry.get("eq_number") or entry.get("formula_no")
     suffix = f" \\quad ( {formula_no} )" if isinstance(formula_no, int) else ""
     return r"\text{Formula body unavailable; see source evidence}" + suffix
+
+
+def _render_formula_fallback_markdown(entry: dict[str, Any]) -> str:
+    formula_no = entry.get("formula_no")
+    reason = str(entry.get("fallback_reason") or entry.get("status") or "second_pass_not_applied")
+    _text, source = _best_formula_fallback_text(entry)
+    return (
+        f"**Formula {formula_no} fallback**: kept at its source anchor; "
+        f"unsafe formula output was isolated (`{reason}`). "
+        "See `formulas/` crops and formula review artifacts for evidence.\n"
+        "<!-- formula-final-output-fallback "
+        f"formula={formula_no} reason={reason} source={source} -->"
+    )
+
+
+def _collapse_markdown_formula_fallbacks(md_text: str) -> tuple[str, int]:
+    pattern = re.compile(
+        r"\$\$(?P<body>.*?)\$\$\s*"
+        r"<!--\s*formula-final-output-fallback\s+formula=(?P<formula>\d+)\s+"
+        r"reason=(?P<reason>.*?)\s*-->",
+        flags=re.S,
+    )
+
+    def replace(match: re.Match[str]) -> str:
+        return _render_formula_fallback_markdown(
+            {
+                "formula_no": int(match.group("formula")),
+                "fallback_reason": match.group("reason").strip(),
+                "route_a_text": match.group("body").strip(),
+            }
+        )
+
+    return pattern.subn(replace, md_text)
 
 
 def _original_formula_html_ranges(html_text: str) -> tuple[list[re.Match[str]], dict[int, re.Match[str]]]:
@@ -9569,19 +10243,13 @@ def synchronize_formula_contract_outputs(
                 continue
             if entry.get("status") == "replaced":
                 output_text = _second_pass_formula_display_text(entry)
+                replacement = f"$${output_text}$$"
             else:
-                output_text = _formula_fallback_contract_text(
+                replacement = _render_formula_fallback_markdown(
                     {
                         **entry,
                         "route_a_text": blocks[formula_no - 1].group(0)[2:-2].strip(),
-                    }
-                )
-            replacement = f"$${output_text}$$"
-            if entry.get("status") != "replaced":
-                replacement += (
-                    "\n<!-- formula-final-output-fallback "
-                    f"formula={formula_no} reason="
-                    f"{entry.get('fallback_reason') or entry.get('status')} -->"
+                    },
                 )
             block = blocks[formula_no - 1]
             if block.group(0) != replacement:
@@ -9589,7 +10257,8 @@ def synchronize_formula_contract_outputs(
                 markdown_patched.append(formula_no)
         for start, end, replacement in sorted(edits, reverse=True):
             md_text = md_text[:start] + replacement + md_text[end:]
-        if edits:
+        md_text, collapsed_count = _collapse_markdown_formula_fallbacks(md_text)
+        if edits or collapsed_count:
             md_path.write_text(md_text, encoding="utf-8")
     return {
         "ok": True,
@@ -9971,7 +10640,8 @@ def _patch_markdown_formula_blocks(output_dir: Path, formula_texts: dict[int, st
         md_text, count = pattern.subn(new, md_text)
         if count:
             text_corrections.append(new)
-    if patched or text_corrections:
+    md_text, collapsed_count = _collapse_markdown_formula_fallbacks(md_text)
+    if patched or text_corrections or collapsed_count:
         md_path.write_text(md_text, encoding="utf-8")
     return patched
 
@@ -11428,6 +12098,20 @@ def main() -> int:
     write_contract_outputs(output_dir, response, metadata, status)
     restore_review_artifact_layer(output_dir, response, metadata, status, conversion_args)
     run_optional_formula_second_pass(output_dir, metadata, status, conversion_args)
+    recovered_document = _load_json_file(output_dir / "document.json")
+    recover_algorithm_blocks_in_outputs(
+        output_dir,
+        recovered_document if isinstance(recovered_document, dict) else response,
+        conversion_args.input_file,
+        metadata,
+        status,
+    )
+    (output_dir / "metadata.json").write_text(
+        json.dumps(metadata, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
+    (output_dir / "status.json").write_text(
+        json.dumps(status, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
     record_cn_accepted_baseline(output_dir, metadata, status, conversion_args)
     summary = {
         "ok": status["ok"],

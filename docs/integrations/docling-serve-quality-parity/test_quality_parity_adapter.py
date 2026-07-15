@@ -375,6 +375,35 @@ class EnglishReviewPolishTests(unittest.TestCase):
         self.assertNotIn("unnecessary_single_formula_array", adapter._formula_output_safety_reasons(formula))
         self.assertIn(r"\quad ( 1 )", display_text)
 
+    def test_formula_tex_qc_removes_balanced_outer_array_group(self) -> None:
+        formula = (
+            r"{ \begin{array} { r l } & { a = b \quad ( 3 ) } \\ "
+            r"& { c = d \quad ( 4 ) } \end{array} }"
+        )
+
+        display_text, reasons = adapter.sanitize_formula_display_text(formula)
+
+        self.assertIn("removed_balanced_outer_formula_group", reasons)
+        self.assertTrue(display_text.startswith(r"\begin{array}"))
+        self.assertNotIn("latex_unmatched_closing_brace", adapter._formula_output_safety_reasons(formula))
+
+    def test_formula_fallback_collapses_misdetected_prose_candidate(self) -> None:
+        html = adapter._render_formula_fallback_html(
+            {
+                "formula_no": 1,
+                "status": "final_output_unsafe",
+                "route_a_text": (
+                    r"\begin{array}{rl} & { t h e o r d e r o f c o m p u t a t i o n } \\ "
+                    r"& { 2 . 1 } & { A D A M U P D A T E R U L E } \end{array}"
+                ),
+            },
+            Path("/tmp/out"),
+            Path("/tmp/out/formula_display_fallback"),
+        )
+
+        self.assertIn("looks like surrounding prose", html)
+        self.assertIn("<details", html)
+
     def test_algorithm_array_is_not_rendered_as_formula(self) -> None:
         formula = (
             r"\begin{array}{lll}\text {Input:} & \alpha & \text {stepsize}\\"
@@ -2835,6 +2864,38 @@ class EnglishReviewPolishTests(unittest.TestCase):
         self.assertEqual((references, citations), (2, 1))
         self.assertIn('href="#docling-reference-2">Graves et al., 2013</a>', html_text)
 
+    def test_bibliography_accepts_reference_entries_labeled_as_text(self) -> None:
+        document = {
+            "texts": [
+                {
+                    "label": "text",
+                    "text": "Inception was used for the benchmark (Szegedy et al., 2014).",
+                    "prov": [{"page_no": 1}],
+                },
+                {"label": "section_header", "text": "References", "prov": [{"page_no": 2}]},
+                {
+                    "label": "text",
+                    "text": "Szegedy, Christian, Liu, Wei, Jia, Yangqing, et al. Going deeper with convolutions. CoRR, abs/1409.4842, 2014.",
+                    "prov": [{"page_no": 2}],
+                },
+            ]
+        }
+
+        diagnostics = adapter.bibliography_diagnostics(document)
+        html_text, references, citations = adapter._link_bibliography_in_html(
+            (
+                "<p>Inception was used for the benchmark (Szegedy et al., 2014).</p>"
+                "<h2>References</h2>"
+                "<p>Szegedy, Christian, Liu, Wei, Jia, Yangqing, et al. Going deeper with convolutions. CoRR, abs/1409.4842, 2014.</p>"
+            ),
+            diagnostics,
+        )
+
+        self.assertEqual(diagnostics["reference_count"], 1)
+        self.assertEqual(diagnostics["citation_count"], 1)
+        self.assertEqual((references, citations), (1, 1))
+        self.assertIn('href="#docling-reference-1">Szegedy et al., 2014</a>', html_text)
+
     def test_bibliography_links_comma_separated_author_year_citations(self) -> None:
         document = {
             "texts": [
@@ -3763,6 +3824,196 @@ class EnglishReviewPolishTests(unittest.TestCase):
         self.assertEqual(count, 1)
         self.assertIn("\nRequire: β", html_text)
         self.assertIn("\nwhile θ", html_text)
+
+    def test_algorithm_recovery_uses_pdf_bbox_text_layer(self) -> None:
+        try:
+            import fitz  # type: ignore
+        except Exception as exc:
+            self.skipTest(f"PyMuPDF unavailable: {exc}")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            pdf_path = Path(tmpdir) / "algorithm.pdf"
+            doc = fitz.open()
+            page = doc.new_page(width=300, height=400)
+            page.insert_text((50, 80), "Require: alpha: Stepsize", fontsize=10)
+            page.insert_text((50, 96), "while theta not converged do", fontsize=10)
+            page.insert_text((60, 112), "theta <- theta + 1", fontsize=10)
+            page.insert_text((50, 128), "return theta", fontsize=10)
+            doc.save(pdf_path)
+            doc.close()
+            document = {
+                "texts": [
+                    {
+                        "label": "code",
+                        "text": "Require: alpha: Stepsize while theta not converged do theta <- theta + 1 return theta",
+                        "prov": [
+                            {
+                                "page_no": 1,
+                                "bbox": {
+                                    "l": 45,
+                                    "t": 325,
+                                    "r": 250,
+                                    "b": 260,
+                                    "coord_origin": "BOTTOMLEFT",
+                                },
+                            }
+                        ],
+                    }
+                ]
+            }
+
+            records = adapter._algorithm_candidate_records(document, pdf_path)
+
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["source"], "pdf_text_bbox")
+        self.assertIn("Require: alpha", records[0]["text"])
+        self.assertIn("\nwhile theta", records[0]["text"])
+
+    def test_algorithm_cluster_recovery_keeps_scattered_algorithm_readable(self) -> None:
+        document = {
+            "texts": [
+                {
+                    "label": "text",
+                    "text": "Algorithm 2: Training a Batch-Normalized Network",
+                    "prov": [{"page_no": 1, "bbox": {"l": 40, "t": 740, "r": 260, "b": 720}}],
+                },
+                {
+                    "label": "text",
+                    "text": "Input: Network N with trainable parameters Θ",
+                    "prov": [{"page_no": 1, "bbox": {"l": 40, "t": 715, "r": 260, "b": 700}}],
+                },
+                {
+                    "label": "list_item",
+                    "text": "1: N tr BN ← N // Training BN network",
+                    "prov": [{"page_no": 1, "bbox": {"l": 45, "t": 695, "r": 260, "b": 680}}],
+                },
+                {
+                    "label": "text",
+                    "text": "Output: Batch-normalized network for inference",
+                    "prov": [{"page_no": 1, "bbox": {"l": 40, "t": 675, "r": 260, "b": 660}}],
+                },
+                {
+                    "label": "list_item",
+                    "text": "2: for k = 1 ... K do",
+                    "prov": [{"page_no": 1, "bbox": {"l": 45, "t": 655, "r": 260, "b": 640}}],
+                },
+            ]
+        }
+
+        records = adapter._algorithm_candidate_records(document, Path("/nonexistent.pdf"))
+        html_text, changed = adapter._replace_algorithm_records_in_html(
+            (
+                "<p>Algorithm 2: Training a Batch-Normalized Network</p>"
+                "<p>Input: Network N with trainable parameters Θ</p>"
+                "<li>1: N tr BN ← N // Training BN network</li>"
+                "<p>Output: Batch-normalized network for inference</p>"
+                "<li>2: for k = 1 ... K do</li>"
+            ),
+            records,
+        )
+
+        self.assertEqual(len(records), 1)
+        self.assertEqual(changed, 1)
+        self.assertEqual(html_text.count("docling-algorithm-recovered"), 1)
+        self.assertIn("Algorithm 2: Training a Batch-Normalized Network", html_text)
+        self.assertIn("Input: Network N", html_text)
+        self.assertNotIn("<li>1: N tr BN", html_text)
+
+    def test_algorithm_cluster_markdown_does_not_match_existing_code_fence(self) -> None:
+        records = [
+            {
+                "label": "Algorithm 2: Training",
+                "text": "Input: Network N\n1: N tr BN ← N",
+                "html_targets": ["Input: Network N", "1: N tr BN ← N"],
+            }
+        ]
+        markdown = (
+            "**Algorithm block 1**\n\n"
+            "```text\n"
+            "Input: Network N\n"
+            "1: N tr BN ← N\n"
+            "```\n\n"
+            "**Algorithm 2: Training**\n\n"
+            "Input: Network N\n\n"
+            "1: N tr BN ← N\n"
+        )
+
+        updated, changed = adapter._replace_algorithm_records_in_markdown(markdown, records)
+
+        self.assertEqual(changed, 1)
+        self.assertEqual(updated.count("```text"), 2)
+        self.assertIn("**Algorithm block 1**", updated)
+        self.assertIn("**Algorithm 2: Training**", updated)
+
+    def test_formula_algorithm_markdown_replacement_removes_fallback_comment(self) -> None:
+        records = [
+            {
+                "label": "Algorithm block 1",
+                "text": "Input: Values\nOutput: Result",
+                "formula_no": 1,
+            }
+        ]
+        markdown = (
+            "$$\n"
+            "\\begin{array}{l} Input: Values \\\\ Output: Result \\end{array}\n"
+            "$$\n\n"
+            "<!-- formula-final-output-fallback formula=1 reason=algorithm_like_formula_array -->\n"
+        )
+
+        updated, changed = adapter._replace_algorithm_records_in_markdown(markdown, records)
+
+        self.assertEqual(changed, 1)
+        self.assertIn("```text", updated)
+        self.assertNotIn("formula-final-output-fallback", updated)
+
+    def test_formula_algorithm_markdown_replaces_collapsed_fallback_block(self) -> None:
+        records = [
+            {
+                "label": "Algorithm block 1",
+                "text": "Input: Values\nOutput: Result",
+                "formula_no": 10,
+            }
+        ]
+        markdown = (
+            "**Formula 10 fallback**: kept at its source anchor; unsafe formula output was isolated.\n"
+            "<!-- formula-final-output-fallback formula=10 reason=algorithm_like_formula_array -->"
+        )
+
+        updated, changed = adapter._replace_algorithm_records_in_markdown(markdown, records)
+
+        self.assertEqual(changed, 1)
+        self.assertIn("```text", updated)
+        self.assertIn("Input: Values", updated)
+        self.assertNotIn("Formula 10 fallback", updated)
+
+    def test_formula_fallback_markdown_is_readable_not_raw_math_block(self) -> None:
+        rendered = adapter._render_formula_fallback_markdown(
+            {
+                "formula_no": 3,
+                "fallback_reason": "latex_unclosed_brace,garbled_letter_spaced_text",
+                "route_a_text": r"\begin{array}{r}{g a r b l e d",
+            }
+        )
+
+        self.assertIn("**Formula 3 fallback**", rendered)
+        self.assertIn("formula-final-output-fallback", rendered)
+        self.assertNotIn("$$", rendered)
+        self.assertNotIn(r"\begin{array}", rendered)
+
+    def test_collapse_markdown_formula_fallbacks_removes_raw_bad_tex(self) -> None:
+        markdown = (
+            "Before\n\n"
+            r"$$\begin{array}{r}{g a r b l e d}$$"
+            "\n<!-- formula-final-output-fallback formula=3 reason=latex_unclosed_brace -->\n"
+            "After"
+        )
+
+        updated, count = adapter._collapse_markdown_formula_fallbacks(markdown)
+
+        self.assertEqual(count, 1)
+        self.assertIn("**Formula 3 fallback**", updated)
+        self.assertNotIn(r"\begin{array}", updated)
+        self.assertNotIn("$$", updated)
 
     def test_visual_axis_tail_is_split_from_figure_caption(self) -> None:
         caption = (
