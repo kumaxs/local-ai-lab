@@ -402,7 +402,8 @@ class EnglishReviewPolishTests(unittest.TestCase):
         )
 
         self.assertIn("looks like surrounding prose", html)
-        self.assertIn("<details", html)
+        self.assertIn("docling-formula-preserved-source", html)
+        self.assertNotIn("<details", html)
 
     def test_algorithm_array_is_not_rendered_as_formula(self) -> None:
         formula = (
@@ -2827,6 +2828,46 @@ class EnglishReviewPolishTests(unittest.TestCase):
         self.assertIn('href="#docling-reference-6">Tieleman &amp; Hinton, 2012</a>', html_text)
         self.assertIn('href="#docling-reference-1">Deng et al., 2013</a>', html_text)
 
+    def test_bibliography_links_partial_author_year_group_with_unresolved_tail(self) -> None:
+        document = {
+            "texts": [
+                {
+                    "label": "text",
+                    "text": (
+                        "Other approaches modify training "
+                        "(Wiesler et al., 2014; Raiko et al., 2012; "
+                        "Povey et al., 2014; Desjardins & Kavukcuoglu)."
+                    ),
+                    "prov": [{"page_no": 1}],
+                },
+                {"label": "section_header", "text": "References", "prov": [{"page_no": 2}]},
+                {"label": "list_item", "text": "Wiesler, Simon and Ney, Hermann. 2014. Mean-normalized stochastic gradient.", "prov": [{"page_no": 2}]},
+                {"label": "list_item", "text": "Raiko, Tapani, Valpola, Harri, and LeCun, Yann. 2012. Deep learning made easier.", "prov": [{"page_no": 2}]},
+                {"label": "list_item", "text": "Povey, Daniel, Zhang, Xiaohui, and Khudanpur, Sanjeev. 2014. Parallel training.", "prov": [{"page_no": 2}]},
+            ]
+        }
+        diagnostics = adapter.bibliography_diagnostics(document)
+        html_text, references, citations = adapter._link_bibliography_in_html(
+            (
+                "<p>Other approaches modify training "
+                "(Wiesler et al., 2014; Raiko et al., 2012; "
+                "Povey et al., 2014; Desjardins &amp; Kavukcuoglu).</p>"
+                "<h2>References</h2><ol>"
+                "<li>Wiesler, Simon and Ney, Hermann. 2014. Mean-normalized stochastic gradient.</li>"
+                "<li>Raiko, Tapani, Valpola, Harri, and LeCun, Yann. 2012. Deep learning made easier.</li>"
+                "<li>Povey, Daniel, Zhang, Xiaohui, and Khudanpur, Sanjeev. 2014. Parallel training.</li>"
+                "</ol>"
+            ),
+            diagnostics,
+        )
+
+        self.assertEqual(diagnostics["citation_count"], 1)
+        self.assertEqual((references, citations), (3, 1))
+        self.assertIn('href="#docling-reference-1">Wiesler et al., 2014</a>', html_text)
+        self.assertIn('href="#docling-reference-2">Raiko et al., 2012</a>', html_text)
+        self.assertIn('href="#docling-reference-3">Povey et al., 2014</a>', html_text)
+        self.assertIn("Desjardins &amp; Kavukcuoglu", html_text)
+
     def test_bibliography_disambiguates_et_al_from_same_author_year(self) -> None:
         document = {
             "texts": [
@@ -3869,6 +3910,134 @@ class EnglishReviewPolishTests(unittest.TestCase):
         self.assertIn("Require: alpha", records[0]["text"])
         self.assertIn("\nwhile theta", records[0]["text"])
 
+    def test_algorithm_cluster_accepts_caption_without_colon_and_formula_steps(self) -> None:
+        document = {
+            "texts": [
+                {
+                    "label": "text",
+                    "text": "Algorithm 1 Minibatch stochastic gradient descent training.",
+                    "prov": [{"page_no": 4}],
+                },
+                {"label": "text", "text": "for number of training iterations do", "prov": [{"page_no": 4}]},
+                {"label": "text", "text": "for k steps do", "prov": [{"page_no": 4}]},
+                {"label": "list_item", "text": "Sample minibatch of m noise samples.", "prov": [{"page_no": 4}]},
+                {"label": "list_item", "text": "Update the discriminator by ascending its stochastic gradient:", "prov": [{"page_no": 4}]},
+                {
+                    "label": "formula",
+                    "text": r"\nabla_{\theta_d} \frac{1}{m}\sum_i \log D(x_i)",
+                    "prov": [{"page_no": 4}],
+                },
+                {"label": "section_header", "text": "end for", "prov": [{"page_no": 4}]},
+                {"label": "text", "text": "The gradient-based updates can use any standard rule.", "prov": [{"page_no": 4}]},
+            ]
+        }
+
+        records = adapter._algorithm_candidate_records(document, Path("/nonexistent.pdf"))
+
+        self.assertEqual(len(records), 1)
+        self.assertIn("Algorithm 1 Minibatch", records[0]["label"])
+        self.assertIn("for number of training iterations do", records[0]["text"])
+        self.assertIn("Update the discriminator", records[0]["text"])
+        self.assertEqual(records[0]["formula_nos"], [1])
+
+    def test_algorithm_recovery_keeps_nearby_caption_with_code_block(self) -> None:
+        document = {
+            "texts": [
+                {
+                    "label": "text",
+                    "text": "Algorithm 1: Adam, our proposed algorithm for stochastic optimization.",
+                    "prov": [{"page_no": 1}],
+                },
+                {
+                    "label": "code",
+                    "text": "Require: alpha: Stepsize while theta not converged do return theta",
+                    "prov": [{"page_no": 2}],
+                },
+            ]
+        }
+
+        records = adapter._algorithm_candidate_records(document, Path("/nonexistent.pdf"))
+        html_text, changed = adapter._replace_algorithm_records_in_html(
+            (
+                "<p>Algorithm 1: Adam, our proposed algorithm for stochastic optimization.</p>"
+                "<pre><code>Require: alpha: Stepsize while theta not converged do return theta</code></pre>"
+            ),
+            records,
+        )
+
+        self.assertEqual(len(records), 1)
+        self.assertEqual(changed, 1)
+        self.assertIn("Algorithm 1: Adam", html_text)
+        self.assertEqual(html_text.count("Algorithm 1: Adam"), 1)
+        self.assertNotIn("<p>Algorithm 1: Adam", html_text)
+        self.assertNotIn("<pre><code>", html_text)
+
+    def test_algorithm_recovery_extracts_caption_from_mixed_affiliation_node(self) -> None:
+        document = {
+            "texts": [
+                {
+                    "label": "text",
+                    "text": (
+                        "Jimmy Lei Ba University jimmy@example.edu "
+                        "Algorithm 1: Adam, our proposed algorithm for stochastic optimization."
+                    ),
+                    "prov": [{"page_no": 1}],
+                },
+                {
+                    "label": "code",
+                    "text": "Require: alpha: Stepsize while theta not converged do return theta",
+                    "prov": [{"page_no": 1}],
+                },
+            ]
+        }
+
+        records = adapter._algorithm_candidate_records(document, Path("/nonexistent.pdf"))
+
+        self.assertEqual(len(records), 1)
+        self.assertIn("Algorithm 1: Adam", records[0]["label"])
+        self.assertNotIn("Jimmy Lei Ba", records[0]["label"])
+
+    def test_algorithm_format_does_not_start_at_for_details_caption_phrase(self) -> None:
+        formatted = adapter._format_algorithm_text(
+            "Algorithm 2: AdaMax. See section 7.1 for details. "
+            "Good default settings for the tested machine learning problems are alpha = 0.002. "
+            "Require: alpha: Stepsize while theta not converged do return theta"
+        )
+
+        self.assertTrue(formatted.startswith("Require: alpha"))
+        self.assertNotIn("for details", formatted)
+        self.assertNotIn("for the tested", formatted)
+
+    def test_formula_algorithm_prefers_array_text_over_fragmented_pdf_text(self) -> None:
+        document = {
+            "texts": [
+                {
+                    "label": "caption",
+                    "text": "Algorithm 1: Batch Normalizing Transform",
+                    "prov": [{"page_no": 1}],
+                },
+                {
+                    "label": "formula",
+                    "text": (
+                        r"\begin{array}{l}"
+                        r"\text{Input: Values of $x$ over a mini-batch;} \\"
+                        r"\text{Output:} y_i \\"
+                        r"\mu_B \leftarrow \frac { 1 } { m } \sum_i x_i \quad \text{// mini-batch mean}"
+                        r"\end{array}"
+                    ),
+                    "prov": [{"page_no": 1}],
+                },
+            ]
+        }
+
+        records = adapter._algorithm_candidate_records(document, Path("/nonexistent.pdf"))
+
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["source"], "docling_node_text")
+        self.assertIn("Input: Values", records[0]["text"])
+        self.assertIn("mini-batch mean", records[0]["text"])
+        self.assertNotIn("\nm\nX\nm", records[0]["text"])
+
     def test_algorithm_cluster_recovery_keeps_scattered_algorithm_readable(self) -> None:
         document = {
             "texts": [
@@ -3957,7 +4126,11 @@ class EnglishReviewPolishTests(unittest.TestCase):
             "$$\n"
             "\\begin{array}{l} Input: Values \\\\ Output: Result \\end{array}\n"
             "$$\n\n"
-            "<!-- formula-final-output-fallback formula=1 reason=algorithm_like_formula_array -->\n"
+            "<!-- formula-final-output-fallback formula=1 reason=algorithm_like_formula_array -->\n\n"
+            "```text\n"
+            "Algorithm 1: leaked fallback evidence\n"
+            "Input: Values\n"
+            "```\n"
         )
 
         updated, changed = adapter._replace_algorithm_records_in_markdown(markdown, records)
@@ -3965,6 +4138,7 @@ class EnglishReviewPolishTests(unittest.TestCase):
         self.assertEqual(changed, 1)
         self.assertIn("```text", updated)
         self.assertNotIn("formula-final-output-fallback", updated)
+        self.assertNotIn("leaked fallback evidence", updated)
 
     def test_formula_algorithm_markdown_replaces_collapsed_fallback_block(self) -> None:
         records = [
@@ -3976,7 +4150,11 @@ class EnglishReviewPolishTests(unittest.TestCase):
         ]
         markdown = (
             "**Formula 10 fallback**: kept at its source anchor; unsafe formula output was isolated.\n"
-            "<!-- formula-final-output-fallback formula=10 reason=algorithm_like_formula_array -->"
+            "<!-- formula-final-output-fallback formula=10 reason=algorithm_like_formula_array -->\n\n"
+            "```text\n"
+            "Algorithm 10: leaked fallback evidence\n"
+            "Input: Values\n"
+            "```"
         )
 
         updated, changed = adapter._replace_algorithm_records_in_markdown(markdown, records)
@@ -3985,6 +4163,7 @@ class EnglishReviewPolishTests(unittest.TestCase):
         self.assertIn("```text", updated)
         self.assertIn("Input: Values", updated)
         self.assertNotIn("Formula 10 fallback", updated)
+        self.assertNotIn("leaked fallback evidence", updated)
 
     def test_formula_fallback_markdown_is_readable_not_raw_math_block(self) -> None:
         rendered = adapter._render_formula_fallback_markdown(
