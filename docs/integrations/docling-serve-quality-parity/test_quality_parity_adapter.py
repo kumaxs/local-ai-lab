@@ -361,6 +361,41 @@ class EnglishReviewPolishTests(unittest.TestCase):
         self.assertNotIn("&", display_text)
         self.assertEqual(diagnostics[0]["action"], "sanitize_display_tex_preserve_raw_tex")
 
+    def test_formula_tex_qc_unwraps_single_array_for_display(self) -> None:
+        formula = (
+            r"\begin{array} { r } { \min _ { G } \max _ { D } V ( D , G ) = "
+            r"\mathbb { E } _ { x \sim p _ { d a t a } ( x ) } [ \log D ( x ) ] } "
+            r"\end{array} \quad ( 1 )"
+        )
+
+        display_text, reasons = adapter.sanitize_formula_display_text(formula)
+
+        self.assertIn("unwrapped_single_formula_array_for_display", reasons)
+        self.assertNotIn(r"\begin{array}", display_text)
+        self.assertNotIn("unnecessary_single_formula_array", adapter._formula_output_safety_reasons(formula))
+        self.assertIn(r"\quad ( 1 )", display_text)
+
+    def test_algorithm_array_is_not_rendered_as_formula(self) -> None:
+        formula = (
+            r"\begin{array}{lll}\text {Input:} & \alpha & \text {stepsize}\\"
+            r"\\ \text {Output:} & \theta_t & \text {parameters}\\"
+            r"\\ \mathbf{while}\ t < T & \text {do update} & \end{array}"
+        )
+
+        html = adapter._render_formula_fallback_html(
+            {
+                "formula_no": 3,
+                "status": "final_output_unsafe",
+                "route_b_candidate": formula,
+            },
+            Path("/tmp/out"),
+            Path("/tmp/out/formula_second_pass"),
+        )
+
+        self.assertIn("docling-algorithm-block", html)
+        self.assertNotIn("docling-formula-render docling-formula-preserved-source", html)
+        self.assertIn("Input:", html)
+
     def test_formula_renderer_preserves_raw_tex_when_display_is_sanitized(self) -> None:
         html = adapter._render_second_pass_formula_html(
             {
@@ -537,7 +572,7 @@ class EnglishReviewPolishTests(unittest.TestCase):
             "malformed_nested_subscript",
             adapter._formula_output_safety_reasons(r"c' _ { \, _ { p } } = O(c_p)"),
         )
-        self.assertIn(
+        self.assertNotIn(
             "unnecessary_single_formula_array",
             adapter._formula_output_safety_reasons(
                 r"\begin{array}{r} q' = O(q) \times W \end{array}"
@@ -2715,6 +2750,91 @@ class EnglishReviewPolishTests(unittest.TestCase):
         self.assertIn('href="#docling-reference-6">Radford et al. (2018)</a>', html_text)
         self.assertIn('href="#docling-reference-4">Peters et al. (2018a)</a>', html_text)
 
+    def test_bibliography_links_escaped_ampersand_author_year_citations(self) -> None:
+        document = {
+            "texts": [
+                {
+                    "label": "text",
+                    "text": (
+                        "Deep models are used in vision and speech "
+                        "(Deng et al., 2013; Krizhevsky et al., 2012; "
+                        "Hinton & Salakhutdinov, 2006; Hinton et al., 2012a; "
+                        "Graves et al., 2013). RMSProp follows "
+                        "(Tieleman & Hinton, 2012)."
+                    ),
+                    "prov": [{"page_no": 1}],
+                },
+                {"label": "section_header", "text": "References", "prov": [{"page_no": 2}]},
+                {"label": "list_item", "text": "Deng et al. 2013. ImageNet large scale visual recognition.", "prov": [{"page_no": 2}]},
+                {"label": "list_item", "text": "Alex Krizhevsky et al. 2012. ImageNet classification.", "prov": [{"page_no": 2}]},
+                {"label": "list_item", "text": "G. Hinton and R. Salakhutdinov. 2006. Reducing data dimensionality.", "prov": [{"page_no": 2}]},
+                {"label": "list_item", "text": "Hinton et al. 2012a. Deep neural networks for acoustic modeling.", "prov": [{"page_no": 2}]},
+                {"label": "list_item", "text": "Graves et al. 2013. Speech recognition with deep recurrent neural networks.", "prov": [{"page_no": 2}]},
+                {"label": "list_item", "text": "Tieleman and Hinton. 2012. Lecture 6.5 RMSProp.", "prov": [{"page_no": 2}]},
+            ]
+        }
+        diagnostics = adapter.bibliography_diagnostics(document)
+        html_text, references, citations = adapter._link_bibliography_in_html(
+            (
+                "<p>Deep models are used in vision and speech "
+                "(Deng et al., 2013; Krizhevsky et al., 2012; "
+                "Hinton &amp; Salakhutdinov, 2006; Hinton et al., 2012a; "
+                "Graves et al., 2013). RMSProp follows "
+                "(Tieleman &amp; Hinton, 2012).</p>"
+                "<h2>References</h2><ol>"
+                "<li>Deng et al. 2013. ImageNet large scale visual recognition.</li>"
+                "<li>Alex Krizhevsky et al. 2012. ImageNet classification.</li>"
+                "<li>G. Hinton and R. Salakhutdinov. 2006. Reducing data dimensionality.</li>"
+                "<li>Hinton et al. 2012a. Deep neural networks for acoustic modeling.</li>"
+                "<li>Graves et al. 2013. Speech recognition with deep recurrent neural networks.</li>"
+                "<li>Tieleman and Hinton. 2012. Lecture 6.5 RMSProp.</li>"
+                "</ol>"
+            ),
+            diagnostics,
+        )
+
+        self.assertEqual((references, citations), (6, 2))
+        self.assertIn('href="#docling-reference-3">Hinton &amp; Salakhutdinov, 2006</a>', html_text)
+        self.assertIn('href="#docling-reference-6">Tieleman &amp; Hinton, 2012</a>', html_text)
+        self.assertIn('href="#docling-reference-1">Deng et al., 2013</a>', html_text)
+
+    def test_bibliography_disambiguates_et_al_from_same_author_year(self) -> None:
+        document = {
+            "texts": [
+                {
+                    "label": "text",
+                    "text": "Speech models improved rapidly (Graves et al., 2013).",
+                    "prov": [{"page_no": 1}],
+                },
+                {"label": "section_header", "text": "References", "prov": [{"page_no": 2}]},
+                {
+                    "label": "list_item",
+                    "text": "Graves, Alex. Generating sequences with recurrent neural networks. arXiv preprint arXiv:1308.0850, 2013.",
+                    "prov": [{"page_no": 2}],
+                },
+                {
+                    "label": "list_item",
+                    "text": "Graves, Alex, Mohamed, Abdel-rahman, and Hinton, Geoffrey. Speech recognition with deep recurrent neural networks. ICASSP, 2013.",
+                    "prov": [{"page_no": 2}],
+                },
+            ]
+        }
+
+        diagnostics = adapter.bibliography_diagnostics(document)
+        html_text, references, citations = adapter._link_bibliography_in_html(
+            (
+                "<p>Speech models improved rapidly (Graves et al., 2013).</p>"
+                "<h2>References</h2><ol>"
+                "<li>Graves, Alex. Generating sequences with recurrent neural networks. arXiv preprint arXiv:1308.0850, 2013.</li>"
+                "<li>Graves, Alex, Mohamed, Abdel-rahman, and Hinton, Geoffrey. Speech recognition with deep recurrent neural networks. ICASSP, 2013.</li>"
+                "</ol>"
+            ),
+            diagnostics,
+        )
+
+        self.assertEqual((references, citations), (2, 1))
+        self.assertIn('href="#docling-reference-2">Graves et al., 2013</a>', html_text)
+
     def test_bibliography_links_comma_separated_author_year_citations(self) -> None:
         document = {
             "texts": [
@@ -3601,6 +3721,59 @@ class EnglishReviewPolishTests(unittest.TestCase):
         self.assertIn("<!-- local-ai-lab structural quarantine", html)
         self.assertNotIn("<span>arXiv:2506.22084v1 [cs.LG]</span>", html)
         self.assertIn("evidence=structural_regions.json", html)
+
+    def test_embedded_visual_ocr_noise_is_hidden_from_main_flow(self) -> None:
+        long_noise = "A" * 520 + "0" * 80
+
+        html_text, html_count = adapter._replace_embedded_visual_ocr_noise_blocks_html(
+            f"<html><body><p>Body remains readable.</p><p>axis {long_noise}</p></body></html>"
+        )
+        markdown, md_count = adapter._replace_embedded_visual_ocr_noise_blocks_markdown(
+            f"Body remains readable.\n\naxis {long_noise}\n"
+        )
+
+        self.assertEqual(html_count, 1)
+        self.assertEqual(md_count, 1)
+        self.assertIn("Body remains readable", html_text)
+        self.assertIn("embedded_visual_ocr_noise", html_text)
+        self.assertIn("embedded_visual_ocr_noise", markdown)
+
+    def test_author_email_prefix_is_split_from_algorithm_caption(self) -> None:
+        html_text, html_count = adapter._split_author_affiliation_from_body_html(
+            "<p><strong>Jimmy Lei Ba</strong> University jimmy@example.edu "
+            "Algorithm 1: Adam, our proposed algorithm.</p>"
+        )
+        markdown, md_count = adapter._split_author_affiliation_from_body_markdown(
+            "**Jimmy Lei Ba** University jimmy@example.edu Algorithm 1: Adam, our proposed algorithm."
+        )
+
+        self.assertEqual(html_count, 1)
+        self.assertEqual(md_count, 1)
+        self.assertIn("author_affiliation_fragment", html_text)
+        self.assertIn("<p>Algorithm 1: Adam", html_text)
+        self.assertNotIn("Jimmy Lei Ba</strong> University", html_text)
+        self.assertIn("Algorithm 1: Adam", markdown)
+
+    def test_algorithm_code_blocks_gain_readable_line_breaks(self) -> None:
+        html_text, count = adapter._normalize_algorithm_code_blocks_html(
+            "<pre><code>Require: α : Stepsize Require: β 1 : Rate "
+            "m 0 ← 0 while θ t not converged do t ← t + 1 return θ t</code></pre>"
+        )
+
+        self.assertEqual(count, 1)
+        self.assertIn("\nRequire: β", html_text)
+        self.assertIn("\nwhile θ", html_text)
+
+    def test_visual_axis_tail_is_split_from_figure_caption(self) -> None:
+        caption = (
+            "Figure 2 shows the frame classification error rate on the core test set. "
+            "The neural net has four fully-connected hidden layers Classification Error %"
+        )
+        html_text, count = adapter._quarantine_visual_axis_tail_html(f"<p>{caption}</p>")
+
+        self.assertEqual(count, 1)
+        self.assertIn("kind=visual_annotation", html_text)
+        self.assertNotIn("Classification Error %</p>", html_text)
 
 
 if __name__ == "__main__":
