@@ -4196,6 +4196,264 @@ def _replace_private_use_math_noise_blocks_markdown(md_text: str) -> tuple[str, 
     return "".join(blocks), replaced
 
 
+def _looks_like_embedded_visual_ocr_noise(text: str) -> bool:
+    visible = _normalized_noise_text(text)
+    if len(visible) < 500:
+        return False
+    tokens = re.findall(r"[A-Za-z0-9+/=_-]{120,}", visible)
+    if not tokens:
+        return False
+    longest = max(tokens, key=len)
+    alnum_ratio = sum(ch.isalnum() for ch in longest) / max(len(longest), 1)
+    return len(longest) >= 300 and alnum_ratio >= 0.85
+
+
+def _replace_embedded_visual_ocr_noise_blocks_html(document_html: str) -> tuple[str, int]:
+    replacements: list[tuple[int, int, str]] = []
+    for match in HTML_TEXT_BLOCK_RE.finditer(document_html):
+        tag = match.group("tag").lower()
+        if tag in {"script", "style", "template", "pre", "code"}:
+            continue
+        visible = html.unescape(HTML_TAG_RE.sub(" ", match.group("body")))
+        if not _looks_like_embedded_visual_ocr_noise(visible):
+            continue
+        item = {
+            "kind": "embedded_visual_ocr_noise",
+            "page_no": "unknown",
+            "reasons": ["long_unbroken_visual_or_image_ocr_token_removed_from_main_flow"],
+        }
+        replacements.append((match.start(), match.end(), _hidden_quarantine_html(item)))
+    updated = document_html
+    for start, end, replacement in reversed(replacements):
+        updated = updated[:start] + replacement + updated[end:]
+    return updated, len(replacements)
+
+
+def _replace_embedded_visual_ocr_noise_blocks_markdown(md_text: str) -> tuple[str, int]:
+    blocks = re.split(r"(\n\s*\n)", md_text)
+    replaced = 0
+    for index, block in enumerate(blocks):
+        if not block.strip() or block.startswith("<!--"):
+            continue
+        if not _looks_like_embedded_visual_ocr_noise(block):
+            continue
+        blocks[index] = (
+            "<!-- local-ai-lab structural quarantine "
+            "kind=embedded_visual_ocr_noise page=unknown "
+            "reasons=long_unbroken_visual_or_image_ocr_token_removed_from_main_flow "
+            "evidence=metadata.json -->"
+        )
+        replaced += 1
+    return "".join(blocks), replaced
+
+
+EMAIL_RE = re.compile(r"\b[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}\b")
+ALGORITHM_CAPTION_RE = re.compile(r"\bAlgorithm\s+\d+\s*:", re.I)
+VISUAL_AXIS_TAIL_RE = re.compile(
+    r"\s+(?P<tail>(?:[A-Z][A-Za-z]*|[A-Z]{1,4}|[%/()0-9.+-])"
+    r"(?:\s+(?:[A-Z][A-Za-z]*|[A-Z]{1,4}|[%/()0-9.+-])){1,8})\s*$"
+)
+VISUAL_LABEL_KEYWORD_RE = re.compile(
+    r"(?i)\b(?:error|accuracy|loss|epoch|iteration|train|test|classification|perplexity|probability)\b|%"
+)
+ALGORITHM_LINE_BREAK_RE = re.compile(
+    r"\s+(?=(?:Require|Input|Output|Parameters?|Initialize|while|for|if|return|end(?:\s+while|\s+for|\s+if)?|"
+    r"[a-zA-Z]?\s*[mtvg]\s*(?:</?[^>]+>)*\s*[0-9t̂^_-]*\s*(?:←|=))\b)",
+    re.I,
+)
+
+
+def _split_author_affiliation_from_body_html(document_html: str) -> tuple[str, int]:
+    replacements: list[tuple[int, int, str]] = []
+    for match in HTML_TEXT_BLOCK_RE.finditer(document_html):
+        if match.group("tag").lower() != "p":
+            continue
+        body = match.group("body")
+        visible = html.unescape(HTML_TAG_RE.sub(" ", body))
+        if not EMAIL_RE.search(visible):
+            continue
+        algorithm_match = ALGORITHM_CAPTION_RE.search(body)
+        if algorithm_match:
+            split_at = algorithm_match.start()
+        else:
+            email_matches = list(EMAIL_RE.finditer(body))
+            if not email_matches:
+                continue
+            split_at = email_matches[-1].end()
+            suffix_visible = _normalized_noise_text(
+                html.unescape(HTML_TAG_RE.sub(" ", body[split_at:]))
+            )
+            if len(suffix_visible) < 80 or not re.match(r"^[A-Z][A-Za-z]", suffix_visible):
+                continue
+        suffix = body[split_at:].strip()
+        if not suffix:
+            continue
+        item = {
+            "kind": "author_affiliation_fragment",
+            "page_no": "unknown",
+            "reasons": ["email_affiliation_prefix_split_from_body_or_algorithm"],
+        }
+        replacement = (
+            _hidden_quarantine_html(item)
+            + f"<p>{suffix}</p>"
+        )
+        replacements.append((match.start(), match.end(), replacement))
+    updated = document_html
+    for start, end, replacement in reversed(replacements):
+        updated = updated[:start] + replacement + updated[end:]
+    return updated, len(replacements)
+
+
+def _split_author_affiliation_from_body_markdown(md_text: str) -> tuple[str, int]:
+    blocks = re.split(r"(\n\s*\n)", md_text)
+    changed = 0
+    for index, block in enumerate(blocks):
+        if not EMAIL_RE.search(block):
+            continue
+        algorithm_match = ALGORITHM_CAPTION_RE.search(block)
+        if algorithm_match:
+            split_at = algorithm_match.start()
+        else:
+            email_matches = list(EMAIL_RE.finditer(block))
+            if not email_matches:
+                continue
+            split_at = email_matches[-1].end()
+            suffix = _normalized_noise_text(block[split_at:])
+            if len(suffix) < 80 or not re.match(r"^[A-Z][A-Za-z]", suffix):
+                continue
+        suffix = block[split_at:].strip()
+        if not suffix:
+            continue
+        blocks[index] = (
+            "<!-- local-ai-lab structural quarantine "
+            "kind=author_affiliation_fragment page=unknown "
+            "reasons=email_affiliation_prefix_split_from_body_or_algorithm "
+            "evidence=metadata.json -->\n\n"
+            + suffix
+        )
+        changed += 1
+    return "".join(blocks), changed
+
+
+def _normalize_algorithm_code_blocks_html(document_html: str) -> tuple[str, int]:
+    changed = 0
+
+    def replace(match: re.Match[str]) -> str:
+        nonlocal changed
+        attrs = match.group("attrs")
+        body = match.group("body")
+        visible = html.unescape(HTML_TAG_RE.sub(" ", body))
+        if "\n" in visible or not re.search(r"(?i)\b(?:Require|Input|Output|while)\b", visible):
+            return match.group(0)
+        normalized = ALGORITHM_LINE_BREAK_RE.sub("\n", visible)
+        normalized = re.sub(r"\n\s*\n+", "\n", normalized).strip()
+        if normalized == visible.strip() or normalized.count("\n") < 3:
+            return match.group(0)
+        changed += 1
+        return f"<pre{attrs}><code>{html.escape(normalized)}</code></pre>"
+
+    updated = re.sub(
+        r"<pre(?P<attrs>[^>]*)>\s*<code[^>]*>(?P<body>.*?)</code>\s*</pre>",
+        replace,
+        document_html,
+        flags=re.I | re.S,
+    )
+    return updated, changed
+
+
+def _normalize_algorithm_code_blocks_markdown(md_text: str) -> tuple[str, int]:
+    changed = 0
+
+    def replace(match: re.Match[str]) -> str:
+        nonlocal changed
+        body = match.group("body")
+        if "\n" in body or not re.search(r"(?i)\b(?:Require|Input|Output|while)\b", body):
+            return match.group(0)
+        normalized = ALGORITHM_LINE_BREAK_RE.sub("\n", body)
+        normalized = re.sub(r"\n\s*\n+", "\n", normalized).strip()
+        if normalized == body.strip() or normalized.count("\n") < 3:
+            return match.group(0)
+        changed += 1
+        return f"```text\n{normalized}\n```"
+
+    updated = re.sub(r"```(?:text|)\n(?P<body>.*?)\n```", replace, md_text, flags=re.S)
+    return updated, changed
+
+
+def _quarantine_visual_axis_tail_html(document_html: str) -> tuple[str, int]:
+    replacements: list[tuple[int, int, str]] = []
+    for match in HTML_TEXT_BLOCK_RE.finditer(document_html):
+        if match.group("tag").lower() != "p":
+            continue
+        body = match.group("body")
+        visible = html.unescape(HTML_TAG_RE.sub(" ", body))
+        normalized = _normalized_noise_text(visible)
+        item = {
+            "kind": "visual_annotation",
+            "page_no": "unknown",
+            "reasons": ["short_axis_label_split_from_main_flow"],
+        }
+        if (
+            len(normalized) <= 80
+            and VISUAL_LABEL_KEYWORD_RE.search(normalized)
+            and not re.search(r"[.!?。！？]", normalized)
+            and len(normalized.split()) <= 8
+        ):
+            replacements.append((match.start(), match.end(), _hidden_quarantine_html(item)))
+            continue
+        tail_match = VISUAL_AXIS_TAIL_RE.search(visible)
+        if not tail_match or not VISUAL_LABEL_KEYWORD_RE.search(tail_match.group("tail")):
+            continue
+        tail = tail_match.group("tail")
+        if len(visible[: tail_match.start()].strip()) < 80:
+            continue
+        escaped_tail = html.escape(tail)
+        if escaped_tail not in body:
+            continue
+        new_body = body.replace(escaped_tail, "", 1).rstrip()
+        replacement = f"<p>{new_body}</p>" + _hidden_quarantine_html(item)
+        replacements.append((match.start(), match.end(), replacement))
+    updated = document_html
+    for start, end, replacement in reversed(replacements):
+        updated = updated[:start] + replacement + updated[end:]
+    return updated, len(replacements)
+
+
+def _quarantine_visual_axis_tail_markdown(md_text: str) -> tuple[str, int]:
+    blocks = re.split(r"(\n\s*\n)", md_text)
+    changed = 0
+    for index, block in enumerate(blocks):
+        visible = _normalized_noise_text(block)
+        if (
+            len(visible) <= 80
+            and VISUAL_LABEL_KEYWORD_RE.search(visible)
+            and not re.search(r"[.!?。！？]", visible)
+            and len(visible.split()) <= 8
+        ):
+            blocks[index] = (
+                "<!-- local-ai-lab structural quarantine "
+                "kind=visual_annotation page=unknown "
+                "reasons=short_axis_label_split_from_main_flow "
+                "evidence=metadata.json -->"
+            )
+            changed += 1
+            continue
+        tail_match = VISUAL_AXIS_TAIL_RE.search(visible)
+        if not tail_match or not VISUAL_LABEL_KEYWORD_RE.search(tail_match.group("tail")):
+            continue
+        if len(visible[: tail_match.start()].strip()) < 80:
+            continue
+        tail = tail_match.group("tail")
+        blocks[index] = block.replace(tail, "", 1).rstrip() + (
+            "\n\n<!-- local-ai-lab structural quarantine "
+            "kind=visual_annotation page=unknown "
+            "reasons=short_axis_label_tail_split_from_figure_caption "
+            "evidence=metadata.json -->"
+        )
+        changed += 1
+    return "".join(blocks), changed
+
+
 def _visible_html_text(document_html: str) -> str:
     visible = re.sub(
         r"<(?:template|style|script)\b.*?</(?:template|style|script)>",
@@ -5504,6 +5762,17 @@ def _reference_author_year_index(
         )
         if old_match:
             aliases.append(old_match.group(1))
+            multi_author_reference = bool(
+                re.search(r"\b(?:et\s+al\.?|and)\b|&", leading, flags=re.I)
+                or re.match(
+                    r"\s*[A-Z][A-Za-z'’.-]{1,40}\s*,\s*"
+                    r"[A-Z][A-Za-z'’.-]{1,40}\s*,\s*"
+                    r"[A-Z][A-Za-z'’.-]{1,40}",
+                    leading,
+                )
+            )
+            if multi_author_reference:
+                aliases.append(f"{old_match.group(1)} et al")
         return list(dict.fromkeys(aliases))
 
     for reference in references:
@@ -5535,6 +5804,7 @@ def _author_year_numbers(
         if not year_matches:
             return []
         author_part = part[: year_matches[0].start()].strip(" ,")
+        original_author_part = author_part
         author_part = re.sub(r"\bet\s+al\.?\s*$", "", author_part, flags=re.I).strip()
         author_part = re.split(r"\s+(?:and|&)\s+", author_part, maxsplit=1)[0]
         author_part = re.sub(r"[^A-Za-z'’.-]+", " ", author_part).strip()
@@ -5549,6 +5819,13 @@ def _author_year_numbers(
             if token.lower().rstrip(".") not in {"and", "et", "al"}:
                 aliases.insert(0, token)
                 break
+        et_al_match = re.match(
+            r"\s*([A-Z][A-Za-z'’.-]{1,40}).*?\bet\s+al\.?\s*$",
+            original_author_part,
+            flags=re.I,
+        )
+        if et_al_match:
+            aliases.insert(0, f"{et_al_match.group(1)} et al")
         aliases = list(dict.fromkeys(aliases))
         result: list[int] = []
         for year_match in year_matches:
@@ -6203,6 +6480,27 @@ def _citation_visible_context_matches(
     return bool(context_checks) and all(context in visible for context in context_checks)
 
 
+def _citation_raw_variants(raw_citation: str) -> list[str]:
+    variants = [
+        raw_citation,
+        html.escape(raw_citation, quote=False),
+        html.unescape(raw_citation),
+    ]
+    return [value for value in dict.fromkeys(variants) if value]
+
+
+def _citation_body_contains_raw(body: str, raw_citation: str) -> bool:
+    visible = html.unescape(HTML_TAG_RE.sub("", body))
+    return any(value in body or value in visible for value in _citation_raw_variants(raw_citation))
+
+
+def _replace_citation_once(body: str, raw_citation: str, linked: str) -> tuple[str, int]:
+    for variant in _citation_raw_variants(raw_citation):
+        if variant in body:
+            return body.replace(variant, linked, 1), 1
+    return body, 0
+
+
 def _link_bibliography_in_html(
     document_html: str,
     diagnostics: dict[str, Any],
@@ -6409,7 +6707,10 @@ def _link_bibliography_in_html(
                     str(citations[0]["raw_citation"]),
                 )
                 or not any(
-                    str(citation["raw_citation"]) in match.group("body")
+                    _citation_body_contains_raw(
+                        match.group("body"),
+                        str(citation["raw_citation"]),
+                    )
                     for citation in citations
                 )
             ):
@@ -6417,11 +6718,10 @@ def _link_bibliography_in_html(
             body = match.group("body")
             for citation in citations:
                 linked = _linked_citation_html(citation)
-                body, changed = re.subn(
-                    re.escape(citation["raw_citation"]),
-                    lambda _match, value=linked: value,
+                body, changed = _replace_citation_once(
                     body,
-                    count=1,
+                    str(citation["raw_citation"]),
+                    linked,
                 )
                 citation_count += changed
             replacement = (
@@ -6541,7 +6841,10 @@ def _link_bibliography_in_markdown(
                     str(citations[0]["raw_citation"]),
                 )
                 and any(
-                    str(citation["raw_citation"]) in candidate.group("body")
+                    _citation_body_contains_raw(
+                        candidate.group("body"),
+                        str(citation["raw_citation"]),
+                    )
                     for citation in citations
                 )
             ):
@@ -6552,11 +6855,10 @@ def _link_bibliography_in_markdown(
         body = block_match.group("body")
         for citation in citations:
             linked = _linked_citation_html(citation)
-            body, changed = re.subn(
-                re.escape(citation["raw_citation"]),
-                lambda _match, value=linked: value,
+            body, changed = _replace_citation_once(
                 body,
-                count=1,
+                str(citation["raw_citation"]),
+                linked,
             )
             citation_count += changed
         updated = (
@@ -7054,6 +7356,14 @@ def apply_structural_quarantine_to_outputs(
                 html_replacements += 1
         html_text, private_use_sweep_count = _replace_private_use_math_noise_blocks_html(html_text)
         html_replacements += private_use_sweep_count
+        html_text, embedded_visual_sweep_count = _replace_embedded_visual_ocr_noise_blocks_html(html_text)
+        html_replacements += embedded_visual_sweep_count
+        html_text, author_split_count = _split_author_affiliation_from_body_html(html_text)
+        html_replacements += author_split_count
+        html_text, algorithm_code_count = _normalize_algorithm_code_blocks_html(html_text)
+        html_replacements += algorithm_code_count
+        html_text, visual_axis_tail_count = _quarantine_visual_axis_tail_html(html_text)
+        html_replacements += visual_axis_tail_count
         html_text, html_reference_link_count = _link_note_references_in_html(
             html_text,
             reference_mappings,
@@ -7103,6 +7413,14 @@ def apply_structural_quarantine_to_outputs(
                 md_replacements += 1
         md_text, private_use_sweep_count = _replace_private_use_math_noise_blocks_markdown(md_text)
         md_replacements += private_use_sweep_count
+        md_text, embedded_visual_sweep_count = _replace_embedded_visual_ocr_noise_blocks_markdown(md_text)
+        md_replacements += embedded_visual_sweep_count
+        md_text, author_split_count = _split_author_affiliation_from_body_markdown(md_text)
+        md_replacements += author_split_count
+        md_text, algorithm_code_count = _normalize_algorithm_code_blocks_markdown(md_text)
+        md_replacements += algorithm_code_count
+        md_text, visual_axis_tail_count = _quarantine_visual_axis_tail_markdown(md_text)
+        md_replacements += visual_axis_tail_count
         md_text, markdown_reference_link_count = _link_note_references_in_markdown(
             md_text,
             reference_mappings,
@@ -7348,10 +7666,67 @@ def formula_number_qc_diagnostics(
     return diagnostics
 
 
+ALGORITHM_FORMULA_RE = re.compile(
+    r"(?i)(?:\\text\s*\{\s*(?:input|output|parameters?|require|ensure|algorithm)|"
+    r"\b(?:Input|Output|Parameters?|Require|Ensure|Algorithm)\s*:|"
+    r"\\mathbf\s*\{\s*(?:for|while|if|return)\b)"
+)
+
+
+def _unwrap_single_formula_array(formula_text: str) -> tuple[str, bool]:
+    body = formula_text.strip()
+    match = re.match(
+        r"(?s)^\\begin\s*\{\s*array\s*\}\s*\{\s*[^{}]{1,24}\s*\}"
+        r"\s*(?P<body>.*?)\s*\\end\s*\{\s*array\s*\}\s*(?P<suffix>.*)$",
+        body,
+    )
+    if not match:
+        return formula_text, False
+    inner = match.group("body").strip()
+    suffix = match.group("suffix").strip()
+    if inner.startswith("{") and inner.endswith("}"):
+        inner = inner[1:-1].strip()
+    if "\\\\" in inner or ALGORITHM_FORMULA_RE.search(inner):
+        return formula_text, False
+    if not re.search(r"(?:[=<>]|\\(?:min|max|sum|frac|mathbb|log|exp|int|prod))", inner):
+        return formula_text, False
+    display = f"{inner} {suffix}".strip()
+    return display, display != formula_text
+
+
+def _looks_like_algorithm_formula(text: str) -> bool:
+    body = text.strip()
+    if not re.search(r"\\begin\s*\{\s*array\s*\}", body):
+        return False
+    return bool(ALGORITHM_FORMULA_RE.search(body) or len(re.findall(r"\\\\", body)) >= 4)
+
+
+def _algorithm_formula_plain_text(text: str) -> str:
+    body = re.sub(
+        r"(?s)^\\begin\s*\{\s*array\s*\}\s*\{\s*[^{}]{1,32}\s*\}\s*",
+        "",
+        text.strip(),
+    )
+    body = re.sub(r"\\end\s*\{\s*array\s*\}\s*$", "", body).strip()
+    body = body.replace(r"\\", "\n")
+    body = re.sub(r"&", "  ", body)
+    body = re.sub(r"\\text\s*\{\s*([^{}]*?)\s*\}", r"\1", body)
+    body = re.sub(r"\\mathbf\s*\{\s*([^{}]*?)\s*\}", r"\1", body)
+    body = re.sub(r"\\mathrm\s*\{\s*([^{}]*?)\s*\}", r"\1", body)
+    body = re.sub(r"[{}]", "", body)
+    body = re.sub(r"[ \t]+", " ", body)
+    lines = [line.strip() for line in body.splitlines()]
+    return "\n".join(line for line in lines if line)
+
+
 def sanitize_formula_display_text(formula_text: str) -> tuple[str, list[str]]:
     """Return a MathJax-display-safe formula body plus evidence-backed reasons."""
     reasons: list[str] = []
     display_text = formula_text
+    unwrapped, changed = _unwrap_single_formula_array(display_text)
+    if changed:
+        display_text = unwrapped
+        reasons.append("unwrapped_single_formula_array_for_display")
     if "&" in display_text and not ALIGNMENT_ENV_RE.search(display_text):
         sanitized = re.sub(r"\s*&\s*", " ", display_text)
         sanitized = re.sub(r"\s+", " ", sanitized).strip()
@@ -8452,7 +8827,12 @@ def _second_pass_formula_display_text(entry: dict[str, Any]) -> str:
         entry.setdefault("final_output_repairs", []).extend(
             repair for repair in repairs if repair not in entry.get("final_output_repairs", [])
         )
-    return normalized
+    display_text, sanitize_reasons = sanitize_formula_display_text(normalized)
+    if sanitize_reasons:
+        entry.setdefault("final_output_repairs", []).extend(
+            reason for reason in sanitize_reasons if reason not in entry.get("final_output_repairs", [])
+        )
+    return display_text
 
 
 def _second_pass_formula_raw_text(entry: dict[str, Any]) -> str:
@@ -8534,10 +8914,16 @@ def _render_formula_fallback_html(
         else ""
     )
     source_formula_render = ""
-    if source_formula and not _formula_output_safety_reasons(source_formula):
+    if source_formula and _looks_like_algorithm_formula(source_formula):
+        source_formula_render = (
+            '<pre class="docling-algorithm-block docling-formula-preserved-source">'
+            f"{html.escape(_algorithm_formula_plain_text(source_formula))}</pre>"
+        )
+    elif source_formula and not _formula_output_safety_reasons(source_formula):
+        display_formula, _sanitize_reasons = sanitize_formula_display_text(source_formula)
         source_formula_render = (
             '<div class="docling-formula-render docling-formula-preserved-source">'
-            f"\\[{html.escape(source_formula)}\\]"
+            f"\\[{html.escape(display_formula)}\\]"
             "</div>"
         )
     elif source_formula:
@@ -8679,8 +9065,11 @@ def _original_formula_visible_ranges(html_text: str) -> list[re.Match[str]]:
 
 
 def _formula_output_safety_reasons(text: str) -> list[str]:
-    body = text.strip()
+    body, _sanitize_reasons = sanitize_formula_display_text(text)
+    body = body.strip()
     reasons: list[str] = []
+    if _looks_like_algorithm_formula(text):
+        reasons.append("algorithm_like_formula_array")
     reasons.extend(formula_hallucination_reasons(body))
     latex_ok, latex_reasons = validate_candidate_latex(body)
     if not latex_ok:
@@ -8732,7 +9121,8 @@ def _best_formula_fallback_text(entry: dict[str, Any]) -> tuple[str, str]:
         normalized, _repairs = canonicalize_formula_output(candidate, eq_number)
         if not normalized or formula_hallucination_reasons(normalized):
             continue
-        ranked.append((_formula_candidate_rank(normalized, eq_number), normalized, source))
+        display_text, _sanitize_reasons = sanitize_formula_display_text(normalized)
+        ranked.append((_formula_candidate_rank(display_text, eq_number), display_text, source))
     if not ranked:
         return "", "unavailable"
     _rank, text, source = min(ranked, key=lambda item: item[0])
