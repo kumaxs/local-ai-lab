@@ -1715,6 +1715,17 @@ sup.docling-footnote-ref {
 .docling-footnote-recovery pre {
   white-space: pre-wrap;
 }
+.docling-algorithm-caption strong,
+.docling-algorithm-label,
+.docling-algorithm-keyword {
+  font-weight: 700;
+}
+.docling-algorithm-block {
+  white-space: pre-wrap;
+}
+.docling-algorithm-block .docling-algorithm-keyword {
+  color: #111827;
+}
 </style>
 """
 
@@ -4585,19 +4596,19 @@ def _algorithm_caption_from_text(text: str) -> str:
 
 
 def _algorithm_record_html(record: dict[str, Any]) -> str:
-    label = html.escape(str(record.get("label") or "Algorithm block"))
-    text = html.escape(str(record.get("text") or ""))
+    label = _algorithm_caption_semantic_html(str(record.get("label") or "Algorithm block"))
+    text = _algorithm_text_semantic_html(str(record.get("text") or ""))
     source = html.escape(str(record.get("source") or "pdf_text_bbox"))
     caption = str(record.get("caption") or "").strip()
     caption_html = (
-        f'<p class="docling-algorithm-caption">{html.escape(caption)}</p>'
+        f'<p class="docling-algorithm-caption">{_algorithm_caption_semantic_html(caption)}</p>'
         if caption and caption != str(record.get("label") or "")
         else ""
     )
     return (
         '<div class="docling-algorithm-recovered" '
         f'data-algorithm-source="{source}">'
-        f'<div class="docling-formula-second-pass-label">{label}</div>'
+        f'<div class="docling-formula-second-pass-label docling-algorithm-label">{label}</div>'
         + caption_html
         + f'<pre class="docling-algorithm-block">{text}</pre>'
         "</div>"
@@ -4609,7 +4620,46 @@ def _algorithm_record_markdown(record: dict[str, Any]) -> str:
     text = str(record.get("text") or "")
     caption = str(record.get("caption") or "").strip()
     caption_text = f"\n\n{caption}\n" if caption and caption != label else ""
-    return f"\n\n**{label}**{caption_text}\n```text\n{text}\n```\n\n"
+    return (
+        f"\n\n**{label}**{caption_text}\n"
+        '<pre class="docling-algorithm-block">\n'
+        f"{_algorithm_text_semantic_html(text)}\n"
+        "</pre>\n\n"
+    )
+
+
+ALGORITHM_SEMANTIC_KEYWORD_RE = re.compile(
+    r"(?i)^(\s*)(Require|Ensure|Input|Output|Parameters?|Initialize|"
+    r"for|while|if|else|return|end(?:\s+(?:for|while|if))?|"
+    r"Sample|Update|Process|Train|Add|Modify|Set|Compute|Draw)\b"
+)
+
+
+def _algorithm_caption_semantic_html(text: str) -> str:
+    escaped = html.escape(text)
+    return re.sub(
+        r"(?i)\b(Algorithm\s+\d+)\b",
+        r'<strong class="docling-algorithm-keyword">\1</strong>',
+        escaped,
+        count=1,
+    )
+
+
+def _algorithm_line_semantic_html(line: str) -> str:
+    escaped = html.escape(line)
+    match = ALGORITHM_SEMANTIC_KEYWORD_RE.match(escaped)
+    if not match:
+        return escaped
+    leading, keyword = match.group(1), match.group(2)
+    return (
+        leading
+        + f'<strong class="docling-algorithm-keyword">{keyword}</strong>'
+        + escaped[match.end(2):]
+    )
+
+
+def _algorithm_text_semantic_html(text: str) -> str:
+    return "\n".join(_algorithm_line_semantic_html(line) for line in text.splitlines())
 
 
 def _nearby_algorithm_caption(
@@ -8364,6 +8414,41 @@ def _repair_array_row_wrappers(formula_text: str) -> tuple[str, bool]:
     return repaired, repaired != formula_text
 
 
+def _repair_unmatched_formula_braces(formula_text: str) -> tuple[str, bool]:
+    """Remove obvious stray display braces so MathJax can render preserved formula bodies."""
+    output: list[str] = []
+    depth = 0
+    changed = False
+    escaped = False
+    for char in formula_text:
+        if escaped:
+            output.append(char)
+            escaped = False
+            continue
+        if char == "\\":
+            output.append(char)
+            escaped = True
+            continue
+        if char == "{":
+            depth += 1
+            output.append(char)
+            continue
+        if char == "}":
+            if depth <= 0:
+                changed = True
+                continue
+            depth -= 1
+            output.append(char)
+            continue
+        output.append(char)
+    repaired = "".join(output)
+    if depth > 0 and not re.search(r"\\(?:begin|left|right)\b", repaired):
+        repaired += "}" * depth
+        changed = True
+    repaired = re.sub(r"\s+", " ", repaired).strip()
+    return repaired, changed or repaired != formula_text
+
+
 def _looks_like_algorithm_formula(text: str) -> bool:
     body = text.strip()
     if not re.search(r"\\begin\s*\{\s*array\s*\}", body):
@@ -8625,6 +8710,14 @@ def sanitize_formula_display_text(formula_text: str) -> tuple[str, list[str]]:
         if sanitized and sanitized != display_text:
             display_text = sanitized
             reasons.append("bare_alignment_marker_without_alignment_environment")
+    brace_repaired, brace_changed = _repair_unmatched_formula_braces(display_text)
+    if brace_changed:
+        display_text = brace_repaired
+        reasons.append("repaired_unmatched_display_braces")
+    compact_spacing = re.sub(r"(?:\\quad\s*){2,}", r"\\quad ", display_text).strip()
+    if compact_spacing != display_text:
+        display_text = compact_spacing
+        reasons.append("collapsed_duplicate_formula_spacing")
     return display_text, reasons
 
 
