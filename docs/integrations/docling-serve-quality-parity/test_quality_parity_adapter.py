@@ -392,8 +392,10 @@ class EnglishReviewPolishTests(unittest.TestCase):
             {
                 "formula_no": 1,
                 "status": "final_output_unsafe",
+                "eq_number": 1,
                 "route_a_text": (
                     r"\begin{array}{rl} & { t h e o r d e r o f c o m p u t a t i o n } \\ "
+                    r"& \alpha _ { t } = \alpha \cdot \sqrt { 1 - \beta _ { 2 } ^ { t } } \\ "
                     r"& { 2 . 1 } & { A D A M U P D A T E R U L E } \end{array}"
                 ),
             },
@@ -401,9 +403,28 @@ class EnglishReviewPolishTests(unittest.TestCase):
             Path("/tmp/out/formula_display_fallback"),
         )
 
-        self.assertIn("looks like surrounding prose", html)
-        self.assertIn("docling-formula-preserved-source", html)
+        self.assertIn("docling-formula-readable-fallback", html)
+        self.assertIn(r"\alpha", html)
+        self.assertNotIn("looks like surrounding prose", html)
         self.assertNotIn("<details", html)
+
+    def test_formula_fallback_markdown_outputs_readable_math_block(self) -> None:
+        markdown = adapter._render_formula_fallback_markdown(
+            {
+                "formula_no": 11,
+                "status": "final_output_unsafe",
+                "route_a_text": (
+                    r"\begin{array}{ll} { p l i c a t i o n } \colon \\ "
+                    r"{ \frac { \partial \ell } { \partial x_i } = "
+                    r"\frac { \partial \ell } { \partial y_i } \cdot \gamma } \\ "
+                    r"{ \frac { \partial \ell } { \partial \mu_B } = 0 } \end{array}"
+                ),
+            }
+        )
+
+        self.assertTrue(markdown.startswith("$$"))
+        self.assertIn(r"\partial", markdown)
+        self.assertNotIn("Formula 11 fallback", markdown)
 
     def test_algorithm_array_is_not_rendered_as_formula(self) -> None:
         formula = (
@@ -3937,7 +3958,8 @@ class EnglishReviewPolishTests(unittest.TestCase):
         self.assertEqual(len(records), 1)
         self.assertIn("Algorithm 1 Minibatch", records[0]["label"])
         self.assertIn("for number of training iterations do", records[0]["text"])
-        self.assertIn("Update the discriminator", records[0]["text"])
+        self.assertIn("    Update the discriminator", records[0]["text"])
+        self.assertIn("  end for", records[0]["text"])
         self.assertEqual(records[0]["formula_nos"], [1])
 
     def test_algorithm_recovery_keeps_nearby_caption_with_code_block(self) -> None:
@@ -4007,6 +4029,21 @@ class EnglishReviewPolishTests(unittest.TestCase):
         self.assertTrue(formatted.startswith("Require: alpha"))
         self.assertNotIn("for details", formatted)
         self.assertNotIn("for the tested", formatted)
+
+    def test_algorithm_format_reconstructs_nested_indentation(self) -> None:
+        formatted = adapter._format_algorithm_text(
+            "for number of training iterations do "
+            "for k steps do "
+            "Sample minibatch of m noise samples. "
+            "Update the discriminator by ascending its stochastic gradient: "
+            "end for "
+            "return theta"
+        )
+
+        self.assertIn("\n  for k steps do", formatted)
+        self.assertIn("\n    Sample minibatch", formatted)
+        self.assertIn("\n    Update the discriminator", formatted)
+        self.assertIn("\n  end for", formatted)
 
     def test_formula_algorithm_prefers_array_text_over_fragmented_pdf_text(self) -> None:
         document = {
@@ -4164,6 +4201,50 @@ class EnglishReviewPolishTests(unittest.TestCase):
         self.assertIn("Input: Values", updated)
         self.assertNotIn("Formula 10 fallback", updated)
         self.assertNotIn("leaked fallback evidence", updated)
+
+    def test_formula_algorithm_markdown_prefers_formula_comment_anchor_over_global_math_index(self) -> None:
+        records = [
+            {
+                "label": "Algorithm block 1",
+                "text": "Input: Values\nOutput: Result",
+                "formula_no": 10,
+            }
+        ]
+        markdown = (
+            "$$\nz = g(Wu + b)\n$$\n\n"
+            "$$\nInput: Values \\\\ Output: Result\n$$\n"
+            "<!-- formula-final-output-fallback formula=10 reason=algorithm_like_formula_array -->\n\n"
+            "$$\nother = formula\n$$\n"
+        )
+
+        updated, changed = adapter._replace_algorithm_records_in_markdown(markdown, records)
+
+        self.assertEqual(changed, 1)
+        self.assertIn("$$\nz = g(Wu + b)\n$$", updated)
+        self.assertIn("$$\nother = formula\n$$", updated)
+        self.assertIn("**Algorithm block 1**", updated)
+        self.assertNotIn("formula=10", updated)
+
+    def test_formula_algorithm_markdown_removes_orphan_math_fence_before_algorithm(self) -> None:
+        records = [
+            {
+                "label": "Algorithm block 1",
+                "text": "Input: Values\nOutput: Result",
+                "formula_no": 3,
+            }
+        ]
+        markdown = (
+            "Body before algorithm.\n\n"
+            "$$\n\n"
+            "$$\nInput: Values \\\\ Output: Result\n$$\n"
+            "<!-- formula-final-output-fallback formula=3 reason=algorithm_like_formula_array -->"
+        )
+
+        updated, changed = adapter._replace_algorithm_records_in_markdown(markdown, records)
+
+        self.assertEqual(changed, 1)
+        self.assertNotIn("$$\n\n**Algorithm", updated)
+        self.assertIn("**Algorithm block 1**", updated)
 
     def test_formula_fallback_markdown_is_readable_not_raw_math_block(self) -> None:
         rendered = adapter._render_formula_fallback_markdown(

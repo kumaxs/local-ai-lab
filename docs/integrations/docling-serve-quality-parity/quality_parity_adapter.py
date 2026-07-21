@@ -4257,7 +4257,8 @@ VISUAL_LABEL_KEYWORD_RE = re.compile(
     r"(?i)\b(?:error|accuracy|loss|epoch|iteration|train|test|classification|perplexity|probability)\b|%"
 )
 ALGORITHM_LINE_BREAK_RE = re.compile(
-    r"\s+(?=(?:Require|Input|Output|Parameters?|Initialize|while|for|if|return|end(?:\s+while|\s+for|\s+if)?|"
+    r"\s+(?=(?:Require|Input|Output|Parameters?|Initialize|while|for|if|return|Sample|Update|Process|Train|"
+    r"Add|Modify|Set|Compute|end(?:\s+while|\s+for|\s+if)?|"
     r"[a-zA-Z]?\s*[mtvg]\s*(?:</?[^>]+>)*\s*[0-9t̂^_-]*\s*(?:←|=))\b)",
     re.I,
 )
@@ -4493,6 +4494,7 @@ def _format_algorithm_text(text: str) -> str:
     text = re.sub(r"\n[ \t]+", "\n", text)
     text = re.sub(r"[ \t]{2,}", " ", text)
     text = ALGORITHM_LINE_BREAK_RE.sub("\n", text)
+    text = re.sub(r"(?im)^(\s*)end\s*\n\s*(for|while|if)\b", r"\1end \2", text)
     lines = [line.strip() for line in text.splitlines() if line.strip()]
     first_algorithm_line = next(
         (
@@ -4511,10 +4513,64 @@ def _format_algorithm_text(text: str) -> str:
     for line in lines:
         if re.match(r"(?i)^Algorithm\s+\d+\b\s*:?", line):
             continue
+        line = _normalize_algorithm_spaced_keywords(line)
+        line = _strip_letter_spaced_formula_noise(line)
         line = re.sub(r"\s+", " ", line).strip()
         if line:
             cleaned.append(line)
-    return "\n".join(cleaned)
+    return "\n".join(_indent_algorithm_lines(cleaned))
+
+
+def _normalize_algorithm_spaced_keywords(line: str) -> str:
+    replacements = {
+        "f o r": "for",
+        "d o": "do",
+        "e n d": "end",
+        "i f": "if",
+        "w h i l e": "while",
+        "r e t u r n": "return",
+        "F o r": "For",
+        "c l a r i t y": "clarity",
+        "e t c": "etc",
+    }
+    for spaced, normal in replacements.items():
+        line = re.sub(rf"(?<![A-Za-z]){re.escape(spaced)}(?![A-Za-z])", normal, line)
+    line = re.sub(r"(?i)^(\s*\d+)\s+:", r"\1:", line)
+    return line
+
+
+def _indent_algorithm_lines(lines: list[str]) -> list[str]:
+    """Rebuild readable algorithm nesting when PDF extraction flattens indentation."""
+    formatted: list[str] = []
+    indent = 0
+    last_line_opened_block = False
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line:
+            continue
+        normalized = _normalized_noise_text(line)
+        starts_end = bool(re.match(r"(?i)^end(?:\s+(?:for|while|if))?\b", normalized))
+        if starts_end:
+            indent = max(indent - 1, 0)
+        effective_indent = indent
+        if (
+            formatted
+            and not starts_end
+            and last_line_opened_block
+            and re.match(r"(?i)^(?:Sample|Update|Process|Train|Add|Modify|Set|Compute|Draw)\b", normalized)
+        ):
+            effective_indent = max(effective_indent, indent)
+        formatted.append(("  " * effective_indent) + line)
+        opens_block = bool(
+            re.search(r"(?i)\bdo\b\s*$", normalized)
+            or re.match(r"(?i)^(?:for|while|if)\b", normalized)
+        )
+        if opens_block and not starts_end:
+            indent += 1
+        if re.match(r"(?i)^return\b", normalized):
+            indent = max(indent - 1, 0)
+        last_line_opened_block = opens_block and not starts_end
+    return formatted
 
 
 def _algorithm_caption_from_text(text: str) -> str:
@@ -4804,6 +4860,19 @@ def _remove_markdown_target_lines(md_text: str, targets: Iterable[str]) -> tuple
     return updated, removed
 
 
+def _remove_orphan_math_fence_before_algorithm(md_text: str) -> str:
+    updated = md_text
+    matches = list(re.finditer(r"(?m)^\$\$\s*\n+(?=\*\*Algorithm\b)", updated))
+    for match in reversed(matches):
+        prefix_lines = [line.strip() for line in updated[: match.start()].splitlines() if line.strip()]
+        previous = prefix_lines[-1] if prefix_lines else ""
+        previous_visible = html.unescape(HTML_TAG_RE.sub(" ", previous))
+        if re.search(r"(?:\\[A-Za-z]+|[=←≤≥^_])", previous_visible):
+            continue
+        updated = updated[: match.start()] + updated[match.end() :]
+    return updated
+
+
 def _replace_algorithm_records_in_markdown(md_text: str, records: list[dict[str, Any]]) -> tuple[str, int]:
     updated = md_text
     changed = 0
@@ -4817,7 +4886,23 @@ def _replace_algorithm_records_in_markdown(md_text: str, records: list[dict[str,
         ]
         anchor_ranges: list[tuple[int, int]] = []
         for formula_no in dict.fromkeys(formula_nos):
-            if 0 < formula_no <= len(formula_blocks):
+            readable_fallback_match = re.search(
+                rf"(?s)\$\$(?:(?!\$\$).)*\$\$\s*"
+                rf"<!--\s*formula-final-output-fallback\s+formula={formula_no}\b.*?-->"
+                rf"(?:\s*```text\n.*?\n```)?",
+                updated,
+            )
+            if readable_fallback_match:
+                anchor_ranges.append((readable_fallback_match.start(), readable_fallback_match.end()))
+            fallback_match = re.search(
+                rf"(?s)\*\*Formula\s+{formula_no}\s+fallback\*\*:.*?"
+                rf"<!--\s*formula-final-output-fallback\s+formula={formula_no}\b.*?-->"
+                rf"(?:\s*```text\n.*?\n```)?",
+                updated,
+            )
+            if fallback_match:
+                anchor_ranges.append((fallback_match.start(), fallback_match.end()))
+            if not anchor_ranges and 0 < formula_no <= len(formula_blocks):
                 block = formula_blocks[formula_no - 1]
                 end = block.end()
                 fallback_comment = re.match(
@@ -4835,14 +4920,6 @@ def _replace_algorithm_records_in_markdown(md_text: str, records: list[dict[str,
                     if evidence_fence:
                         end += evidence_fence.end()
                 anchor_ranges.append((block.start(), end))
-            fallback_match = re.search(
-                rf"(?s)\*\*Formula\s+{formula_no}\s+fallback\*\*:.*?"
-                rf"<!--\s*formula-final-output-fallback\s+formula={formula_no}\b.*?-->"
-                rf"(?:\s*```text\n.*?\n```)?",
-                updated,
-            )
-            if fallback_match:
-                anchor_ranges.append((fallback_match.start(), fallback_match.end()))
         if anchor_ranges:
             start = min(start for start, _end in anchor_ranges)
             end = max(end for _start, end in anchor_ranges)
@@ -4887,6 +4964,7 @@ def _replace_algorithm_records_in_markdown(md_text: str, records: list[dict[str,
                 changed += 1
     for start, end, replacement in sorted(edits, reverse=True):
         updated = updated[:start] + replacement + updated[end:]
+    updated = _remove_orphan_math_fence_before_algorithm(updated)
     for record in records:
         html_targets = [
             target
@@ -4948,6 +5026,7 @@ def _replace_algorithm_records_in_markdown(md_text: str, records: list[dict[str,
                 updated = stripped
             changed += 1
             break
+    updated = _remove_orphan_math_fence_before_algorithm(updated)
     return updated, changed
 
 
@@ -9714,6 +9793,7 @@ def _render_formula_fallback_html(
     reason = str(entry.get("fallback_reason") or entry.get("status") or "second_pass_not_applied")
     raw_candidate = str(entry.get("route_b_candidate") or "").strip()
     source_formula, fallback_source = _best_formula_fallback_text(entry)
+    readable_display, readable_source, readable_reasons = _readable_formula_fallback_display_text(entry)
     links = [
         f'<a href="formulas/formula_{formula_no}.png">source image</a>',
         f'<a href="formulas/formula_{formula_no}_context.png">context crop</a>',
@@ -9727,19 +9807,31 @@ def _render_formula_fallback_html(
         else ""
     )
     source_formula_render = ""
-    if source_formula and _looks_like_misdetected_formula_prose(source_formula):
-        source_formula_render = (
-            '<p class="docling-formula-unavailable">'
-            "Formula candidate was isolated from the main math flow because the extracted text "
-            "looks like surrounding prose or a section heading. The extracted content is shown below."
-            "</p>"
-            '<pre class="docling-formula-tex docling-formula-preserved-source">'
-            f"{html.escape(source_formula)}</pre>"
-        )
-    elif source_formula and _looks_like_algorithm_formula(source_formula):
+    if source_formula and _looks_like_algorithm_formula(source_formula):
         source_formula_render = (
             '<pre class="docling-algorithm-block docling-formula-preserved-source">'
             f"{html.escape(_algorithm_formula_plain_text(source_formula))}</pre>"
+        )
+    elif readable_display:
+        source_formula_render = (
+            '<div class="docling-formula-render docling-formula-readable-fallback">'
+            f"\\[{html.escape(readable_display)}\\]"
+            "</div>"
+            '<div class="docling-formula-fallback-source">'
+            f"Readable fallback source: {html.escape(readable_source)}"
+            + (
+                f" ({html.escape(','.join(readable_reasons[:4]))})"
+                if readable_reasons
+                else ""
+            )
+            + "</div>"
+        )
+    elif source_formula and _looks_like_misdetected_formula_prose(source_formula):
+        source_formula_render = (
+            '<p class="docling-formula-unavailable">Readable formula fallback was not available; '
+            "source evidence is preserved below.</p>"
+            '<pre class="docling-formula-tex docling-formula-preserved-source">'
+            f"{html.escape(source_formula)}</pre>"
         )
     elif source_formula and not _formula_output_safety_reasons(source_formula):
         display_formula, _sanitize_reasons = sanitize_formula_display_text(source_formula)
@@ -9778,7 +9870,11 @@ def _render_formula_fallback_html(
         + source_formula_render
         + candidate
         + crop
-        + f'<div class="docling-formula-fallback-source">Fallback source: {html.escape(fallback_source)}</div>'
+        + (
+            f'<div class="docling-formula-fallback-source">Fallback source: {html.escape(fallback_source)}</div>'
+            if not readable_display
+            else ""
+        )
         + '<div class="docling-formula-source">'
         + " | ".join(links)
         + "</div></div>"
@@ -9802,9 +9898,14 @@ def _ensure_formula_second_pass_html_assets(html_text: str) -> tuple[str, bool]:
   font: 0.85rem system-ui, sans-serif;
   margin-bottom: 0.5rem;
 }
-.docling-formula-render {
-  overflow-x: auto;
-}
+	.docling-formula-render {
+	  overflow-x: auto;
+	}
+	.docling-formula-readable-fallback {
+	  background: #ffffff;
+	  border: 1px solid #cbd5e1;
+	  padding: 0.65rem;
+	}
 .docling-formula-tex {
   background: #ffffff;
   border: 1px solid #cbd5e1;
@@ -9944,6 +10045,94 @@ def _formula_candidate_rank(text: str, equation_number: int | None) -> tuple[int
     return (len(reasons), 0 if body_length >= 8 else 1, -min(body_length, 1200))
 
 
+def _strip_letter_spaced_formula_noise(text: str) -> str:
+    def replace(match: re.Match[str]) -> str:
+        token = match.group(0)
+        compact = re.sub(r"\s+", "", token)
+        if compact.lower() == "and":
+            return r" \quad "
+        if len(compact) >= 5 or compact.lower() in {
+            "the",
+            "with",
+            "for",
+            "from",
+            "where",
+            "then",
+        }:
+            return " "
+        return token
+
+    return re.sub(r"(?<!\\)(?<![A-Za-z])(?:[A-Za-z]\s+){2,}[A-Za-z](?![A-Za-z])", replace, text)
+
+
+def _formula_like_row_score(text: str) -> int:
+    score = 0
+    score += 3 * len(re.findall(r"(?<![<>])=(?!=)|≤|≥|\\leq|\\geq|\\approx|\\sim|←|\\leftarrow", text))
+    score += 2 * len(re.findall(r"\\(?:frac|sum|prod|int|sqrt|log|exp|nabla|partial|mathbb|widehat)", text))
+    score += len(re.findall(r"[_^]", text))
+    score += 2 if re.search(r"\(\s*\d+\s*\)|\\quad\s*\(\s*\d+\s*\)", text) else 0
+    score -= 3 if re.search(r"(?<![A-Za-z])(?:[A-Za-z]\s+){5,}[A-Za-z](?![A-Za-z])", text) else 0
+    return score
+
+
+def _formula_rows_from_candidate(text: str) -> list[str]:
+    body = html.unescape(text).strip()
+    body = re.sub(r"\\begin\s*\{\s*array\s*\}\s*(?:\{[^{}]*\})?", " ", body)
+    body = re.sub(r"\\end\s*\{\s*array\s*\}", " ", body)
+    rows = re.split(r"\\\\+", body)
+    cleaned: list[str] = []
+    for row in rows:
+        row = re.sub(r"^\s*&+", "", row)
+        row = re.sub(r"&", " ", row)
+        row = re.sub(r"^\s*\{\s*", "", row)
+        row = re.sub(r"\s*\}\s*$", "", row)
+        row = _strip_letter_spaced_formula_noise(row)
+        row = re.sub(r"\s+", " ", row).strip(" .;")
+        if not row:
+            continue
+        if _formula_like_row_score(row) < 3:
+            continue
+        cleaned.append(row)
+    return cleaned
+
+
+def _readable_formula_fallback_display_text(entry: dict[str, Any]) -> tuple[str, str, list[str]]:
+    equation_number = entry.get("eq_number")
+    eq_number = equation_number if isinstance(equation_number, int) else None
+    candidates = [
+        ("second_pass_candidate", str(entry.get("route_b_candidate") or "")),
+        ("route_a_source", str(entry.get("route_a_text") or "")),
+        ("raw_tex", str(entry.get("raw_tex") or "")),
+    ]
+    ranked: list[tuple[tuple[int, int, int], str, str, list[str]]] = []
+    for source, candidate in candidates:
+        if not candidate.strip():
+            continue
+        rows = _formula_rows_from_candidate(candidate)
+        if not rows:
+            normalized, _repairs = canonicalize_formula_output(candidate, eq_number)
+            display_text, sanitize_reasons = sanitize_formula_display_text(normalized)
+            rows = [display_text] if _formula_like_row_score(display_text) >= 4 else []
+        if not rows:
+            continue
+        display = r" \\ ".join(rows[:8])
+        if len(rows) > 1:
+            display = r"\begin{aligned} " + display + r" \end{aligned}"
+        if eq_number and not re.search(r"\(\s*" + re.escape(str(eq_number)) + r"\s*\)", display):
+            display = f"{display} \\quad ({eq_number})"
+        display, sanitize_reasons = sanitize_formula_display_text(display)
+        latex_ok, latex_reasons = validate_candidate_latex(display)
+        safety_reasons = formula_hallucination_reasons(display)
+        if not latex_ok:
+            safety_reasons.extend(f"latex_{reason}" for reason in latex_reasons)
+        score = (len(safety_reasons), 0 if len(rows) > 1 else 1, -_formula_like_row_score(display))
+        ranked.append((score, display[:1600], source, sanitize_reasons + safety_reasons))
+    if not ranked:
+        return "", "unavailable", []
+    _score, display, source, reasons = min(ranked, key=lambda item: item[0])
+    return display, source, list(dict.fromkeys(reasons))
+
+
 def _best_formula_fallback_text(entry: dict[str, Any]) -> tuple[str, str]:
     equation_number = entry.get("eq_number")
     eq_number = equation_number if isinstance(equation_number, int) else None
@@ -9977,6 +10166,16 @@ def _formula_fallback_contract_text(entry: dict[str, Any]) -> str:
 def _render_formula_fallback_markdown(entry: dict[str, Any]) -> str:
     formula_no = entry.get("formula_no")
     reason = str(entry.get("fallback_reason") or entry.get("status") or "second_pass_not_applied")
+    readable_display, readable_source, readable_reasons = _readable_formula_fallback_display_text(entry)
+    if readable_display and not _looks_like_algorithm_formula(readable_display):
+        reason_comment = ",".join(readable_reasons[:4])
+        return (
+            f"$$\n{readable_display}\n$$\n"
+            "<!-- formula-final-output-fallback "
+            f"formula={formula_no} reason={reason} source={readable_source}"
+            + (f" readable_repairs={reason_comment}" if reason_comment else "")
+            + " -->"
+        )
     text, source = _best_formula_fallback_text(entry)
     evidence = (
         f"\n\n```text\n{text}\n```"
