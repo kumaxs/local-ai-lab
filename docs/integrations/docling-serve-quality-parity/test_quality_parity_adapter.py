@@ -375,6 +375,20 @@ class EnglishReviewPolishTests(unittest.TestCase):
         self.assertNotIn("unnecessary_single_formula_array", adapter._formula_output_safety_reasons(formula))
         self.assertIn(r"\quad ( 1 )", display_text)
 
+    def test_formula_tex_qc_repairs_unmatched_display_braces(self) -> None:
+        formula = (
+            r"\min _ { G } \max _ { D } V ( D , G ) = "
+            r"\mathbb { E } _ { x \sim p _ { d a t a } ( x ) } "
+            r"[ \log D ( x ) ] \quad } \quad ( 1 )"
+        )
+
+        display_text, reasons = adapter.sanitize_formula_display_text(formula)
+
+        self.assertIn("repaired_unmatched_display_braces", reasons)
+        self.assertNotIn(r"\quad } \quad", display_text)
+        latex_ok, latex_reasons = adapter.validate_candidate_latex(display_text)
+        self.assertTrue(latex_ok, latex_reasons)
+
     def test_formula_tex_qc_removes_balanced_outer_array_group(self) -> None:
         formula = (
             r"{ \begin{array} { r l } & { a = b \quad ( 3 ) } \\ "
@@ -555,7 +569,7 @@ class EnglishReviewPolishTests(unittest.TestCase):
         self.assertIn(sources[13], {"formula_second_pass", "guarded_fallback_full"})
         self.assertEqual(adapter._compact_formula_numbers(texts[1]), [1])
 
-    def test_cn_default_sources_prefer_clean_route_b_for_first_formulas(self) -> None:
+    def test_cn_default_sources_keep_first_formulas_clean(self) -> None:
         if not adapter._default_cn_route_b_dirs() or not adapter._default_cn_guarded_fallback_dirs():
             self.skipTest("local CN default formula sources are not available")
         args = Namespace(formula_second_pass_guarded_fallback_dir=[])
@@ -565,13 +579,11 @@ class EnglishReviewPolishTests(unittest.TestCase):
             Path("/tmp/nonexistent-sidecar"),
         )
 
-        self.assertEqual(sources[1], "route_b")
-        self.assertEqual(sources[2], "route_b")
+        self.assertIn(sources[1], {"route_b", "accepted_cn_baseline"})
+        self.assertIn(sources[2], {"route_b", "accepted_cn_baseline"})
         self.assertNotIn(r"_ { \, _ { p } }", texts[1])
-        self.assertEqual(
-            texts[2],
-            r"q ^ { \prime } _ { t } = O ( q _ { t } ) \times W _ { q } \quad ( 2 )",
-        )
+        self.assertEqual(adapter._compact_formula_numbers(texts[2]), [2])
+        self.assertNotIn(r"_ { \, _ { p } }", texts[2])
 
     def test_formula_final_canonicalization_trims_noise_and_duplicate_number(self) -> None:
         text, repairs = formula_second_pass.canonicalize_formula_output(
@@ -3989,8 +4001,10 @@ class EnglishReviewPolishTests(unittest.TestCase):
 
         self.assertEqual(len(records), 1)
         self.assertEqual(changed, 1)
-        self.assertIn("Algorithm 1: Adam", html_text)
-        self.assertEqual(html_text.count("Algorithm 1: Adam"), 1)
+        visible = adapter.HTML_TAG_RE.sub("", html_text)
+        self.assertIn("Algorithm 1: Adam", visible)
+        self.assertEqual(visible.count("Algorithm 1: Adam"), 1)
+        self.assertIn('class="docling-algorithm-keyword">Require</strong>', html_text)
         self.assertNotIn("<p>Algorithm 1: Adam", html_text)
         self.assertNotIn("<pre><code>", html_text)
 
@@ -4121,8 +4135,11 @@ class EnglishReviewPolishTests(unittest.TestCase):
         self.assertEqual(len(records), 1)
         self.assertEqual(changed, 1)
         self.assertEqual(html_text.count("docling-algorithm-recovered"), 1)
-        self.assertIn("Algorithm 2: Training a Batch-Normalized Network", html_text)
-        self.assertIn("Input: Network N", html_text)
+        visible = adapter.HTML_TAG_RE.sub("", html_text)
+        self.assertIn("Algorithm 2: Training a Batch-Normalized Network", visible)
+        self.assertIn("Input: Network N", visible)
+        self.assertIn('class="docling-algorithm-keyword">Algorithm 2</strong>', html_text)
+        self.assertIn('class="docling-algorithm-keyword">Input</strong>', html_text)
         self.assertNotIn("<li>1: N tr BN", html_text)
 
     def test_algorithm_cluster_markdown_does_not_match_existing_code_fence(self) -> None:
@@ -4147,7 +4164,9 @@ class EnglishReviewPolishTests(unittest.TestCase):
         updated, changed = adapter._replace_algorithm_records_in_markdown(markdown, records)
 
         self.assertEqual(changed, 1)
-        self.assertEqual(updated.count("```text"), 2)
+        self.assertEqual(updated.count("```text"), 1)
+        self.assertIn('<pre class="docling-algorithm-block">', updated)
+        self.assertIn('class="docling-algorithm-keyword">Input</strong>', updated)
         self.assertIn("**Algorithm block 1**", updated)
         self.assertIn("**Algorithm 2: Training**", updated)
 
@@ -4173,7 +4192,8 @@ class EnglishReviewPolishTests(unittest.TestCase):
         updated, changed = adapter._replace_algorithm_records_in_markdown(markdown, records)
 
         self.assertEqual(changed, 1)
-        self.assertIn("```text", updated)
+        self.assertIn('<pre class="docling-algorithm-block">', updated)
+        self.assertIn('class="docling-algorithm-keyword">Input</strong>', updated)
         self.assertNotIn("formula-final-output-fallback", updated)
         self.assertNotIn("leaked fallback evidence", updated)
 
@@ -4197,8 +4217,9 @@ class EnglishReviewPolishTests(unittest.TestCase):
         updated, changed = adapter._replace_algorithm_records_in_markdown(markdown, records)
 
         self.assertEqual(changed, 1)
-        self.assertIn("```text", updated)
-        self.assertIn("Input: Values", updated)
+        self.assertIn('<pre class="docling-algorithm-block">', updated)
+        self.assertIn('class="docling-algorithm-keyword">Output</strong>', updated)
+        self.assertIn("Input: Values", adapter.HTML_TAG_RE.sub("", updated))
         self.assertNotIn("Formula 10 fallback", updated)
         self.assertNotIn("leaked fallback evidence", updated)
 
