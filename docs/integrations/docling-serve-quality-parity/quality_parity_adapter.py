@@ -4622,6 +4622,12 @@ def _format_algorithm_text(text: str) -> str:
     text = re.sub(r"\n[ \t]+", "\n", text)
     text = re.sub(r"[ \t]{2,}", " ", text)
     text = ALGORITHM_LINE_BREAK_RE.sub("\n", text)
+    text = re.sub(
+        r"(?im)^(\s*\d+\s*:)\s*\n\s*(?=(?:for|while|if|return|end|Process|Train|Add|Modify|Sample)\b)",
+        r"\1 ",
+        text,
+    )
+    text = re.sub(r"(?im)^(\s*\d+\s*:\s*end)\s*\n\s*(for|while|if)\b", r"\1 \2", text)
     text = re.sub(r"(?im)^(\s*)end\s*\n\s*(for|while|if)\b", r"\1end \2", text)
     lines = [line.strip() for line in text.splitlines() if line.strip()]
     first_algorithm_line = next(
@@ -4637,16 +4643,44 @@ def _format_algorithm_text(text: str) -> str:
         0,
     )
     lines = lines[first_algorithm_line:]
+    lines = _join_algorithm_header_continuations(lines)
     cleaned: list[str] = []
+    output_seen = False
     for line in lines:
         if re.match(r"(?i)^Algorithm\s+\d+\b\s*:?", line):
             continue
         line = _normalize_algorithm_spaced_keywords(line)
         line = _strip_letter_spaced_formula_noise(line)
+        line = re.sub(r"(?i)^[a-z]{1,4}\.?\s+(?=\d+\s*:)", "", line)
+        line = re.sub(r"^\{\s*((?:Input|Output|Require|Ensure|Parameters?)\s*:)", r"\1", line)
+        line = re.sub(r"^\{\s*(\d+\s*:)", r"\1", line)
+        if re.match(r"(?i)^Output\s*:", line) and re.search(r"(?i)\{?Input\s*:", line):
+            line = re.sub(r"(?i)\s*;?\s*\{?Input\s*:.*$", "", line).strip()
+        line = re.sub(r"(\$[^$]+\$)\}\s*(?=←|=|\\leftarrow)", r"\1 ", line)
+        while _brace_balance_delta(line) < 0 and line.rstrip().endswith("}"):
+            line = line.rstrip()[:-1].rstrip()
+        line = re.sub(r"(?i)^size\s+.*?:\s*(?=[A-Za-z\\]+\s*(?:\[|_|\\leftarrow|←|=))", "", line)
         line = re.sub(r"\s+", " ", line).strip()
+        if re.match(r"(?i)^\d+\s*:\s*$", line):
+            continue
+        if output_seen and re.match(r"(?i)^Input\s*:", line):
+            continue
+        if output_seen and re.match(r"(?i)^Output\s*:", line) and re.search(r"(?:←|=|\\leftarrow|\\frac)", line):
+            line = re.sub(r"(?i)^Output\s*:\s*", "", line).strip()
+        if re.match(r"(?i)^Output\s*:", line):
+            output_seen = True
+        if (
+            len(_normalized_noise_text(line)) < 16
+            and not re.search(
+                r"(?i)^(?:Require|Ensure|Input|Output|for|while|if|return|end|\d+\s*:)|"
+                r"(?:←|=|\\leftarrow|\\frac|\\sum|\\nabla)",
+                line,
+            )
+        ):
+            continue
         if line:
             cleaned.append(line)
-    return "\n".join(_indent_algorithm_lines(cleaned))
+    return "\n".join(_indent_algorithm_lines(_dedupe_algorithm_lines(cleaned)))
 
 
 def _normalize_algorithm_spaced_keywords(line: str) -> str:
@@ -4663,8 +4697,85 @@ def _normalize_algorithm_spaced_keywords(line: str) -> str:
     }
     for spaced, normal in replacements.items():
         line = re.sub(rf"(?<![A-Za-z]){re.escape(spaced)}(?![A-Za-z])", normal, line)
+    line = re.sub(
+        r"(?<!\d)(\d)(?:\s+(\d)){1,2}\s*:",
+        lambda match: re.sub(r"\s+", "", match.group(0)),
+        line,
+    )
     line = re.sub(r"(?i)^(\s*\d+)\s+:", r"\1:", line)
     return line
+
+
+def _dedupe_algorithm_lines(lines: list[str]) -> list[str]:
+    result: list[str] = []
+    seen_normalized: set[str] = set()
+    seen_steps: set[str] = set()
+    seen_assignment_lhs: set[str] = set()
+    compact_lines = [re.sub(r"\s+", "", _normalized_noise_text(line)).lower() for line in lines]
+    for raw_index, raw_line in enumerate(lines):
+        line = raw_line.strip()
+        if not line:
+            continue
+        normalized = _normalized_noise_text(line)
+        compact = re.sub(r"\s+", "", normalized).lower()
+        repeatable_step = bool(re.match(r"(?i)^(?:Sample|Update|Train|Add|Modify|Set|Compute|Draw)\b", normalized))
+        if compact in seen_normalized and not repeatable_step:
+            continue
+        step_match = re.match(r"^(\d+)\s*:\s*(.*)$", normalized)
+        if not step_match and not repeatable_step and len(compact) > 20:
+            if any(compact in later for later in compact_lines[raw_index + 1 :]):
+                continue
+        if step_match:
+            step_no = step_match.group(1)
+            body = step_match.group(2).strip()
+            if not re.sub(r"[{}\s]", "", body):
+                continue
+            if step_no in seen_steps:
+                continue
+            seen_steps.add(step_no)
+        if (
+            normalized.lower() in {"end for", "end while", "end if"}
+            and any(re.match(r"(?i)^\d+\s*:\s*" + re.escape(normalized) + r"\b", later) for later in lines[raw_index + 1 :])
+        ):
+            continue
+        assignment_match = re.match(r"^(.{1,80}?)(?:←|=)", normalized)
+        if assignment_match and not step_match:
+            lhs_key = re.sub(r"\W+", "", assignment_match.group(1)).lower()
+            if lhs_key and lhs_key in seen_assignment_lhs:
+                continue
+            if lhs_key:
+                seen_assignment_lhs.add(lhs_key)
+        if not repeatable_step:
+            seen_normalized.add(compact)
+        result.append(line)
+    return result
+
+
+def _join_algorithm_header_continuations(lines: list[str]) -> list[str]:
+    joined: list[str] = []
+    starts_new_line = re.compile(
+        r"(?i)^\s*\{?(?:Require|Ensure|Input|Output|Parameters?|Initialize|for\b.*\bdo\b|"
+        r"while\b|if\b|return\b|end(?:\s+(?:for|while|if))?|\d+\s*:|"
+        r"Sample|Update|Process|Train|Add|Modify|Set|Compute|Draw)\b|"
+        r"(?:←|\\leftarrow|\\frac|\\sum|\\nabla)"
+    )
+    for line in lines:
+        stripped = line.strip()
+        if (
+            joined
+            and re.match(r"(?i)^(?:Input|Output|Require|Ensure|Parameters?)\s*:", joined[-1])
+            and (
+                not starts_new_line.search(stripped)
+                or (
+                    re.match(r"(?i)^Input\s*:", joined[-1])
+                    and re.match(r"(?i)^Parameters?\b(?!\s*:)", stripped)
+                )
+            )
+        ):
+            joined[-1] = joined[-1].rstrip(" ;") + "; " + stripped
+        else:
+            joined.append(stripped)
+    return joined
 
 
 def _indent_algorithm_lines(lines: list[str]) -> list[str]:
@@ -4825,12 +4936,36 @@ def _algorithm_layout_visible_lines(record: dict[str, Any], lines: list[Any]) ->
     return filtered
 
 
+def _algorithm_layout_fragmentation_reasons(lines: list[Any]) -> list[str]:
+    text_lines = [
+        _normalized_noise_text(str(line.get("text") or ""))
+        for line in lines
+        if isinstance(line, dict) and _normalized_noise_text(str(line.get("text") or ""))
+    ]
+    if len(text_lines) < 3:
+        return ["too_few_visible_layout_lines"]
+    short_lines = [line for line in text_lines if len(line) <= 3]
+    readable_lines = [line for line in text_lines if len(line) >= 12]
+    reasons: list[str] = []
+    if len(short_lines) >= 4 and len(short_lines) / max(1, len(text_lines)) > 0.28:
+        reasons.append("layout_fragmented_short_line_ratio")
+    if len(short_lines) >= 6 and len(readable_lines) < 4:
+        reasons.append("layout_fragmented_missing_readable_lines")
+    if len({line for line in short_lines}) >= 5 and len(text_lines) >= 10:
+        reasons.append("layout_fragmented_math_glyph_columns")
+    return reasons
+
+
 def _algorithm_layout_html(record: dict[str, Any]) -> str:
     layout = record.get("layout")
     if not isinstance(layout, dict) or int(layout.get("line_count") or 0) < 3:
         return ""
     rendered_lines: list[str] = []
     visible_lines = _algorithm_layout_visible_lines(record, list(layout.get("lines") or []))
+    fragmentation_reasons = _algorithm_layout_fragmentation_reasons(visible_lines)
+    if fragmentation_reasons:
+        record["layout_visible_fallback_reasons"] = fragmentation_reasons
+        return ""
     for line in visible_lines:
         if not isinstance(line, dict):
             continue
@@ -8636,6 +8771,45 @@ def _repair_array_row_wrappers(formula_text: str) -> tuple[str, bool]:
     return repaired, repaired != formula_text
 
 
+def _brace_balance_delta(formula_text: str) -> int:
+    depth = 0
+    escaped = False
+    for char in formula_text:
+        if escaped:
+            escaped = False
+            continue
+        if char == "\\":
+            escaped = True
+            continue
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+    return depth
+
+
+def _formula_structure_score(formula_text: str) -> tuple[int, int, int]:
+    return (
+        abs(_brace_balance_delta(formula_text)),
+        formula_text.count(r"\begin{") - formula_text.count(r"\end{"),
+        formula_text.count(r"\\"),
+    )
+
+
+def _sanitized_formula_regressed(original: str, candidate: str) -> bool:
+    original_score = _formula_structure_score(original)
+    candidate_score = _formula_structure_score(candidate)
+    if candidate_score[0] > original_score[0]:
+        return True
+    if abs(candidate_score[1]) > abs(original_score[1]):
+        return True
+    if r"\begin{array}" in original and original_score[2] > 0 and candidate_score[2] < original_score[2]:
+        return True
+    if r"\begin{cases}" in original and r"\end{cases}" not in candidate:
+        return True
+    return False
+
+
 def _repair_unmatched_formula_braces(formula_text: str) -> tuple[str, bool]:
     """Remove obvious stray display braces so MathJax can render preserved formula bodies."""
     output: list[str] = []
@@ -8694,22 +8868,11 @@ def _algorithm_formula_plain_text(text: str) -> str:
     )
     body = re.sub(r"\\end\s*\{\s*array\s*\}\s*$", "", body).strip()
     body = body.replace(r"\\", "\n")
-    body = re.sub(r"&", "  ", body)
-    body = re.sub(r"\\text\s*\{\s*([^{}]*?)\s*\}", r"\1", body)
-    body = re.sub(r"\\mathbf\s*\{\s*([^{}]*?)\s*\}", r"\1", body)
-    body = re.sub(r"\\mathrm\s*\{\s*([^{}]*?)\s*\}", r"\1", body)
-    body = re.sub(r"\\(?:text|mathbf|mathrm)\s+", "", body)
-    body = re.sub(r"\\mathcal\s*", "", body)
-    body = re.sub(r"\\quad|\\,", " ", body)
-    body = re.sub(r"\\leftarrow", "←", body)
-    body = re.sub(r"\\colon", ":", body)
-    body = re.sub(r"\\slash", "/", body)
-    body = re.sub(r"[{}]", "", body)
-    body = re.sub(r"[ \t]+", " ", body)
     lines = []
     for line in (line.strip() for line in body.splitlines()):
         if not line:
             continue
+        line = _algorithm_tex_row_to_text(line)
         normalized = _normalized_noise_text(line)
         if len(normalized) <= 18 and normalized.endswith("-"):
             continue
@@ -8717,6 +8880,27 @@ def _algorithm_formula_plain_text(text: str) -> str:
             continue
         lines.append(line)
     return "\n".join(line for line in lines if line)
+
+
+def _algorithm_tex_row_to_text(line: str) -> str:
+    previous = None
+    while previous != line:
+        previous = line
+        line = re.sub(r"\\(?:text|mathbf|mathrm)\s*\{\s*([^{}]*?)\s*\}", r"\1", line)
+    line = re.sub(r"\\(?:text|mathbf|mathrm)\s+", "", line)
+    line = re.sub(r"(?<!\\)&", " ", line)
+    line = re.sub(r"\\quad|\\,", " ", line)
+    line = re.sub(r"\\leftarrow", "←", line)
+    line = re.sub(r"\\colon", ":", line)
+    line = re.sub(r"\\slash", "/", line)
+    line = re.sub(r"\\mathcal\s*\{\s*B\s*\}", "B", line)
+    line = re.sub(r"\\text\s*\{\s*BN\s*\}", "BN", line)
+    line = re.sub(r"\s+", " ", line).strip()
+    line = re.sub(r"^\{\s*((?:\d+\s*:|Input:|Output:|Require:|Ensure:)[^{}]*)\s*\}\s*", r"\1 ", line)
+    line = re.sub(r"^(\d+\s*:)\s*\}\s*\{\s*", r"\1 ", line)
+    line = re.sub(r"^(\d+\s*:)\s*[{}]+\s*", r"\1 ", line)
+    line = re.sub(r"^(\d+\s*:)\s*/\s*", r"\1 ", line)
+    return _normalize_algorithm_spaced_keywords(line.strip())
 
 
 def _algorithm_cluster_line_text(node: dict[str, Any]) -> str:
@@ -8787,6 +8971,14 @@ def _merge_bbox_geometry(nodes: list[dict[str, Any]]) -> dict[str, Any] | None:
     return result
 
 
+def _algorithm_cluster_reading_key(item: tuple[int, dict[str, Any]]) -> tuple[int, float, float]:
+    index, node = item
+    bbox = bbox_geometry(first_prov(node) or {}) or {}
+    top = float(bbox.get("t", 0.0) or 0.0)
+    left = float(bbox.get("l", 0.0) or 0.0)
+    return (-int((first_prov(node) or {}).get("page_no") or 0), -top, left if left else float(index))
+
+
 def _algorithm_cluster_records(
     nodes: list[dict[str, Any]],
     used_text_indexes: set[int],
@@ -8854,9 +9046,10 @@ def _algorithm_cluster_records(
         if len(cluster) < 3 or not saw_body_signal:
             index = max(start + 1, index)
             continue
+        ordered_cluster = sorted(cluster, key=_algorithm_cluster_reading_key)
         text_lines = [
             _algorithm_cluster_line_text(cluster_node)
-            for _cluster_index, cluster_node in cluster
+            for _cluster_index, cluster_node in ordered_cluster
         ]
         formatted = _format_algorithm_text("\n".join(text_lines))
         if len(formatted) < 40:
@@ -8891,16 +9084,16 @@ def _algorithm_cluster_records(
                 "id": f"algorithm-block-{start_record_no + len(records)}",
                 "label": label,
                 "text": formatted,
-                "original_text": "\n".join(str(cluster_node.get("text") or "") for _, cluster_node in cluster),
+                "original_text": "\n".join(str(cluster_node.get("text") or "") for _, cluster_node in ordered_cluster),
                 "source": "docling_algorithm_cluster",
-                "text_indexes": [cluster_index for cluster_index, _cluster_node in cluster],
+                "text_indexes": [cluster_index for cluster_index, _cluster_node in ordered_cluster],
                 "formula_nos": formula_nos,
                 "formula_no": None,
                 "page_no": page_no,
                 "bbox": merged_bbox,
                 "layout": layout,
                 "original_label": "algorithm_cluster",
-                "html_targets": [str(cluster_node.get("text") or "") for _, cluster_node in cluster],
+                "html_targets": [str(cluster_node.get("text") or "") for _, cluster_node in ordered_cluster],
             }
         )
     return records
@@ -8929,8 +9122,11 @@ def sanitize_formula_display_text(formula_text: str) -> tuple[str, list[str]]:
         reasons.append("removed_balanced_outer_formula_group")
     repaired_array, repaired_changed = _repair_array_row_wrappers(display_text)
     if repaired_changed:
-        display_text = repaired_array
-        reasons.append("repaired_array_row_wrappers")
+        if _sanitized_formula_regressed(display_text, repaired_array):
+            reasons.append("skipped_array_row_wrapper_repair_regressed_structure")
+        else:
+            display_text = repaired_array
+            reasons.append("repaired_array_row_wrappers")
     unwrapped, changed = _unwrap_single_formula_array(display_text)
     if changed:
         display_text = unwrapped

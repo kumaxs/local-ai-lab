@@ -401,6 +401,21 @@ class EnglishReviewPolishTests(unittest.TestCase):
         self.assertTrue(display_text.startswith(r"\begin{array}"))
         self.assertNotIn("latex_unmatched_closing_brace", adapter._formula_output_safety_reasons(formula))
 
+    def test_formula_tex_qc_does_not_regress_multiline_array_structure(self) -> None:
+        formula = (
+            r"\begin{array} { r c l } { \Delta w ^ { t } } & { = } & "
+            r"{ p ^ { t } \Delta w ^ { t - 1 } - ( 1 - p ^ { t } ) "
+            r"\epsilon ^ { t } \langle \nabla _ { w } L \rangle } \\ "
+            r"{ w ^ { t } } & { = } & { w ^ { t - 1 } + \Delta w ^ { t } , } "
+            r"\end{array}"
+        )
+
+        display_text, reasons = adapter.sanitize_formula_display_text(formula)
+
+        self.assertIn("skipped_array_row_wrapper_repair_regressed_structure", reasons)
+        self.assertIn(r"\langle \nabla _ { w } L \rangle } \\", display_text)
+        self.assertIn(r"+ \Delta w ^ { t } , } \end{array}", display_text)
+
     def test_formula_fallback_collapses_misdetected_prose_candidate(self) -> None:
         html = adapter._render_formula_fallback_html(
             {
@@ -3992,6 +4007,67 @@ class EnglishReviewPolishTests(unittest.TestCase):
         self.assertIn("docling-algorithm-span-bold", html_text)
         self.assertIn("docling-algorithm-span-italic", html_text)
         self.assertNotIn("Algorithm 1: Adam", html_text)
+
+    def test_algorithm_fragmented_layout_falls_back_to_semantic_text(self) -> None:
+        record = {
+            "layout": {
+                "source": "pdf_text_span_layout",
+                "line_count": 12,
+                "span_count": 12,
+                "lines": [
+                    {"text": "Input: values", "indent_px": 0, "spans": [{"text": "Input: values", "styles": ["bold"]}]},
+                    {"text": "m", "indent_px": 52, "spans": [{"text": "m", "styles": []}]},
+                    {"text": "X", "indent_px": 50, "spans": [{"text": "X", "styles": []}]},
+                    {"text": "m", "indent_px": 38, "spans": [{"text": "m", "styles": []}]},
+                    {"text": "i=1", "indent_px": 51, "spans": [{"text": "i=1", "styles": []}]},
+                    {"text": "xi", "indent_px": 65, "spans": [{"text": "xi", "styles": []}]},
+                    {"text": "// mini-batch mean", "indent_px": 144, "spans": [{"text": "// mini-batch mean", "styles": []}]},
+                    {"text": "p", "indent_px": 38, "spans": [{"text": "p", "styles": []}]},
+                    {"text": "B + eps", "indent_px": 54, "spans": [{"text": "B + eps", "styles": []}]},
+                    {"text": "// normalize", "indent_px": 181, "spans": [{"text": "// normalize", "styles": []}]},
+                ],
+            }
+        }
+
+        html_text = adapter._algorithm_layout_html(record)
+
+        self.assertEqual(html_text, "")
+        self.assertIn("layout_fragmented_short_line_ratio", record["layout_visible_fallback_reasons"])
+
+    def test_algorithm_formula_plain_text_preserves_fraction_structure(self) -> None:
+        formula = (
+            r"\begin{array} { l l } "
+            r"\text {Input:} & \text {Values of $x$ over a mini-batch;} \\ "
+            r"\text {Output:} & \{y_i = \text {BN}_{\gamma,\beta}(x_i)\} \\ "
+            r"& \text {Input: $m$ over a mini-batch;} \\ "
+            r"& \text {Output: $\mu_B$} \leftarrow \frac { 1 } { m } \sum_i x_i \\ "
+            r"& \sigma_B^2 \leftarrow \frac { 1 } { m } \sum_i (x_i-\mu_B)^2 \quad "
+            r"\text {// mini-batch variance} "
+            r"\end{array}"
+        )
+
+        formatted = adapter._format_algorithm_text(adapter._algorithm_formula_plain_text(formula))
+
+        self.assertIn(r"\frac { 1 } { m }", formatted)
+        self.assertIn("// mini-batch variance", formatted)
+        self.assertNotIn("Input: $m$ over", formatted)
+        self.assertIn(r"\mu_B", formatted)
+
+    def test_algorithm_lines_drop_duplicate_numbered_steps(self) -> None:
+        formatted = adapter._format_algorithm_text(
+            "8: for k = 1 \\dots K do\n"
+            "10:\n"
+            "10: Process multiple training mini-batches B, each of size m\n"
+            "identity.\n"
+            "11: replace the transform\n"
+            "11: replace the transform duplicate\n"
+            "12: end for"
+        )
+
+        self.assertIn("10: Process multiple", formatted)
+        self.assertNotIn("10:\n", formatted)
+        self.assertNotIn("identity", formatted)
+        self.assertEqual(formatted.count("11:"), 1)
 
     def test_algorithm_cluster_accepts_caption_without_colon_and_formula_steps(self) -> None:
         document = {
