@@ -1726,6 +1726,25 @@ sup.docling-footnote-ref {
 .docling-algorithm-block .docling-algorithm-keyword {
   color: #111827;
 }
+.docling-algorithm-layout-block {
+  background: #f8fafc;
+  border: 1px solid #cbd5e1;
+  overflow-x: auto;
+  padding: 0.65rem;
+}
+.docling-algorithm-layout-line {
+  min-height: 1.15em;
+  white-space: pre;
+}
+.docling-algorithm-span-bold {
+  font-weight: 700;
+}
+.docling-algorithm-span-italic {
+  font-style: italic;
+}
+.docling-algorithm-bullet {
+  font-weight: 700;
+}
 </style>
 """
 
@@ -4498,6 +4517,104 @@ def _pdf_text_for_bbox(pdf_path: Path, prov: dict[str, Any], padding: float = 5.
         doc.close()
 
 
+def _pdf_algorithm_layout_for_bbox(
+    pdf_path: Path,
+    prov: dict[str, Any],
+    padding: float = 4.0,
+) -> dict[str, Any] | None:
+    try:
+        import fitz  # type: ignore
+    except Exception:
+        return None
+    bbox = prov.get("bbox") if isinstance(prov, dict) else None
+    page_no = prov.get("page_no") if isinstance(prov, dict) else None
+    if not isinstance(bbox, dict) or not isinstance(page_no, int):
+        return None
+    try:
+        doc = fitz.open(pdf_path)
+    except Exception:
+        return None
+    try:
+        if not (1 <= page_no <= len(doc)):
+            return None
+        page = doc[page_no - 1]
+        page_height = float(page.rect.height)
+        rect = fitz.Rect(
+            float(bbox.get("l", 0)) - padding,
+            page_height - float(bbox.get("t", page_height)) - padding,
+            float(bbox.get("r", 0)) + padding,
+            page_height - float(bbox.get("b", 0)) + padding,
+        )
+        extracted = page.get_text("dict", clip=rect, sort=True)
+    except Exception:
+        return None
+    finally:
+        doc.close()
+
+    lines: list[dict[str, Any]] = []
+    for block in extracted.get("blocks") or []:
+        if block.get("type") != 0:
+            continue
+        for line in block.get("lines") or []:
+            spans: list[dict[str, Any]] = []
+            line_text_parts: list[str] = []
+            for span in line.get("spans") or []:
+                span_text = str(span.get("text") or "").replace("\x00", "").replace("\x01", "")
+                if not span_text:
+                    continue
+                font_name = str(span.get("font") or "")
+                flags = int(span.get("flags") or 0)
+                styles = _font_semantic_styles(font_name, 700 if flags & 16 else None)
+                if flags & 2 and "italic" not in styles:
+                    styles.append("italic")
+                span_bbox = span.get("bbox") or [0, 0, 0, 0]
+                spans.append(
+                    {
+                        "text": span_text,
+                        "bbox": [round(float(value), 3) for value in span_bbox],
+                        "font_name": font_name,
+                        "font_size": round(float(span.get("size") or 0.0), 3),
+                        "font_flags": flags,
+                        "styles": styles,
+                    }
+                )
+                line_text_parts.append(span_text)
+            line_text = "".join(line_text_parts).strip()
+            if not line_text:
+                continue
+            line_bbox = line.get("bbox") or [0, 0, 0, 0]
+            lines.append(
+                {
+                    "text": line_text,
+                    "bbox": [round(float(value), 3) for value in line_bbox],
+                    "spans": spans,
+                }
+            )
+    if len(lines) < 3:
+        return None
+    min_left = min(float(line["bbox"][0]) for line in lines)
+    max_left = max(float(line["bbox"][0]) for line in lines)
+    bold_span_count = sum(
+        1
+        for line in lines
+        for span in line.get("spans") or []
+        if "bold" in (span.get("styles") or [])
+    )
+    for line in lines:
+        line["indent_px"] = round(max(0.0, float(line["bbox"][0]) - min_left), 3)
+    return {
+        "source": "pdf_text_span_layout",
+        "page_no": page_no,
+        "clip_bbox": bbox_geometry(prov),
+        "line_count": len(lines),
+        "span_count": sum(len(line.get("spans") or []) for line in lines),
+        "bold_span_count": bold_span_count,
+        "distinct_indent_count": len({round(float(line.get("indent_px") or 0.0), 1) for line in lines}),
+        "indent_range_px": round(max_left - min_left, 3),
+        "lines": lines,
+    }
+
+
 def _format_algorithm_text(text: str) -> str:
     text = html.unescape(HTML_TAG_RE.sub(" ", text))
     text = text.replace("\x00", "").replace("\x01", "")
@@ -4597,7 +4714,11 @@ def _algorithm_caption_from_text(text: str) -> str:
 
 def _algorithm_record_html(record: dict[str, Any]) -> str:
     label = _algorithm_caption_semantic_html(str(record.get("label") or "Algorithm block"))
-    text = _algorithm_text_semantic_html(str(record.get("text") or ""))
+    layout_html = _algorithm_layout_html(record)
+    text = layout_html or (
+        '<pre class="docling-algorithm-block">'
+        f'{_algorithm_text_semantic_html(str(record.get("text") or ""))}</pre>'
+    )
     source = html.escape(str(record.get("source") or "pdf_text_bbox"))
     caption = str(record.get("caption") or "").strip()
     caption_html = (
@@ -4610,8 +4731,8 @@ def _algorithm_record_html(record: dict[str, Any]) -> str:
         f'data-algorithm-source="{source}">'
         f'<div class="docling-formula-second-pass-label docling-algorithm-label">{label}</div>'
         + caption_html
-        + f'<pre class="docling-algorithm-block">{text}</pre>'
-        "</div>"
+        + text
+        + "</div>"
     )
 
 
@@ -4622,9 +4743,15 @@ def _algorithm_record_markdown(record: dict[str, Any]) -> str:
     caption_text = f"\n\n{caption}\n" if caption and caption != label else ""
     return (
         f"\n\n**{label}**{caption_text}\n"
-        '<pre class="docling-algorithm-block">\n'
-        f"{_algorithm_text_semantic_html(text)}\n"
-        "</pre>\n\n"
+        + (
+            _algorithm_layout_html(record)
+            or (
+                '<pre class="docling-algorithm-block">\n'
+                f"{_algorithm_text_semantic_html(text)}\n"
+                "</pre>"
+            )
+        )
+        + "\n\n"
     )
 
 
@@ -4660,6 +4787,98 @@ def _algorithm_line_semantic_html(line: str) -> str:
 
 def _algorithm_text_semantic_html(text: str) -> str:
     return "\n".join(_algorithm_line_semantic_html(line) for line in text.splitlines())
+
+
+ALGORITHM_LAYOUT_BODY_START_RE = re.compile(
+    r"(?i)^\s*(?:"
+    r"Require|Ensure|Input|Output|Parameters?|Initialize|"
+    r"for\b.*\bdo\b|while\b|if\b|else\b|return\b|"
+    r"end(?:\s+(?:for|while|if))?\b|"
+    r"\d+\s*[:.]|"
+    r"[•\-\u2022]\s*"
+    r"(?:Sample|Update|Process|Train|Add|Modify|Set|Compute|Draw)\b|"
+    r"Sample|Update|Process|Train|Add|Modify|Set|Compute|Draw"
+    r")"
+)
+
+
+def _algorithm_layout_visible_lines(record: dict[str, Any], lines: list[Any]) -> list[Any]:
+    """Keep algorithm layout readable by hiding duplicated captions from visible flow."""
+    if len(lines) < 3:
+        return lines
+    start_index: int | None = None
+    for index, line in enumerate(lines):
+        if not isinstance(line, dict):
+            continue
+        line_text = _normalized_noise_text(str(line.get("text") or ""))
+        if ALGORITHM_LAYOUT_BODY_START_RE.match(line_text):
+            start_index = index
+            break
+    visible = lines if start_index is None else lines[start_index:]
+    filtered: list[Any] = []
+    for line in visible:
+        if isinstance(line, dict):
+            line_text = _normalized_noise_text(str(line.get("text") or ""))
+            if re.match(r"(?i)^Algorithm\s+\d+\b", line_text):
+                continue
+        filtered.append(line)
+    return filtered
+
+
+def _algorithm_layout_html(record: dict[str, Any]) -> str:
+    layout = record.get("layout")
+    if not isinstance(layout, dict) or int(layout.get("line_count") or 0) < 3:
+        return ""
+    rendered_lines: list[str] = []
+    visible_lines = _algorithm_layout_visible_lines(record, list(layout.get("lines") or []))
+    for line in visible_lines:
+        if not isinstance(line, dict):
+            continue
+        spans_html: list[str] = []
+        for span in line.get("spans") or []:
+            if not isinstance(span, dict):
+                continue
+            text = html.escape(str(span.get("text") or ""))
+            if not text:
+                continue
+            classes: list[str] = []
+            styles = set(span.get("styles") or [])
+            if "bold" in styles:
+                classes.append("docling-algorithm-span-bold")
+            if "italic" in styles:
+                classes.append("docling-algorithm-span-italic")
+            if text.strip() in {"•", "-", "–"}:
+                classes.append("docling-algorithm-bullet")
+            if classes:
+                spans_html.append(f'<span class="{" ".join(classes)}">{text}</span>')
+            else:
+                spans_html.append(text)
+        if not spans_html:
+            line_text = str(line.get("text") or "")
+            spans_html.append(_algorithm_line_semantic_html(line_text))
+        indent_ch = max(0.0, float(line.get("indent_px") or 0.0) / 7.0)
+        rendered_lines.append(
+            '<div class="docling-algorithm-layout-line" '
+            f'style="padding-left:{indent_ch:.2f}ch">'
+            + "".join(spans_html)
+            + "</div>"
+        )
+    if not rendered_lines:
+        return ""
+    evidence = (
+        '<div class="docling-formula-fallback-source">'
+        f'Layout source: {html.escape(str(layout.get("source") or "pdf_text_span_layout"))}; '
+        f'lines={int(layout.get("line_count") or 0)}; '
+        f'spans={int(layout.get("span_count") or 0)}'
+        "</div>"
+    )
+    return (
+        '<div class="docling-algorithm-layout-block" '
+        f'data-layout-source="{html.escape(str(layout.get("source") or "pdf_text_span_layout"))}">'
+        + "".join(rendered_lines)
+        + "</div>"
+        + evidence
+    )
 
 
 def _nearby_algorithm_caption(
@@ -4726,6 +4945,7 @@ def _algorithm_candidate_records(document_json: Any, pdf_path: Path) -> list[dic
         formatted = _format_algorithm_text(formatted_source)
         if len(formatted) < 20:
             continue
+        layout = _pdf_algorithm_layout_for_bbox(pdf_path, prov) if pdf_path.exists() else None
         caption, caption_indexes, caption_targets = _nearby_algorithm_caption(
             nodes,
             text_index,
@@ -4744,6 +4964,7 @@ def _algorithm_candidate_records(document_json: Any, pdf_path: Path) -> list[dic
                 "formula_no": formula_no,
                 "page_no": prov.get("page_no"),
                 "bbox": bbox_geometry(prov),
+                "layout": layout,
                 "original_label": label,
                 "html_targets": caption_targets,
             }
@@ -4755,6 +4976,7 @@ def _algorithm_candidate_records(document_json: Any, pdf_path: Path) -> list[dic
             nodes,
             used_text_indexes,
             len(records) + 1,
+            pdf_path,
         )
     )
     return records
@@ -8569,6 +8791,7 @@ def _algorithm_cluster_records(
     nodes: list[dict[str, Any]],
     used_text_indexes: set[int],
     start_record_no: int,
+    pdf_path: Path | None = None,
 ) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
     index = 0
@@ -8656,6 +8879,13 @@ def _algorithm_cluster_records(
             "",
         )
         label = title_text if title_text else f"Algorithm block {start_record_no + len(records)}"
+        merged_bbox = _merge_bbox_geometry([cluster_node for _, cluster_node in cluster])
+        layout = None
+        if pdf_path and pdf_path.exists() and isinstance(page_no, int) and merged_bbox:
+            layout = _pdf_algorithm_layout_for_bbox(
+                pdf_path,
+                {"page_no": page_no, "bbox": merged_bbox},
+            )
         records.append(
             {
                 "id": f"algorithm-block-{start_record_no + len(records)}",
@@ -8667,7 +8897,8 @@ def _algorithm_cluster_records(
                 "formula_nos": formula_nos,
                 "formula_no": None,
                 "page_no": page_no,
-                "bbox": _merge_bbox_geometry([cluster_node for _, cluster_node in cluster]),
+                "bbox": merged_bbox,
+                "layout": layout,
                 "original_label": "algorithm_cluster",
                 "html_targets": [str(cluster_node.get("text") or "") for _, cluster_node in cluster],
             }

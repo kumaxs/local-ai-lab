@@ -3942,6 +3942,56 @@ class EnglishReviewPolishTests(unittest.TestCase):
         self.assertEqual(records[0]["source"], "pdf_text_bbox")
         self.assertIn("Require: alpha", records[0]["text"])
         self.assertIn("\nwhile theta", records[0]["text"])
+        self.assertIsInstance(records[0].get("layout"), dict)
+        self.assertGreaterEqual(records[0]["layout"]["line_count"], 4)
+        self.assertGreaterEqual(records[0]["layout"]["distinct_indent_count"], 2)
+
+    def test_algorithm_layout_html_preserves_span_styles_and_offsets(self) -> None:
+        html_text = adapter._algorithm_layout_html(
+            {
+                "layout": {
+                    "source": "pdf_text_span_layout",
+                    "line_count": 4,
+                    "span_count": 5,
+                    "lines": [
+                        {
+                            "text": "Algorithm 1: Adam, our proposed algorithm.",
+                            "indent_px": 0,
+                            "spans": [{"text": "Algorithm 1: Adam, our proposed algorithm.", "styles": []}],
+                        },
+                        {
+                            "text": "Require: alpha",
+                            "indent_px": 0,
+                            "spans": [
+                                {"text": "Require:", "styles": ["bold"]},
+                                {"text": " alpha", "styles": []},
+                            ],
+                        },
+                        {
+                            "text": "return theta",
+                            "indent_px": 14,
+                            "spans": [
+                                {"text": "return", "styles": ["bold", "italic"]},
+                                {"text": " theta", "styles": []},
+                            ],
+                        },
+                        {
+                            "text": "end",
+                            "indent_px": 0,
+                            "spans": [
+                                {"text": "end", "styles": ["bold"]},
+                            ],
+                        },
+                    ],
+                }
+            }
+        )
+
+        self.assertIn("docling-algorithm-layout-block", html_text)
+        self.assertIn("padding-left:2.00ch", html_text)
+        self.assertIn("docling-algorithm-span-bold", html_text)
+        self.assertIn("docling-algorithm-span-italic", html_text)
+        self.assertNotIn("Algorithm 1: Adam", html_text)
 
     def test_algorithm_cluster_accepts_caption_without_colon_and_formula_steps(self) -> None:
         document = {
