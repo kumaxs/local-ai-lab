@@ -1736,6 +1736,16 @@ sup.docling-footnote-ref {
   min-height: 1.15em;
   white-space: pre;
 }
+.docling-algorithm-semantic-layout {
+  background: #f8fafc;
+  border: 1px solid #cbd5e1;
+  overflow-x: auto;
+  padding: 0.65rem;
+}
+.docling-algorithm-formula-line {
+  display: inline-block;
+  min-width: max-content;
+}
 .docling-algorithm-span-bold {
   font-weight: 700;
 }
@@ -4826,10 +4836,7 @@ def _algorithm_caption_from_text(text: str) -> str:
 def _algorithm_record_html(record: dict[str, Any]) -> str:
     label = _algorithm_caption_semantic_html(str(record.get("label") or "Algorithm block"))
     layout_html = _algorithm_layout_html(record)
-    text = layout_html or (
-        '<pre class="docling-algorithm-block">'
-        f'{_algorithm_text_semantic_html(str(record.get("text") or ""))}</pre>'
-    )
+    text = layout_html or _algorithm_semantic_layout_html(str(record.get("text") or ""))
     source = html.escape(str(record.get("source") or "pdf_text_bbox"))
     caption = str(record.get("caption") or "").strip()
     caption_html = (
@@ -4866,6 +4873,34 @@ def _algorithm_record_markdown(record: dict[str, Any]) -> str:
     )
 
 
+def _algorithm_semantic_layout_html(text: str) -> str:
+    lines = text.splitlines()
+    rendered: list[str] = []
+    for line in lines:
+        if not line.strip():
+            continue
+        leading_spaces = len(line) - len(line.lstrip(" "))
+        indent_ch = max(0.0, float(leading_spaces))
+        stripped = line.strip()
+        if "\\" in stripped and _formula_like_row_score(stripped) >= 4:
+            line_html = (
+                '<span class="docling-algorithm-formula-line">'
+                f'\\({html.escape(stripped)}\\)'
+                "</span>"
+            )
+        else:
+            line_html = _algorithm_line_semantic_html(stripped)
+        rendered.append(
+            '<div class="docling-algorithm-layout-line" '
+            f'style="padding-left:{indent_ch:.2f}ch">'
+            f'{line_html}'
+            "</div>"
+        )
+    if not rendered:
+        return '<pre class="docling-algorithm-block"></pre>'
+    return '<div class="docling-algorithm-semantic-layout">' + "".join(rendered) + "</div>"
+
+
 ALGORITHM_SEMANTIC_KEYWORD_RE = re.compile(
     r"(?i)^(\s*)(Require|Ensure|Input|Output|Parameters?|Initialize|"
     r"for|while|if|else|return|end(?:\s+(?:for|while|if))?|"
@@ -4887,7 +4922,19 @@ def _algorithm_line_semantic_html(line: str) -> str:
     escaped = html.escape(line)
     match = ALGORITHM_SEMANTIC_KEYWORD_RE.match(escaped)
     if not match:
-        return escaped
+        numbered = re.match(
+            r"(?i)^(\s*\d+\s*:\s*)(for|while|if|else|return|end(?:\s+(?:for|while|if))?|"
+            r"Sample|Update|Process|Train|Add|Modify|Set|Compute|Draw)\b",
+            escaped,
+        )
+        if not numbered:
+            return escaped
+        prefix, keyword = numbered.group(1), numbered.group(2)
+        return (
+            prefix
+            + f'<strong class="docling-algorithm-keyword">{keyword}</strong>'
+            + escaped[numbered.end(2):]
+        )
     leading, keyword = match.group(1), match.group(2)
     return (
         leading
@@ -8810,6 +8857,30 @@ def _sanitized_formula_regressed(original: str, candidate: str) -> bool:
     return False
 
 
+def _latex_environment_stack_ok(formula_text: str) -> bool:
+    stack: list[str] = []
+    for match in re.finditer(r"\\(?P<kind>begin|end)\s*\{\s*(?P<env>[^{}]+?)\s*\}", formula_text):
+        kind = match.group("kind")
+        env = re.sub(r"\s+", "", match.group("env"))
+        if kind == "begin":
+            stack.append(env)
+        elif stack and stack[-1] == env:
+            stack.pop()
+        else:
+            return False
+    return not stack
+
+
+def _validated_latex_reasons(formula_text: str) -> list[str]:
+    latex_ok, latex_reasons = validate_candidate_latex(formula_text)
+    if latex_ok:
+        return []
+    reasons = list(latex_reasons)
+    if "environment_mismatch" in reasons and _latex_environment_stack_ok(formula_text):
+        reasons = [reason for reason in reasons if reason != "environment_mismatch"]
+    return reasons
+
+
 def _repair_unmatched_formula_braces(formula_text: str) -> tuple[str, bool]:
     """Remove obvious stray display braces so MathJax can render preserved formula bodies."""
     output: list[str] = []
@@ -10514,9 +10585,7 @@ def _formula_output_safety_reasons(text: str) -> list[str]:
     if _looks_like_algorithm_formula(text):
         reasons.append("algorithm_like_formula_array")
     reasons.extend(formula_hallucination_reasons(body))
-    latex_ok, latex_reasons = validate_candidate_latex(body)
-    if not latex_ok:
-        reasons.extend(f"latex_{reason}" for reason in latex_reasons)
+    reasons.extend(f"latex_{reason}" for reason in _validated_latex_reasons(body))
     if re.search(r"(?<![A-Za-z])(?:[A-Za-z]\s+){4,}[A-Za-z](?![A-Za-z])", body):
         reasons.append("garbled_letter_spaced_text")
     if CN_CHAR_RE.search(body):
@@ -10628,10 +10697,16 @@ def _readable_formula_fallback_display_text(entry: dict[str, Any]) -> tuple[str,
     for source, candidate in candidates:
         if not candidate.strip():
             continue
+        normalized, _repairs = canonicalize_formula_output(candidate, eq_number)
+        display_text, sanitize_reasons = sanitize_formula_display_text(normalized)
+        full_safety_reasons = formula_hallucination_reasons(display_text)
+        full_safety_reasons.extend(f"latex_{reason}" for reason in _validated_latex_reasons(display_text))
+        if display_text and _formula_like_row_score(display_text) >= 4 and not full_safety_reasons:
+            score = (0, 0, -_formula_like_row_score(display_text))
+            ranked.append((score, display_text[:1600], source, sanitize_reasons))
+            continue
         rows = _formula_rows_from_candidate(candidate)
         if not rows:
-            normalized, _repairs = canonicalize_formula_output(candidate, eq_number)
-            display_text, sanitize_reasons = sanitize_formula_display_text(normalized)
             rows = [display_text] if _formula_like_row_score(display_text) >= 4 else []
         if not rows:
             continue
@@ -10641,10 +10716,8 @@ def _readable_formula_fallback_display_text(entry: dict[str, Any]) -> tuple[str,
         if eq_number and not re.search(r"\(\s*" + re.escape(str(eq_number)) + r"\s*\)", display):
             display = f"{display} \\quad ({eq_number})"
         display, sanitize_reasons = sanitize_formula_display_text(display)
-        latex_ok, latex_reasons = validate_candidate_latex(display)
         safety_reasons = formula_hallucination_reasons(display)
-        if not latex_ok:
-            safety_reasons.extend(f"latex_{reason}" for reason in latex_reasons)
+        safety_reasons.extend(f"latex_{reason}" for reason in _validated_latex_reasons(display))
         score = (len(safety_reasons), 0 if len(rows) > 1 else 1, -_formula_like_row_score(display))
         ranked.append((score, display[:1600], source, sanitize_reasons + safety_reasons))
     if not ranked:
