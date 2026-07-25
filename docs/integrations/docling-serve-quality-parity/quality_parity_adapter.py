@@ -4883,9 +4883,10 @@ def _algorithm_semantic_layout_html(text: str) -> str:
         indent_ch = max(0.0, float(leading_spaces))
         stripped = line.strip()
         if "\\" in stripped and _formula_like_row_score(stripped) >= 4:
+            display_formula, _sanitize_reasons = sanitize_formula_display_text(stripped)
             line_html = (
                 '<span class="docling-algorithm-formula-line">'
-                f'\\({html.escape(stripped)}\\)'
+                f'\\({html.escape(display_formula)}\\)'
                 "</span>"
             )
         else:
@@ -8857,6 +8858,34 @@ def _sanitized_formula_regressed(original: str, candidate: str) -> bool:
     return False
 
 
+def _repair_formula_ocr_variable_artifacts(formula_text: str) -> tuple[str, list[str]]:
+    """Repair tightly-scoped OCR artifacts where bold variables are split into math operators."""
+    repaired = formula_text
+    reasons: list[str] = []
+
+    def replace_braced_pm_b(match: re.Match[str]) -> str:
+        variable = match.group("var")
+        reasons.append("repaired_pm_bold_variable_ocr_artifact")
+        return rf"\mathbf {{ {variable} }}"
+
+    repaired = re.sub(
+        r"\{\s*\\pm\s+b\s*(?P<var>[A-Za-z])\s*\}",
+        replace_braced_pm_b,
+        repaired,
+    )
+    repaired = re.sub(
+        r"\\pm\s+b\s*\{\s*(?P<var>[A-Za-z])\s*\}",
+        replace_braced_pm_b,
+        repaired,
+    )
+    repaired = re.sub(
+        r"\\pm\s+b\s+(?P<var>[A-Za-z])(?=\s*(?:[\^_)\]\},;]|\\(?:sim|right|quad|cdot)\b))",
+        replace_braced_pm_b,
+        repaired,
+    )
+    return repaired, list(dict.fromkeys(reasons))
+
+
 def _latex_environment_stack_ok(formula_text: str) -> bool:
     stack: list[str] = []
     for match in re.finditer(r"\\(?P<kind>begin|end)\s*\{\s*(?P<env>[^{}]+?)\s*\}", formula_text):
@@ -9187,6 +9216,10 @@ def sanitize_formula_display_text(formula_text: str) -> tuple[str, list[str]]:
     """Return a MathJax-display-safe formula body plus evidence-backed reasons."""
     reasons: list[str] = []
     display_text = formula_text
+    repaired_ocr, ocr_reasons = _repair_formula_ocr_variable_artifacts(display_text)
+    if ocr_reasons:
+        display_text = repaired_ocr
+        reasons.extend(ocr_reasons)
     ungrouped, group_changed = _strip_balanced_array_group(display_text)
     if group_changed:
         display_text = ungrouped

@@ -389,6 +389,27 @@ class EnglishReviewPolishTests(unittest.TestCase):
         latex_ok, latex_reasons = adapter.validate_candidate_latex(display_text)
         self.assertTrue(latex_ok, latex_reasons)
 
+    def test_formula_tex_qc_repairs_pm_bold_variable_ocr_artifact(self) -> None:
+        formula = (
+            r"D _ { G } ^ { * } ( { \pm b x } ) = "
+            r"\frac { p _ { d a t a } ( { \pm b x } ) } "
+            r"{ p _ { d a t a } ( { \pm b x } ) + p _ { g } ( { \pm b x } ) }"
+        )
+
+        display_text, reasons = adapter.sanitize_formula_display_text(formula)
+
+        self.assertIn("repaired_pm_bold_variable_ocr_artifact", reasons)
+        self.assertNotIn(r"\pm b", display_text)
+        self.assertIn(r"\mathbf { x }", display_text)
+
+    def test_formula_tex_qc_preserves_legitimate_pm_b_expression(self) -> None:
+        formula = r"y = a \pm b + c"
+
+        display_text, reasons = adapter.sanitize_formula_display_text(formula)
+
+        self.assertNotIn("repaired_pm_bold_variable_ocr_artifact", reasons)
+        self.assertEqual(display_text, formula)
+
     def test_formula_tex_qc_removes_balanced_outer_array_group(self) -> None:
         formula = (
             r"{ \begin{array} { r l } & { a = b \quad ( 3 ) } \\ "
@@ -4073,6 +4094,15 @@ class EnglishReviewPolishTests(unittest.TestCase):
         self.assertIn("docling-algorithm-formula-line", html_text)
         self.assertIn(r"\(", html_text)
         self.assertIn(r"\nabla", html_text)
+
+    def test_algorithm_semantic_layout_repairs_formula_ocr_artifacts(self) -> None:
+        html_text = adapter._algorithm_semantic_layout_html(
+            r"  \nabla _ { \theta _ { d } } \log D \left ( \pm b { x } ^ { ( i ) } \right )"
+        )
+
+        self.assertIn("docling-algorithm-formula-line", html_text)
+        self.assertNotIn(r"\pm b", html_text)
+        self.assertIn(r"\mathbf { x }", html_text)
 
     def test_algorithm_formula_plain_text_preserves_fraction_structure(self) -> None:
         formula = (
