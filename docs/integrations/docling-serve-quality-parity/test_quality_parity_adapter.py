@@ -416,6 +416,24 @@ class EnglishReviewPolishTests(unittest.TestCase):
         self.assertIn(r"\langle \nabla _ { w } L \rangle } \\", display_text)
         self.assertIn(r"+ \Delta w ^ { t } , } \end{array}", display_text)
 
+    def test_formula_fallback_keeps_nested_cases_array_intact(self) -> None:
+        formula = (
+            r"\begin{array} { c c l l } { { \epsilon ^ { t } } } & { = } & "
+            r"{ { \epsilon _ { 0 } f ^ { t } } } \\ { { p ^ { t } } } & { = } & "
+            r"{ { \begin{cases} { \frac { t } { T } p _ { i } + "
+            r"( 1 - \frac { t } { T } ) p _ { f } } & { t < T } \\ "
+            r"{ p _ { f } } & { t \geq T } \end{cases} } } \end{array}"
+        )
+
+        display, source, reasons = adapter._readable_formula_fallback_display_text(
+            {"route_a_text": formula}
+        )
+
+        self.assertEqual(source, "route_a_source")
+        self.assertIn(r"\begin{cases}", display)
+        self.assertNotIn(r"\begin{aligned}", display)
+        self.assertNotIn("latex_environment_mismatch", reasons)
+
     def test_formula_fallback_collapses_misdetected_prose_candidate(self) -> None:
         html = adapter._render_formula_fallback_html(
             {
@@ -4033,6 +4051,28 @@ class EnglishReviewPolishTests(unittest.TestCase):
 
         self.assertEqual(html_text, "")
         self.assertIn("layout_fragmented_short_line_ratio", record["layout_visible_fallback_reasons"])
+
+    def test_algorithm_semantic_layout_renders_indented_lines(self) -> None:
+        html_text = adapter._algorithm_semantic_layout_html(
+            "1: initialize\n"
+            "2: for k = 1 .. K do\n"
+            "  3: update state\n"
+            "  4: end for"
+        )
+
+        self.assertIn("docling-algorithm-semantic-layout", html_text)
+        self.assertIn("padding-left:2.00ch", html_text)
+        self.assertIn("docling-algorithm-keyword", html_text)
+
+    def test_algorithm_semantic_layout_renders_formula_lines_as_math(self) -> None:
+        html_text = adapter._algorithm_semantic_layout_html(
+            r"Update the discriminator:" "\n"
+            r"  \nabla _ { \theta _ { d } } \frac { 1 } { m } \sum _ { i = 1 } ^ { m } \log D ( x_i )"
+        )
+
+        self.assertIn("docling-algorithm-formula-line", html_text)
+        self.assertIn(r"\(", html_text)
+        self.assertIn(r"\nabla", html_text)
 
     def test_algorithm_formula_plain_text_preserves_fraction_structure(self) -> None:
         formula = (
