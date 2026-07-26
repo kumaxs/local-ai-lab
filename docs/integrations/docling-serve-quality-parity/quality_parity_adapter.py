@@ -5193,6 +5193,98 @@ def _find_html_blocks_for_targets(document_html: str, targets: list[str]) -> lis
     return ranges
 
 
+def _html_visible_text_range(document_html: str, start: int, end: int) -> str:
+    return html.unescape(HTML_TAG_RE.sub(" ", document_html[start:end]))
+
+
+def _algorithm_record_normalized_content(record: dict[str, Any]) -> str:
+    parts = [
+        str(record.get("label") or ""),
+        str(record.get("caption") or ""),
+        str(record.get("text") or ""),
+        str(record.get("original_text") or ""),
+    ]
+    parts.extend(str(target or "") for target in (record.get("html_targets") or []))
+    return _normalized_noise_text(" ".join(part for part in parts if part))
+
+
+def _algorithm_range_belongs_to_record(
+    document_html: str,
+    range_item: tuple[int, int],
+    record: dict[str, Any],
+) -> bool:
+    visible = _normalized_noise_text(_html_visible_text_range(document_html, *range_item))
+    if not visible:
+        return False
+    record_text = _algorithm_record_normalized_content(record)
+    compact_visible = re.sub(r"\s+", "", visible)
+    compact_record = re.sub(r"\s+", "", record_text)
+    return (
+        visible in record_text
+        or compact_visible in compact_record
+        or record_text[:160] in visible
+        or compact_record[:160] in compact_visible
+    )
+
+
+POST_ALGORITHM_MAIN_FLOW_RE = re.compile(
+    r"(?i)\b(?:"
+    r"\d+\s*\.\s*\d+\b|"
+    r"Proposition\s+\d+|Theorem\s+\d+|Lemma\s+\d+|Corollary\s+\d+|"
+    r"References|Acknowledg(?:e)?ments"
+    r")"
+)
+
+
+def _algorithm_merged_replacement_safe(
+    document_html: str,
+    start: int,
+    end: int,
+    record: dict[str, Any],
+) -> bool:
+    visible = _normalized_noise_text(_html_visible_text_range(document_html, start, end))
+    record_text = _algorithm_record_normalized_content(record)
+    if not visible:
+        return False
+    if len(visible) > max(1800, len(record_text) * 2 + 500):
+        return False
+    protected = [
+        match.group(0)
+        for match in POST_ALGORITHM_MAIN_FLOW_RE.finditer(visible)
+        if match.group(0) not in record_text
+    ]
+    if protected:
+        return False
+    return True
+
+
+def _replace_algorithm_record_non_destructive_html(
+    document_html: str,
+    record: dict[str, Any],
+    ranges: list[tuple[int, int]],
+    replacement: str,
+) -> tuple[str, bool]:
+    if not ranges:
+        return document_html, False
+    anchor = min(start for start, _end in ranges)
+    safe_ranges = [
+        range_item
+        for range_item in ranges
+        if _algorithm_range_belongs_to_record(document_html, range_item, record)
+    ]
+    updated = document_html[:anchor] + replacement + document_html[anchor:]
+    shift = len(replacement)
+    removed_any = False
+    adjusted_ranges = [
+        (start + shift, end + shift)
+        for start, end in safe_ranges
+    ]
+    for start, end in sorted(adjusted_ranges, reverse=True):
+        updated = updated[:start] + updated[end:]
+        removed_any = True
+    return updated, True if replacement else removed_any
+
+
 def _replace_algorithm_records_in_html(document_html: str, records: list[dict[str, Any]]) -> tuple[str, int]:
     updated = document_html
     changed = 0
@@ -5225,7 +5317,15 @@ def _replace_algorithm_records_in_html(document_html: str, records: list[dict[st
             if len(target_ranges) >= required_targets:
                 start = min(start for start, _end in target_ranges)
                 end = max(end for _start, end in target_ranges)
-                updated = updated[:start] + replacement + updated[end:]
+                if _algorithm_merged_replacement_safe(updated, start, end, record):
+                    updated = updated[:start] + replacement + updated[end:]
+                else:
+                    updated, _ = _replace_algorithm_record_non_destructive_html(
+                        updated,
+                        record,
+                        target_ranges,
+                        replacement,
+                    )
                 changed += 1
                 continue
         formula_no = record.get("formula_no")
@@ -5305,6 +5405,77 @@ def _find_markdown_target_line_ranges(md_text: str, targets: Iterable[str]) -> l
     return ranges
 
 
+def _markdown_visible_text_range(md_text: str, start: int, end: int) -> str:
+    visible = md_text[start:end]
+    visible = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", visible)
+    visible = re.sub(r"<!--.*?-->", " ", visible, flags=re.S)
+    visible = re.sub(r"`{1,3}[^`]*`{1,3}", " ", visible)
+    visible = re.sub(r"[*_#>`]", " ", visible)
+    return html.unescape(visible)
+
+
+def _algorithm_markdown_merged_replacement_safe(
+    md_text: str,
+    start: int,
+    end: int,
+    record: dict[str, Any],
+) -> bool:
+    visible = _normalized_noise_text(_markdown_visible_text_range(md_text, start, end))
+    record_text = _algorithm_record_normalized_content(record)
+    if not visible:
+        return False
+    if len(visible) > max(1800, len(record_text) * 2 + 500):
+        return False
+    protected = [
+        match.group(0)
+        for match in POST_ALGORITHM_MAIN_FLOW_RE.finditer(visible)
+        if match.group(0) not in record_text
+    ]
+    if protected:
+        return False
+    return True
+
+
+def _markdown_range_belongs_to_record(
+    md_text: str,
+    range_item: tuple[int, int],
+    record: dict[str, Any],
+) -> bool:
+    visible = _normalized_noise_text(_markdown_visible_text_range(md_text, *range_item))
+    if not visible:
+        return False
+    record_text = _algorithm_record_normalized_content(record)
+    compact_visible = re.sub(r"\s+", "", visible)
+    compact_record = re.sub(r"\s+", "", record_text)
+    return (
+        visible in record_text
+        or compact_visible in compact_record
+        or record_text[:160] in visible
+        or compact_record[:160] in compact_visible
+    )
+
+
+def _replace_algorithm_record_non_destructive_markdown(
+    md_text: str,
+    record: dict[str, Any],
+    ranges: list[tuple[int, int]],
+    replacement: str,
+) -> tuple[str, bool]:
+    if not ranges:
+        return md_text, False
+    anchor = min(start for start, _end in ranges)
+    safe_ranges = [
+        range_item
+        for range_item in ranges
+        if _markdown_range_belongs_to_record(md_text, range_item, record)
+    ]
+    updated = md_text[:anchor] + replacement + md_text[anchor:]
+    shift = len(replacement)
+    for start, end in sorted(((s + shift, e + shift) for s, e in safe_ranges), reverse=True):
+        updated = updated[:start] + updated[end:]
+    return updated, True
+
+
 def _remove_markdown_target_lines(md_text: str, targets: Iterable[str]) -> tuple[str, int]:
     updated = md_text
     ranges = _find_markdown_target_line_ranges(updated, targets)
@@ -5378,7 +5549,27 @@ def _replace_algorithm_records_in_markdown(md_text: str, records: list[dict[str,
         if anchor_ranges:
             start = min(start for start, _end in anchor_ranges)
             end = max(end for _start, end in anchor_ranges)
-            edits.append((start, end, _algorithm_record_markdown(record)))
+            replacement = _algorithm_record_markdown(record)
+            if _algorithm_markdown_merged_replacement_safe(updated, start, end, record):
+                edits.append((start, end, replacement))
+            else:
+                if edits:
+                    for edit_start, edit_end, edit_replacement in sorted(edits, reverse=True):
+                        updated = updated[:edit_start] + edit_replacement + updated[edit_end:]
+                    edits = []
+                    formula_blocks = list(re.finditer(r"\$\$.*?\$\$", updated, re.DOTALL))
+                    anchor_ranges = []
+                    for formula_no in dict.fromkeys(formula_nos):
+                        if 0 < formula_no <= len(formula_blocks):
+                            block = formula_blocks[formula_no - 1]
+                            anchor_ranges.append((block.start(), block.end()))
+                updated, _ = _replace_algorithm_record_non_destructive_markdown(
+                    updated,
+                    record,
+                    anchor_ranges,
+                    replacement,
+                )
+                formula_blocks = list(re.finditer(r"\$\$.*?\$\$", updated, re.DOTALL))
             changed += 1
             continue
         formula_no = record.get("formula_no")

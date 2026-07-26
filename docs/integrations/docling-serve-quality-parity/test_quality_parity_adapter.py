@@ -4104,6 +4104,62 @@ class EnglishReviewPolishTests(unittest.TestCase):
         self.assertNotIn(r"\pm b", html_text)
         self.assertIn(r"\mathbf { x }", html_text)
 
+    def test_algorithm_html_replacement_does_not_swallow_following_sections(self) -> None:
+        html_text = (
+            "<p>Algorithm 1 Training loop.</p>"
+            '<div class="docling-formula-second-pass" data-formula-index="2">'
+            r"<div>\[\nabla D(x)\]</div></div>"
+            "<h2>4.1 Global Optimality of p g = p data</h2>"
+            "<p>Proposition 1. For fixed G, the optimal discriminator is important.</p>"
+            '<div class="docling-formula-second-pass" data-formula-index="3">'
+            r"<div>\[\nabla G(z)\]</div></div>"
+        )
+        records = [
+            {
+                "label": "Algorithm 1 Training loop.",
+                "text": "for number of training iterations do\n  update discriminator\n  update generator",
+                "original_text": r"Algorithm 1 Training loop. \nabla D(x) \nabla G(z)",
+                "source": "docling_algorithm_cluster",
+                "formula_nos": [2, 3],
+                "html_targets": ["Algorithm 1 Training loop."],
+                "original_label": "algorithm_cluster",
+            }
+        ]
+
+        updated, changed = adapter._replace_algorithm_records_in_html(html_text, records)
+
+        self.assertEqual(changed, 1)
+        self.assertIn("docling-algorithm-recovered", updated)
+        self.assertIn("4.1 Global Optimality", updated)
+        self.assertIn("Proposition 1", updated)
+
+    def test_algorithm_markdown_replacement_does_not_swallow_following_sections(self) -> None:
+        md_text = (
+            "Algorithm 1 Training loop.\n\n"
+            "$$\\nabla D(x)$$\n\n"
+            "## 4.1 Global Optimality\n\n"
+            "Proposition 1. For fixed G, the optimal discriminator is important.\n\n"
+            "$$\\nabla G(z)$$\n"
+        )
+        records = [
+            {
+                "label": "Algorithm 1 Training loop.",
+                "text": "for number of training iterations do\n  update discriminator\n  update generator",
+                "original_text": r"Algorithm 1 Training loop. \nabla D(x) \nabla G(z)",
+                "source": "docling_algorithm_cluster",
+                "formula_nos": [1, 2],
+                "html_targets": ["Algorithm 1 Training loop."],
+                "original_label": "algorithm_cluster",
+            }
+        ]
+
+        updated, changed = adapter._replace_algorithm_records_in_markdown(md_text, records)
+
+        self.assertEqual(changed, 1)
+        self.assertIn("Algorithm 1 Training loop", updated)
+        self.assertIn("4.1 Global Optimality", updated)
+        self.assertIn("Proposition 1", updated)
+
     def test_algorithm_formula_plain_text_preserves_fraction_structure(self) -> None:
         formula = (
             r"\begin{array} { l l } "
