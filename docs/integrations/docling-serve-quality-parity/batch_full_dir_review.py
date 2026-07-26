@@ -15,6 +15,7 @@ import re
 import subprocess
 import sys
 import time
+from urllib.parse import quote
 from pathlib import Path
 from typing import Any
 
@@ -331,6 +332,17 @@ def write_manual_review_index(output_root: Path, rows: list[dict[str, Any]]) -> 
         prefix = f"../{job_id}"
         status_label = "OK" if row.get("ok") else "FAILED"
         output_dir = output_root / job_id
+        input_path = Path(str(row.get("input_path") or "")).expanduser()
+        source_link = "N/A"
+        md_source_link = "N/A"
+        if input_path:
+            source_href = "file://" + quote(input_path.as_posix())
+            source_text = html.escape(input_path.as_posix())
+            source_link = (
+                f'<a href="{source_href}">Source PDF</a>'
+                f'<br><code>{source_text}</code>'
+            )
+            md_source_link = f"[Source PDF]({source_href})<br>`{input_path.as_posix()}`"
         html_link = (
             f'<a href="{prefix}/document.html">HTML</a>'
             if (output_dir / "document.html").exists()
@@ -355,6 +367,7 @@ def write_manual_review_index(output_root: Path, rows: list[dict[str, Any]]) -> 
             "<tr>"
             f"<td>{html.escape(row['input_filename'])}</td>"
             f"<td>{status_label}</td>"
+            f"<td>{source_link}</td>"
             f"<td>{html_link}</td>"
             f"<td>{md_link}</td>"
             f"<td>{structural_content_link}</td>"
@@ -383,6 +396,7 @@ def write_manual_review_index(output_root: Path, rows: list[dict[str, Any]]) -> 
         )
         markdown_rows.append(
             f"| {row['input_filename']} | {status_label} | "
+            f"{md_source_link} | "
             f"{md_html_link} | {md_document_link} | "
             f"{md_structural_content_link} | {md_structural_regions_link} |"
         )
@@ -405,7 +419,7 @@ a { color: #075ea8; }
 <h1>Docling manual review</h1>
 <p class="summary">Completed: %d / %d. Review rendered HTML first, then compare Markdown and structural evidence.</p>
 <table>
-<thead><tr><th>PDF</th><th>Status</th><th>Rendered</th><th>Markdown</th><th>Structural output</th><th>Evidence</th></tr></thead>
+<thead><tr><th>PDF</th><th>Status</th><th>Source PDF</th><th>Rendered</th><th>Markdown</th><th>Structural output</th><th>Evidence</th></tr></thead>
 <tbody>%s</tbody>
 </table>
 </body>
@@ -419,8 +433,8 @@ a { color: #075ea8; }
     markdown = [
         "# Docling manual review",
         "",
-        "| PDF | Status | Rendered | Markdown | Structural output | Evidence |",
-        "| --- | --- | --- | --- | --- | --- |",
+        "| PDF | Status | Source PDF | Rendered | Markdown | Structural output | Evidence |",
+        "| --- | --- | --- | --- | --- | --- | --- |",
         *markdown_rows,
         "",
     ]
