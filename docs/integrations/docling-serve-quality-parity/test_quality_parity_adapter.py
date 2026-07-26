@@ -410,6 +410,26 @@ class EnglishReviewPolishTests(unittest.TestCase):
         self.assertNotIn("repaired_pm_bold_variable_ocr_artifact", reasons)
         self.assertEqual(display_text, formula)
 
+    def test_formula_tex_qc_repairs_log_argument_and_stale_number_artifact(self) -> None:
+        formula = (
+            r"C ( G ) = - \log + K L \left ( p _ { d a t a } \left \| "
+            r"\frac { p _ { d a t a } + p _ { g } } { 2 } \right ) "
+            r"+ K L \left ( p _ { g } \left \| "
+            r"\frac { p _ { d a t a } + p _ { g } } { 2 } \right ) \right ) "
+            r"\quad ( 5 ) \quad ( 4 )"
+        )
+
+        display_text, reasons = adapter.sanitize_formula_display_text(formula)
+
+        self.assertIn("repaired_empty_log_argument_from_stale_trailing_number", reasons)
+        self.assertIn("downgraded_unbalanced_left_right_commands", reasons)
+        self.assertIn(r"\log ( 4 )", display_text)
+        self.assertIn(r"\quad ( 5 )", display_text)
+        self.assertNotIn(r"\quad ( 4 )", display_text)
+        self.assertNotIn(r"\left", display_text)
+        self.assertNotIn(r"\right", display_text)
+        self.assertNotIn("latex_left_right_mismatch", adapter._formula_output_safety_reasons(display_text))
+
     def test_formula_tex_qc_removes_balanced_outer_array_group(self) -> None:
         formula = (
             r"{ \begin{array} { r l } & { a = b \quad ( 3 ) } \\ "
@@ -493,6 +513,26 @@ class EnglishReviewPolishTests(unittest.TestCase):
         self.assertTrue(markdown.startswith("$$"))
         self.assertIn(r"\partial", markdown)
         self.assertNotIn("Formula 11 fallback", markdown)
+
+    def test_formula_fallback_renders_repaired_log_formula_instead_of_error(self) -> None:
+        html = adapter._render_formula_fallback_html(
+            {
+                "formula_no": 8,
+                "status": "final_output_unsafe",
+                "fallback_reason": "latex_left_right_mismatch",
+                "route_a_text": (
+                    r"C ( G ) = - \log + 2 \cdot J S D \left ( p _ { d a t a } "
+                    r"\left \| p _ { g } \right ) \quad ( 6 ) \quad ( 4 )"
+                ),
+            },
+            Path("/tmp/out"),
+            Path("/tmp/out/formula_second_pass"),
+        )
+
+        self.assertIn("docling-formula-readable-fallback", html)
+        self.assertIn(r"\log ( 4 )", html)
+        self.assertNotIn(r"\quad ( 4 )", html)
+        self.assertNotIn("Formula body could not be recovered", html)
 
     def test_algorithm_array_is_not_rendered_as_formula(self) -> None:
         formula = (
@@ -1287,6 +1327,100 @@ class EnglishReviewPolishTests(unittest.TestCase):
         self.assertIn(r"\operatorname{Attention}", html_text)
         self.assertIn(r"\operatorname{Attention}", md_text)
         self.assertIn("current_formula_display_fallback", status["quality_signals"])
+
+    def test_current_formula_display_fallback_synchronizes_sanitized_contract_outputs(self) -> None:
+        formula = (
+            r"C ( G ) = - \log + 2 \cdot J S D \left ( p _ { d a t a } "
+            r"\left \| p _ { g } \right ) \quad ( 6 ) \quad ( 4 )"
+        )
+        document = {"texts": [{"label": "formula", "text": formula}]}
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir)
+            (output_dir / "document.json").write_text(
+                adapter.json.dumps(document),
+                encoding="utf-8",
+            )
+            (output_dir / "document.html").write_text(
+                (
+                    "<html><body><div><math><annotation>"
+                    f"{formula}"
+                    "</annotation></math></div></body></html>"
+                ),
+                encoding="utf-8",
+            )
+            (output_dir / "document.md").write_text(f"$${formula}$$", encoding="utf-8")
+            metadata: dict[str, object] = {}
+            status = {"quality_signals": {}, "warnings": [], "success_class": "degraded_success"}
+            args = Namespace(input_file=Path("gan-1406.2661.pdf"))
+
+            result = adapter.apply_current_formula_display_fallback(
+                output_dir,
+                metadata,  # type: ignore[arg-type]
+                status,  # type: ignore[arg-type]
+                args,
+                reason="test_current_formula_sanitize",
+            )
+            final_document = adapter.json.loads((output_dir / "document.json").read_text())
+            final_markdown = (output_dir / "document.md").read_text()
+            final_html = (output_dir / "document.html").read_text()
+
+        self.assertTrue(result["applied"])
+        self.assertIn(r"\log ( 4 )", final_document["texts"][0]["text"])
+        self.assertIn(r"\log ( 4 )", final_markdown)
+        self.assertIn(r"\log ( 4 )", final_html)
+        self.assertNotIn(r"\quad ( 4 )", final_document["texts"][0]["text"])
+
+    def test_markdown_main_flow_supplement_adds_html_visible_missing_records(self) -> None:
+        document = {
+            "texts": [
+                {
+                    "label": "section_header",
+                    "text": "4.1 Global Optimality of p_g = p_data",
+                    "prov": [{"page_no": 5}],
+                },
+                {
+                    "label": "text",
+                    "text": (
+                        "Theorem 4.1 The global minimum of the virtual training "
+                        "criterion is achieved if and only if p_g = p_data."
+                    ),
+                    "prov": [{"page_no": 5}],
+                },
+                {
+                    "label": "footnote",
+                    "text": "1 This structural note must remain outside main flow.",
+                    "prov": [{"page_no": 1}],
+                },
+            ]
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir)
+            (output_dir / "document.html").write_text(
+                (
+                    "<html><body><h2>4.1 Global Optimality of p_g = p_data</h2>"
+                    "<p>Theorem 4.1 The global minimum of the virtual training "
+                    "criterion is achieved if and only if p_g = p_data.</p>"
+                    "</body></html>"
+                ),
+                encoding="utf-8",
+            )
+            (output_dir / "document.md").write_text("# Existing\n", encoding="utf-8")
+            metadata: dict[str, object] = {}
+            status = {"quality_signals": {}, "warnings": []}
+
+            result = adapter.apply_markdown_main_flow_supplement(
+                output_dir,
+                document,
+                metadata,  # type: ignore[arg-type]
+                status,  # type: ignore[arg-type]
+            )
+            markdown = (output_dir / "document.md").read_text(encoding="utf-8")
+
+        self.assertTrue(result["applied"])
+        self.assertIn(adapter.MARKDOWN_MAIN_FLOW_SUPPLEMENT_START, markdown)
+        self.assertIn("4.1 Global Optimality", markdown)
+        self.assertIn("Theorem 4.1", markdown)
+        self.assertNotIn("structural note", markdown)
 
     def test_header_footer_qc_flags_page_edge_noise(self) -> None:
         document = {

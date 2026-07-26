@@ -8489,6 +8489,150 @@ def _markdown_without_structural_content(document_markdown: str) -> str:
     )
 
 
+MARKDOWN_MAIN_FLOW_SUPPLEMENT_START = "<!-- local-ai-lab markdown-main-flow-supplement start -->"
+MARKDOWN_MAIN_FLOW_SUPPLEMENT_END = "<!-- local-ai-lab markdown-main-flow-supplement end -->"
+MAIN_FLOW_SUPPLEMENT_LABELS = {"title", "section_header", "text", "list_item", "code"}
+
+
+def _markdown_without_main_flow_supplement(document_markdown: str) -> str:
+    return re.sub(
+        re.escape(MARKDOWN_MAIN_FLOW_SUPPLEMENT_START)
+        + r".*?"
+        + re.escape(MARKDOWN_MAIN_FLOW_SUPPLEMENT_END),
+        " ",
+        document_markdown,
+        flags=re.DOTALL,
+    )
+
+
+def _compact_presence_text(text: str) -> str:
+    normalized = html.unescape(text).translate(
+        str.maketrans({"（": "(", "）": ")", "［": "[", "］": "]"})
+    )
+    normalized = re.sub(r"[*_`#>\[\]()<>{}|\\$]+", "", normalized)
+    return re.sub(r"\s+", "", normalized).lower()
+
+
+def _text_present_on_surface(surface_text: str, target_text: str) -> bool:
+    normalized_surface = _normalized_noise_text(surface_text)
+    normalized_target = _normalized_noise_text(target_text)
+    if not normalized_target:
+        return False
+    if normalized_target in normalized_surface:
+        return True
+    compact_target = _compact_presence_text(normalized_target)
+    if len(compact_target) < 28:
+        return False
+    return compact_target in _compact_presence_text(normalized_surface)
+
+
+def _main_flow_supplement_markdown_text(record: dict[str, Any]) -> str:
+    label = str(record.get("label") or "")
+    text = _normalized_noise_text(str(record.get("text") or ""))
+    if label == "title":
+        return f"# {text}"
+    if label == "section_header":
+        return f"## {text}"
+    if label == "list_item":
+        return f"- {text}"
+    if label == "code":
+        return f"```\n{text}\n```"
+    return text
+
+
+def apply_markdown_main_flow_supplement(
+    output_dir: Path,
+    document_json: Any,
+    metadata: dict[str, Any],
+    status: dict[str, Any],
+    *,
+    max_records: int = 80,
+) -> dict[str, Any]:
+    """Append final-HTML-visible main-flow records that Docling omitted from Markdown."""
+    md_path = output_dir / "document.md"
+    html_path = output_dir / "document.html"
+    if not md_path.exists() or not html_path.exists():
+        return {"ok": True, "applied": False, "reason": "missing_document_surface", "count": 0}
+    markdown = md_path.read_text(encoding="utf-8")
+    base_markdown = _markdown_without_main_flow_supplement(
+        _markdown_without_structural_content(markdown)
+    )
+    html_text = html_path.read_text(encoding="utf-8")
+    body_html = _html_without_structural_content(html_text)
+    visible_html = _visible_html_text(body_html)
+    missing: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for record in structural_text_records(document_json):
+        label = str(record.get("label") or "").lower()
+        if label not in MAIN_FLOW_SUPPLEMENT_LABELS:
+            continue
+        if label.startswith("quarantined") or label.startswith("page_") or "footnote" in label:
+            continue
+        text = _normalized_noise_text(str(record.get("text") or ""))
+        if not text:
+            continue
+        if label not in {"title", "section_header"} and len(text) < 45:
+            continue
+        compact = _compact_presence_text(text)
+        if not compact or compact in seen:
+            continue
+        seen.add(compact)
+        if not _text_present_on_surface(visible_html, text):
+            continue
+        if _text_present_on_surface(base_markdown, text):
+            continue
+        missing.append(
+            {
+                "label": label,
+                "text": text,
+                "page_no": record.get("page_no"),
+                "reading_order": record.get("reading_order"),
+            }
+        )
+        if len(missing) >= max_records:
+            break
+    if not missing:
+        metadata["markdown_main_flow_supplement"] = {
+            "applied": False,
+            "missing_visible_record_count": 0,
+        }
+        status["quality_signals"]["markdown_main_flow_supplement"] = metadata[
+            "markdown_main_flow_supplement"
+        ]
+        return {"ok": True, "applied": False, "count": 0}
+    lines = [
+        "",
+        MARKDOWN_MAIN_FLOW_SUPPLEMENT_START,
+        "",
+        "## Markdown main-flow supplement",
+        "",
+        "<!-- Records below were visible in final document.html but absent from document.md. -->",
+        "",
+    ]
+    for index, record in enumerate(missing, start=1):
+        lines.append(
+            "<!-- markdown-main-flow-supplement "
+            f"item={index} label={record['label']} page={record.get('page_no')} "
+            f"order={record.get('reading_order')} -->"
+        )
+        lines.append(_main_flow_supplement_markdown_text(record))
+        lines.append("")
+    lines.append(MARKDOWN_MAIN_FLOW_SUPPLEMENT_END)
+    lines.append("")
+    md_path.write_text(base_markdown.rstrip() + "\n".join(lines), encoding="utf-8")
+    result = {
+        "ok": True,
+        "applied": True,
+        "missing_visible_record_count": len(missing),
+        "records": missing[:20],
+        "truncated": len(missing) >= max_records,
+    }
+    metadata["markdown_main_flow_supplement"] = result
+    status["quality_signals"]["markdown_main_flow_supplement"] = result
+    status["warnings"].append(f"markdown_main_flow_supplement:count={len(missing)}")
+    return result
+
+
 def _without_bibliography_section_html(document_html: str) -> str:
     heading_match = next(
         (
@@ -9077,6 +9221,134 @@ def _repair_formula_ocr_variable_artifacts(formula_text: str) -> tuple[str, list
     return repaired, list(dict.fromkeys(reasons))
 
 
+def _repair_formula_log_argument_from_trailing_number(
+    formula_text: str,
+) -> tuple[str, list[str]]:
+    """Move a stale trailing numeric artifact back into an obviously empty log call.
+
+    Some formula OCR outputs keep the real equation number at the anchor but move a
+    small constant argument, such as the ``4`` in ``-\log(4)``, to a second trailing
+    ``\quad (4)`` block.  This repair only applies when the first trailing number is
+    larger than the second one and the formula has a visibly argument-less log term.
+    """
+    pattern = re.compile(
+        r"(?P<prefix>.*?)(?P<first>\\quad\s*\(\s*(?P<eq>\d{1,3})\s*\))"
+        r"\s*\\quad\s*\(\s*(?P<stale>\d{1,3})\s*\)\s*$",
+        flags=re.DOTALL,
+    )
+    match = pattern.match(formula_text.strip())
+    if not match:
+        return formula_text, []
+    eq_number = int(match.group("eq"))
+    stale_number = int(match.group("stale"))
+    if stale_number >= eq_number:
+        return formula_text, []
+    prefix = match.group("prefix")
+    log_gap = re.search(r"\\log\s*(?P<operator>[+,\-])", prefix)
+    if not log_gap:
+        return formula_text, []
+    repaired_prefix = (
+        prefix[: log_gap.start()]
+        + rf"\log ( {stale_number} ) {log_gap.group('operator')}"
+        + prefix[log_gap.end() :]
+    )
+    repaired = f"{repaired_prefix}{match.group('first')}".strip()
+    return repaired, ["repaired_empty_log_argument_from_stale_trailing_number"]
+
+
+def _remove_stale_trailing_formula_number_artifact(
+    formula_text: str,
+) -> tuple[str, list[str]]:
+    """Remove a second lower trailing equation number left by OCR/anchor drift."""
+    pattern = re.compile(
+        r"(?P<body>.*?\\quad\s*\(\s*(?P<first>\d{1,3})\s*\))"
+        r"\s*\\quad\s*\(\s*(?P<second>\d{1,3})\s*\)\s*$",
+        flags=re.DOTALL,
+    )
+    match = pattern.match(formula_text.strip())
+    if not match:
+        return formula_text, []
+    first = int(match.group("first"))
+    second = int(match.group("second"))
+    if second >= first:
+        return formula_text, []
+    return match.group("body").strip(), ["removed_stale_lower_trailing_equation_number"]
+
+
+def _repair_left_right_delimiter_artifacts(formula_text: str) -> tuple[str, list[str]]:
+    """Repair unambiguous ``\left``/``\right`` delimiter OCR mismatches."""
+    token_re = re.compile(r"\\(?P<kind>left|right)\s*(?P<delimiter>\\\||[()\[\]{}])")
+    replacements: dict[tuple[int, int], str] = {}
+    stack: list[str] = []
+    for match in token_re.finditer(formula_text):
+        kind = match.group("kind")
+        delimiter = match.group("delimiter")
+        if kind == "left":
+            stack.append(delimiter)
+            continue
+        left = stack.pop() if stack else ""
+        if left == r"\|" and delimiter == ")":
+            replacements[(match.start("delimiter"), match.end("delimiter"))] = r"\|"
+        elif left == "(" and delimiter == r"\|":
+            replacements[(match.start("delimiter"), match.end("delimiter"))] = ")"
+    if not replacements:
+        return formula_text, []
+    output: list[str] = []
+    cursor = 0
+    for (start, end), replacement in sorted(replacements.items()):
+        output.append(formula_text[cursor:start])
+        output.append(replacement)
+        cursor = end
+    output.append(formula_text[cursor:])
+    return "".join(output), ["repaired_left_right_delimiter_artifact"]
+
+
+def _downgrade_unbalanced_left_right_commands(formula_text: str) -> tuple[str, list[str]]:
+    left_count = len(re.findall(r"\\left(?=\s|[\(\[\{\\])", formula_text))
+    right_count = len(re.findall(r"\\right(?=\s|[\)\]\}\\])", formula_text))
+    if left_count == right_count:
+        return formula_text, []
+    repaired = re.sub(r"\\left\s*(?P<delimiter>\\\||[()\[\]{}])", r"\g<delimiter>", formula_text)
+    repaired = re.sub(r"\\right\s*(?P<delimiter>\\\||[()\[\]{}])", r"\g<delimiter>", repaired)
+    return repaired, ["downgraded_unbalanced_left_right_commands"]
+
+
+def _repair_unmatched_formula_parentheses(formula_text: str) -> tuple[str, list[str]]:
+    trailing_number = re.search(r"\s*\\quad\s*\(\s*\d{1,3}\s*\)\s*$", formula_text)
+    body = formula_text[: trailing_number.start()] if trailing_number else formula_text
+    suffix = formula_text[trailing_number.start() :] if trailing_number else ""
+    output: list[str] = []
+    depth = 0
+    escaped = False
+    changed = False
+    for char in body:
+        if escaped:
+            output.append(char)
+            escaped = False
+            continue
+        if char == "\\":
+            output.append(char)
+            escaped = True
+            continue
+        if char == "(":
+            depth += 1
+            output.append(char)
+            continue
+        if char == ")":
+            if depth <= 0:
+                changed = True
+                continue
+            depth -= 1
+            output.append(char)
+            continue
+        output.append(char)
+    if depth == 1 and re.search(r"(?:\\\||\\frac|\\sum|\\log|\\mathbb|[=+\-])", body):
+        output.append(" )")
+        changed = True
+    repaired = re.sub(r"\s+", " ", "".join(output) + suffix).strip()
+    return repaired, ["repaired_unmatched_display_parentheses"] if changed else []
+
+
 def _latex_environment_stack_ok(formula_text: str) -> bool:
     stack: list[str] = []
     for match in re.finditer(r"\\(?P<kind>begin|end)\s*\{\s*(?P<env>[^{}]+?)\s*\}", formula_text):
@@ -9411,6 +9683,23 @@ def sanitize_formula_display_text(formula_text: str) -> tuple[str, list[str]]:
     if ocr_reasons:
         display_text = repaired_ocr
         reasons.extend(ocr_reasons)
+    repaired_log, log_reasons = _repair_formula_log_argument_from_trailing_number(display_text)
+    if log_reasons:
+        display_text = repaired_log
+        reasons.extend(log_reasons)
+    repaired_stale_number, stale_number_reasons = _remove_stale_trailing_formula_number_artifact(display_text)
+    if stale_number_reasons:
+        display_text = repaired_stale_number
+        reasons.extend(stale_number_reasons)
+    downgraded_delimiters, downgraded_reasons = _downgrade_unbalanced_left_right_commands(display_text)
+    if downgraded_reasons:
+        display_text = downgraded_delimiters
+        reasons.extend(downgraded_reasons)
+    else:
+        repaired_delimiters, delimiter_reasons = _repair_left_right_delimiter_artifacts(display_text)
+        if delimiter_reasons:
+            display_text = repaired_delimiters
+            reasons.extend(delimiter_reasons)
     ungrouped, group_changed = _strip_balanced_array_group(display_text)
     if group_changed:
         display_text = ungrouped
@@ -9436,6 +9725,10 @@ def sanitize_formula_display_text(formula_text: str) -> tuple[str, list[str]]:
     if brace_changed:
         display_text = brace_repaired
         reasons.append("repaired_unmatched_display_braces")
+    parenthesis_repaired, parenthesis_reasons = _repair_unmatched_formula_parentheses(display_text)
+    if parenthesis_reasons:
+        display_text = parenthesis_repaired
+        reasons.extend(parenthesis_reasons)
     compact_spacing = re.sub(r"(?:\\quad\s*){2,}", r"\\quad ", display_text).strip()
     if compact_spacing != display_text:
         display_text = compact_spacing
@@ -10496,6 +10789,12 @@ def restore_review_artifact_layer(
         )
     else:
         run_unified_review_qc(output_dir, document_json, formulas, metadata, status, args)
+        apply_markdown_main_flow_supplement(
+            output_dir,
+            document_json,
+            metadata,
+            status,
+        )
     (output_dir / "metadata.json").write_text(
         json.dumps(metadata, indent=2, ensure_ascii=False), encoding="utf-8"
     )
@@ -12364,13 +12663,14 @@ def _current_formula_display_texts(output_dir: Path) -> tuple[dict[int, str], di
         raw_text = str(formula.get("text") or "").strip()
         if not raw_text:
             continue
-        eq_numbers = _compact_formula_numbers(raw_text)
-        eq_number = eq_numbers[0] if eq_numbers else None
         normalized = normalize_formula_candidate(raw_text)
-        if eq_number is not None:
-            normalized, _repairs = canonicalize_formula_output(normalized, eq_number)
+        normalized, sanitize_reasons = sanitize_formula_display_text(normalized)
         formula_texts[index] = normalized or raw_text
-        source_map[index] = "current_formula_json"
+        source_map[index] = (
+            "current_formula_json_sanitized"
+            if sanitize_reasons
+            else "current_formula_json"
+        )
     return formula_texts, source_map
 
 
@@ -12424,7 +12724,7 @@ def apply_current_formula_display_fallback(
         sidecar_dir,
         formula_texts,
         status_label="current_formula_display_fallback",
-        complete_missing_sequence=False,
+        complete_missing_sequence=True,
         allow_formula_number_match=False,
     )
     unsafe_indexes = [
@@ -12727,14 +13027,25 @@ def run_optional_formula_second_pass(
             output_dir,
             validation_log,
         )
+        markdown_supplement = {"ok": True, "applied": False, "reason": "cn_accepted_path"}
+        if not is_cn_accepted_path(args):
+            current_document = _load_json_file(output_dir / "document.json")
+            markdown_supplement = apply_markdown_main_flow_supplement(
+                output_dir,
+                current_document,
+                metadata,
+                status,
+            )
         metadata["formula_second_pass_html_patch"] = html_patch
         metadata["formula_second_pass_html_gate"] = html_gate
         metadata["formula_second_pass_contract_sync"] = contract_sync
         metadata["cn_final_document_polish"] = cn_final_polish
+        metadata["post_formula_markdown_main_flow_supplement"] = markdown_supplement
         status["quality_signals"]["formula_second_pass_html_patch"] = html_patch
         status["quality_signals"]["formula_second_pass_html_gate"] = html_gate
         status["quality_signals"]["formula_second_pass_contract_sync"] = contract_sync
         status["quality_signals"]["cn_final_document_polish"] = cn_final_polish
+        status["quality_signals"]["post_formula_markdown_main_flow_supplement"] = markdown_supplement
         if not html_patch.get("ok") or not html_gate.get("ok") or not cn_final_polish.get("ok"):
             status["ok"] = False
             status["success_class"] = "degraded_failure"
