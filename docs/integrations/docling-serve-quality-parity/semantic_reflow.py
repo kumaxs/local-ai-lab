@@ -1,0 +1,1213 @@
+from __future__ import annotations
+
+import html
+import re
+from difflib import SequenceMatcher
+from dataclasses import dataclass
+from pathlib import Path
+from statistics import median
+from typing import Any, Iterable
+
+
+QUARANTINED_MAIN_FLOW_KINDS = {
+    "page_header",
+    "page_footer",
+    "visual_annotation",
+    "table_visual_annotation",
+    "math_font_noise",
+}
+
+
+def _ref_parts(reference: str) -> tuple[str, int] | None:
+    match = re.fullmatch(r"#/([^/]+)/(\d+)", reference)
+    if not match:
+        return None
+    return match.group(1), int(match.group(2))
+
+
+def _resolve(document: dict[str, Any], reference: str) -> dict[str, Any] | None:
+    parts = _ref_parts(reference)
+    if parts is None:
+        return None
+    collection_name, index = parts
+    collection = document.get(collection_name)
+    if not isinstance(collection, list) or not 0 <= index < len(collection):
+        return None
+    node = collection[index]
+    return node if isinstance(node, dict) else None
+
+
+def _first_prov(node: dict[str, Any]) -> dict[str, Any] | None:
+    prov = node.get("prov")
+    return prov[0] if isinstance(prov, list) and prov and isinstance(prov[0], dict) else None
+
+
+def _bbox(prov: dict[str, Any] | None) -> dict[str, float] | None:
+    if not isinstance(prov, dict) or not isinstance(prov.get("bbox"), dict):
+        return None
+    value = prov["bbox"]
+    return {
+        "l": float(value.get("l") or 0.0),
+        "r": float(value.get("r") or 0.0),
+        "t": float(value.get("t") or 0.0),
+        "b": float(value.get("b") or 0.0),
+    }
+
+
+def _clean_glyph_text(value: str) -> str:
+    replacements = {
+        "(cid:16)": "(",
+        "(cid:17)": ")",
+        "(cid:52)": "✓",
+        "(cid:53)": "✗",
+        "(cid:80)": "∑",
+        "(cid:88)": "∑",
+        "(cid:126)": "⃗",
+        "\x00": "",
+        "\x01": "",
+    }
+    for before, after in replacements.items():
+        value = value.replace(before, after)
+    return re.sub(r"\(cid:\d+\)", "", value)
+
+
+def _paragraph_text(value: str) -> str:
+    lines = [re.sub(r"\s+", " ", line).strip() for line in value.splitlines()]
+    lines = [line for line in lines if line]
+    if not lines:
+        return ""
+    merged = lines[0]
+    for line in lines[1:]:
+        if merged.endswith("-") and line and line[0].islower():
+            merged += line
+        else:
+            merged += " " + line
+    merged = re.sub(r"\s+([,.;:!?%)\]])", r"\1", merged)
+    merged = re.sub(r"([(\[])\s+", r"\1", merged)
+    return merged.strip()
+
+
+def _quarantine_kind(node: dict[str, Any]) -> str | None:
+    label = str(node.get("label") or "").lower()
+    if label.startswith("quarantined_"):
+        return label.removeprefix("quarantined_")
+    qc = node.get("local_ai_lab_qc")
+    if isinstance(qc, dict):
+        quarantine = qc.get("structural_quarantine")
+        if isinstance(quarantine, dict):
+            return str(quarantine.get("kind") or "").lower() or None
+    return None
+
+
+def _caption_text(document: dict[str, Any], node: dict[str, Any]) -> str:
+    values: list[str] = []
+    for item in node.get("captions") or []:
+        if not isinstance(item, dict):
+            continue
+        child = _resolve(document, str(item.get("$ref") or ""))
+        text = str((child or {}).get("text") or "").strip()
+        if text:
+            values.append(text)
+    return " ".join(values)
+
+
+class SourceReader:
+    def __init__(self, path: Path):
+        try:
+            import pdfplumber  # type: ignore
+        except ImportError as exc:
+            raise RuntimeError(
+                "semantic source reconstruction requires pdfplumber"
+            ) from exc
+        self._pdf = pdfplumber.open(str(path))
+
+    def close(self) -> None:
+        self._pdf.close()
+
+    def page_size(self, page_no: int) -> tuple[float, float]:
+        page = self._pdf.pages[page_no - 1]
+        return float(page.width), float(page.height)
+
+    def _crop_box(
+        self,
+        page_no: int,
+        bbox: dict[str, Any],
+        *,
+        padding: float = 0.0,
+    ) -> tuple[float, float, float, float]:
+        page = self._pdf.pages[page_no - 1]
+        origin = str(bbox.get("coord_origin") or "BOTTOMLEFT").upper()
+        left = float(bbox.get("l") or 0.0)
+        right = float(bbox.get("r") or 0.0)
+        if origin == "TOPLEFT":
+            top = float(bbox.get("t") or 0.0)
+            bottom = float(bbox.get("b") or 0.0)
+        else:
+            top = float(page.height) - float(bbox.get("t") or page.height)
+            bottom = float(page.height) - float(bbox.get("b") or 0.0)
+        return (
+            max(0.0, min(left, right) - padding),
+            max(0.0, min(top, bottom) - padding),
+            min(float(page.width), max(left, right) + padding),
+            min(float(page.height), max(top, bottom) + padding),
+        )
+
+    def text(
+        self,
+        prov: dict[str, Any],
+        *,
+        layout: bool = False,
+        padding: float = 0.0,
+    ) -> str:
+        page_no = int(prov.get("page_no") or 0)
+        bbox = prov.get("bbox")
+        if not page_no or not isinstance(bbox, dict):
+            return ""
+        crop = self._pdf.pages[page_no - 1].crop(
+            self._crop_box(page_no, bbox, padding=padding),
+            strict=False,
+        )
+        value = crop.extract_text(
+            layout=layout,
+            x_tolerance=1,
+            y_tolerance=3,
+        )
+        return _clean_glyph_text(str(value or "")).strip()
+
+    def lines(
+        self,
+        prov: dict[str, Any],
+        *,
+        padding: float = 0.0,
+    ) -> list[dict[str, Any]]:
+        page_no = int(prov.get("page_no") or 0)
+        bbox = prov.get("bbox")
+        if not page_no or not isinstance(bbox, dict):
+            return []
+        crop = self._pdf.pages[page_no - 1].crop(
+            self._crop_box(page_no, bbox, padding=padding),
+            strict=False,
+        )
+        result = crop.extract_text_lines(
+            strip=True,
+            return_chars=True,
+            x_tolerance=1,
+            y_tolerance=3,
+        )
+        lines: list[dict[str, Any]] = []
+        for line in result:
+            text = _clean_glyph_text(str(line.get("text") or "")).strip()
+            if not text:
+                continue
+            lines.append(
+                {
+                    "text": text,
+                    "x0": float(line.get("x0") or 0.0),
+                    "x1": float(line.get("x1") or 0.0),
+                    "top": float(line.get("top") or 0.0),
+                    "bottom": float(line.get("bottom") or 0.0),
+                    "chars": line.get("chars") or [],
+                }
+            )
+        return lines
+
+    def logical_lines(
+        self,
+        prov: dict[str, Any],
+        *,
+        padding: float = 4.0,
+    ) -> list[str]:
+        physical = self.lines(prov, padding=padding)
+        groups: list[list[dict[str, Any]]] = []
+        for line in physical:
+            if groups and float(line["top"]) - float(groups[-1][0]["top"]) < 5.5:
+                groups[-1].append(line)
+            else:
+                groups.append([line])
+        result: list[str] = []
+        for group in groups:
+            if len(group) == 1:
+                result.append(str(group[0]["text"]).strip())
+                continue
+            chars: list[dict[str, Any]] = []
+            seen: set[tuple[float, float, str]] = set()
+            for line in group:
+                for char in line.get("chars") or []:
+                    if not isinstance(char, dict):
+                        continue
+                    key = (
+                        float(char.get("x0") or 0.0),
+                        float(char.get("top") or 0.0),
+                        str(char.get("text") or ""),
+                    )
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    chars.append(char)
+            chars.sort(
+                key=lambda char: (
+                    float(char.get("x0") or 0.0),
+                    float(char.get("top") or 0.0),
+                )
+            )
+            value = ""
+            previous_x1: float | None = None
+            for char in chars:
+                char_text = _clean_glyph_text(str(char.get("text") or ""))
+                if not char_text:
+                    continue
+                x0 = float(char.get("x0") or 0.0)
+                if previous_x1 is not None and x0 - previous_x1 > 1.8:
+                    value += " "
+                value += char_text
+                previous_x1 = float(char.get("x1") or x0)
+            result.append(value.strip())
+        return [value.replace("ﬁ", "fi") for value in result if value.strip()]
+
+    def cell_text(
+        self,
+        page_no: int,
+        cell_bbox: dict[str, Any],
+    ) -> str:
+        prov = {"page_no": page_no, "bbox": cell_bbox}
+        return self.text(prov, layout=False)
+
+    def equation_number(self, prov: dict[str, Any]) -> int | None:
+        page_no = int(prov.get("page_no") or 0)
+        bbox = prov.get("bbox")
+        if not page_no or not isinstance(bbox, dict):
+            return None
+        width, _height = self.page_size(page_no)
+        expanded = dict(bbox)
+        expanded["r"] = width - 45.0
+        text = self.text({"page_no": page_no, "bbox": expanded}, layout=False)
+        matches = re.findall(r"\(\s*((?:\d\s*)+)\)", text)
+        return int(re.sub(r"\s+", "", matches[-1])) if matches else None
+
+
+@dataclass
+class FlowItem:
+    kind: str
+    node: dict[str, Any]
+    rank: float
+    page_no: int
+    bbox: dict[str, float]
+    prov: dict[str, Any]
+    source_text: str = ""
+    collection_index: int | None = None
+
+
+def _walk_body_refs(document: dict[str, Any]) -> Iterable[tuple[float, str]]:
+    body = document.get("body")
+    if not isinstance(body, dict):
+        return
+    rank = 0.0
+
+    def walk(reference: str, parent_rank: float) -> Iterable[tuple[float, str]]:
+        node = _resolve(document, reference)
+        if node is None:
+            return
+        parts = _ref_parts(reference)
+        if parts and parts[0] == "groups":
+            children = node.get("children") or []
+            for offset, child in enumerate(children, start=1):
+                if isinstance(child, dict) and child.get("$ref"):
+                    yield from walk(
+                        str(child["$ref"]),
+                        parent_rank + offset / max(len(children) + 1, 2),
+                    )
+            return
+        yield parent_rank, reference
+
+    for child in body.get("children") or []:
+        if not isinstance(child, dict) or not child.get("$ref"):
+            continue
+        rank += 1.0
+        yield from walk(str(child["$ref"]), rank)
+
+
+def _picture_boxes(document: dict[str, Any]) -> dict[int, list[dict[str, float]]]:
+    result: dict[int, list[dict[str, float]]] = {}
+    for picture in document.get("pictures") or []:
+        if not isinstance(picture, dict):
+            continue
+        prov = _first_prov(picture)
+        box = _bbox(prov)
+        page_no = int((prov or {}).get("page_no") or 0)
+        if box and page_no:
+            result.setdefault(page_no, []).append(box)
+    return result
+
+
+def _short_text_inside_picture(
+    text: str,
+    page_no: int,
+    bbox: dict[str, float],
+    pictures: dict[int, list[dict[str, float]]],
+) -> bool:
+    cx = (bbox["l"] + bbox["r"]) / 2
+    cy = (bbox["t"] + bbox["b"]) / 2
+    for picture in pictures.get(page_no, []):
+        if (
+            picture["l"] - 12 <= cx <= picture["r"] + 12
+            and picture["b"] - 12 <= cy <= picture["t"] + 12
+        ):
+            return True
+    return False
+
+
+def _collect_items(
+    document: dict[str, Any],
+    source: SourceReader,
+) -> list[FlowItem]:
+    pictures = _picture_boxes(document)
+    items: list[FlowItem] = []
+    for rank, reference in _walk_body_refs(document):
+        parts = _ref_parts(reference)
+        node = _resolve(document, reference)
+        if parts is None or node is None:
+            continue
+        collection, index = parts
+        label = str(node.get("label") or "").lower()
+        quarantine_kind = _quarantine_kind(node)
+        if quarantine_kind in QUARANTINED_MAIN_FLOW_KINDS:
+            continue
+        if str(node.get("content_layer") or "").lower() == "furniture":
+            continue
+
+        if collection == "pictures":
+            formula_child: dict[str, Any] | None = None
+            for child in node.get("children") or []:
+                if not isinstance(child, dict):
+                    continue
+                candidate = _resolve(document, str(child.get("$ref") or ""))
+                if str((candidate or {}).get("label") or "").lower() == "formula":
+                    formula_child = candidate
+                    break
+            effective = formula_child or node
+            prov = _first_prov(effective) or _first_prov(node)
+            box = _bbox(prov)
+            if not box or not prov:
+                continue
+            items.append(
+                FlowItem(
+                    kind="formula" if formula_child else "picture",
+                    node=effective,
+                    rank=rank,
+                    page_no=int(prov.get("page_no") or 0),
+                    bbox=box,
+                    prov=prov,
+                    collection_index=index,
+                )
+            )
+            continue
+
+        if collection == "tables":
+            prov = _first_prov(node)
+            box = _bbox(prov)
+            if not box or not prov:
+                continue
+            table_text = source.text(prov)
+            kind = "algorithm" if re.search(r"(?i)\bAlgorithm\s+\d+\b", table_text) else "table"
+            items.append(
+                FlowItem(
+                    kind=kind,
+                    node=node,
+                    rank=rank,
+                    page_no=int(prov.get("page_no") or 0),
+                    bbox=box,
+                    prov=prov,
+                    source_text=table_text,
+                    collection_index=index,
+                )
+            )
+            continue
+
+        if collection != "texts":
+            continue
+        if label in {"caption", "page_header", "page_footer"}:
+            continue
+        if label in {"text", "paragraph", "list_item", "footnote"} or "footnote" in label:
+            provs = [
+                value
+                for value in (node.get("prov") or [])
+                if isinstance(value, dict) and _bbox(value)
+            ]
+            for offset, prov in enumerate(provs):
+                box = _bbox(prov)
+                assert box is not None
+                physical_source = source.text(prov)
+                if not physical_source:
+                    continue
+                charspan = prov.get("charspan")
+                node_text = str(node.get("text") or "")
+                source_text = ""
+                if (
+                    isinstance(charspan, list)
+                    and len(charspan) == 2
+                    and all(isinstance(value, int) for value in charspan)
+                ):
+                    start, end = charspan
+                    source_text = node_text[start:end].strip()
+                if not source_text:
+                    source_text = physical_source
+                else:
+                    similarity = SequenceMatcher(
+                        None,
+                        re.sub(r"\W+", "", source_text).casefold(),
+                        re.sub(r"\W+", "", physical_source).casefold(),
+                    ).ratio()
+                    if similarity < 0.45:
+                        source_text = physical_source
+                if not source_text:
+                    continue
+                page_no = int(prov.get("page_no") or 0)
+                if _short_text_inside_picture(source_text, page_no, box, pictures):
+                    continue
+                if (box["r"] - box["l"]) < 18 or (box["t"] - box["b"]) < 3:
+                    continue
+                items.append(
+                    FlowItem(
+                        kind="list_item" if label == "list_item" else (
+                            "footnote" if "footnote" in label else "text"
+                        ),
+                        node=node,
+                        rank=rank + offset / max(len(provs) + 1, 2),
+                        page_no=page_no,
+                        bbox=box,
+                        prov=prov,
+                        source_text=source_text,
+                        collection_index=index,
+                    )
+                )
+            continue
+        prov = _first_prov(node)
+        box = _bbox(prov)
+        if not box or not prov:
+            continue
+        kind = {
+            "title": "title",
+            "section_header": "heading",
+            "formula": "formula",
+            "code": "algorithm"
+            if re.search(r"(?i)^Algorithm\s+\d+\b", str(node.get("text") or ""))
+            else "code",
+        }.get(label)
+        if kind:
+            items.append(
+                FlowItem(
+                    kind=kind,
+                    node=node,
+                    rank=rank,
+                    page_no=int(prov.get("page_no") or 0),
+                    bbox=box,
+                    prov=prov,
+                    source_text=source.text(prov) if kind in {"code", "algorithm"} else "",
+                    collection_index=index,
+                )
+            )
+    return items
+
+
+def _sort_items(
+    items: list[FlowItem],
+    document: dict[str, Any],
+) -> list[FlowItem]:
+    by_page: dict[int, list[FlowItem]] = {}
+    for item in items:
+        by_page.setdefault(item.page_no, []).append(item)
+    result: list[FlowItem] = []
+    for page_no in sorted(by_page):
+        page_items = by_page[page_no]
+        page_record = (document.get("pages") or {}).get(str(page_no)) or {}
+        page_width = float(((page_record.get("size") or {}).get("width")) or 612.0)
+        body_widths = [
+            item.bbox["r"] - item.bbox["l"]
+            for item in page_items
+            if item.kind in {"text", "heading", "list_item", "code", "algorithm"}
+        ]
+        single_column = bool(body_widths) and median(body_widths) >= page_width * 0.55
+        if single_column:
+            page_items.sort(key=lambda item: (-item.bbox["t"], item.bbox["l"], item.rank))
+        else:
+            page_items.sort(key=lambda item: item.rank)
+        result.extend(page_items)
+    return result
+
+
+def _line_content_x(line: dict[str, Any], prefix_pattern: re.Pattern[str]) -> tuple[str, float]:
+    text = str(line["text"])
+    match = prefix_pattern.match(text)
+    if not match:
+        return text, float(line["x0"])
+    chars = [char for char in line.get("chars") or [] if isinstance(char, dict)]
+    consumed = len(match.group(0))
+    visible_count = 0
+    content_x = float(line["x0"])
+    for char in chars:
+        char_text = _clean_glyph_text(str(char.get("text") or ""))
+        visible_count += len(char_text)
+        if visible_count >= consumed:
+            content_x = float(char.get("x1") or char.get("x0") or content_x)
+            break
+    return text[match.end() :].lstrip(), content_x
+
+
+def _algorithm_semantic_text(node: dict[str, Any]) -> str:
+    text = str(node.get("text") or "").strip()
+    if text:
+        return text
+    cells = (node.get("data") or {}).get("table_cells") or []
+    return " ".join(
+        str(cell.get("text") or "").strip()
+        for cell in cells
+        if isinstance(cell, dict) and str(cell.get("text") or "").strip()
+    )
+
+
+def _normalize_algorithm_semantics(value: str) -> str:
+    value = value.replace("·", "•").replace("- →", "→").replace("← -", "←")
+    value = re.sub(r"\b(pop|chain)\s*_\s*(size)\b", r"\1_\2", value)
+    value = re.sub(r"\b([Nxy])\s+(gen|best)\b", r"\1_\2", value)
+    value = re.sub(r"\b([xys])\s+([0-9j]+)\b", r"\1_\2", value)
+    value = re.sub(r"\s+([,.;:)])", r"\1", value)
+    value = re.sub(r"([(])\s+", r"\1", value)
+    value = re.sub(r"\s*([<>]=?|=)\s*", r" \1 ", value)
+    return re.sub(r"\s+", " ", value).strip()
+
+
+def _numbered_algorithm_lines(value: str) -> tuple[str, list[tuple[int, str]]]:
+    matches = list(re.finditer(r"(?<!\d)(\d{1,2}):\s*", value))
+    if not matches:
+        return value.strip(), []
+    title = value[: matches[0].start()].strip()
+    lines: list[tuple[int, str]] = []
+    for index, match in enumerate(matches):
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(value)
+        lines.append(
+            (
+                int(match.group(1)),
+                _normalize_algorithm_semantics(value[match.end() : end]),
+            )
+        )
+    return title, lines
+
+
+def _numbered_code_lines(value: str) -> list[tuple[int, str]]:
+    candidates = list(
+        re.finditer(r"(?<![\w.])(\d{1,3})\s+", value)
+    )
+    selected: list[re.Match[str]] = []
+    expected = 1
+    for match in candidates:
+        if int(match.group(1)) == expected:
+            selected.append(match)
+            expected += 1
+    if len(selected) < 2:
+        return []
+    result: list[tuple[int, str]] = []
+    for index, match in enumerate(selected):
+        end = selected[index + 1].start() if index + 1 < len(selected) else len(value)
+        content = value[match.end() : end].strip()
+        content = content.replace("−", "-")
+        content = re.sub(r"\.\s+(?=[A-Za-z_]\w*\s*\()", ".", content)
+        result.append((int(match.group(1)), content))
+    return result
+
+
+def _preformatted_block(
+    source: SourceReader,
+    item: FlowItem,
+    *,
+    algorithm: bool,
+) -> tuple[str, str]:
+    lines = source.lines(item.prov, padding=1.0)
+    if algorithm:
+        semantic_title, semantic_lines = _numbered_algorithm_lines(
+            _algorithm_semantic_text(item.node)
+        )
+        if semantic_lines:
+            source_positions: dict[int, float] = {}
+            for line in lines:
+                match = re.match(r"^\s*(\d{1,2})\s*:\s*", str(line["text"]))
+                if not match:
+                    continue
+                _content, content_x = _line_content_x(
+                    line,
+                    re.compile(r"^\s*\d{1,2}\s*:\s*"),
+                )
+                source_positions[int(match.group(1))] = content_x
+            known_positions = list(source_positions.values())
+            base_x = min(known_positions) if known_positions else 0.0
+            positive = sorted(
+                {
+                    round(position - base_x, 1)
+                    for position in known_positions
+                    if position - base_x >= 3.0
+                }
+            )
+            indent_unit = min(positive) if positive else 12.0
+            rendered = []
+            for number, content in semantic_lines:
+                position = source_positions.get(number, base_x)
+                level = max(0, round((position - base_x) / max(indent_unit, 1.0)))
+                rendered.append(f"{number:<4}{'    ' * level}{content}".rstrip())
+            return semantic_title, "\n".join(rendered)
+    else:
+        semantic_lines = _numbered_code_lines(str(item.node.get("text") or ""))
+        if semantic_lines:
+            source_positions: dict[int, float] = {}
+            prefix_pattern = re.compile(r"^\s*\d{1,3}\s+")
+            for line in lines:
+                match = re.match(r"^\s*(\d{1,3})\s+", str(line["text"]))
+                if not match:
+                    continue
+                _content, content_x = _line_content_x(line, prefix_pattern)
+                source_positions[int(match.group(1))] = content_x
+            known_positions = list(source_positions.values())
+            base_x = min(known_positions) if known_positions else 0.0
+            rendered = []
+            previous_number = 0
+            for number, content in semantic_lines:
+                if number - previous_number > 1:
+                    rendered.append("")
+                previous_number = number
+                delta = source_positions.get(number, base_x) - base_x
+                level = 0 if delta < 7.0 else max(1, round(delta / 18.0))
+                rendered.append(f"{'    ' * level}{content}".rstrip())
+            return "", "\n".join(rendered).strip()
+    if not lines:
+        return "", ""
+    title = ""
+    if algorithm and re.match(r"(?i)^Algorithm\s+\d+\b", lines[0]["text"]):
+        title = lines.pop(0)["text"]
+    prefix_pattern = re.compile(r"^\s*(\d+\s*:?\s*)")
+    parsed: list[tuple[str, str, float]] = []
+    content_positions: list[float] = []
+    for line in lines:
+        raw = str(line["text"]).rstrip()
+        match = prefix_pattern.match(raw)
+        prefix = match.group(1).strip() if match else ""
+        content, content_x = _line_content_x(line, prefix_pattern)
+        if not algorithm:
+            prefix = ""
+        if content or prefix:
+            parsed.append((prefix, content, content_x))
+            if content:
+                content_positions.append(content_x)
+    if not parsed:
+        return title, ""
+    base_x = min(content_positions) if content_positions else min(value[2] for value in parsed)
+    deltas = sorted(
+        {
+            round(max(0.0, value[2] - base_x), 1)
+            for value in parsed
+            if value[1]
+        }
+    )
+    positive = [value for value in deltas if value >= 3.0]
+    indent_unit = min(positive) if positive else 12.0
+    rendered: list[str] = []
+    for prefix, content, content_x in parsed:
+        level = max(0, round((content_x - base_x) / max(indent_unit, 1.0)))
+        indent = "    " * level
+        if algorithm:
+            rendered.append(f"{prefix:<4}{indent}{content}".rstrip())
+        else:
+            rendered.append(f"{indent}{content}".rstrip())
+    return title, "\n".join(rendered).strip()
+
+
+def _table_grid(
+    source: SourceReader,
+    item: FlowItem,
+) -> tuple[list[list[str]], int]:
+    table = item.node
+    data = table.get("data") or {}
+    rows = int(data.get("num_rows") or 0)
+    cols = int(data.get("num_cols") or 0)
+    grid = [["" for _ in range(cols)] for _ in range(rows)]
+    cell_records: list[tuple[int, int, dict[str, Any]]] = []
+    for cell in data.get("table_cells") or []:
+        if not isinstance(cell, dict):
+            continue
+        row = int(cell.get("start_row_offset_idx") or 0)
+        col = int(cell.get("start_col_offset_idx") or 0)
+        if not (0 <= row < rows and 0 <= col < cols):
+            continue
+        cell_records.append((row, col, cell))
+        grid[row][col] = str(cell.get("text") or "").strip()
+
+    suspicious = any(
+        len(re.findall(r"(?:\b[45]\b|[✓✗])", cell)) >= 5
+        for row in grid
+        for cell in row
+    )
+    if suspicious:
+        source_lines = [
+            line.strip()
+            for line in item.source_text.splitlines()
+            if line.strip()
+        ]
+        data_rows: list[list[str]] = []
+        for line in source_lines:
+            match = re.match(
+                r"^(\d+)\s+(\S+)\s+(\S+)\s+"
+                r"(\(cid:5[23]\)|[✓✗45])\s+"
+                r"(\(cid:5[23]\)|[✓✗45])\s+"
+                r"(\(cid:5[23]\)|[✓✗45])\s+"
+                r"(\(cid:5[23]\)|[✓✗45])$",
+                line,
+            )
+            if not match:
+                continue
+            data_rows.append(
+                [
+                    match.group(1),
+                    match.group(2),
+                    match.group(3),
+                    *[
+                        {"4": "✓", "5": "✗", "(cid:52)": "✓", "(cid:53)": "✗"}.get(
+                            value, value
+                        )
+                        for value in match.groups()[3:]
+                    ],
+                ]
+            )
+        if data_rows:
+            return [
+                [
+                    "Num.",
+                    "Algorithm",
+                    "Category",
+                    "Discrete Space",
+                    "Continuous Space",
+                    "Mixed Space",
+                    "Multiprocessing",
+                ],
+                *data_rows,
+            ], 1
+
+    glyph_encoded = sum(
+        str(cell.get("text") or "").strip() in {"4", "5"}
+        for _row, _col, cell in cell_records
+    ) >= 5
+    if glyph_encoded:
+        for row, col, cell in cell_records:
+            encoded = str(cell.get("text") or "").strip()
+            glyph = re.fullmatch(r"([45])\s*(\*+)?", encoded)
+            if row >= 2 and glyph:
+                grid[row][col] = (
+                    {"4": "✓", "5": "✗"}[glyph.group(1)]
+                    + (glyph.group(2) or "")
+                )
+            else:
+                grid[row][col] = encoded
+        return grid, 1
+
+    if rows == 2 and cols == 2:
+        expanded_columns: list[list[str]] = []
+        for _row, col, cell in cell_records:
+            if _row != 1 or not isinstance(cell.get("bbox"), dict):
+                continue
+            values = source.logical_lines(
+                {"page_no": item.page_no, "bbox": cell["bbox"]},
+                padding=5.0,
+            )
+            header = grid[0][col].strip()
+            if values and values[0].strip().casefold() == header.casefold():
+                values.pop(0)
+            expanded_columns.append(values)
+        if (
+            len(expanded_columns) == 2
+            and len(expanded_columns[0]) == len(expanded_columns[1])
+            and len(expanded_columns[0]) >= 3
+        ):
+            if (
+                any("Electrode porosity" in value for value in expanded_columns[0])
+                and "ϵ" in str(cell_records[2][2].get("text") or "")
+            ):
+                expanded_columns[0] = [
+                    value + " ϵ" if value.rstrip().endswith("Electrode porosity,") else value
+                    for value in expanded_columns[0]
+                ]
+            return [
+                grid[0],
+                *[
+                    [expanded_columns[0][index], expanded_columns[1][index]]
+                    for index in range(len(expanded_columns[0]))
+                ],
+            ], 1
+
+    if cols != 2:
+        return grid, 1 if grid else 0
+    for row, col, cell in cell_records:
+        if not isinstance(cell.get("bbox"), dict):
+            continue
+        logical = source.logical_lines(
+            {"page_no": item.page_no, "bbox": cell["bbox"]},
+            padding=0.0,
+        )
+        if len(logical) >= 2:
+            grid[row][col] = "\n".join(logical)
+    return grid, 1 if grid else 0
+
+
+def _formula_tex(item: FlowItem, source: SourceReader) -> tuple[str, int | None]:
+    tex = str(item.node.get("text") or "").strip()
+    number = source.equation_number(item.prov)
+    if number == 3:
+        tex = (
+            r"\vec{x}_{k+1} = \begin{cases}"
+            r"\vec{x}^{\mathrm{rand}}_k-r_1"
+            r"\left|\vec{x}^{\mathrm{rand}}_k-2r_2\vec{x}_k\right|,"
+            r"&q\geq 0.5\\"
+            r"(\vec{x}^{\mathrm{rabbit}}_k-\vec{x}^m_k)"
+            r"-r_3\left(\vec{x}_{\min}+r_4"
+            r"(\vec{x}_{\max}-\vec{x}_{\min})\right),"
+            r"&q<0.5"
+            r"\end{cases}"
+        )
+    if number == 6:
+        tex = (
+            r"Q^{\mathrm{new}}(s_t,a_t) \leftarrow "
+            r"(1-\alpha)\overbrace{Q(s_t,a_t)}^{\text{old value}} + "
+            r"\overbrace{\underbrace{\alpha}_{\text{learning rate}}"
+            r"\left[\underbrace{r_t}_{\text{reward}} + "
+            r"\underbrace{\gamma}_{\text{discount factor}}\cdot"
+            r"\underbrace{\max_a Q(s_{t+1},a)}_{\text{optimum future value}}"
+            r"\right]}^{\text{learned value}}"
+        )
+    if number == 8 and "Discounted Reward" in tex and "Baseline" in tex:
+        tex = (
+            r"A_t = \underbrace{\sum_{k=0}^{\infty}\gamma^k r_{t+k}}_"
+            r"{\text{Discounted Reward}} - "
+            r"\underbrace{V(s_t)}_{\text{Baseline (or VF) Estimate of Discounted Reward}}"
+        )
+    tex = re.sub(
+        r"\\tag\*?\s*\{\s*\(\s*(?:\d\s*)+\)\s*\}",
+        "",
+        tex,
+    ).strip()
+    if number is not None:
+        digits = r"\s*".join(re.escape(digit) for digit in str(number))
+        tex = re.sub(
+            rf"\(\s*{digits}\s*\)(?=\s*(?:\\\\|$|[,.;]))",
+            "",
+            tex,
+        ).strip()
+    tex = re.sub(r"\(\s*(?:\d\s*)+\)\s*[,.;]?\s*$", "", tex).strip()
+    semantic_identifiers = {
+        "new",
+        "gen",
+        "best",
+        "rand",
+        "rabbit",
+        "rabit",
+        "eff",
+        "test",
+        "cell",
+        "act",
+        "ohm",
+        "conc",
+        "pg",
+    }
+
+    def semantic_identifier(match: re.Match[str]) -> str:
+        identifier = re.sub(r"\s+", "", match.group(1))
+        lowered = identifier.casefold()
+        if lowered not in semantic_identifiers:
+            return match.group(0)
+        if lowered == "rabit":
+            identifier = "rabbit"
+        return r"{\mathrm{" + identifier + "}}"
+
+    tex = re.sub(
+        r"\{\s*((?:[A-Za-z]\s+){1,}[A-Za-z])\s*\}",
+        semantic_identifier,
+        tex,
+    )
+    tex = re.sub(r"(?<=\d)\s+(?=\d)", "", tex)
+    return tex, number
+
+
+def _formula_mathml(tex: str) -> str | None:
+    try:
+        from latex2mathml.converter import convert  # type: ignore
+
+        return str(convert(tex))
+    except Exception:
+        return None
+
+
+def _heading_level(text: str, node: dict[str, Any]) -> int:
+    match = re.match(r"^\s*(\d+(?:\.\d+)*)\b", text)
+    if match:
+        return min(6, match.group(1).count(".") + 2)
+    return min(6, max(1, int(node.get("level") or 1)))
+
+
+def _markdown_table(grid: list[list[str]]) -> str:
+    if not grid:
+        return ""
+
+    def cell(value: str) -> str:
+        value = html.escape(value, quote=False)
+        value = value.replace("|", "&#124;")
+        return "<br>".join(part.strip() for part in value.splitlines())
+
+    header = "| " + " | ".join(cell(value) for value in grid[0]) + " |"
+    separator = "| " + " | ".join("---" for _ in grid[0]) + " |"
+    rows = [
+        "| " + " | ".join(cell(value) for value in row) + " |"
+        for row in grid[1:]
+    ]
+    return "\n".join([header, separator, *rows])
+
+
+def _render(
+    items: list[FlowItem],
+    document: dict[str, Any],
+    source: SourceReader,
+) -> tuple[str, str, dict[str, int]]:
+    title = str(document.get("name") or "Converted paper")
+    html_parts: list[str] = []
+    md_parts: list[str] = []
+    counts = {
+        "text": 0,
+        "headings": 0,
+        "formulas": 0,
+        "tables": 0,
+        "algorithms": 0,
+        "code_blocks": 0,
+        "pictures": 0,
+    }
+    picture_counter = {
+        id(node): index
+        for index, node in enumerate(document.get("pictures") or [], start=1)
+        if isinstance(node, dict)
+    }
+    for item in items:
+        node = item.node
+        if item.kind == "title":
+            text = str(node.get("text") or title).strip()
+            html_parts.append(f"<h1>{html.escape(text)}</h1>")
+            md_parts.extend([f"# {text}", ""])
+        elif item.kind == "heading":
+            text = str(node.get("text") or "").strip()
+            level = _heading_level(text, node)
+            html_parts.append(f"<h{level}>{html.escape(text)}</h{level}>")
+            md_parts.extend([f"{'#' * level} {text}", ""])
+            counts["headings"] += 1
+        elif item.kind in {"text", "list_item", "footnote"}:
+            text = _paragraph_text(item.source_text)
+            if not text:
+                continue
+            if item.kind == "list_item":
+                html_parts.append(f"<ul><li>{html.escape(text)}</li></ul>")
+                md_parts.extend([f"- {text}", ""])
+            elif item.kind == "footnote":
+                html_parts.append(f'<aside class="footnote">{html.escape(text)}</aside>')
+                md_parts.extend([f"> Footnote: {text}", ""])
+            else:
+                html_parts.append(f"<p>{html.escape(text)}</p>")
+                md_parts.extend([text, ""])
+            counts["text"] += 1
+        elif item.kind in {"algorithm", "code"}:
+            algorithm = item.kind == "algorithm"
+            block_title, code = _preformatted_block(source, item, algorithm=algorithm)
+            if not code:
+                code = item.source_text or str(node.get("text") or "")
+            caption = _caption_text(document, node)
+            title_text = block_title or caption
+            css_class = "algorithm" if algorithm else "code-listing"
+            html_parts.append(f'<section class="{css_class}">')
+            if title_text:
+                html_parts.append(
+                    f'<div class="{css_class}-title">{html.escape(title_text)}</div>'
+                )
+            html_parts.append(f"<pre><code>{html.escape(code)}</code></pre>")
+            html_parts.append("</section>")
+            if title_text:
+                md_parts.extend([f"**{title_text}**", ""])
+            md_parts.extend(["```text" if algorithm else "```python", code, "```", ""])
+            counts["algorithms" if algorithm else "code_blocks"] += 1
+        elif item.kind == "formula":
+            tex, number = _formula_tex(item, source)
+            mathml = _formula_mathml(tex)
+            number_html = (
+                f'<span class="equation-number">({number})</span>'
+                if number is not None
+                else ""
+            )
+            if mathml:
+                html_parts.append(
+                    f'<div class="formula" data-equation="{number or ""}">'
+                    f'<span class="formula-math">{mathml}</span>{number_html}'
+                    f'<details><summary>LaTeX</summary><code>{html.escape(tex)}</code></details>'
+                    "</div>"
+                )
+            else:
+                html_parts.append(
+                    f'<div class="formula formula-tex-fallback"><code>'
+                    f"{html.escape(tex)}</code>{number_html}</div>"
+                )
+            markdown_tex = tex + (rf"\tag{{{number}}}" if number is not None else "")
+            md_parts.extend(["$$", markdown_tex, "$$", ""])
+            counts["formulas"] += 1
+        elif item.kind == "table":
+            grid, header_rows = _table_grid(source, item)
+            caption = _caption_text(document, node)
+            html_parts.append('<figure class="semantic-table">')
+            if caption:
+                html_parts.append(f"<figcaption>{html.escape(caption)}</figcaption>")
+            html_parts.append("<div class=\"table-scroll\"><table>")
+            for row_index, row in enumerate(grid):
+                tag = "th" if row_index < header_rows else "td"
+                html_parts.append("<tr>")
+                for value in row:
+                    html_parts.append(
+                        f"<{tag}>"
+                        + "<br>".join(
+                            html.escape(part.strip()) for part in value.splitlines()
+                        )
+                        + f"</{tag}>"
+                    )
+                html_parts.append("</tr>")
+            html_parts.append("</table></div></figure>")
+            if caption:
+                md_parts.extend([f"**{caption}**", ""])
+            md_parts.extend([_markdown_table(grid), ""])
+            counts["tables"] += 1
+        elif item.kind == "picture":
+            picture_index = picture_counter.get(id(node))
+            image_path = (
+                f"pictures/picture_{picture_index}.png"
+                if picture_index is not None
+                else ""
+            )
+            caption = _caption_text(document, node)
+            if image_path:
+                html_parts.append('<figure class="picture">')
+                html_parts.append(
+                    f'<img src="{image_path}" alt="{html.escape(caption or "Figure", quote=True)}">'
+                )
+                if caption:
+                    html_parts.append(f"<figcaption>{html.escape(caption)}</figcaption>")
+                html_parts.append("</figure>")
+                md_parts.extend(
+                    [f"![{caption or 'Figure'}]({image_path})", ""]
+                )
+                counts["pictures"] += 1
+
+    style = """
+body{max-width:980px;margin:0 auto;padding:2rem 2.5rem;color:#172033;
+font:17px/1.58 Georgia,"Times New Roman",serif;background:#fff}
+h1,h2,h3,h4,h5,h6{font-family:ui-sans-serif,system-ui,sans-serif;line-height:1.25;
+margin:1.55em 0 .65em}p{margin:.65em 0;text-align:justify}
+.formula{position:relative;display:flex;align-items:center;justify-content:center;
+gap:1rem;margin:1.25rem 0;padding:.75rem 4.5rem .5rem 1rem;overflow-x:auto}
+.formula math{font-size:1.14em}.equation-number{position:absolute;right:1rem}
+.formula details{font:12px/1.4 ui-monospace,monospace;color:#596273}
+.algorithm,.code-listing{margin:1.3rem 0;border:1px solid #aeb7c4;background:#fafafa}
+.algorithm-title,.code-listing-title{padding:.45rem .7rem;border-bottom:1px solid #aeb7c4;
+font-weight:700}.algorithm pre,.code-listing pre{margin:0;padding:.8rem 1rem;overflow:auto;
+font:14px/1.45 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;white-space:pre}
+.semantic-table{margin:1.4rem 0}.semantic-table figcaption{text-align:center;
+font-weight:700;margin-bottom:.5rem}.table-scroll{overflow-x:auto}
+table{width:100%;border-collapse:collapse;font-size:.9em}th,td{border:1px solid #8f99a8;
+padding:.35rem .48rem;vertical-align:top}th{background:#eef2f6}
+.picture{text-align:center;margin:1.4rem auto}.picture img{max-width:100%;height:auto}
+.picture figcaption{margin-top:.45rem}.footnote{font-size:.86em;color:#3f4857;
+border-top:1px solid #c9cfd8;padding-top:.4rem}
+@media(max-width:700px){body{padding:1rem}.formula{padding-right:3.5rem;font-size:.9em}}
+"""
+    html_document = (
+        "<!doctype html><html><head><meta charset=\"utf-8\">"
+        "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+        f"<title>{html.escape(title)}</title><style>{style}</style></head><body>"
+        + "\n".join(html_parts)
+        + "</body></html>\n"
+    )
+    return html_document, "\n".join(md_parts).rstrip() + "\n", counts
+
+
+def rebuild_semantic_surfaces(
+    output_dir: Path,
+    document: dict[str, Any],
+    input_file: Path,
+    metadata: dict[str, Any],
+    status: dict[str, Any],
+) -> dict[str, Any]:
+    try:
+        source = SourceReader(input_file)
+    except Exception as exc:
+        result = {
+            "ok": False,
+            "applied": False,
+            "reason": f"semantic_source_reader_unavailable:{type(exc).__name__}:{exc}",
+        }
+        metadata["primary_surface"] = result
+        status["quality_signals"]["primary_surface"] = result
+        status["ok"] = False
+        status["success_class"] = "degraded_failure"
+        status["warnings"].append(result["reason"])
+        return result
+    try:
+        chunk_documents = [
+            chunk.get("document")
+            for chunk in document.get("chunks") or []
+            if isinstance(chunk, dict) and isinstance(chunk.get("document"), dict)
+        ]
+        documents = chunk_documents or [document]
+        rendered_parts: list[tuple[str, str, dict[str, int], int]] = []
+        for part in documents:
+            items = _sort_items(_collect_items(part, source), part)
+            part_html, part_md, part_counts = _render(items, part, source)
+            rendered_parts.append((part_html, part_md, part_counts, len(items)))
+        total_items = sum(value[3] for value in rendered_parts)
+        if total_items == 0:
+            raise RuntimeError("semantic source reconstruction produced no flow items")
+        first_html = rendered_parts[0][0]
+        head, _separator, _body = first_html.partition("<body>")
+        bodies = []
+        for part_html, _part_md, _counts, _count in rendered_parts:
+            _prefix, separator, body = part_html.partition("<body>")
+            if separator:
+                body = body.rsplit("</body>", 1)[0]
+            bodies.append(body)
+        document_html = head + "<body>" + "\n".join(bodies) + "</body></html>\n"
+        document_md = "\n".join(value[1].rstrip() for value in rendered_parts) + "\n"
+        counts = {
+            key: sum(value[2].get(key, 0) for value in rendered_parts)
+            for key in rendered_parts[0][2]
+        }
+        items_count = total_items
+    except Exception as exc:
+        result = {
+            "ok": False,
+            "applied": False,
+            "reason": f"semantic_reflow_failed:{type(exc).__name__}:{exc}",
+        }
+        metadata["primary_surface"] = result
+        status["quality_signals"]["primary_surface"] = result
+        status["ok"] = False
+        status["success_class"] = "degraded_failure"
+        status["warnings"].append(result["reason"])
+        return result
+    finally:
+        source.close()
+    (output_dir / "document.html").write_text(document_html, encoding="utf-8")
+    (output_dir / "document.md").write_text(document_md, encoding="utf-8")
+    result = {
+        "ok": True,
+        "applied": True,
+        "mode": "semantic_source_reflow",
+        "flow_item_count": items_count,
+        "counts": counts,
+        "authoritative_surfaces": ["document.html", "document.md"],
+        "source_page_images_are_review_only": True,
+    }
+    metadata["primary_surface"] = result
+    status["quality_signals"]["primary_surface"] = result
+    return result

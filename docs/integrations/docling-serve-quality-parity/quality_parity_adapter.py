@@ -30,6 +30,7 @@ from formula_only_second_pass import (
     run_formula_second_pass,
     validate_candidate_latex,
 )
+from semantic_reflow import rebuild_semantic_surfaces
 
 GXX_RE = re.compile(r"/G[0-9A-Fa-f]{2}")
 DATA_IMAGE_RE = re.compile(r"data:image/[^\"')\s]+")
@@ -11835,191 +11836,6 @@ def restore_review_artifact_layer(
     )
 
 
-def finalize_source_faithful_surfaces(
-    output_dir: Path,
-    metadata: dict[str, Any],
-    status: dict[str, Any],
-) -> dict[str, Any]:
-    """Make exact source-page renderings the authoritative HTML/Markdown flow.
-
-    Reflowed/OCR content remains available as an auxiliary surface, but it must
-    never be allowed to move, omit, or invent source content in the primary
-    reading experience. This is intentionally page based: tables, algorithms,
-    code, formulas, symbols, indentation, and line wrapping are then identical
-    to the source PDF by construction.
-    """
-    pages_dir = output_dir / "pages"
-    page_paths = sorted(
-        pages_dir.glob("page_*.png"),
-        key=lambda path: int(path.stem.rsplit("_", 1)[-1]),
-    )
-    html_path = output_dir / "document.html"
-    md_path = output_dir / "document.md"
-    if not page_paths:
-        result = {
-            "ok": False,
-            "applied": False,
-            "reason": "source_page_renderings_missing",
-            "page_count": 0,
-        }
-        metadata["primary_surface"] = result
-        status["quality_signals"]["primary_surface"] = result
-        status["ok"] = False
-        status["success_class"] = "degraded_failure"
-        status["warnings"].append("source_faithful_primary_surface_not_applied:no_pages")
-        return result
-    if not html_path.exists() or not md_path.exists():
-        result = {
-            "ok": False,
-            "applied": False,
-            "reason": "document_surface_missing",
-            "page_count": len(page_paths),
-        }
-        metadata["primary_surface"] = result
-        status["quality_signals"]["primary_surface"] = result
-        status["ok"] = False
-        status["success_class"] = "degraded_failure"
-        status["warnings"].append(
-            "source_faithful_primary_surface_not_applied:document_surface_missing"
-        )
-        return result
-
-    reflow_html_path = output_dir / "document.reflow.html"
-    reflow_md_path = output_dir / "document.reflow.md"
-    shutil.copyfile(html_path, reflow_html_path)
-    shutil.copyfile(md_path, reflow_md_path)
-
-    title = str(
-        metadata.get("sample_name")
-        or metadata.get("job_id")
-        or metadata.get("input_file")
-        or "Converted paper"
-    )
-    title = Path(title).stem if "/" in title or "\\" in title else title
-    page_figures = "\n".join(
-        (
-            f'<figure class="source-page" id="page-{page_no}">'
-            f'<img src="pages/{path.name}" '
-            f'alt="Original PDF page {page_no}, exact source rendering" '
-            'loading="lazy" decoding="async">'
-            f"<figcaption>Page {page_no}</figcaption>"
-            "</figure>"
-        )
-        for page_no, path in enumerate(page_paths, start=1)
-    )
-    html_document = f"""<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{html.escape(title)}</title>
-<style>
-:root {{ color-scheme: light; }}
-* {{ box-sizing: border-box; }}
-body {{
-  margin: 0;
-  color: #172033;
-  background: #dfe3e8;
-  font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-}}
-.source-toolbar {{
-  position: sticky;
-  z-index: 10;
-  top: 0;
-  padding: 0.8rem 1rem;
-  border-bottom: 1px solid #c8ced7;
-  background: rgba(255, 255, 255, 0.96);
-  box-shadow: 0 1px 7px rgba(15, 23, 42, 0.12);
-}}
-.source-toolbar strong {{ display: block; }}
-.source-toolbar p {{ margin: 0.25rem 0 0; font-size: 0.88rem; }}
-.source-toolbar a {{ color: #174ea6; }}
-main {{ width: min(100%, 1120px); margin: 1rem auto 3rem; padding: 0 0.75rem; }}
-.source-page {{
-  margin: 0 auto 1.25rem;
-  background: #fff;
-  box-shadow: 0 4px 18px rgba(15, 23, 42, 0.22);
-}}
-.source-page img {{ display: block; width: 100%; height: auto; }}
-.source-page figcaption {{
-  padding: 0.45rem 0.75rem;
-  color: #596273;
-  border-top: 1px solid #e5e7eb;
-  font-size: 0.8rem;
-}}
-@media print {{
-  .source-toolbar, .source-page figcaption {{ display: none; }}
-  body, main {{ margin: 0; padding: 0; background: #fff; width: 100%; }}
-  .source-page {{ margin: 0; box-shadow: none; break-after: page; }}
-}}
-</style>
-</head>
-<body>
-<header class="source-toolbar">
-  <strong>{html.escape(title)} — exact source-page view</strong>
-  <p>The primary view preserves the original PDF's reading order, typography,
-  formulas, tables, code, symbols, and indentation exactly.
-  <a href="document.reflow.html">Open the auxiliary searchable reflow</a>.</p>
-</header>
-<main>
-{page_figures}
-</main>
-</body>
-</html>
-"""
-    html_path.write_text(html_document, encoding="utf-8")
-
-    markdown_lines = [
-        f"# {title}",
-        "",
-        (
-            "> This is the source-faithful primary view. Every page below is an "
-            "exact rendering of the original PDF, preserving reading order, "
-            "typography, formulas, tables, code, symbols, indentation, and line breaks."
-        ),
-        "",
-        "[Open the auxiliary searchable reflow](document.reflow.md).",
-        "",
-    ]
-    for page_no, path in enumerate(page_paths, start=1):
-        markdown_lines.extend(
-            [
-                f"## Page {page_no}",
-                "",
-                f"![Original PDF page {page_no}, exact source rendering](pages/{path.name})",
-                "",
-            ]
-        )
-    md_path.write_text("\n".join(markdown_lines), encoding="utf-8")
-
-    generated = metadata.setdefault("generated_outputs", [])
-    for relative_path in ("document.reflow.html", "document.reflow.md"):
-        if relative_path not in generated:
-            generated.append(relative_path)
-    result = {
-        "ok": True,
-        "applied": True,
-        "mode": "source_page_facsimile",
-        "page_count": len(page_paths),
-        "authoritative_surfaces": ["document.html", "document.md"],
-        "auxiliary_reflow_surfaces": ["document.reflow.html", "document.reflow.md"],
-        "guarantees": [
-            "source_reading_order",
-            "source_typography",
-            "source_formulas_and_symbols",
-            "source_table_cell_layout",
-            "source_code_and_algorithm_indentation",
-        ],
-    }
-    metadata["primary_surface"] = result
-    status["quality_signals"]["primary_surface"] = result
-    status["warnings"].append(
-        "primary_surface_source_page_facsimile:"
-        "searchable_reflow_is_auxiliary_and_may_be_approximate"
-    )
-    return result
-
-
 def _relative_output_link(output_dir: Path, target: Path) -> str:
     try:
         return target.relative_to(output_dir).as_posix()
@@ -15189,10 +15005,26 @@ def main() -> int:
         metadata,
         status,
     )
-    # The accepted CN regression gate evaluates the searchable reflow before
-    # the exact page facsimile becomes the authoritative reading surface.
+    semantic_document = (
+        recovered_document
+        if isinstance(recovered_document, dict)
+        else (response.get("document") or {}).get("json_content")
+    )
+    if isinstance(semantic_document, dict):
+        rebuild_semantic_surfaces(
+            output_dir,
+            semantic_document,
+            conversion_args.input_file,
+            metadata,
+            status,
+        )
+    else:
+        status["ok"] = False
+        status["success_class"] = "degraded_failure"
+        status["warnings"].append(
+            "semantic_source_reflow_not_applied:document_json_missing"
+        )
     record_cn_accepted_baseline(output_dir, metadata, status, conversion_args)
-    finalize_source_faithful_surfaces(output_dir, metadata, status)
     refresh_final_broken_local_refs(output_dir, metadata, status)
     (output_dir / "metadata.json").write_text(
         json.dumps(metadata, indent=2, ensure_ascii=False), encoding="utf-8"

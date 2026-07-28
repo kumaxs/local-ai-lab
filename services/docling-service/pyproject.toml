@@ -3,7 +3,7 @@ name = "docling-service"
 version = "0.0.0"
 description = "Minimal local CLI skeleton for Local AI Lab document parsing."
 requires-python = ">=3.11"
-dependencies = []
+dependencies = ["pdfplumber"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
