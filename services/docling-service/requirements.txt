@@ -1,3 +1,4 @@
 # The initial skeleton had no external dependencies.
 # Install only inside an isolated service venv for the Docling adapter spike.
 docling
+pdfplumber

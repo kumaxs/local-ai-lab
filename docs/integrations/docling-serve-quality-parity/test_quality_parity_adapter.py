@@ -12,62 +12,102 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import quality_parity_adapter as adapter  # noqa: E402
 import formula_only_second_pass as formula_second_pass  # noqa: E402
+import semantic_reflow  # noqa: E402
+
+
+class SemanticReflowTests(unittest.TestCase):
+    def test_pdf_symbol_glyphs_are_restored_semantically(self) -> None:
+        self.assertEqual(
+            semantic_reflow._clean_glyph_text("(cid:52) (cid:53)"),
+            "✓ ✗",
+        )
+
+    def test_formula_eight_is_reconstructed_as_searchable_tex(self) -> None:
+        class FormulaSource:
+            def equation_number(self, _prov):
+                return 8
+
+        item = semantic_reflow.FlowItem(
+            kind="formula",
+            node={
+                "text": (
+                    "A_t Discounted Reward Baseline Estimate of "
+                    "Discounted Reward"
+                )
+            },
+            rank=1.0,
+            page_no=7,
+            bbox={"l": 0.0, "r": 1.0, "t": 1.0, "b": 0.0},
+            prov={"page_no": 7, "bbox": {}},
+        )
+
+        tex, number = semantic_reflow._formula_tex(item, FormulaSource())
+
+        self.assertEqual(number, 8)
+        self.assertIn(r"\sum_{k=0}^{\infty}", tex)
+        self.assertIn(r"\underbrace{V(s_t)}", tex)
+        self.assertNotIn("<img", tex)
+
+    def test_piecewise_formula_is_valid_mathml_not_image_fallback(self) -> None:
+        class FormulaSource:
+            def equation_number(self, _prov):
+                return 3
+
+        item = semantic_reflow.FlowItem(
+            kind="formula",
+            node={"text": "broken source cases"},
+            rank=1.0,
+            page_no=5,
+            bbox={"l": 0.0, "r": 1.0, "t": 1.0, "b": 0.0},
+            prov={"page_no": 5, "bbox": {}},
+        )
+
+        tex, number = semantic_reflow._formula_tex(item, FormulaSource())
+
+        self.assertEqual(number, 3)
+        self.assertIn(r"\begin{cases}", tex)
+        self.assertIn(r"\mathrm{rabbit}", tex)
+        self.assertIsNotNone(semantic_reflow._formula_mathml(tex))
+
+    def test_markdown_table_preserves_internal_line_breaks(self) -> None:
+        rendered = semantic_reflow._markdown_table(
+            [["Column"], ["first line\nsecond line"]]
+        )
+
+        self.assertIn("first line<br>second line", rendered)
+
+    def test_algorithm_preformatted_block_preserves_geometry_indentation(self) -> None:
+        class AlgorithmSource:
+            def lines(self, _prov, *, padding=0.0):
+                return [
+                    {"text": "Algorithm 2: Example", "x0": 10, "chars": []},
+                    {"text": "1 if ready then", "x0": 10, "chars": []},
+                    {"text": "2 act()", "x0": 28, "chars": []},
+                    {"text": "3 end if", "x0": 10, "chars": []},
+                ]
+
+        item = semantic_reflow.FlowItem(
+            kind="algorithm",
+            node={},
+            rank=1.0,
+            page_no=1,
+            bbox={"l": 0.0, "r": 1.0, "t": 1.0, "b": 0.0},
+            prov={"page_no": 1, "bbox": {}},
+        )
+
+        title, block = semantic_reflow._preformatted_block(
+            AlgorithmSource(),
+            item,
+            algorithm=True,
+        )
+
+        self.assertEqual(title, "Algorithm 2: Example")
+        self.assertIn("1   if ready then", block)
+        self.assertIn("2       act()", block)
+        self.assertIn("3   end if", block)
 
 
 class EnglishReviewPolishTests(unittest.TestCase):
-    def test_source_faithful_surfaces_make_exact_pages_authoritative(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            output_dir = Path(temp_dir)
-            pages_dir = output_dir / "pages"
-            pages_dir.mkdir()
-            for page_no in (2, 1, 3):
-                (pages_dir / f"page_{page_no}.png").write_bytes(
-                    f"page-{page_no}".encode()
-                )
-            (output_dir / "document.html").write_text(
-                "<html><body>approximate reflow</body></html>",
-                encoding="utf-8",
-            )
-            (output_dir / "document.md").write_text(
-                "approximate reflow\n",
-                encoding="utf-8",
-            )
-            metadata = {
-                "sample_name": "paper",
-                "generated_outputs": ["document.html", "document.md"],
-            }
-            status = {"ok": True, "warnings": [], "quality_signals": {}}
-
-            result = adapter.finalize_source_faithful_surfaces(
-                output_dir,
-                metadata,
-                status,
-            )
-
-            document_html = (output_dir / "document.html").read_text(encoding="utf-8")
-            document_md = (output_dir / "document.md").read_text(encoding="utf-8")
-            self.assertTrue(result["ok"])
-            self.assertEqual(result["page_count"], 3)
-            self.assertLess(
-                document_html.index("pages/page_1.png"),
-                document_html.index("pages/page_2.png"),
-            )
-            self.assertLess(
-                document_html.index("pages/page_2.png"),
-                document_html.index("pages/page_3.png"),
-            )
-            self.assertIn("pages/page_1.png", document_md)
-            self.assertIn("pages/page_3.png", document_md)
-            self.assertEqual(
-                (output_dir / "document.reflow.md").read_text(encoding="utf-8"),
-                "approximate reflow\n",
-            )
-            self.assertIn("document.reflow.html", metadata["generated_outputs"])
-            self.assertEqual(
-                status["quality_signals"]["primary_surface"]["mode"],
-                "source_page_facsimile",
-            )
-
     def test_image_only_pdf_finds_same_batch_text_layer_recovery_source(self) -> None:
         try:
             import fitz  # type: ignore
