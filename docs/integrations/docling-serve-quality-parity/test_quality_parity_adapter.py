@@ -15,6 +15,59 @@ import formula_only_second_pass as formula_second_pass  # noqa: E402
 
 
 class EnglishReviewPolishTests(unittest.TestCase):
+    def test_source_faithful_surfaces_make_exact_pages_authoritative(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir)
+            pages_dir = output_dir / "pages"
+            pages_dir.mkdir()
+            for page_no in (2, 1, 3):
+                (pages_dir / f"page_{page_no}.png").write_bytes(
+                    f"page-{page_no}".encode()
+                )
+            (output_dir / "document.html").write_text(
+                "<html><body>approximate reflow</body></html>",
+                encoding="utf-8",
+            )
+            (output_dir / "document.md").write_text(
+                "approximate reflow\n",
+                encoding="utf-8",
+            )
+            metadata = {
+                "sample_name": "paper",
+                "generated_outputs": ["document.html", "document.md"],
+            }
+            status = {"ok": True, "warnings": [], "quality_signals": {}}
+
+            result = adapter.finalize_source_faithful_surfaces(
+                output_dir,
+                metadata,
+                status,
+            )
+
+            document_html = (output_dir / "document.html").read_text(encoding="utf-8")
+            document_md = (output_dir / "document.md").read_text(encoding="utf-8")
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["page_count"], 3)
+            self.assertLess(
+                document_html.index("pages/page_1.png"),
+                document_html.index("pages/page_2.png"),
+            )
+            self.assertLess(
+                document_html.index("pages/page_2.png"),
+                document_html.index("pages/page_3.png"),
+            )
+            self.assertIn("pages/page_1.png", document_md)
+            self.assertIn("pages/page_3.png", document_md)
+            self.assertEqual(
+                (output_dir / "document.reflow.md").read_text(encoding="utf-8"),
+                "approximate reflow\n",
+            )
+            self.assertIn("document.reflow.html", metadata["generated_outputs"])
+            self.assertEqual(
+                status["quality_signals"]["primary_surface"]["mode"],
+                "source_page_facsimile",
+            )
+
     def test_image_only_pdf_finds_same_batch_text_layer_recovery_source(self) -> None:
         try:
             import fitz  # type: ignore
