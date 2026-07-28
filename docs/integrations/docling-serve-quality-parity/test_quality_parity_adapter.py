@@ -344,6 +344,14 @@ class EnglishReviewPolishTests(unittest.TestCase):
         self.assertEqual(diagnostics[0]["recovered_number"], 10)
         self.assertIn("equation_number_recoverable_from_formula_text", diagnostics[0]["reasons"])
 
+    def test_formula_number_qc_does_not_invent_number_without_source_evidence(self) -> None:
+        diagnostics = adapter.formula_number_qc_diagnostics(
+            [{"label": "formula", "text": r"x = y", "prov": [{"page_no": 2}]}],
+            '<div><math display="block"><mi>x</mi><mo>=</mo><mi>y</mi></math></div>',
+        )
+
+        self.assertEqual(diagnostics, [])
+
     def test_formula_tex_qc_sanitizes_bare_alignment_markers(self) -> None:
         formulas = [
             {
@@ -491,10 +499,100 @@ class EnglishReviewPolishTests(unittest.TestCase):
             Path("/tmp/out/formula_display_fallback"),
         )
 
-        self.assertIn("docling-formula-readable-fallback", html)
-        self.assertIn(r"\alpha", html)
-        self.assertNotIn("looks like surrounding prose", html)
+        self.assertIn("recognized formula text was withheld", html)
+        self.assertNotIn(r"\alpha", html)
+        self.assertNotIn("t h e o r d e r", html)
         self.assertNotIn("<details", html)
+        self.assertNotIn("second-pass review", html)
+
+    def test_formula_renderer_links_second_pass_review_only_when_it_exists(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir)
+            sidecar_dir = output_dir / "formula_second_pass"
+            sidecar_dir.mkdir()
+            (sidecar_dir / "review_index.html").write_text("review", encoding="utf-8")
+
+            html = adapter._render_second_pass_formula_html(
+                {
+                    "formula_no": 1,
+                    "status": "reviewed",
+                    "markdown_after": r"$$x = y$$",
+                },
+                output_dir,
+                sidecar_dir,
+            )
+
+        self.assertIn('href="formula_second_pass/review_index.html"', html)
+
+    def test_broken_local_refs_audits_final_html_and_markdown_links(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir)
+            (output_dir / "present.png").write_bytes(b"png")
+            broken = adapter.broken_local_refs(
+                output_dir,
+                {
+                    "html_content": (
+                        '<img src="present.png"><a href="missing-review.html#formula-1">'
+                        "review</a>"
+                    ),
+                    "md_content": (
+                        "[present](present.png)\n"
+                        "![missing](missing-image.png)\n"
+                    ),
+                },
+            )
+
+        self.assertEqual(broken, ["missing-image.png", "missing-review.html"])
+
+    def test_unsafe_markdown_formula_uses_exact_source_crop(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir)
+            (output_dir / "formulas").mkdir()
+            (output_dir / "formulas" / "formula_1.png").write_bytes(b"png")
+            (output_dir / "document.md").write_text(
+                "Before\n\n$$\n"
+                r"\begin{array}{r}{i c y o u}\\{r i s k.}\end{array}"
+                "\n$$\n\nAfter\n",
+                encoding="utf-8",
+            )
+
+            count = adapter._replace_unsafe_markdown_formula_blocks_with_source_images(
+                output_dir,
+                [1],
+            )
+            markdown = (output_dir / "document.md").read_text(encoding="utf-8")
+
+        self.assertEqual(count, 1)
+        self.assertNotIn("i c y o u", markdown)
+        self.assertIn("formulas/formula_1.png", markdown)
+        self.assertIn("Exact formula preserved", markdown)
+
+    def test_all_formula_source_crops_are_appended_to_html_and_markdown(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir)
+            (output_dir / "formulas").mkdir()
+            for index in (1, 2):
+                (output_dir / "formulas" / f"formula_{index}.png").write_bytes(b"png")
+            (output_dir / "document.html").write_text(
+                "<html><body><p>Body</p></body></html>",
+                encoding="utf-8",
+            )
+            (output_dir / "document.md").write_text("Body\n", encoding="utf-8")
+
+            result = adapter.append_formula_source_renderings(
+                output_dir,
+                [
+                    {"label": "formula", "prov": [{"page_no": 1}]},
+                    {"label": "formula", "prov": [{"page_no": 2}]},
+                ],
+            )
+            html_text = (output_dir / "document.html").read_text(encoding="utf-8")
+            markdown = (output_dir / "document.md").read_text(encoding="utf-8")
+
+        self.assertEqual(result["html_applied_count"], 2)
+        self.assertEqual(result["markdown_applied_count"], 2)
+        self.assertEqual(html_text.count("docling-formula-source-evidence"), 3)
+        self.assertIn("formulas/formula_2.png", markdown)
 
     def test_formula_fallback_markdown_outputs_readable_math_block(self) -> None:
         markdown = adapter._render_formula_fallback_markdown(
@@ -1529,6 +1627,55 @@ class EnglishReviewPolishTests(unittest.TestCase):
 
         self.assertEqual(qc["candidate_count"], 0)
         self.assertEqual(document["texts"][0]["label"], "section_header")
+
+    def test_structural_qc_normalizes_strict_top_edge_against_nonzero_page_bottom(self) -> None:
+        document = {
+            "pages": {
+                "1": {"size": {"width": 612, "height": 792}},
+                "2": {"size": {"width": 612, "height": 792}},
+            },
+            "texts": [
+                {
+                    "label": "text",
+                    "text": "This implies that",
+                    "prov": [{"page_no": 1, "bbox": {"l": 72, "r": 154, "t": 716, "b": 707}}],
+                },
+                {
+                    "label": "text",
+                    "text": "This implies that",
+                    "prov": [{"page_no": 2, "bbox": {"l": 72, "r": 154, "t": 716, "b": 707}}],
+                },
+                {
+                    "label": "page_header",
+                    "text": "Running paper title",
+                    "prov": [{"page_no": 1, "bbox": {"l": 72, "r": 180, "t": 776, "b": 766}}],
+                },
+                {
+                    "label": "page_header",
+                    "text": "Running paper title",
+                    "prov": [{"page_no": 2, "bbox": {"l": 72, "r": 180, "t": 776, "b": 766}}],
+                },
+                {
+                    "label": "page_footer",
+                    "text": "1",
+                    "prov": [{"page_no": 1, "bbox": {"l": 303, "r": 309, "t": 79, "b": 70}}],
+                },
+                {
+                    "label": "page_footer",
+                    "text": "2",
+                    "prov": [{"page_no": 2, "bbox": {"l": 303, "r": 309, "t": 79, "b": 70}}],
+                },
+            ]
+        }
+
+        qc = adapter.structural_noise_qc(document)
+
+        self.assertEqual(document["texts"][0]["label"], "text")
+        self.assertEqual(document["texts"][1]["label"], "text")
+        self.assertNotIn(
+            "This implies that",
+            {candidate["text"] for candidate in qc["candidates"]},
+        )
 
     def test_structural_qc_quarantines_text_rendered_inside_picture(self) -> None:
         document = {
@@ -3361,6 +3508,74 @@ class EnglishReviewPolishTests(unittest.TestCase):
         self.assertIn("tables/table_1.png", html_text)
         self.assertIn("![Figure 1. Presented table.](tables/table_1.png)", markdown)
 
+    def test_structured_table_keeps_grid_and_appends_exact_source_rendering(self) -> None:
+        document = {
+            "texts": [
+                {
+                    "self_ref": "#/texts/0",
+                    "label": "caption",
+                    "text": "Table 1. Results.",
+                    "prov": [{"page_no": 1}],
+                }
+            ],
+            "tables": [
+                {
+                    "label": "table",
+                    "captions": [{"$ref": "#/texts/0"}],
+                    "data": {"table_cells": [{"text": "A"}], "num_rows": 1, "num_cols": 1},
+                    "prov": [{"page_no": 1}],
+                }
+            ],
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir)
+            (output_dir / "tables").mkdir()
+            (output_dir / "tables" / "table_1.png").write_bytes(b"png")
+            (output_dir / "document.html").write_text(
+                "<html><body><table><tr><td>A</td></tr></table></body></html>",
+                encoding="utf-8",
+            )
+            (output_dir / "document.md").write_text(
+                "| A |\n|---|\n| 1 |\n",
+                encoding="utf-8",
+            )
+
+            result = adapter.append_structured_table_source_renderings(
+                output_dir,
+                document,
+                document["tables"],
+            )
+            html_text = (output_dir / "document.html").read_text(encoding="utf-8")
+            markdown = (output_dir / "document.md").read_text(encoding="utf-8")
+
+        self.assertEqual(result["html_applied_count"], 1)
+        self.assertIn("<table><tr><td>A</td></tr></table>", html_text)
+        self.assertIn("docling-table-source-evidence", html_text)
+        self.assertIn("tables/table_1.png", markdown)
+
+    def test_chunk_merge_adds_no_visible_page_range_heading(self) -> None:
+        merged = adapter.merge_chunk_responses(
+            [
+                {
+                    "page_range": [1, 2],
+                    "response": {
+                        "status": "success",
+                        "document": {
+                            "md_content": "Body",
+                            "html_content": "<p>Body</p>",
+                            "text_content": "Body",
+                            "json_content": {"texts": []},
+                        },
+                    },
+                }
+            ],
+            source_label="transient-recovery",
+        )
+
+        html_text = merged["document"]["html_content"]
+        self.assertNotIn("<h2>Pages", html_text)
+        self.assertIn('data-page-range="[1, 2]"', html_text)
+
     def test_footnote_superscript_polish_does_not_split_adjacent_words(self) -> None:
         updated, count = adapter._polish_footnote_superscripts(
             "<p>Yelong Shen ∗ Shean Wang</p>"
@@ -4359,6 +4574,52 @@ class EnglishReviewPolishTests(unittest.TestCase):
         self.assertIn("    Update the discriminator", records[0]["text"])
         self.assertIn("  end for", records[0]["text"])
         self.assertEqual(records[0]["formula_nos"], [1])
+
+    def test_algorithm_cluster_accepts_numbered_parameter_and_assignment_steps(self) -> None:
+        document = {
+            "texts": [
+                {
+                    "label": "section_header",
+                    "text": "Algorithm 2 Stochastic Proximal Point Method (SPPM)",
+                    "prov": [{"page_no": 3, "bbox": {"l": 10, "r": 200, "t": 300, "b": 285}}],
+                },
+                {
+                    "label": "list_item",
+                    "text": "1: Parameters: learning rate γ > 0",
+                    "prov": [{"page_no": 3, "bbox": {"l": 10, "r": 200, "t": 280, "b": 265}}],
+                },
+                {
+                    "label": "list_item",
+                    "text": "2: for k = 0, 1, 2, ... do",
+                    "prov": [{"page_no": 3, "bbox": {"l": 10, "r": 200, "t": 260, "b": 245}}],
+                },
+                {
+                    "label": "list_item",
+                    "text": "3: Sample ξ_k from D",
+                    "prov": [{"page_no": 3, "bbox": {"l": 10, "r": 200, "t": 240, "b": 225}}],
+                },
+                {
+                    "label": "list_item",
+                    "text": "4: x_{k+1} = prox(x_k)",
+                    "prov": [{"page_no": 3, "bbox": {"l": 10, "r": 200, "t": 220, "b": 205}}],
+                },
+                {
+                    "label": "list_item",
+                    "text": "5: end for",
+                    "prov": [{"page_no": 3, "bbox": {"l": 10, "r": 200, "t": 200, "b": 185}}],
+                },
+            ]
+        }
+
+        records = adapter._algorithm_candidate_records(
+            document,
+            Path("/nonexistent.pdf"),
+        )
+
+        self.assertEqual(len(records), 1)
+        self.assertIn("Algorithm 2", records[0]["label"])
+        self.assertIn("Parameters: learning rate", records[0]["text"])
+        self.assertIn("4: x_", records[0]["text"])
 
     def test_algorithm_recovery_keeps_nearby_caption_with_code_block(self) -> None:
         document = {

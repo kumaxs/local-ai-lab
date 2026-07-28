@@ -188,6 +188,23 @@ def parse_args() -> argparse.Namespace:
         help="Page count per chunk when full-document CN OCR fallback gets 503/504.",
     )
     parser.add_argument(
+        "--conversion-chunk-size",
+        type=int,
+        default=8,
+        help=(
+            "Page count per chunk when the initial full-document conversion gets "
+            "a transient HTTP 503/504 response."
+        ),
+    )
+    parser.add_argument(
+        "--force-chunked-conversion",
+        action="store_true",
+        help=(
+            "Skip the initial full-document request and convert the selected PDF "
+            "as complete page chunks."
+        ),
+    )
+    parser.add_argument(
         "--formula-policy",
         choices=["granite_mlx", "off"],
         default="granite_mlx",
@@ -438,16 +455,53 @@ def html_ref_metrics(document: dict[str, Any]) -> dict[str, Any]:
 
 
 def broken_local_refs(output_dir: Path, document: dict[str, Any]) -> list[str]:
-    html = document.get("html_content") or ""
+    html_content = document.get("html_content") or ""
     markdown = document.get("md_content") or ""
-    refs = re.findall(r'(?:src|href)="([^"]+)"', html)
-    refs.extend(re.findall(r"!\[[^\]]*\]\(([^)]+)\)", markdown))
+    refs = re.findall(
+        r"(?:src|href)\s*=\s*[\"']([^\"']+)[\"']",
+        html_content,
+        flags=re.I,
+    )
+    refs.extend(re.findall(r"!?\[[^\]]*\]\(([^)]+)\)", markdown))
     broken: list[str] = []
     for ref in refs:
+        ref = html.unescape(ref).strip().strip("<>")
         if not ref or ref.startswith(("data:", "http://", "https://", "#", "mailto:")):
             continue
-        if not (output_dir / ref).exists():
-            broken.append(ref)
+        path_ref = ref.split("#", 1)[0].split("?", 1)[0]
+        if path_ref and not (output_dir / path_ref).exists():
+            broken.append(path_ref)
+    return sorted(set(broken))
+
+
+def refresh_final_broken_local_refs(
+    output_dir: Path,
+    metadata: dict[str, Any],
+    status: dict[str, Any],
+) -> list[str]:
+    """Audit the final post-processed HTML/Markdown, not only the Serve response."""
+    final_document = {
+        "html_content": (
+            (output_dir / "document.html").read_text(encoding="utf-8")
+            if (output_dir / "document.html").exists()
+            else ""
+        ),
+        "md_content": (
+            (output_dir / "document.md").read_text(encoding="utf-8")
+            if (output_dir / "document.md").exists()
+            else ""
+        ),
+    }
+    broken = broken_local_refs(output_dir, final_document)
+    metadata["broken_local_refs_count"] = len(broken)
+    metadata["broken_local_refs"] = broken[:20]
+    status.setdefault("quality_signals", {})["broken_local_refs_count"] = len(broken)
+    if broken:
+        status["ok"] = False
+        status["success_class"] = "degraded_failure"
+        status.setdefault("warnings", []).append(
+            "final_output_broken_local_refs:" + ",".join(broken[:20])
+        )
     return broken
 
 
@@ -558,28 +612,49 @@ def pdf_text_layer_profile(path: Path) -> dict[str, Any]:
     """Return lightweight PDF features used for scan/source recovery decisions."""
     try:
         import fitz  # type: ignore
-    except Exception as exc:  # pragma: no cover - depends on local review env
-        return {"path": str(path), "error": f"pymupdf_unavailable:{exc}"}
-    try:
-        doc = fitz.open(path)
-    except Exception as exc:
-        return {"path": str(path), "error": f"pdf_open_failed:{exc}"}
-    text_chars = 0
-    page_sizes: list[tuple[float, float]] = []
-    image_counts: list[int] = []
-    for page in doc:
+    except Exception:
+        fitz = None
+    if fitz is not None:
         try:
-            text_chars += len(page.get_text().strip())
-        except Exception:
-            pass
-        rect = page.rect
-        page_sizes.append((round(float(rect.width), 1), round(float(rect.height), 1)))
+            doc = fitz.open(path)
+        except Exception as exc:
+            return {"path": str(path), "error": f"pdf_open_failed:{exc}"}
+        text_chars = 0
+        page_sizes: list[tuple[float, float]] = []
+        image_counts: list[int] = []
+        for page in doc:
+            try:
+                text_chars += len(page.get_text().strip())
+            except Exception:
+                pass
+            rect = page.rect
+            page_sizes.append((round(float(rect.width), 1), round(float(rect.height), 1)))
+            try:
+                image_counts.append(len(page.get_images(full=True)))
+            except Exception:
+                image_counts.append(0)
+        page_count = doc.page_count
+        doc.close()
+    else:
         try:
-            image_counts.append(len(page.get_images(full=True)))
-        except Exception:
-            image_counts.append(0)
-    page_count = doc.page_count
-    doc.close()
+            import pdfplumber  # type: ignore
+
+            text_chars = 0
+            page_sizes = []
+            image_counts = []
+            with pdfplumber.open(path) as pdf:
+                page_count = len(pdf.pages)
+                for page in pdf.pages:
+                    text_chars += len((page.extract_text() or "").strip())
+                    page_sizes.append(
+                        (round(float(page.width), 1), round(float(page.height), 1))
+                    )
+                    image_counts.append(len(page.images or []))
+        except Exception as exc:  # pragma: no cover - depends on local review env
+            return {
+                "path": str(path),
+                "error": f"pdf_text_profile_unavailable:{exc}",
+            }
     return {
         "path": str(path),
         "page_count": page_count,
@@ -1125,7 +1200,25 @@ def render_page_images_and_crops(
             return True, metric
 
         for index, table in enumerate(tables, start=1):
-            wrote_table, _ = crop_node(table, tables_dir / f"table_{index}.png", padding)
+            table_crop_node = dict(table)
+            table_prov = [
+                dict(prov)
+                for prov in (table.get("prov") or [])
+                if isinstance(prov, dict)
+            ]
+            if table_prov and isinstance(table_prov[0].get("bbox"), dict):
+                expanded_bbox = dict(table_prov[0]["bbox"])
+                expanded_bbox["l"] = float(expanded_bbox.get("l", 0.0)) - 100.0
+                expanded_bbox["r"] = float(expanded_bbox.get("r", 0.0)) + 100.0
+                expanded_bbox["t"] = float(expanded_bbox.get("t", 0.0)) + 16.0
+                expanded_bbox["b"] = float(expanded_bbox.get("b", 0.0)) - 16.0
+                table_prov[0]["bbox"] = expanded_bbox
+                table_crop_node["prov"] = table_prov
+            wrote_table, _ = crop_node(
+                table_crop_node,
+                tables_dir / f"table_{index}.png",
+                max(padding, 48),
+            )
             if wrote_table:
                 counts["table_image_count"] += 1
         for index, formula in enumerate(formulas, start=1):
@@ -1261,6 +1354,200 @@ def inject_empty_table_visual_fallbacks(
         "html_applied_count": html_count,
         "markdown_applied_count": markdown_count,
         "candidates": candidates,
+    }
+
+
+def append_structured_table_source_renderings(
+    output_dir: Path,
+    document_json: Any,
+    tables: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Append exact PDF crops for non-empty tables without replacing structure."""
+    nodes_by_ref = {
+        str(node.get("self_ref")): node
+        for node in iter_nodes(document_json)
+        if isinstance(node, dict) and node.get("self_ref")
+    }
+    candidates: list[dict[str, Any]] = []
+    for index, table in enumerate(tables, start=1):
+        data = table.get("data") or {}
+        if not (
+            data.get("table_cells") or data.get("num_rows") or data.get("num_cols")
+        ):
+            continue
+        image_path = output_dir / "tables" / f"table_{index}.png"
+        if not image_path.exists():
+            continue
+        caption_texts: list[str] = []
+        for caption in table.get("captions") or []:
+            reference = str(caption.get("$ref") or "")
+            text = str((nodes_by_ref.get(reference) or {}).get("text") or "").strip()
+            if text:
+                caption_texts.append(text)
+        caption = " ".join(caption_texts) or f"Table {index}"
+        if re.match(r"(?i)^Figure\b", caption):
+            caption = f"Table {index}"
+        candidates.append(
+            {
+                "table_index": index,
+                "image": f"tables/table_{index}.png",
+                "caption": caption,
+                "page_no": (first_prov(table) or {}).get("page_no"),
+            }
+        )
+
+    html_applied = 0
+    html_path = output_dir / "document.html"
+    if candidates and html_path.exists():
+        document_html = html_path.read_text(encoding="utf-8")
+        figures = "\n".join(
+            (
+                '<figure class="docling-table-source-evidence">'
+                f'<img src="{candidate["image"]}" '
+                f'alt="{html.escape(candidate["caption"], quote=True)} source rendering">'
+                f'<figcaption>{html.escape(candidate["caption"])} — '
+                "exact source rendering from the original PDF</figcaption>"
+                "</figure>"
+            )
+            for candidate in candidates
+        )
+        appendix = (
+            '<section class="docling-table-source-evidence-appendix">'
+            "<h2>Original table renderings</h2>"
+            f"{figures}</section>"
+        )
+        if "</body>" in document_html.lower():
+            match = re.search(r"</body>", document_html, flags=re.I)
+            assert match is not None
+            document_html = (
+                document_html[: match.start()] + appendix + document_html[match.start() :]
+            )
+        else:
+            document_html += appendix
+        html_path.write_text(document_html, encoding="utf-8")
+        html_applied = len(candidates)
+
+    markdown_applied = 0
+    md_path = output_dir / "document.md"
+    if candidates and md_path.exists():
+        document_markdown = md_path.read_text(encoding="utf-8").rstrip()
+        parts = [
+            "\n\n## Original table renderings\n",
+            (
+                "The following images preserve each structured table exactly as "
+                "rendered in the original PDF."
+            ),
+        ]
+        for candidate in candidates:
+            parts.extend(
+                [
+                    "",
+                    f'![{candidate["caption"]} — source rendering]'
+                    f'({candidate["image"]})',
+                ]
+            )
+        md_path.write_text(
+            document_markdown + "\n".join(parts) + "\n",
+            encoding="utf-8",
+        )
+        markdown_applied = len(candidates)
+
+    return {
+        "candidate_count": len(candidates),
+        "html_applied_count": html_applied,
+        "markdown_applied_count": markdown_applied,
+        "candidates": candidates,
+    }
+
+
+def append_formula_source_renderings(
+    output_dir: Path,
+    formulas: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Append exact PDF crops so every formula and symbol remains recoverable."""
+    candidates = [
+        {
+            "formula_index": index,
+            "image": f"formulas/formula_{index}.png",
+            "context_image": f"formulas/formula_{index}_context.png",
+            "page_no": (first_prov(formula) or {}).get("page_no"),
+        }
+        for index, formula in enumerate(formulas, start=1)
+        if (output_dir / "formulas" / f"formula_{index}.png").exists()
+    ]
+
+    html_applied = 0
+    html_path = output_dir / "document.html"
+    if candidates and html_path.exists():
+        document_html = html_path.read_text(encoding="utf-8")
+        if "docling-formula-source-evidence-appendix" not in document_html:
+            figures = "\n".join(
+                (
+                    '<figure class="docling-formula-source-evidence">'
+                    f'<img loading="lazy" src="{candidate["image"]}" '
+                    f'alt="Formula {candidate["formula_index"]} source rendering">'
+                    f'<figcaption>Formula {candidate["formula_index"]} — exact '
+                    "source rendering from the original PDF"
+                    + (
+                        f' (<a href="{candidate["context_image"]}">page context</a>)'
+                        if (
+                            output_dir / candidate["context_image"]
+                        ).exists()
+                        else ""
+                    )
+                    + "</figcaption></figure>"
+                )
+                for candidate in candidates
+            )
+            appendix = (
+                '<section class="docling-formula-source-evidence-appendix">'
+                "<h2>Original formula renderings</h2>"
+                "<p>These source crops preserve every mathematical symbol exactly "
+                "as printed in the original PDF.</p>"
+                f"{figures}</section>"
+            )
+            body_end = re.search(r"</body>", document_html, flags=re.I)
+            if body_end:
+                document_html = (
+                    document_html[: body_end.start()]
+                    + appendix
+                    + document_html[body_end.start() :]
+                )
+            else:
+                document_html += appendix
+            html_path.write_text(document_html, encoding="utf-8")
+            html_applied = len(candidates)
+
+    markdown_applied = 0
+    md_path = output_dir / "document.md"
+    if candidates and md_path.exists():
+        document_markdown = md_path.read_text(encoding="utf-8")
+        if "## Original formula renderings" not in document_markdown:
+            parts = [
+                document_markdown.rstrip(),
+                "",
+                "## Original formula renderings",
+                "",
+                (
+                    "These source crops preserve every mathematical symbol exactly "
+                    "as printed in the original PDF."
+                ),
+            ]
+            for candidate in candidates:
+                parts.extend(
+                    [
+                        "",
+                        f'![Formula {candidate["formula_index"]} — source rendering]'
+                        f'({candidate["image"]})',
+                    ]
+                )
+            md_path.write_text("\n".join(parts) + "\n", encoding="utf-8")
+            markdown_applied = len(candidates)
+
+    return {
+        "candidate_count": len(candidates),
+        "html_applied_count": html_applied,
+        "markdown_applied_count": markdown_applied,
     }
 
 
@@ -2269,7 +2556,7 @@ def _normalized_noise_text(text: str) -> str:
 def header_footer_qc_diagnostics(document_json: Any) -> list[dict[str, Any]]:
     diagnostics: list[dict[str, Any]] = []
     records = structural_text_records(document_json)
-    page_extents = _page_vertical_extents(records)
+    page_extents = _page_vertical_extents(records, document_json)
     edge_records = [record for record in records if record["label"].lower() in PAGE_EDGE_LABELS]
     text_counts: dict[str, int] = {}
     for record in edge_records:
@@ -2340,12 +2627,50 @@ def _is_bottom_footnote_region(geometry: dict[str, Any] | None) -> bool:
     return bool(geometry and float(geometry.get("b", 9999)) < 160)
 
 
-def _page_vertical_extents(records: list[dict[str, Any]]) -> dict[Any, dict[str, float]]:
+def _document_page_vertical_extents(document_json: Any) -> dict[Any, dict[str, float]]:
     extents: dict[Any, dict[str, float]] = {}
+    documents: list[dict[str, Any]] = []
+    if isinstance(document_json, dict):
+        documents.append(document_json)
+        for chunk in document_json.get("chunks") or []:
+            if not isinstance(chunk, dict):
+                continue
+            chunk_document = chunk.get("document")
+            if isinstance(chunk_document, dict):
+                documents.append(chunk_document)
+    for document in documents:
+        pages = document.get("pages")
+        if not isinstance(pages, dict):
+            continue
+        for page_key, page in pages.items():
+            if not isinstance(page, dict):
+                continue
+            try:
+                page_no: Any = int(page.get("page_no") or page_key)
+            except (TypeError, ValueError):
+                page_no = page.get("page_no") or page_key
+            size = page.get("size") or {}
+            try:
+                height = float(size.get("height"))
+            except (TypeError, ValueError):
+                continue
+            if height > 0:
+                extents[page_no] = {"top": height, "bottom": 0.0}
+    return extents
+
+
+def _page_vertical_extents(
+    records: list[dict[str, Any]],
+    document_json: Any = None,
+) -> dict[Any, dict[str, float]]:
+    extents = _document_page_vertical_extents(document_json)
+    physical_page_numbers = set(extents)
     for record in records:
         page_no = record.get("page_no")
         geometry = record.get("bbox") or {}
         if page_no is None or not geometry:
+            continue
+        if page_no in physical_page_numbers:
             continue
         page = extents.setdefault(page_no, {"top": 0.0, "bottom": float("inf")})
         page["top"] = max(page["top"], float(geometry.get("t", 0.0)))
@@ -3439,7 +3764,7 @@ def structural_noise_qc(
     records = structural_text_records(document_json)
     picture_records = structural_picture_records(document_json)
     table_records = structural_table_records(document_json)
-    page_extents = _page_vertical_extents(records)
+    page_extents = _page_vertical_extents(records, document_json)
     known_structural_records = [
         record
         for record in records
@@ -3556,9 +3881,21 @@ def structural_noise_qc(
         text = str(record.get("text") or "")
         normalized = _normalized_noise_text(text)
         geometry = record.get("bbox") or {}
+        page_extent = page_extents.get(record.get("page_no"))
         bottom_zone, top_zone, page_height = _edge_zone_flags(
             geometry,
-            page_extents.get(record.get("page_no")),
+            page_extent,
+        )
+        page_bottom = float((page_extent or {}).get("bottom") or 0.0)
+        strict_bottom_edge = bool(
+            geometry
+            and float(geometry.get("b", page_bottom + page_height))
+            <= page_bottom + page_height * 0.07
+        )
+        strict_top_edge = bool(
+            geometry
+            and float(geometry.get("t", page_bottom))
+            >= page_bottom + page_height * 0.93
         )
         small_text = bool(
             geometry
@@ -3915,7 +4252,7 @@ def structural_noise_qc(
             kind = label_l
             reasons.append(f"docling_label_{label_l}")
         elif geometry and not body_semantic_label:
-            if bottom_zone and (
+            if strict_bottom_edge and (
                 re.fullmatch(r"\d{1,3}", normalized)
                 or (
                     HEADER_FOOTER_NOISE_RE.search(normalized)
@@ -3929,7 +4266,7 @@ def structural_noise_qc(
             ):
                 kind = "page_footer_candidate"
                 reasons.append("bottom_edge_noise_candidate")
-            if top_zone and (
+            if strict_top_edge and (
                 (
                     HEADER_FOOTER_NOISE_RE.search(normalized)
                     and len(normalized) <= 160
@@ -4499,32 +4836,229 @@ def _pdf_text_for_bbox(pdf_path: Path, prov: dict[str, Any], padding: float = 5.
     try:
         import fitz  # type: ignore
     except Exception:
-        return ""
+        fitz = None
     bbox = prov.get("bbox") if isinstance(prov, dict) else None
     page_no = prov.get("page_no") if isinstance(prov, dict) else None
     if not isinstance(bbox, dict) or not isinstance(page_no, int):
         return ""
+    if fitz is not None:
+        try:
+            doc = fitz.open(pdf_path)
+        except Exception:
+            doc = None
+        if doc is not None:
+            try:
+                if not (1 <= page_no <= len(doc)):
+                    return ""
+                page = doc[page_no - 1]
+                height = float(page.rect.height)
+                rect = fitz.Rect(
+                    float(bbox.get("l", 0)) - padding,
+                    height - float(bbox.get("t", height)) - padding,
+                    float(bbox.get("r", 0)) + padding,
+                    height - float(bbox.get("b", 0)) + padding,
+                )
+                blocks = page.get_text("blocks", clip=rect, sort=True)
+                return "\n".join(
+                    str(block[4]).strip()
+                    for block in blocks
+                    if str(block[4]).strip()
+                )
+            except Exception:
+                pass
+            finally:
+                doc.close()
+
     try:
-        doc = fitz.open(pdf_path)
+        import pdfplumber  # type: ignore
     except Exception:
         return ""
     try:
-        if not (1 <= page_no <= len(doc)):
-            return ""
-        page = doc[page_no - 1]
-        height = float(page.rect.height)
-        rect = fitz.Rect(
-            float(bbox.get("l", 0)) - padding,
-            height - float(bbox.get("t", height)) - padding,
-            float(bbox.get("r", 0)) + padding,
-            height - float(bbox.get("b", 0)) + padding,
+        with pdfplumber.open(str(pdf_path)) as pdf:
+            if not (1 <= page_no <= len(pdf.pages)):
+                return ""
+            page = pdf.pages[page_no - 1]
+            top = float(page.height) - float(bbox.get("t", page.height))
+            bottom = float(page.height) - float(bbox.get("b", 0))
+            crop_bbox = (
+                max(0.0, float(bbox.get("l", 0)) - padding),
+                max(0.0, top - padding),
+                min(float(page.width), float(bbox.get("r", 0)) + padding),
+                min(float(page.height), bottom + padding),
+            )
+            crop = page.crop(crop_bbox, strict=False)
+            return _clean_pdfplumber_glyph_text(
+                str(
+                crop.extract_text(
+                    layout=True,
+                    x_tolerance=1,
+                    y_tolerance=4,
+                )
+                or ""
+                )
+            ).strip()
+    except Exception:
+        return ""
+
+
+def _clean_pdfplumber_glyph_text(text: str) -> str:
+    cleaned = (
+        text.replace("(cid:126)", "⃗")
+        .replace("(cid:16)", "(")
+        .replace("(cid:17)", ")")
+        .replace("(cid:80)", "∑")
+        .replace("(cid:40)", "")
+        .replace("\x00", "")
+        .replace("\x01", "")
+    )
+    return re.sub(r"\(cid:\d+\)", "", cleaned)
+
+
+def _pdfplumber_algorithm_layout_for_bbox(
+    pdf_path: Path,
+    prov: dict[str, Any],
+    padding: float,
+) -> dict[str, Any] | None:
+    try:
+        import pdfplumber  # type: ignore
+    except Exception:
+        return None
+    bbox = prov.get("bbox") if isinstance(prov, dict) else None
+    page_no = prov.get("page_no") if isinstance(prov, dict) else None
+    if not isinstance(bbox, dict) or not isinstance(page_no, int):
+        return None
+    try:
+        with pdfplumber.open(str(pdf_path)) as pdf:
+            if not (1 <= page_no <= len(pdf.pages)):
+                return None
+            page = pdf.pages[page_no - 1]
+            top = float(page.height) - float(bbox.get("t", page.height))
+            bottom = float(page.height) - float(bbox.get("b", 0))
+            crop_bbox = (
+                max(0.0, float(bbox.get("l", 0)) - padding),
+                max(0.0, top - padding),
+                min(float(page.width), float(bbox.get("r", 0)) + padding),
+                min(float(page.height), bottom + padding),
+            )
+            crop = page.crop(crop_bbox, strict=False)
+            extracted_lines = crop.extract_text_lines(
+                strip=True,
+                return_chars=True,
+                x_tolerance=1,
+                y_tolerance=4,
+            )
+    except Exception:
+        return None
+
+    lines: list[dict[str, Any]] = []
+    for extracted_line in extracted_lines:
+        line_text = _clean_pdfplumber_glyph_text(
+            str(extracted_line.get("text") or "")
+        ).strip()
+        if not line_text:
+            continue
+        chars = [
+            char
+            for char in (extracted_line.get("chars") or [])
+            if isinstance(char, dict) and str(char.get("text") or "")
+        ]
+        spans: list[dict[str, Any]] = []
+        if "(cid:" in "".join(str(char.get("text") or "") for char in chars):
+            spans.append(
+                {
+                    "text": line_text,
+                    "bbox": [
+                        round(float(extracted_line.get("x0") or 0.0), 3),
+                        round(float(extracted_line.get("top") or 0.0), 3),
+                        round(float(extracted_line.get("x1") or 0.0), 3),
+                        round(float(extracted_line.get("bottom") or 0.0), 3),
+                    ],
+                    "font_name": "",
+                    "font_size": 0.0,
+                    "font_flags": 0,
+                    "styles": [],
+                }
+            )
+        else:
+            current: dict[str, Any] | None = None
+            for char in chars:
+                char_text = _clean_pdfplumber_glyph_text(
+                    str(char.get("text") or "")
+                )
+                if not char_text:
+                    continue
+                font_name = str(char.get("fontname") or "")
+                font_size = float(char.get("size") or 0.0)
+                styles = _font_semantic_styles(font_name, None)
+                style_key = (font_name, round(font_size, 2), tuple(styles))
+                if current is None or current["style_key"] != style_key:
+                    current = {
+                        "style_key": style_key,
+                        "text": char_text,
+                        "bbox": [
+                            float(char.get("x0") or 0.0),
+                            float(char.get("top") or 0.0),
+                            float(char.get("x1") or 0.0),
+                            float(char.get("bottom") or 0.0),
+                        ],
+                        "font_name": font_name,
+                        "font_size": round(font_size, 3),
+                        "font_flags": 0,
+                        "styles": styles,
+                    }
+                    spans.append(current)
+                else:
+                    current["text"] += char_text
+                    current["bbox"][2] = float(char.get("x1") or current["bbox"][2])
+                    current["bbox"][3] = max(
+                        current["bbox"][3],
+                        float(char.get("bottom") or current["bbox"][3]),
+                    )
+            for span in spans:
+                span.pop("style_key", None)
+                span["bbox"] = [round(float(value), 3) for value in span["bbox"]]
+        lines.append(
+            {
+                "text": line_text,
+                "bbox": [
+                    round(float(extracted_line.get("x0") or 0.0), 3),
+                    round(float(extracted_line.get("top") or 0.0), 3),
+                    round(float(extracted_line.get("x1") or 0.0), 3),
+                    round(float(extracted_line.get("bottom") or 0.0), 3),
+                ],
+                "spans": spans,
+            }
         )
-        blocks = page.get_text("blocks", clip=rect, sort=True)
-        return "\n".join(str(block[4]).strip() for block in blocks if str(block[4]).strip())
-    except Exception:
-        return ""
-    finally:
-        doc.close()
+    if len(lines) < 3:
+        return None
+    min_left = min(float(line["bbox"][0]) for line in lines)
+    max_left = max(float(line["bbox"][0]) for line in lines)
+    for line in lines:
+        line["indent_px"] = round(
+            max(0.0, float(line["bbox"][0]) - min_left),
+            3,
+        )
+    return {
+        "source": "pdfplumber_text_span_layout",
+        "page_no": page_no,
+        "clip_bbox": bbox_geometry(prov),
+        "line_count": len(lines),
+        "span_count": sum(len(line.get("spans") or []) for line in lines),
+        "bold_span_count": sum(
+            1
+            for line in lines
+            for span in line.get("spans") or []
+            if "bold" in (span.get("styles") or [])
+        ),
+        "distinct_indent_count": len(
+            {
+                round(float(line.get("indent_px") or 0.0), 1)
+                for line in lines
+            }
+        ),
+        "indent_range_px": round(max_left - min_left, 3),
+        "lines": lines,
+    }
 
 
 def _pdf_algorithm_layout_for_bbox(
@@ -4535,7 +5069,7 @@ def _pdf_algorithm_layout_for_bbox(
     try:
         import fitz  # type: ignore
     except Exception:
-        return None
+        return _pdfplumber_algorithm_layout_for_bbox(pdf_path, prov, padding)
     bbox = prov.get("bbox") if isinstance(prov, dict) else None
     page_no = prov.get("page_no") if isinstance(prov, dict) else None
     if not isinstance(bbox, dict) or not isinstance(page_no, int):
@@ -4823,14 +5357,42 @@ def _indent_algorithm_lines(lines: list[str]) -> list[str]:
 
 
 def _algorithm_caption_from_text(text: str) -> str:
-    match = re.search(r"(?is)\bAlgorithm\s+\d+\b\s*:?\s+[A-Z][^.]*.*", text)
-    if not match:
-        return ""
-    caption = _normalized_noise_text(text[match.start() :])
+    matching_lines = [
+        line.strip()
+        for line in text.splitlines()
+        if re.match(r"(?i)^\s*Algorithm\s+\d+\b", line)
+    ]
+    if matching_lines:
+        caption = matching_lines[0]
+    else:
+        match = re.search(r"(?i)\bAlgorithm\s+\d+\b", text)
+        if not match:
+            return ""
+        caption = text[match.start() :]
+    header = re.match(r"(?i)\s*Algorithm\s+\d+\b\s*:?", caption)
+    search_start = header.end() if header else 0
+    body_start = re.search(
+        r"\s+(?=(?:1\s*:|Require\s*:|Input\s*:|Output\s*:))",
+        caption[search_start:],
+        flags=re.I,
+    )
+    if body_start:
+        caption = caption[: search_start + body_start.start()]
+    caption = _normalized_noise_text(caption)
     caption = re.sub(r"\s+", " ", caption).strip()
-    if len(caption) < 20:
+    if len(caption) < 12:
         return ""
-    return caption[:1200]
+    return caption[:300]
+
+
+def _looks_like_program_listing(text: str) -> bool:
+    return bool(
+        re.search(
+            r"(?m)(?:^\s*#|(?:for|while)\s+\w+\s+in\s+range\s*\(|"
+            r"\bprint\s*\(|\bdef\s+\w+\s*\(|\w+\[['\"][^'\"]+['\"]\]\s*=)",
+            text,
+        )
+    )
 
 
 def _algorithm_record_html(record: dict[str, Any]) -> str:
@@ -4844,12 +5406,23 @@ def _algorithm_record_html(record: dict[str, Any]) -> str:
         if caption and caption != str(record.get("label") or "")
         else ""
     )
+    source_image = str(record.get("source_image") or "").strip()
+    source_figure = (
+        '<figure class="docling-algorithm-source-evidence">'
+        f'<img src="{html.escape(source_image, quote=True)}" '
+        f'alt="{html.escape(str(record.get("label") or "Algorithm block"), quote=True)} source rendering">'
+        '<figcaption>Algorithm source rendering from the original PDF.</figcaption>'
+        "</figure>"
+        if source_image
+        else ""
+    )
     return (
         '<div class="docling-algorithm-recovered" '
         f'data-algorithm-source="{source}">'
         f'<div class="docling-formula-second-pass-label docling-algorithm-label">{label}</div>'
         + caption_html
         + text
+        + source_figure
         + "</div>"
     )
 
@@ -4859,6 +5432,12 @@ def _algorithm_record_markdown(record: dict[str, Any]) -> str:
     text = str(record.get("text") or "")
     caption = str(record.get("caption") or "").strip()
     caption_text = f"\n\n{caption}\n" if caption and caption != label else ""
+    source_image = str(record.get("source_image") or "").strip()
+    source_figure = (
+        f"\n\n![{label} source rendering]({source_image})\n"
+        if source_image
+        else ""
+    )
     return (
         f"\n\n**{label}**{caption_text}\n"
         + (
@@ -4869,6 +5448,7 @@ def _algorithm_record_markdown(record: dict[str, Any]) -> str:
                 "</pre>"
             )
         )
+        + source_figure
         + "\n\n"
     )
 
@@ -5100,7 +5680,33 @@ def _algorithm_candidate_records(document_json: Any, pdf_path: Path) -> list[dic
     if not isinstance(document_json, dict):
         return []
     records: list[dict[str, Any]] = []
-    nodes = [node for node in (document_json.get("texts") or []) if isinstance(node, dict)]
+    if (
+        document_json.get("schema_name") == "local_ai_lab_docling_serve_chunked"
+        and isinstance(document_json.get("chunks"), list)
+    ):
+        nodes = []
+        chunks = sorted(
+            (
+                chunk
+                for chunk in document_json["chunks"]
+                if isinstance(chunk, dict)
+            ),
+            key=lambda chunk: tuple(chunk.get("page_range") or [0, 0]),
+        )
+        for chunk in chunks:
+            chunk_document = chunk.get("document")
+            if isinstance(chunk_document, dict):
+                nodes.extend(
+                    node
+                    for node in (chunk_document.get("texts") or [])
+                    if isinstance(node, dict)
+                )
+    else:
+        nodes = [
+            node
+            for node in (document_json.get("texts") or [])
+            if isinstance(node, dict)
+        ]
     used_text_indexes: set[int] = set()
     formula_index = 0
     for text_index, node in enumerate(nodes):
@@ -5134,6 +5740,19 @@ def _algorithm_candidate_records(document_json: Any, pdf_path: Path) -> list[dic
             text_index,
             prov.get("page_no"),
         )
+        pdf_caption = _algorithm_caption_from_text(pdf_text)
+        if pdf_caption:
+            caption = pdf_caption
+            if pdf_caption not in caption_targets:
+                caption_targets.append(pdf_caption)
+        elif not caption:
+            caption = _algorithm_caption_from_text(node_text)
+            if caption:
+                caption_targets = [caption]
+        if label == "code" and not caption and _looks_like_program_listing(
+            pdf_text or node_text
+        ):
+            continue
         records.append(
             {
                 "id": f"algorithm-block-{len(records) + 1}",
@@ -5162,6 +5781,52 @@ def _algorithm_candidate_records(document_json: Any, pdf_path: Path) -> list[dic
             pdf_path,
         )
     )
+    existing_algorithm_keys: set[tuple[str | None, Any]] = set()
+    for record in records:
+        number_match = re.search(
+            r"(?i)\bAlgorithm\s+(\d+)\b",
+            str(record.get("label") or ""),
+        )
+        existing_algorithm_keys.add(
+            (
+                number_match.group(1) if number_match else None,
+                record.get("page_no"),
+            )
+        )
+    for table in extract_table_nodes(document_json):
+        prov = first_prov(table) or {}
+        pdf_text = _pdf_text_for_bbox(pdf_path, prov) if pdf_path.exists() else ""
+        caption = _algorithm_caption_from_text(pdf_text)
+        number_match = re.search(r"(?i)\bAlgorithm\s+(\d+)\b", caption)
+        key = (
+            number_match.group(1) if number_match else None,
+            prov.get("page_no"),
+        )
+        if not caption or key in existing_algorithm_keys:
+            continue
+        formatted = _format_algorithm_text(pdf_text)
+        if len(formatted) < 40:
+            continue
+        records.append(
+            {
+                "id": f"algorithm-block-{len(records) + 1}",
+                "label": caption,
+                "caption": caption,
+                "text": formatted,
+                "original_text": pdf_text,
+                "source": "pdf_text_from_algorithm_like_table",
+                "formula_no": None,
+                "page_no": prov.get("page_no"),
+                "bbox": bbox_geometry(prov),
+                "layout": _pdf_algorithm_layout_for_bbox(pdf_path, prov)
+                if pdf_path.exists()
+                else None,
+                "original_label": "algorithm_like_table",
+                "html_targets": [caption],
+            }
+        )
+        table.setdefault("local_ai_lab_qc", {})["algorithm_like_table"] = True
+        existing_algorithm_keys.add(key)
     return records
 
 
@@ -5171,12 +5836,20 @@ def _find_html_blocks_for_targets(document_html: str, targets: list[str]) -> lis
     block_re = re.compile(
         r"(?is)<(?P<tag>p|li|figcaption|h[1-6])\b[^>]*>.*?</(?P=tag)>",
     )
+    structural_content_start = document_html.find(
+        '<section id="docling-structural-content"'
+    )
+    searchable_html = (
+        document_html[:structural_content_start]
+        if structural_content_start >= 0
+        else document_html
+    )
     for target_text in targets:
         normalized_target = _normalized_noise_text(target_text)[:96]
         if not normalized_target:
             continue
         compact_target = re.sub(r"\s+", "", normalized_target)
-        for match in block_re.finditer(document_html):
+        for match in block_re.finditer(searchable_html):
             if any(not (match.end() <= start or match.start() >= end) for start, end in used_ranges):
                 continue
             visible = html.unescape(HTML_TAG_RE.sub(" ", match.group(0)))
@@ -5288,6 +5961,21 @@ def _replace_algorithm_record_non_destructive_html(
 def _replace_algorithm_records_in_html(document_html: str, records: list[dict[str, Any]]) -> tuple[str, int]:
     updated = document_html
     changed = 0
+
+    def main_flow_formula_range(formula_no: int) -> tuple[int, int] | None:
+        structural_start = updated.find('<section id="docling-structural-content"')
+        return next(
+            (
+                formula_range
+                for formula_range in _find_existing_second_pass_formula_ranges(
+                    updated,
+                    formula_no,
+                )
+                if structural_start < 0 or formula_range[0] < structural_start
+            ),
+            None,
+        )
+
     for record in records:
         replacement = _algorithm_record_html(record)
         html_targets = [
@@ -5308,7 +5996,7 @@ def _replace_algorithm_records_in_html(document_html: str, records: list[dict[st
             if not formula_nos and record.get("original_label") != "algorithm_cluster":
                 target_ranges = []
             for formula_no_value in formula_nos:
-                formula_range = _find_existing_second_pass_formula_range(updated, formula_no_value)
+                formula_range = main_flow_formula_range(formula_no_value)
                 if formula_range is not None:
                     target_ranges.append(formula_range)
             required_targets = max(1, min(3, len(html_targets)))
@@ -5330,7 +6018,7 @@ def _replace_algorithm_records_in_html(document_html: str, records: list[dict[st
                 continue
         formula_no = record.get("formula_no")
         if isinstance(formula_no, int):
-            formula_range = _find_existing_second_pass_formula_range(updated, formula_no)
+            formula_range = main_flow_formula_range(formula_no)
             if formula_range is not None:
                 updated = updated[: formula_range[0]] + replacement + updated[formula_range[1] :]
                 changed += 1
@@ -5342,9 +6030,17 @@ def _replace_algorithm_records_in_html(document_html: str, records: list[dict[st
             for value in (original_text, original_node_text)
             if _normalized_noise_text(value)
         ]
+        structural_content_start = updated.find(
+            '<section id="docling-structural-content"'
+        )
+        searchable_html = (
+            updated[:structural_content_start]
+            if structural_content_start >= 0
+            else updated
+        )
         for match in re.finditer(
             r"<pre(?P<attrs>[^>]*)>\s*<code[^>]*>(?P<body>.*?)</code>\s*</pre>",
-            updated,
+            searchable_html,
             flags=re.I | re.S,
         ):
             visible = html.unescape(HTML_TAG_RE.sub(" ", match.group("body")))
@@ -5372,9 +6068,25 @@ def _replace_algorithm_records_in_html(document_html: str, records: list[dict[st
 
 
 def _find_markdown_target_line_ranges(md_text: str, targets: Iterable[str]) -> list[tuple[int, int]]:
+    boundary_markers = (
+        STRUCTURAL_CONTENT_MD_START,
+        "## Original table renderings",
+        "## Original formula renderings",
+        "## Original algorithm renderings",
+    )
+    boundary_positions = [
+        position
+        for marker in boundary_markers
+        if (position := md_text.find(marker)) >= 0
+    ]
+    searchable_md = (
+        md_text[: min(boundary_positions)]
+        if boundary_positions
+        else md_text
+    )
     fence_ranges = [
         (match.start(), match.end())
-        for match in re.finditer(r"```.*?```", md_text, flags=re.S)
+        for match in re.finditer(r"```.*?```", searchable_md, flags=re.S)
     ]
     ranges: list[tuple[int, int]] = []
     for target in targets:
@@ -5382,7 +6094,7 @@ def _find_markdown_target_line_ranges(md_text: str, targets: Iterable[str]) -> l
         if not normalized_target:
             continue
         compact_target = re.sub(r"\s+", "", normalized_target)
-        for match in re.finditer(r"(?m)^(?P<line>.+)$", md_text):
+        for match in re.finditer(r"(?m)^(?P<line>.+)$", searchable_md):
             if any(start <= match.start() < end for start, end in fence_ranges):
                 continue
             raw_line = match.group("line").lstrip()
@@ -5676,6 +6388,160 @@ def _replace_algorithm_records_in_markdown(md_text: str, records: list[dict[str,
     return updated, changed
 
 
+def _write_algorithm_source_crops(
+    output_dir: Path,
+    pdf_path: Path,
+    records: list[dict[str, Any]],
+) -> list[str]:
+    try:
+        import pdfplumber  # type: ignore
+        from PIL import Image
+    except Exception:
+        return []
+    page_sizes: dict[int, tuple[float, float]] = {}
+    try:
+        with pdfplumber.open(str(pdf_path)) as pdf:
+            page_sizes = {
+                index: (float(page.width), float(page.height))
+                for index, page in enumerate(pdf.pages, start=1)
+            }
+    except Exception:
+        return []
+
+    written: list[str] = []
+    algorithms_dir = output_dir / "algorithms"
+    for index, record in enumerate(records, start=1):
+        bbox = record.get("bbox")
+        page_no = record.get("page_no")
+        if not isinstance(bbox, dict) or not isinstance(page_no, int):
+            continue
+        page_size = page_sizes.get(page_no)
+        page_image_path = output_dir / "pages" / f"page_{page_no}.png"
+        if page_size is None or not page_image_path.exists():
+            continue
+        try:
+            with Image.open(page_image_path) as image:
+                page_width, page_height = page_size
+                scale_x = image.width / max(page_width, 1.0)
+                scale_y = image.height / max(page_height, 1.0)
+                left = float(bbox.get("l") or 0.0) * scale_x
+                right = float(bbox.get("r") or 0.0) * scale_x
+                top = (page_height - float(bbox.get("t") or page_height)) * scale_y
+                bottom = (page_height - float(bbox.get("b") or 0.0)) * scale_y
+                padding_px = 12
+                record_text = _normalized_noise_text(str(record.get("text") or ""))
+                needs_lower_algorithm_context = not re.search(
+                    r"(?i)(?:\bend\s+for\b|\bend\s+while\b|\breturn\b|\bend\s+end\b)",
+                    record_text,
+                )
+                lower_context_px = int(90.0 * scale_y) if needs_lower_algorithm_context else 0
+                crop_box = (
+                    max(0, int(min(left, right) - padding_px)),
+                    max(0, int(min(top, bottom) - padding_px)),
+                    min(image.width, int(max(left, right) + padding_px)),
+                    min(
+                        image.height,
+                        int(max(top, bottom) + padding_px + lower_context_px),
+                    ),
+                )
+                if crop_box[2] <= crop_box[0] or crop_box[3] <= crop_box[1]:
+                    continue
+                algorithms_dir.mkdir(exist_ok=True)
+                relative_path = f"algorithms/algorithm_{index}.png"
+                image.crop(crop_box).save(output_dir / relative_path)
+        except Exception:
+            continue
+        record["source_image"] = relative_path
+        record["source_image_page_no"] = page_no
+        record["source_image_pixel_box"] = crop_box
+        written.append(relative_path)
+    return written
+
+
+def _algorithm_recovered_div_ranges(document_html: str) -> list[tuple[int, int]]:
+    ranges: list[tuple[int, int]] = []
+    marker = '<div class="docling-algorithm-recovered"'
+    search_from = 0
+    while True:
+        start = document_html.find(marker, search_from)
+        if start < 0:
+            return ranges
+        search_from = start + len(marker)
+        depth = 0
+        for tag_match in re.finditer(
+            r"</?div\b[^>]*>",
+            document_html[start:],
+            flags=re.I,
+        ):
+            if tag_match.group(0).startswith("</"):
+                depth -= 1
+                if depth == 0:
+                    ranges.append((start, start + tag_match.end()))
+                    break
+            else:
+                depth += 1
+
+
+def _dedupe_algorithm_recovered_html(
+    document_html: str,
+    records: list[dict[str, Any]],
+) -> tuple[str, int]:
+    ranges = _algorithm_recovered_div_ranges(document_html)
+    if len(ranges) <= len(records):
+        return document_html, 0
+    expected_by_number: dict[str, str] = {}
+    expected_unnumbered = 0
+    for record in records:
+        match = re.search(
+            r"(?i)\bAlgorithm\s+(\d+)\b",
+            str(record.get("label") or ""),
+        )
+        if match:
+            expected_by_number[match.group(1)] = str(record.get("source_image") or "")
+        else:
+            expected_unnumbered += 1
+
+    groups: dict[str, list[tuple[int, int, str]]] = {}
+    unnumbered: list[tuple[int, int, str]] = []
+    for start, end in ranges:
+        block = document_html[start:end]
+        visible = _normalized_noise_text(html.unescape(HTML_TAG_RE.sub(" ", block)))
+        match = re.search(r"(?i)\bAlgorithm\s+(\d+)\b", visible)
+        item = (start, end, block)
+        if match:
+            groups.setdefault(match.group(1), []).append(item)
+        else:
+            unnumbered.append(item)
+
+    remove_ranges: list[tuple[int, int]] = []
+    for number, items in groups.items():
+        if number not in expected_by_number:
+            remove_ranges.extend((start, end) for start, end, _block in items)
+            continue
+        expected_image = expected_by_number[number]
+        preferred = next(
+            (
+                item
+                for item in reversed(items)
+                if expected_image and expected_image in item[2]
+            ),
+            items[-1],
+        )
+        remove_ranges.extend(
+            (start, end)
+            for start, end, _block in items
+            if (start, end) != preferred[:2]
+        )
+    if len(unnumbered) > expected_unnumbered:
+        remove_ranges.extend(
+            (start, end)
+            for start, end, _block in unnumbered[: len(unnumbered) - expected_unnumbered]
+        )
+    for start, end in sorted(set(remove_ranges), reverse=True):
+        document_html = document_html[:start] + document_html[end:]
+    return document_html, len(set(remove_ranges))
+
+
 def recover_algorithm_blocks_in_outputs(
     output_dir: Path,
     document_json: Any,
@@ -5684,15 +6550,71 @@ def recover_algorithm_blocks_in_outputs(
     status: dict[str, Any],
 ) -> dict[str, Any]:
     records = _algorithm_candidate_records(document_json, pdf_path)
+    source_images = _write_algorithm_source_crops(output_dir, pdf_path, records)
     html_changed = 0
     md_changed = 0
+    missing_html_records: list[dict[str, Any]] = []
+    missing_md_records: list[dict[str, Any]] = []
     html_path = output_dir / "document.html"
     if records and html_path.exists():
         html_text, html_changed = _replace_algorithm_records_in_html(
             html_path.read_text(encoding="utf-8"),
             records,
         )
-        if html_changed:
+        html_text, html_deduplicated = _dedupe_algorithm_recovered_html(
+            html_text,
+            records,
+        )
+        missing_html_records = [
+            record
+            for record in records
+            if record.get("source_image")
+            and str(record["source_image"]) not in html_text
+        ]
+        if missing_html_records:
+            figures = "".join(
+                (
+                    '<figure class="docling-algorithm-source-evidence">'
+                    f'<img src="{html.escape(str(record["source_image"]), quote=True)}" '
+                    f'alt="{html.escape(str(record.get("label") or "Algorithm block"), quote=True)} '
+                    'source rendering">'
+                    f'<figcaption>{html.escape(str(record.get("label") or "Algorithm block"))}'
+                    " — exact source rendering from the original PDF</figcaption></figure>"
+                )
+                for record in missing_html_records
+            )
+            appendix_marker = (
+                '<section class="docling-algorithm-source-evidence-appendix">'
+            )
+            appendix_start = html_text.rfind(appendix_marker)
+            appendix_end = (
+                html_text.find("</section>", appendix_start)
+                if appendix_start >= 0
+                else -1
+            )
+            if appendix_end >= 0:
+                html_text = (
+                    html_text[:appendix_end]
+                    + figures
+                    + html_text[appendix_end:]
+                )
+            else:
+                appendix = (
+                    appendix_marker
+                    + "<h2>Original algorithm renderings</h2>"
+                    + figures
+                    + "</section>"
+                )
+                body_end = re.search(r"</body>", html_text, flags=re.I)
+                if body_end:
+                    html_text = (
+                        html_text[: body_end.start()]
+                        + appendix
+                        + html_text[body_end.start() :]
+                    )
+                else:
+                    html_text += appendix
+        if html_changed or missing_html_records:
             html_path.write_text(html_text, encoding="utf-8")
     md_path = output_dir / "document.md"
     if records and md_path.exists():
@@ -5700,7 +6622,25 @@ def recover_algorithm_blocks_in_outputs(
             md_path.read_text(encoding="utf-8"),
             records,
         )
-        if md_changed:
+        missing_md_records = [
+            record
+            for record in records
+            if record.get("source_image")
+            and str(record["source_image"]) not in md_text
+        ]
+        if missing_md_records:
+            md_text = md_text.rstrip() + (
+                "\n\n## Original algorithm renderings\n\n"
+                "The following images preserve each algorithm exactly as rendered "
+                "in the original PDF.\n"
+            )
+            for record in missing_md_records:
+                label = str(record.get("label") or "Algorithm block")
+                md_text += (
+                    f"\n![{label} — source rendering]"
+                    f"({record['source_image']})\n"
+                )
+        if md_changed or missing_md_records:
             md_path.write_text(md_text, encoding="utf-8")
     if records:
         (output_dir / "algorithm_blocks.json").write_text(
@@ -5711,9 +6651,21 @@ def recover_algorithm_blocks_in_outputs(
         "ok": True,
         "candidate_count": len(records),
         "html_replacement_count": html_changed,
+        "html_deduplicated_count": html_deduplicated
+        if records and html_path.exists()
+        else 0,
         "markdown_replacement_count": md_changed,
+        "source_image_count": len(source_images),
+        "source_images": source_images,
+        "html_source_appendix_count": len(missing_html_records),
+        "markdown_source_appendix_count": len(missing_md_records),
         "output": str(output_dir / "algorithm_blocks.json") if records else None,
     }
+    for relative_path in source_images:
+        if relative_path not in metadata.setdefault("generated_outputs", []):
+            metadata["generated_outputs"].append(relative_path)
+    if records and "algorithm_blocks.json" not in metadata.setdefault("generated_outputs", []):
+        metadata["generated_outputs"].append("algorithm_blocks.json")
     metadata["algorithm_block_recovery"] = result
     status["quality_signals"]["algorithm_block_recovery"] = result
     if records:
@@ -9068,9 +10020,57 @@ def apply_structural_quarantine_to_outputs(
     return qc
 
 
+def _pdf_formula_number_for_bbox(
+    pdf_path: Path | None,
+    prov: dict[str, Any],
+) -> int | None:
+    if pdf_path is None or not pdf_path.exists():
+        return None
+    bbox = prov.get("bbox") if isinstance(prov, dict) else None
+    page_no = prov.get("page_no") if isinstance(prov, dict) else None
+    if not isinstance(bbox, dict) or not isinstance(page_no, int):
+        return None
+    try:
+        import pdfplumber  # type: ignore
+    except Exception:
+        return None
+    try:
+        with pdfplumber.open(str(pdf_path)) as pdf:
+            if not (1 <= page_no <= len(pdf.pages)):
+                return None
+            page = pdf.pages[page_no - 1]
+            top = float(page.height) - float(bbox.get("t", page.height))
+            bottom = float(page.height) - float(bbox.get("b", 0))
+            crop = page.crop(
+                (
+                    max(0.0, float(bbox.get("l", 0)) - 3.0),
+                    max(0.0, top - 3.0),
+                    min(float(page.width), float(bbox.get("r", 0)) + 10.0),
+                    min(float(page.height), bottom + 3.0),
+                ),
+                strict=False,
+            )
+            lines = crop.extract_text_lines(
+                strip=True,
+                return_chars=False,
+                x_tolerance=1,
+                y_tolerance=4,
+            )
+    except Exception:
+        return None
+    candidates: list[int] = []
+    for line in lines:
+        text = _clean_pdfplumber_glyph_text(str(line.get("text") or "")).strip()
+        match = re.search(r"\(\s*(\d{1,3})\s*\)\s*[.,;:]?\s*$", text)
+        if match:
+            candidates.append(int(match.group(1)))
+    return candidates[-1] if candidates else None
+
+
 def formula_number_qc_diagnostics(
     formulas: list[dict[str, Any]],
     document_html: str,
+    pdf_path: Path | None = None,
 ) -> list[dict[str, Any]]:
     diagnostics: list[dict[str, Any]] = []
     html_blocks = list(FORMULA_MATH_BLOCK_RE.finditer(document_html))
@@ -9081,14 +10081,25 @@ def formula_number_qc_diagnostics(
         normal_numbers = [int(value) for value in FORMULA_NUMBER_RE.findall(text)]
         reasons: list[str] = []
         safe_recovered_number: int | None = None
+        source_number = _pdf_formula_number_for_bbox(pdf_path, prov)
         if compact_numbers and not normal_numbers:
             safe_recovered_number = compact_numbers[-1]
             reasons.append("equation_number_recoverable_from_formula_text")
-        if MATH_TEXT_RE.search(text) and not compact_numbers:
+        if source_number is not None and source_number not in compact_numbers:
+            safe_recovered_number = source_number
             reasons.append("display_formula_missing_equation_number")
+            reasons.append("equation_number_recoverable_from_pdf_source")
         if index <= len(html_blocks):
             html_block_text = html.unescape(html_blocks[index - 1].group(0))
-            if compact_numbers and not any(f"({number})" in html_block_text for number in compact_numbers):
+            expected_numbers = (
+                [source_number]
+                if source_number is not None
+                else compact_numbers
+            )
+            if expected_numbers and not any(
+                f"({number})" in html_block_text
+                for number in expected_numbers
+            ):
                 reasons.append("html_formula_number_not_compactly_visible")
         if reasons:
             diagnostics.append(
@@ -9099,6 +10110,7 @@ def formula_number_qc_diagnostics(
                     "page_no": prov.get("page_no"),
                     "bbox": bbox_geometry(prov),
                     "recovered_number": safe_recovered_number,
+                    "source_number": source_number,
                     "safe_to_recover": safe_recovered_number is not None,
                     "evidence": f"formulas/formula_{index}_context.png",
                 }
@@ -9224,7 +10236,7 @@ def _repair_formula_ocr_variable_artifacts(formula_text: str) -> tuple[str, list
 def _repair_formula_log_argument_from_trailing_number(
     formula_text: str,
 ) -> tuple[str, list[str]]:
-    """Move a stale trailing numeric artifact back into an obviously empty log call.
+    r"""Move a stale trailing numeric artifact back into an obviously empty log call.
 
     Some formula OCR outputs keep the real equation number at the anchor but move a
     small constant argument, such as the ``4`` in ``-\log(4)``, to a second trailing
@@ -9276,7 +10288,7 @@ def _remove_stale_trailing_formula_number_artifact(
 
 
 def _repair_left_right_delimiter_artifacts(formula_text: str) -> tuple[str, list[str]]:
-    """Repair unambiguous ``\left``/``\right`` delimiter OCR mismatches."""
+    r"""Repair unambiguous ``\left``/``\right`` delimiter OCR mismatches."""
     token_re = re.compile(r"\\(?P<kind>left|right)\s*(?P<delimiter>\\\||[()\[\]{}])")
     replacements: dict[tuple[int, int], str] = {}
     stack: list[str] = []
@@ -9488,6 +10500,11 @@ def _looks_like_algorithm_cluster_line(node: dict[str, Any], *, active: bool = F
         return True
     if label == "list_item" and re.match(
         r"(?i)^\d+\s*:\s*(?:for|end|Process|In|Train|Add|Modify|return|while|if|N\b)",
+        text,
+    ):
+        return True
+    if active and label == "list_item" and re.match(
+        r"(?i)^(?:\d+\s+)?\d+\s*:",
         text,
     ):
         return True
@@ -10304,7 +11321,11 @@ def run_unified_review_qc(
     document_html, footnote_sup_count = _polish_footnote_superscripts(document_html)
     document_html, math_text_count = _mark_math_heavy_text(document_html)
     formula_second_pass_start = time.monotonic()
-    formula_number_diag = formula_number_qc_diagnostics(formulas, document_html)
+    formula_number_diag = formula_number_qc_diagnostics(
+        formulas,
+        document_html,
+        args.input_file,
+    )
     formula_tex_diag = formula_tex_qc_diagnostics(formulas)
     formula_second_pass_owns_html = args.formula_second_pass_policy != "off"
     if formula_second_pass_owns_html:
@@ -10693,6 +11714,15 @@ def restore_review_artifact_layer(
         document_json,
         tables,
     )
+    table_source_renderings = append_structured_table_source_renderings(
+        output_dir,
+        document_json,
+        tables,
+    )
+    formula_source_renderings = append_formula_source_renderings(
+        output_dir,
+        formulas,
+    )
     diagnostics = formula_review_diagnostics(
         formulas,
         output_dir,
@@ -10723,6 +11753,8 @@ def restore_review_artifact_layer(
     metadata.update(crop_counts)
     metadata.update(diagnostics)
     metadata["table_visual_fallbacks"] = table_visual_fallbacks
+    metadata["table_source_renderings"] = table_source_renderings
+    metadata["formula_source_renderings"] = formula_source_renderings
     metadata["table_artifact_count"] = len(tables) + len(table_outputs) + crop_counts["table_image_count"]
     metadata["picture_artifact_count"] = crop_counts["picture_artifact_count"]
     metadata["asset_count"] = (
@@ -10861,7 +11893,12 @@ def _render_second_pass_formula_html(
     raw_text = _second_pass_formula_raw_text(entry)
     source_link = f"formulas/formula_{formula_no}.png" if formula_no else None
     context_link = f"formulas/formula_{formula_no}_context.png" if formula_no else None
-    review_link = _relative_output_link(output_dir, sidecar_dir / "review_index.html")
+    review_path = sidecar_dir / "review_index.html"
+    review_link = (
+        _relative_output_link(output_dir, review_path)
+        if review_path.exists()
+        else None
+    )
     links = []
     for label, href in (
         ("source image", source_link),
@@ -10908,16 +11945,30 @@ def _render_formula_fallback_html(
     raw_candidate = str(entry.get("route_b_candidate") or "").strip()
     source_formula, fallback_source = _best_formula_fallback_text(entry)
     readable_display, readable_source, readable_reasons = _readable_formula_fallback_display_text(entry)
+    readable_safety_reasons = (
+        _formula_output_safety_reasons(readable_display)
+        if readable_display
+        else []
+    )
     links = [
         f'<a href="formulas/formula_{formula_no}.png">source image</a>',
         f'<a href="formulas/formula_{formula_no}_context.png">context crop</a>',
-        f'<a href="{html.escape(_relative_output_link(output_dir, sidecar_dir / "review_index.html"))}">'
-        "second-pass review</a>",
     ]
+    review_path = sidecar_dir / "review_index.html"
+    if review_path.exists():
+        links.append(
+            f'<a href="{html.escape(_relative_output_link(output_dir, review_path))}">'
+            "second-pass review</a>"
+        )
     candidate = (
         '<pre class="docling-formula-tex docling-formula-fallback-candidate">'
         f"{html.escape(raw_candidate[:1200])}</pre>"
-        if raw_candidate and raw_candidate != source_formula
+        if (
+            raw_candidate
+            and raw_candidate != source_formula
+            and entry.get("status") != "final_output_unsafe"
+            and not _formula_output_safety_reasons(raw_candidate)
+        )
         else ""
     )
     source_formula_render = ""
@@ -10926,7 +11977,7 @@ def _render_formula_fallback_html(
             '<pre class="docling-algorithm-block docling-formula-preserved-source">'
             f"{html.escape(_algorithm_formula_plain_text(source_formula))}</pre>"
         )
-    elif readable_display:
+    elif readable_display and not readable_safety_reasons:
         source_formula_render = (
             '<div class="docling-formula-render docling-formula-readable-fallback">'
             f"\\[{html.escape(readable_display)}\\]"
@@ -10940,12 +11991,17 @@ def _render_formula_fallback_html(
             )
             + "</div>"
         )
+    elif readable_display and readable_safety_reasons:
+        source_formula_render = (
+            '<p class="docling-formula-unavailable">'
+            "The recognized formula text was withheld because it failed safety "
+            "checks; the exact source rendering is preserved below."
+            "</p>"
+        )
     elif source_formula and _looks_like_misdetected_formula_prose(source_formula):
         source_formula_render = (
             '<p class="docling-formula-unavailable">Readable formula fallback was not available; '
-            "source evidence is preserved below.</p>"
-            '<pre class="docling-formula-tex docling-formula-preserved-source">'
-            f"{html.escape(source_formula)}</pre>"
+            "the exact source rendering is preserved below.</p>"
         )
     elif source_formula and not _formula_output_safety_reasons(source_formula):
         display_formula, _sanitize_reasons = sanitize_formula_display_text(source_formula)
@@ -10956,8 +12012,9 @@ def _render_formula_fallback_html(
         )
     elif source_formula:
         source_formula_render = (
-            '<pre class="docling-formula-tex docling-formula-preserved-source">'
-            f"{html.escape(source_formula)}</pre>"
+            '<p class="docling-formula-unavailable">'
+            "The recognized formula text was withheld because it failed safety "
+            "checks; the exact source rendering is preserved below.</p>"
         )
     else:
         source_formula_render = (
@@ -12504,10 +13561,13 @@ def _patch_html_formula_blocks(
         html_text,
         set(formula_texts),
     )
-    html_text, visible_order_repairs = _repair_formula_visible_order(
-        html_text,
-        formula_anchors,
-    )
+    if complete_missing_sequence:
+        html_text, visible_order_repairs = _repair_formula_visible_order(
+            html_text,
+            formula_anchors,
+        )
+    else:
+        visible_order_repairs = []
     deduplicated_missing_indexes = _deduplicated_missing_formula_indexes(
         html_text,
         missing_indexes,
@@ -12674,6 +13734,38 @@ def _current_formula_display_texts(output_dir: Path) -> tuple[dict[int, str], di
     return formula_texts, source_map
 
 
+def _replace_unsafe_markdown_formula_blocks_with_source_images(
+    output_dir: Path,
+    unsafe_indexes: list[int],
+) -> int:
+    markdown_path = output_dir / "document.md"
+    if not markdown_path.exists() or not unsafe_indexes:
+        return 0
+    markdown = markdown_path.read_text(encoding="utf-8")
+    formula_blocks = list(re.finditer(r"\$\$.*?\$\$", markdown, flags=re.DOTALL))
+    edits: list[tuple[int, int, str]] = []
+    for formula_no in unsafe_indexes:
+        if not (0 < formula_no <= len(formula_blocks)):
+            continue
+        crop_path = output_dir / "formulas" / f"formula_{formula_no}.png"
+        if not crop_path.exists():
+            continue
+        block = formula_blocks[formula_no - 1]
+        replacement = (
+            "$$\n"
+            r"\text{Exact formula preserved in the source rendering below.}"
+            "\n$$\n\n"
+            f"![Formula {formula_no} source rendering]"
+            f"(formulas/formula_{formula_no}.png)"
+        )
+        edits.append((block.start(), block.end(), replacement))
+    for start, end, replacement in reversed(edits):
+        markdown = markdown[:start] + replacement + markdown[end:]
+    if edits:
+        markdown_path.write_text(markdown, encoding="utf-8")
+    return len(edits)
+
+
 def apply_current_formula_display_fallback(
     output_dir: Path,
     metadata: dict[str, Any],
@@ -12712,6 +13804,88 @@ def apply_current_formula_display_fallback(
         return result
     sidecar_dir = output_dir / "formula_display_fallback"
     sidecar_dir.mkdir(parents=True, exist_ok=True)
+    current_document = _load_json_file(output_dir / "document.json")
+    if (
+        isinstance(current_document, dict)
+        and current_document.get("schema_name")
+        == "local_ai_lab_docling_serve_chunked"
+    ):
+        unsafe_indexes = [
+            formula_no
+            for formula_no, formula_text in formula_texts.items()
+            if _formula_output_safety_reasons(formula_text)
+        ]
+        html_patched_indexes: list[int] = []
+        html_block_count = 0
+        if html_path.exists():
+            document_html = html_path.read_text(encoding="utf-8")
+            formula_blocks = list(FORMULA_MATH_BLOCK_RE.finditer(document_html))
+            html_block_count = len(formula_blocks)
+            edits: list[tuple[int, int, str]] = []
+            for formula_no in unsafe_indexes:
+                if not (0 < formula_no <= len(formula_blocks)):
+                    continue
+                formula_text = formula_texts[formula_no]
+                replacement = _render_formula_fallback_html(
+                    {
+                        "formula_no": formula_no,
+                        "status": "final_output_unsafe",
+                        "route_a_text": formula_text,
+                        "fallback_reason": ",".join(
+                            _formula_output_safety_reasons(formula_text)
+                        ),
+                    },
+                    output_dir,
+                    sidecar_dir,
+                )
+                block = formula_blocks[formula_no - 1]
+                edits.append((block.start(), block.end(), replacement))
+                html_patched_indexes.append(formula_no)
+            for start, end, replacement in reversed(edits):
+                document_html = document_html[:start] + replacement + document_html[end:]
+            if edits:
+                document_html, _ = _ensure_formula_second_pass_html_assets(
+                    document_html
+                )
+                html_path.write_text(document_html, encoding="utf-8")
+        markdown_visual_fallback_count = (
+            _replace_unsafe_markdown_formula_blocks_with_source_images(
+                output_dir,
+                unsafe_indexes,
+            )
+        )
+        result = {
+            "ok": True,
+            "applied": True,
+            "reason": reason,
+            "mode": "chunk_order_preserving_safety_fallback",
+            "formula_count": len(formula_texts),
+            "formula_texts": sorted(formula_texts),
+            "candidate_sources": source_map,
+            "unsafe_formula_indexes": unsafe_indexes,
+            "html_formula_block_count": html_block_count,
+            "html_patched_unsafe_indexes": html_patched_indexes,
+            "markdown_visual_fallback_count": markdown_visual_fallback_count,
+            "document_json_patched": [],
+            "document_md_patched": [],
+            "document_html_patch": {
+                "ok": True,
+                "patched_indexes": html_patched_indexes,
+                "missing_unsafe_indexes": sorted(
+                    set(unsafe_indexes) - set(html_patched_indexes)
+                ),
+                "visible_order_repair_indexes": [],
+            },
+        }
+        metadata["current_formula_display_fallback"] = result
+        status["quality_signals"]["current_formula_display_fallback"] = result
+        status["warnings"].append(
+            "current_formula_display_fallback:"
+            f"{reason}:mode=chunk_order_preserving_safety_fallback:"
+            f"unsafe={len(unsafe_indexes)}"
+        )
+        write_state()
+        return result
     json_patched = _patch_formula_json_nodes(
         output_dir,
         formula_texts,
@@ -12724,7 +13898,7 @@ def apply_current_formula_display_fallback(
         sidecar_dir,
         formula_texts,
         status_label="current_formula_display_fallback",
-        complete_missing_sequence=True,
+        complete_missing_sequence=False,
         allow_formula_number_match=False,
     )
     unsafe_indexes = [
@@ -12732,6 +13906,12 @@ def apply_current_formula_display_fallback(
         for formula_no, formula_text in formula_texts.items()
         if _formula_output_safety_reasons(formula_text)
     ]
+    markdown_visual_fallback_count = (
+        _replace_unsafe_markdown_formula_blocks_with_source_images(
+            output_dir,
+            unsafe_indexes,
+        )
+    )
     result = {
         "ok": bool(html_patch.get("ok")),
         "applied": True,
@@ -12740,6 +13920,7 @@ def apply_current_formula_display_fallback(
         "formula_texts": sorted(formula_texts),
         "candidate_sources": source_map,
         "unsafe_formula_indexes": unsafe_indexes,
+        "markdown_visual_fallback_count": markdown_visual_fallback_count,
         "document_json_patched": json_patched,
         "document_md_patched": markdown_patched,
         "document_html_patch": html_patch,
@@ -13108,14 +14289,18 @@ def page_count_from_document(document_json: Any) -> int | None:
 
 def chunk_ranges(page_count: int, chunk_size: int) -> list[list[int]]:
     if chunk_size < 1:
-        raise ValueError("--cn-ocr-chunk-size must be >= 1")
+        raise ValueError("chunk size must be >= 1")
     ranges: list[list[int]] = []
     for start in range(1, page_count + 1, chunk_size):
         ranges.append([start, min(start + chunk_size - 1, page_count)])
     return ranges
 
 
-def merge_chunk_responses(chunk_responses: list[dict[str, Any]]) -> dict[str, Any]:
+def merge_chunk_responses(
+    chunk_responses: list[dict[str, Any]],
+    *,
+    source_label: str = "chunked",
+) -> dict[str, Any]:
     md_parts: list[str] = []
     html_parts: list[str] = []
     json_chunks: list[dict[str, Any]] = []
@@ -13136,13 +14321,13 @@ def merge_chunk_responses(chunk_responses: list[dict[str, Any]]) -> dict[str, An
         except (TypeError, ValueError):
             pass
         md_parts.append(
-            f"\n\n<!-- docling-serve-cn-chunk pages {page_range_value} -->\n\n"
+            f"\n\n<!-- docling-serve-{source_label}-chunk pages "
+            f"{page_range_value} -->\n\n"
             + (document.get("md_content") or "")
         )
         html_parts.append(
-            "<section class=\"docling-cn-chunk\" "
+            f"<section class=\"docling-{source_label}-chunk\" "
             f"data-page-range=\"{page_range_value}\">\n"
-            f"<h2>Pages {page_range_value}</h2>\n"
             f"{document.get('html_content') or ''}\n</section>"
         )
         text_parts.append(document.get("text_content") or "")
@@ -13164,7 +14349,7 @@ def merge_chunk_responses(chunk_responses: list[dict[str, Any]]) -> dict[str, An
             "html_content": "\n".join(
                 [
                     "<!doctype html><html><head><meta charset=\"utf-8\">",
-                    "<title>Docling Serve CN OCR chunks</title>",
+                    "<title>Docling Serve chunked conversion</title>",
                     "</head><body>",
                     *html_parts,
                     "</body></html>",
@@ -13173,7 +14358,7 @@ def merge_chunk_responses(chunk_responses: list[dict[str, Any]]) -> dict[str, An
             "text_content": "\n".join(text_parts),
             "json_content": {
                 "schema_name": "local_ai_lab_docling_serve_chunked",
-                "source": "docling_serve_cn_ocr_chunked",
+                "source": f"docling_serve_{source_label}_chunked",
                 "chunks": json_chunks,
             },
         },
@@ -13353,7 +14538,7 @@ def run_cn_chunked_fallback(
                 }
             )
 
-    merged = merge_chunk_responses(chunk_responses)
+    merged = merge_chunk_responses(chunk_responses, source_label="cn-ocr")
     if failed_pages:
         merged["status"] = "partial_success" if chunk_responses else "failure"
         merged["errors"] = list(merged.get("errors") or []) + chunk_failures
@@ -13394,6 +14579,161 @@ def run_cn_chunked_fallback(
             "Chunked JSON preserves chunk documents under json_content.chunks.",
         ]
     )
+    if failed_pages:
+        status["ok"] = False
+        status["success_class"] = "degraded_failure"
+    return merged, metadata, status
+
+
+def run_transient_chunked_fallback(
+    args: argparse.Namespace,
+    name: str,
+    *,
+    page_count: int,
+    full_document_error: BaseException | None,
+    forced: bool = False,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    """Retry a failed full-document conversion as bounded, complete page chunks."""
+    selected_range = page_range(args)
+    if selected_range:
+        first_page, last_page = selected_range
+        ranges = [
+            [start, min(start + args.conversion_chunk_size - 1, last_page)]
+            for start in range(first_page, last_page + 1, args.conversion_chunk_size)
+        ]
+    else:
+        ranges = chunk_ranges(page_count, args.conversion_chunk_size)
+
+    chunk_responses: list[dict[str, Any]] = []
+    failed_pages: list[int] = []
+    chunk_failures: list[dict[str, Any]] = []
+    recovered_chunk_ranges: list[list[int]] = []
+    start = time.perf_counter()
+    for range_value in ranges:
+        try:
+            response, _, _ = run_conversion(
+                args,
+                name,
+                force_ocr=False,
+                page_range_override=range_value,
+            )
+            chunk_responses.append({"page_range": range_value, "response": response})
+            if response.get("status") != "success":
+                failed_pages.extend(range(range_value[0], range_value[1] + 1))
+                chunk_failures.append(
+                    {
+                        "page_range": range_value,
+                        "error_type": "DoclingServeConversionFailure",
+                        "error": response.get("errors") or [],
+                    }
+                )
+        except Exception as exc:
+            failed_pages.extend(range(range_value[0], range_value[1] + 1))
+            chunk_failures.append(
+                {
+                    "page_range": range_value,
+                    "error_type": exc.__class__.__name__,
+                    "error": str(exc),
+                    "transient_http": is_transient_http_error(exc),
+                }
+            )
+
+    for failure in list(chunk_failures):
+        if not failure.get("transient_http"):
+            continue
+        range_value = failure["page_range"]
+        for retry_attempt in range(1, 3):
+            if retry_attempt > 1:
+                time.sleep(max(1.0, float(args.http_retry_sleep_seconds)))
+            try:
+                response, _, _ = run_conversion(
+                    args,
+                    name,
+                    force_ocr=False,
+                    page_range_override=range_value,
+                )
+            except Exception as exc:
+                failure["tail_retry_error_type"] = exc.__class__.__name__
+                failure["tail_retry_error"] = str(exc)
+                failure["tail_retry_attempts"] = retry_attempt
+                if not is_transient_http_error(exc):
+                    break
+                continue
+            if response.get("status") != "success":
+                failure["tail_retry_error_type"] = "DoclingServeConversionFailure"
+                failure["tail_retry_error"] = response.get("errors") or []
+                failure["tail_retry_attempts"] = retry_attempt
+                continue
+            chunk_responses.append(
+                {"page_range": range_value, "response": response}
+            )
+            failed_pages = [
+                page
+                for page in failed_pages
+                if not (range_value[0] <= page <= range_value[1])
+            ]
+            chunk_failures.remove(failure)
+            recovered_chunk_ranges.append(range_value)
+            break
+
+    chunk_responses.sort(key=lambda item: tuple(item.get("page_range") or [0, 0]))
+    merged = merge_chunk_responses(
+        chunk_responses,
+        source_label="transient-recovery",
+    )
+    if failed_pages:
+        merged["status"] = "partial_success" if chunk_responses else "failure"
+        merged["errors"] = list(merged.get("errors") or []) + chunk_failures
+
+    output_dir = args.output_root / name
+    options = base_options(args, force_ocr=False)
+    conversion_mode = (
+        "forced_chunked_conversion"
+        if forced
+        else "chunked_after_transient_http"
+    )
+    warnings = [
+        (
+            "conversion was explicitly run as complete page chunks"
+            if forced
+            else "full-document conversion got transient Serve error; used page-chunk recovery"
+        ),
+        conversion_mode,
+    ]
+    if failed_pages:
+        warnings.append(f"conversion_chunked_failed_pages:{failed_pages}")
+    metadata, status = summarize_response(
+        name,
+        merged,
+        time.perf_counter() - start,
+        options,
+        warnings,
+        args,
+        output_dir,
+    )
+    covered_pages = [
+        page
+        for range_value in ranges
+        for page in range(range_value[0], range_value[1] + 1)
+    ]
+    metadata["conversion_mode"] = conversion_mode
+    metadata["conversion_chunk_ranges"] = ranges
+    metadata["conversion_pages"] = covered_pages
+    metadata["conversion_failed_pages"] = sorted(set(failed_pages))
+    metadata["conversion_chunk_failures"] = chunk_failures
+    metadata["conversion_tail_recovered_chunk_ranges"] = recovered_chunk_ranges
+    metadata["conversion_full_document_error"] = (
+        {
+            "error_type": full_document_error.__class__.__name__,
+            "error": str(full_document_error),
+            "http_code": getattr(full_document_error, "code", None),
+        }
+        if full_document_error is not None
+        else None
+    )
+    status["quality_signals"]["conversion_mode"] = metadata["conversion_mode"]
+    status["quality_signals"]["conversion_chunk_ranges"] = ranges
+    status["quality_signals"]["conversion_failed_pages"] = sorted(set(failed_pages))
     if failed_pages:
         status["ok"] = False
         status["success_class"] = "degraded_failure"
@@ -13467,7 +14807,37 @@ def main() -> int:
         )
         return 2
 
-    response, metadata, status = run_conversion(conversion_args, name, force_ocr=False)
+    if conversion_args.force_chunked_conversion:
+        input_profile = pdf_text_layer_profile(conversion_args.input_file)
+        input_page_count = input_profile.get("page_count")
+        if not isinstance(input_page_count, int):
+            raise RuntimeError("PDF page count unavailable for forced chunk conversion")
+        response, metadata, status = run_transient_chunked_fallback(
+            conversion_args,
+            name,
+            page_count=input_page_count,
+            full_document_error=None,
+            forced=True,
+        )
+    else:
+        try:
+            response, metadata, status = run_conversion(
+                conversion_args,
+                name,
+                force_ocr=False,
+            )
+        except Exception as exc:
+            input_profile = pdf_text_layer_profile(conversion_args.input_file)
+            input_page_count = input_profile.get("page_count")
+            if is_transient_http_error(exc) and isinstance(input_page_count, int):
+                response, metadata, status = run_transient_chunked_fallback(
+                    conversion_args,
+                    name,
+                    page_count=input_page_count,
+                    full_document_error=exc,
+                )
+            else:
+                raise
     metadata["original_input_file"] = str(original_input_file)
     metadata["conversion_input_file"] = str(conversion_args.input_file)
     metadata["text_layer_recovery"] = text_layer_recovery
@@ -13634,6 +15004,7 @@ def main() -> int:
         metadata,
         status,
     )
+    refresh_final_broken_local_refs(output_dir, metadata, status)
     (output_dir / "metadata.json").write_text(
         json.dumps(metadata, indent=2, ensure_ascii=False), encoding="utf-8"
     )
