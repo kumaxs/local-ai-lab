@@ -8,7 +8,7 @@ import json
 import os
 import re
 import shutil
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -17,7 +17,7 @@ from .quality import CONVERSION_POLICY, count_tables, extract_table_dicts, relat
 
 
 def utc_now_iso() -> str:
-    return datetime.now(UTC).isoformat()
+    return datetime.now(timezone.utc).isoformat()
 
 
 def resolve_output_root(output_root: str | Path | None = None) -> Path:
@@ -86,7 +86,7 @@ def build_metadata(
         "input_file_path": str(path.resolve()),
         "input_sha256": input_sha256,
         "file_size_bytes": stat.st_size,
-        "input_mtime": datetime.fromtimestamp(stat.st_mtime, UTC).isoformat(),
+        "input_mtime": datetime.fromtimestamp(stat.st_mtime, timezone.utc).isoformat(),
         "detected_format": detected_format,
         "page_count": page_count,
         "docling_version": docling_version,
