@@ -25,12 +25,16 @@ class SemanticReflowTests(unittest.TestCase):
     def test_detached_diacritics_and_math_overlays_are_recombined(self) -> None:
         rendered = semantic_reflow._normalize_detached_diacritics(
             "⃗ x 0 ̸= 1 X ̸∈ S Richt´ arik P˘ atra¸ scu D¨ utting "
-            "Pglyph[suppress] L-condition"
+            "Pglyph[suppress] L-condition Paglyph[suppress] lka"
         )
 
         self.assertEqual(
             rendered,
-            "x⃗ 0 ≠ 1 X ∉ S Richtárik Pătraşcu Dütting PL-condition",
+            "x⃗ 0 ≠ 1 X ∉ S Richtárik Pătraşcu Dütting PL-condition Pałka",
+        )
+        self.assertEqual(
+            semantic_reflow._normalize_detached_diacritics(rendered),
+            rendered,
         )
 
     def test_inline_citations_link_numeric_and_author_year_relations(self) -> None:
@@ -97,6 +101,36 @@ class SemanticReflowTests(unittest.TestCase):
         self.assertEqual(callouts[id(callout)], [("5", "5-1")])
         self.assertNotIn(id(heading), callouts)
 
+    def test_footnote_relation_can_target_following_table_caption(self) -> None:
+        footnote = semantic_reflow.FlowItem(
+            "footnote", {}, 1.0, 1, {}, {}, "8 See the benchmark FAQ"
+        )
+        table = semantic_reflow.FlowItem(
+            "table",
+            {"captions": [{"$ref": "#/texts/0"}]},
+            2.0,
+            1,
+            {},
+            {},
+        )
+        document = {
+            "texts": [
+                {
+                    "text": (
+                        "Table 1: Results. 8 BERT is evaluated without WNLI."
+                    )
+                }
+            ]
+        }
+
+        _footnotes, callouts = semantic_reflow._footnote_relations(
+            [footnote, table],
+            {},
+            document,
+        )
+
+        self.assertEqual(callouts[id(table)], [("8", "8-1")])
+
     def test_table_note_relation_links_symbol_to_explanatory_note(self) -> None:
         table = semantic_reflow.FlowItem("table", {}, 1.0, 1, {}, {})
         spacer = semantic_reflow.FlowItem("heading", {}, 2.0, 1, {}, {}, "")
@@ -122,7 +156,7 @@ class SemanticReflowTests(unittest.TestCase):
 
     def test_algorithm_and_python_emphasis_remain_semantic_html(self) -> None:
         algorithm = semantic_reflow._highlight_algorithm_html(
-            "1   Input: x\n2   if x then // keep it"
+            "1   Input: x⃗_1^0 ∈ ℝ^d\n2   if x then // keep it"
         )
         python = semantic_reflow._highlight_python_html(
             "def solve(x):\n    # preserve comment\n    return x + 1\n"
@@ -130,8 +164,48 @@ class SemanticReflowTests(unittest.TestCase):
 
         self.assertIn('<strong class="alg-keyword">Input</strong>', algorithm)
         self.assertIn('<em class="alg-comment">// keep it</em>', algorithm)
+        self.assertIn('class="alg-symbol"', algorithm)
+        self.assertIn(">x⃗</span>", algorithm)
+        self.assertIn("<sub>1</sub><sup>0</sup>", algorithm)
+        self.assertIn(">ℝ</span>", algorithm)
         self.assertIn('<span class="code-keyword">def</span>', python)
         self.assertIn('<span class="code-comment"># preserve comment</span>', python)
+
+    def test_formula_array_with_many_single_letter_terms_is_not_erased(self) -> None:
+        class FormulaSource:
+            def equation_number(self, _prov):
+                return 5
+
+            def text(self, _prov, *, padding=0.0):
+                return (
+                    "E ∥∇fξ(x) − ∇f(x) − ∇fξ(x⋆)∥² "
+                    "≤ δ²∥x − x⋆∥², ∀x ∈ Rᵈ. (5)"
+                )
+
+        item = semantic_reflow.FlowItem(
+            kind="formula",
+            node={
+                "text": (
+                    r"\begin{array}{r}"
+                    r"{E_{\xi\sim\mathcal D}["
+                    r"\|\nabla f_\xi(x)-\nabla f(x)-\nabla f_\xi(x_\star)\|^2]"
+                    r"\leq\delta^2\|x-x_\star\|^2,\quad"
+                    r"\forall x\in\mathbb R^d.}\end{array}(5)"
+                )
+            },
+            rank=1.0,
+            page_no=4,
+            bbox={"l": 0.0, "r": 1.0, "t": 1.0, "b": 0.0},
+            prov={"page_no": 4, "bbox": {}},
+        )
+
+        tex, number = semantic_reflow._formula_tex(item, FormulaSource())
+
+        self.assertEqual(number, 5)
+        self.assertIn(r"\nabla f_\xi(x)", tex)
+        self.assertIn(r"\leq\delta^2", tex)
+        self.assertNotEqual(tex, r"\begin{array}{r}\end{array}")
+        self.assertIsNotNone(semantic_reflow._formula_mathml(tex))
 
     def test_formula_eight_is_reconstructed_as_searchable_tex(self) -> None:
         class FormulaSource:
