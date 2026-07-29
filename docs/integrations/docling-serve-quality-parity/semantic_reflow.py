@@ -96,10 +96,20 @@ def _normalize_detached_diacritics(value: str) -> str:
         value,
         flags=re.IGNORECASE,
     )
+    value = re.sub(
+        r"glyph\s*\[\s*suppress\s*\]\s*L",
+        "Ł",
+        value,
+    )
+    value = re.sub(
+        r"glyph\s*\[\s*suppress\s*\]\s*l",
+        "ł",
+        value,
+    )
     value = re.sub(r"\u0338\s*=", "≠", value)
     value = re.sub(r"\u0338\s*∈", "∉", value)
     value = re.sub(
-        r"\u20d7\s*([A-Za-zΑ-Ωα-ω])",
+        r"(?<![A-Za-zΑ-Ωα-ω])\u20d7\s*([A-Za-zΑ-Ωα-ω])",
         lambda match: match.group(1) + "\u20d7",
         value,
     )
@@ -149,7 +159,7 @@ def _caption_text(document: dict[str, Any], node: dict[str, Any]) -> str:
         text = str((child or {}).get("text") or "").strip()
         if text:
             values.append(text)
-    return " ".join(values)
+    return _paragraph_text(" ".join(values))
 
 
 def _source_caption(
@@ -828,6 +838,12 @@ def _collect_items(
             if re.search(r"(?i)^Algorithm\s+\d+\b", str(node.get("text") or ""))
             else "code",
         }.get(label)
+        if (
+            kind == "formula"
+            and (box["r"] - box["l"]) < 20
+            and len(re.sub(r"[\s{}_^*.,]", "", str(node.get("text") or ""))) < 4
+        ):
+            continue
         if kind:
             items.append(
                 FlowItem(
@@ -963,6 +979,12 @@ def _normalize_algorithm_semantics(value: str) -> str:
     value = re.sub(r"\buniformly at random\s+n\b", "uniformly at random", value)
     value = re.sub(r"\b(pop|chain)\s*_\s*(size)\b", r"\1_\2", value)
     value = re.sub(r"\b([Nxy])\s+(gen|best)\b", r"\1_\2", value)
+    value = re.sub(
+        r"([xhs])⃗\s+0\s+([A-Za-z0-9_]+)\b",
+        r"\1⃗_\2^0",
+        value,
+    )
+    value = re.sub(r"([xhs])⃗\s+([A-Za-z0-9_]+)\b", r"\1⃗_\2", value)
     value = re.sub(r"\b([xys])\s+([0-9j]+)\b", r"\1_\2", value)
     value = re.sub(r"\s+([,.;:)])", r"\1", value)
     value = re.sub(r"([(])\s+", r"\1", value)
@@ -1529,9 +1551,14 @@ def _formula_tex(
                 re.findall(r"(?<!\\)\b[A-Za-z]\b", row)
             )
             strong_math = bool(
-                re.search(r"(?:\\(?:sum|frac|Delta|alpha|beta)|[=<>])", row)
+                re.search(
+                    r"(?:\\(?:sum|prod|frac|Delta|alpha|beta|gamma|nabla|"
+                    r"leq|geq|approx|sim|equiv|in|min|max|arg|lVert|rVert)|"
+                    r"[=<>∑∏≤≥])",
+                    row,
+                )
             )
-            if single_letters >= 12 or (single_letters >= 4 and not strong_math):
+            if single_letters >= 4 and not strong_math:
                 rows.pop(0)
                 continue
             break
@@ -1628,26 +1655,37 @@ def _heading_level(text: str, node: dict[str, Any]) -> int:
 def _markdown_table(
     grid: list[list[str]],
     reference_texts: list[tuple[int, str]] | None = None,
-    footnote_callouts: list[tuple[str, str]] | None = None,
+    footnote_callouts: dict[tuple[int, int], list[tuple[str, str]]] | None = None,
 ) -> str:
     if not grid:
         return ""
 
-    def cell(value: str) -> str:
+    def cell(value: str, row: int, column: int) -> str:
         value = _inline_replacements(
             value,
             reference_texts or [],
-            footnote_callouts or [],
+            (footnote_callouts or {}).get((row, column), []),
             markdown=True,
         )
         value = value.replace("|", "&#124;")
         return "<br>".join(part.strip() for part in value.splitlines())
 
-    header = "| " + " | ".join(cell(value) for value in grid[0]) + " |"
+    header = (
+        "| "
+        + " | ".join(
+            cell(value, 0, column) for column, value in enumerate(grid[0])
+        )
+        + " |"
+    )
     separator = "| " + " | ".join("---" for _ in grid[0]) + " |"
     rows = [
-        "| " + " | ".join(cell(value) for value in row) + " |"
-        for row in grid[1:]
+        "| "
+        + " | ".join(
+            cell(value, row_index, column)
+            for column, value in enumerate(row)
+        )
+        + " |"
+        for row_index, row in enumerate(grid[1:], start=1)
     ]
     return "\n".join([header, separator, *rows])
 
@@ -1683,6 +1721,7 @@ def _reference_items(
 def _footnote_relations(
     items: list[FlowItem],
     reference_items: dict[int, int],
+    document: dict[str, Any] | None = None,
 ) -> tuple[dict[int, tuple[str, str, str]], dict[int, list[tuple[str, str]]]]:
     footnotes: dict[int, tuple[str, str, str]] = {}
     callouts: dict[int, list[tuple[str, str]]] = {}
@@ -1710,6 +1749,7 @@ def _footnote_relations(
             marker_pattern = re.compile(rf"(?<![\w\[])({re.escape(marker)})(?![\w\]])")
         else:
             marker_pattern = re.compile(re.escape(marker))
+        linked = False
         for candidate in reversed(items[max(0, index - 24) : index]):
             if candidate.kind not in {"title", "heading", "text", "list_item"}:
                 continue
@@ -1722,6 +1762,20 @@ def _footnote_relations(
                 and re.match(rf"^{re.escape(marker)}(?:\.|\s|$)", candidate_text)
             ):
                 continue
+            if marker_pattern.search(candidate_text):
+                callouts.setdefault(id(candidate), []).append((marker, footnote_id))
+                linked = True
+                break
+        if linked or document is None:
+            continue
+        for candidate in items[index + 1 : min(len(items), index + 8)]:
+            candidate_text = ""
+            if candidate.kind == "table":
+                candidate_text = _caption_text(document, candidate.node)
+            elif candidate.kind in {"title", "heading", "text", "list_item"}:
+                candidate_text = _paragraph_text(
+                    candidate.source_text or str(candidate.node.get("text") or "")
+                )
             if marker_pattern.search(candidate_text):
                 callouts.setdefault(id(candidate), []).append((marker, footnote_id))
                 break
@@ -1755,7 +1809,6 @@ def _table_note_relations(
             table_callouts.setdefault(id(item), []).append(
                 (callout_marker, note_id)
             )
-            break
     return notes, table_callouts
 
 
@@ -1912,10 +1965,44 @@ _ALGORITHM_KEYWORDS = re.compile(
 
 
 def _highlight_algorithm_html(code: str) -> str:
+    def escape_with_math_fonts(value: str) -> str:
+        clusters: list[str] = []
+        for character in value:
+            if unicodedata.combining(character) and clusters:
+                clusters[-1] += character
+            else:
+                clusters.append(character)
+        rendered_clusters: list[str] = []
+        for cluster in clusters:
+            visible = html.escape(cluster, quote=False)
+            if any(ord(character) > 127 for character in cluster):
+                rendered_clusters.append(
+                    '<span class="alg-symbol" '
+                    'style="font-family:&quot;STIX Two Math&quot;,&quot;Cambria Math&quot;,'
+                    '&quot;Apple Symbols&quot;,&quot;Noto Sans Math&quot;,math,serif">'
+                    + visible
+                    + "</span>"
+                )
+            else:
+                rendered_clusters.append(visible)
+        return "".join(rendered_clusters)
+
     rendered: list[str] = []
     for raw_line in _normalize_detached_diacritics(code).splitlines():
         body, separator, comment = raw_line.partition("//")
-        escaped = html.escape(body, quote=False)
+        escaped = escape_with_math_fonts(body)
+        escaped = re.sub(
+            r'(<span class="alg-symbol"[^>]*>[A-Za-z]⃗</span>)'
+            r"_([A-Za-z0-9_]+)\^([A-Za-z0-9_]+)",
+            r"\1<sub>\2</sub><sup>\3</sup>",
+            escaped,
+        )
+        escaped = re.sub(
+            r'(<span class="alg-symbol"[^>]*>[A-Za-z]⃗</span>)'
+            r"_([A-Za-z0-9_]+)",
+            r"\1<sub>\2</sub>",
+            escaped,
+        )
         escaped = re.sub(
             r"^(\s*)(\d+)(\s+)",
             r'\1<span class="line-number">\2</span>\3',
@@ -1928,7 +2015,7 @@ def _highlight_algorithm_html(code: str) -> str:
         if separator:
             escaped += (
                 '<em class="alg-comment">//'
-                + html.escape(comment, quote=False)
+                + escape_with_math_fonts(comment)
                 + "</em>"
             )
         rendered.append(escaped)
@@ -2006,7 +2093,11 @@ def _render(
             for number, text in local_reference_texts
         ]
     reference_texts = shared_reference_texts or local_reference_texts
-    footnotes, footnote_callouts = _footnote_relations(items, reference_items)
+    footnotes, footnote_callouts = _footnote_relations(
+        items,
+        reference_items,
+        document,
+    )
     table_notes, table_footnote_callouts = _table_note_relations(items)
     counts = {
         "text": 0,
@@ -2241,23 +2332,55 @@ def _render(
                 html_parts.append(
                     "<figcaption>"
                     + _inline_replacements(
-                        caption, reference_texts, [], markdown=False
+                        caption,
+                        reference_texts,
+                        footnote_callouts.get(id(item), []),
+                        markdown=False,
                     )
                     + "</figcaption>"
                 )
             html_parts.append("<div class=\"table-scroll\"><table>")
             table_callouts = table_footnote_callouts.get(id(item), [])
+            table_cell_callouts: dict[
+                tuple[int, int], list[tuple[str, str]]
+            ] = {}
+            for marker, note_id in table_callouts:
+                variants = (
+                    ("*", "∗")
+                    if marker in {"*", "∗"}
+                    else (marker,)
+                )
+                assigned = False
+                for row_index, row in enumerate(grid):
+                    for column, value in enumerate(row):
+                        matched = next(
+                            (variant for variant in variants if variant in value),
+                            None,
+                        )
+                        if matched is None:
+                            continue
+                        table_cell_callouts.setdefault(
+                            (row_index, column),
+                            [],
+                        ).append((matched, note_id))
+                        assigned = True
+                        break
+                    if assigned:
+                        break
             for row_index, row in enumerate(grid):
                 tag = "th" if row_index < header_rows else "td"
                 html_parts.append("<tr>")
-                for value in row:
+                for column, value in enumerate(row):
                     html_parts.append(
                         f"<{tag}>"
                         + "<br>".join(
                             _inline_replacements(
                                 part.strip(),
                                 reference_texts,
-                                table_callouts,
+                                table_cell_callouts.get(
+                                    (row_index, column),
+                                    [],
+                                ),
                                 markdown=False,
                             )
                             for part in value.splitlines()
@@ -2273,7 +2396,7 @@ def _render(
                     _markdown_table(
                         grid,
                         reference_texts=reference_texts,
-                        footnote_callouts=table_callouts,
+                        footnote_callouts=table_cell_callouts,
                     ),
                     "",
                 ]
