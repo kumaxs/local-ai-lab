@@ -13,6 +13,8 @@ from urllib.parse import urlparse
 
 from .quality import CONVERSION_POLICY, measure_gxx_quality
 
+FORMULA_CROP_PADDING_POINTS = 2.5
+
 
 class DoclingAdapterError(RuntimeError):
     """Controlled adapter error safe to expose as a short CLI message."""
@@ -74,6 +76,52 @@ def _code_formula_options_for_model(pipeline_options: Any, model: str) -> Any:
     return pipeline_options.CodeFormulaVlmOptions.from_preset("codeformulav2")
 
 
+def _prepare_formula_with_tight_padding(
+    self: Any,
+    conv_res: Any,
+    element: Any,
+) -> Any:
+    label = str(getattr(element, "label", "")).casefold()
+    if label not in {"formula", "docitemlabel.formula"}:
+        base_model = import_module("docling.models.base_model")
+        return base_model.BaseItemAndImageEnrichmentModel.prepare_element(
+            self,
+            conv_res,
+            element,
+        )
+    if not self.is_processable(doc=conv_res.document, element=element):
+        return None
+    if not getattr(element, "prov", None):
+        return None
+    element_prov = element.prov[0]
+    bbox = element_prov.bbox
+    x_scale = FORMULA_CROP_PADDING_POINTS / max(float(bbox.width), 1.0)
+    y_scale = FORMULA_CROP_PADDING_POINTS / max(float(bbox.height), 1.0)
+    expanded_bbox = bbox.expand_by_scale(x_scale, y_scale)
+    page_ix = element_prov.page_no - conv_res.pages[0].page_no
+    cropped_image = conv_res.pages[page_ix].get_image(
+        scale=self.images_scale,
+        cropbox=expanded_bbox,
+    )
+    if cropped_image is None:
+        return None
+    base_models = import_module("docling.datamodel.base_models")
+    return base_models.ItemAndImageEnrichmentElement(
+        item=element,
+        image=cropped_image,
+    )
+
+
+def _configure_formula_crop_padding() -> None:
+    module = import_module(
+        "docling.models.stages.code_formula.code_formula_vlm_model"
+    )
+    model_class = module.CodeFormulaVlmModel
+    model_class.expansion_factor = 0.0
+    model_class.tight_crop_padding_points = FORMULA_CROP_PADDING_POINTS
+    model_class.prepare_element = _prepare_formula_with_tight_padding
+
+
 def _make_document_converter(profile: str) -> Any:
     DocumentConverter = _load_document_converter()
     try:
@@ -84,6 +132,8 @@ def _make_document_converter(profile: str) -> Any:
         artifacts_path = Path.home() / ".cache" / "docling" / "models"
         artifacts_path_value = str(artifacts_path) if artifacts_path.is_dir() else None
         formula_model = _formula_model_for_profile(profile)
+        if formula_model is not None:
+            _configure_formula_crop_padding()
         option_kwargs: dict[str, Any] = {
             "accelerator_options": accelerator_options.AcceleratorOptions(device="cpu"),
             "do_ocr": False,

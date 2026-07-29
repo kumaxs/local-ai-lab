@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import html
 import io
 import keyword
@@ -730,6 +731,18 @@ def _collect_items(
                 if str((candidate or {}).get("label") or "").lower() == "formula":
                     formula_child = candidate
                     break
+            image_size = (
+                ((node.get("image") or {}).get("size") or {})
+                if isinstance(node.get("image"), dict)
+                else {}
+            )
+            if (
+                formula_child is None
+                and not node.get("captions")
+                and float(image_size.get("width") or 0.0) <= 64.0
+                and float(image_size.get("height") or 0.0) <= 64.0
+            ):
+                continue
             effective = formula_child or node
             prov = _first_prov(effective) or _first_prov(node)
             box = _bbox(prov)
@@ -839,6 +852,26 @@ def _collect_items(
             if re.search(r"(?i)^Algorithm\s+\d+\b", str(node.get("text") or ""))
             else "code",
         }.get(label)
+        standalone_equation_number = (
+            re.fullmatch(
+                r"\(\s*((?:\d\s*)+(?:\.\s*(?:\d\s*)+)?)\s*\)",
+                str(node.get("text") or "").strip(),
+            )
+            if kind == "formula"
+            else None
+        )
+        if standalone_equation_number:
+            number = re.sub(r"\s+", "", standalone_equation_number.group(1))
+            center = (box["t"] + box["b"]) / 2.0
+            for previous in reversed(items):
+                if previous.kind != "formula" or previous.page_no != int(
+                    prov.get("page_no") or 0
+                ):
+                    continue
+                if previous.bbox["b"] - 2.0 <= center <= previous.bbox["t"] + 2.0:
+                    previous.node["_semantic_equation_number"] = number
+                    break
+            continue
         if (
             kind == "formula"
             and (box["r"] - box["l"]) < 20
@@ -987,6 +1020,14 @@ def _normalize_algorithm_semantics(value: str) -> str:
     )
     value = re.sub(r"([xhs])⃗\s+([A-Za-z0-9_]+)\b", r"\1⃗_\2", value)
     value = re.sub(r"\b([xys])\s+([0-9j]+)\b", r"\1_\2", value)
+    value = re.sub(r"\bx\s+out\b", "x_out", value, flags=re.IGNORECASE)
+    value = re.sub(
+        r"\bT\s*\(\s*([0-9kL]+(?:\s*[-−]\s*1)?)\s*\)",
+        lambda match: "T^("
+        + re.sub(r"\s+", "", match.group(1)).replace("-", "−")
+        + ")",
+        value,
+    )
     value = re.sub(r"\s+([,.;:)])", r"\1", value)
     value = re.sub(r"([(])\s+", r"\1", value)
     value = re.sub(r"\s*([<>]=?|=)\s*", r" \1 ", value)
@@ -1030,6 +1071,167 @@ def _numbered_code_lines(value: str) -> list[tuple[int, str]]:
         content = re.sub(r"\.\s+(?=[A-Za-z_]\w*\s*\()", ".", content)
         result.append((int(match.group(1)), content))
     return result
+
+
+def _algorithm_table_block(
+    item: FlowItem,
+) -> tuple[str, str] | None:
+    data = item.node.get("data") or {}
+    rows = int(data.get("num_rows") or 0)
+    cells = [
+        cell
+        for cell in data.get("table_cells") or []
+        if isinstance(cell, dict)
+    ]
+    if rows < 3 or not cells:
+        return None
+    by_row: dict[int, list[dict[str, Any]]] = {}
+    for cell in cells:
+        row = int(cell.get("start_row_offset_idx") or 0)
+        by_row.setdefault(row, []).append(cell)
+    for values in by_row.values():
+        values.sort(key=lambda cell: int(cell.get("start_col_offset_idx") or 0))
+
+    def row_text(row: int, *, minimum_column: int = 0) -> str:
+        return " ".join(
+            str(cell.get("text") or "").strip()
+            for cell in by_row.get(row, [])
+            if int(cell.get("start_col_offset_idx") or 0) >= minimum_column
+            and str(cell.get("text") or "").strip()
+        ).strip()
+
+    title = row_text(0)
+    if not re.match(r"(?i)^Algorithm\s+\d+\b", title):
+        return None
+    header = row_text(1)
+    header = re.sub(r"\s+(?=Ensure\s*:)", "\n", header, flags=re.IGNORECASE)
+    header = re.sub(
+        r"([A-Za-z])\s*=\s*\{\s*([A-Za-z])\s*([0-9]+)\s*,\s*"
+        r"(?:\.\s*){3},?\s*\2\s*([A-Za-z0-9]+)\s*\}",
+        lambda match: (
+            f"{match.group(1)} = "
+            f"{{{match.group(2)}_{match.group(3)}, …, "
+            f"{match.group(2)}_{match.group(4)}}}"
+        ),
+        header,
+        flags=re.IGNORECASE,
+    )
+    source_preamble = re.split(
+        r"(?m)^\s*1\s*:",
+        item.source_text,
+        maxsplit=1,
+    )[0]
+    source_ensure = re.search(
+        r"(?im)^Ensure\s*:\s*(?P<variable>[A-Za-z])\s*∈\s*"
+        r"(?:R|ℝ)\s*(?P<dimensions>[A-Za-z0-9]+"
+        r"(?:\s*×\s*[A-Za-z0-9]+)+)\s*$",
+        source_preamble,
+    )
+    if source_ensure:
+        following_lines = source_preamble[source_ensure.end() :].splitlines()
+        subscript = next(
+            (
+                line.strip()
+                for line in following_lines
+                if re.fullmatch(r"[A-Za-z][A-Za-z0-9]*", line.strip())
+            ),
+            "",
+        )
+        variable = source_ensure.group("variable")
+        dimensions = re.sub(
+            r"\s+",
+            "",
+            source_ensure.group("dimensions"),
+        )
+        header = re.sub(
+            r"(?i)(Ensure\s*:\s*)"
+            + re.escape(variable)
+            + r"\s*∈\s*(?:R|ℝ)?\s*"
+            + re.escape(dimensions).replace("×", r"\s*×\s*"),
+            lambda match: (
+                f"{match.group(1)}{variable}"
+                + (f"_{subscript}" if subscript else "")
+                + f" ∈ ℝ^({dimensions})"
+            ),
+            header,
+        )
+    header_lines = [
+        _normalize_algorithm_semantics(line)
+        for line in header.splitlines()
+        if line.strip()
+    ]
+
+    _source_title, source_lines = _numbered_algorithm_lines(item.source_text)
+    source_map = {number: content for number, content in source_lines if content}
+    records: list[tuple[int, str, float]] = []
+    for row in range(2, rows):
+        row_cells = by_row.get(row, [])
+        prefix_cells = [
+            cell
+            for cell in row_cells
+            if int(cell.get("start_col_offset_idx") or 0) == 0
+        ]
+        content_cells = [
+            cell
+            for cell in row_cells
+            if int(cell.get("start_col_offset_idx") or 0) > 0
+        ]
+        prefixes = re.findall(
+            r"(?<!\d)(\d{1,2})\s*:",
+            " ".join(str(cell.get("text") or "") for cell in prefix_cells),
+        )
+        if not prefixes:
+            continue
+        content = " ".join(
+            str(cell.get("text") or "").strip()
+            for cell in content_cells
+            if str(cell.get("text") or "").strip()
+        )
+        content_x = min(
+            (
+                float(((cell.get("bbox") or {}).get("l")) or 0.0)
+                for cell in content_cells
+                if isinstance(cell.get("bbox"), dict)
+            ),
+            default=0.0,
+        )
+        numbers = [int(value) for value in prefixes]
+        if len(numbers) == 1:
+            value = content or source_map.get(numbers[0], "")
+            records.append(
+                (
+                    numbers[0],
+                    _normalize_algorithm_semantics(value),
+                    content_x,
+                )
+            )
+            continue
+        for number in numbers:
+            value = source_map.get(number, "")
+            if value:
+                records.append(
+                    (
+                        number,
+                        _normalize_algorithm_semantics(value),
+                        content_x,
+                    )
+                )
+    if not records:
+        return None
+    base_x = min(value[2] for value in records)
+    positive = sorted(
+        {
+            round(value[2] - base_x, 1)
+            for value in records
+            if value[2] - base_x >= 3.0
+        }
+    )
+    indent_unit = min(positive) if positive else 12.0
+    rendered = list(header_lines)
+    for number, content, content_x in records:
+        level = max(0, round((content_x - base_x) / max(indent_unit, 1.0)))
+        rendered.append(f"{number:<4}{'    ' * level}{content}".rstrip())
+    return title, "\n".join(rendered)
 
 
 def _unnumbered_algorithm_block(value: str) -> tuple[str, str]:
@@ -1094,6 +1296,9 @@ def _preformatted_block(
 ) -> tuple[str, str]:
     lines = source.lines(item.prov, padding=1.0)
     if algorithm:
+        table_block = _algorithm_table_block(item)
+        if table_block is not None:
+            return table_block
         semantic_title, semantic_lines = _numbered_algorithm_lines(
             _algorithm_semantic_text(item.node)
         )
@@ -1338,7 +1543,9 @@ def _formula_tex(
 ) -> tuple[str, int | str | None]:
     tex = str(item.node.get("text") or "").strip()
     tex = re.sub(r"(?s)<formula><loc_[^>]*>.*$", "", tex).strip()
-    number = source.equation_number(item.prov)
+    number = item.node.get("_semantic_equation_number") or source.equation_number(
+        item.prov
+    )
     source_text = ""
     source_text_reader = getattr(source, "text", None)
     if callable(source_text_reader):
@@ -1527,6 +1734,26 @@ def _formula_tex(
         r"\1 &",
         tex,
     )
+    tex = re.sub(r"(?:\s*&)+\s*$", "", tex)
+    duplicate_array_tail = re.search(
+        r"(?s)(?P<close>\\end\s*\{\s*array\s*\})"
+        r"(?:\s*\\quad\s*)?"
+        r"(?:\(\s*(?P<number>(?:\d\s*)+(?:\.\s*(?:\d\s*)+)?)\s*\))?"
+        r"\s*\\\\\s*&.*"
+        r"\\end\s*\{\s*array\s*\}\s*$",
+        tex,
+    )
+    if duplicate_array_tail:
+        if number is None and duplicate_array_tail.group("number"):
+            number = re.sub(
+                r"\s+",
+                "",
+                duplicate_array_tail.group("number"),
+            )
+        tex = (
+            tex[: duplicate_array_tail.start()]
+            + duplicate_array_tail.group("close")
+        )
     array_match = re.match(
         r"(?s)^(?P<prefix>\\begin\s*\{\s*array\s*\}\s*\{[^{}]*\})"
         r"(?P<body>.*)(?P<suffix>\\end\s*\{\s*array\s*\})$",
@@ -1605,7 +1832,25 @@ def _formula_mathml(tex: str) -> str | None:
     try:
         from latex2mathml.converter import convert  # type: ignore
 
-        mathml = str(convert(tex))
+        conversion_tex = tex
+        if (
+            not re.match(r"\s*\\begin\s*\{\s*array\s*\}", conversion_tex)
+            and re.search(
+                r"(?s)(?:"
+                r"(?:^|\\\\)\s*&|"
+                r"(?:^|\\\\)(?:(?!\\\\).){0,500}&\s*"
+                r"(?:=|\\(?:leq|geq|approx|sim|equiv|to|leftarrow|rightarrow|"
+                r"stackrel|overset|underset))"
+                r")",
+                conversion_tex,
+            )
+        ):
+            conversion_tex = (
+                r"\begin{array}{rl}"
+                + conversion_tex
+                + r"\end{array}"
+            )
+        mathml = str(convert(conversion_tex))
         mathml = re.sub(
             r"&(?!#(?:x[0-9A-Fa-f]+|\d+);|amp;|lt;|gt;|quot;|apos;)",
             "&amp;",
@@ -1616,10 +1861,57 @@ def _formula_mathml(tex: str) -> str | None:
             r"\1&lt;",
             mathml,
         )
+        mathml = mathml.replace("<mi>&amp;</mi>", "")
         ET.fromstring(mathml)
         return mathml
     except Exception:
         return None
+
+
+def _materialize_picture_assets(
+    output_dir: Path,
+    documents: list[dict[str, Any]],
+) -> dict[str, int]:
+    pictures_dir = output_dir / "pictures"
+    written = 0
+    skipped = 0
+    counter = 0
+    extensions = {
+        "image/png": "png",
+        "image/jpeg": "jpg",
+        "image/webp": "webp",
+        "image/gif": "gif",
+    }
+    for document in documents:
+        for node in document.get("pictures") or []:
+            if not isinstance(node, dict):
+                continue
+            counter += 1
+            image = node.get("image")
+            uri = str((image or {}).get("uri") or "") if isinstance(image, dict) else ""
+            match = re.match(
+                r"^data:(image/(?:png|jpeg|webp|gif));base64,(.+)$",
+                uri,
+                flags=re.DOTALL,
+            )
+            if not match:
+                skipped += 1
+                continue
+            try:
+                payload = base64.b64decode(match.group(2), validate=False)
+            except Exception:
+                skipped += 1
+                continue
+            if not payload:
+                skipped += 1
+                continue
+            extension = extensions[match.group(1)]
+            relative_path = f"pictures/picture_{counter}.{extension}"
+            pictures_dir.mkdir(parents=True, exist_ok=True)
+            (output_dir / relative_path).write_bytes(payload)
+            node["_semantic_picture_path"] = relative_path
+            written += 1
+    return {"written": written, "skipped": skipped}
 
 
 _LEGACY_SECOND_PASS_FORMULA_RE = re.compile(
@@ -2237,7 +2529,7 @@ def _inline_replacements(
 
 
 _ALGORITHM_KEYWORDS = re.compile(
-    r"(?i)\b(Input|Output|Parameters?|Initialize|Set|Sample|Draw|Choose|Construct|"
+    r"(?i)\b(Require|Ensure|Input|Output|Parameters?|Initialize|Set|Sample|Draw|Choose|Construct|"
     r"Form|Accept|Stop|Return|for|do|if|then|else|end\s+if|end\s+for)\b"
 )
 
@@ -2279,6 +2571,21 @@ def _highlight_algorithm_html(code: str) -> str:
             r'(<span class="alg-symbol"[^>]*>[A-Za-z]⃗</span>)'
             r"_([A-Za-z0-9_]+)",
             r"\1<sub>\2</sub>",
+            escaped,
+        )
+        escaped = re.sub(
+            r"\b([A-Za-z])_([A-Za-z0-9]+)",
+            r"\1<sub>\2</sub>",
+            escaped,
+        )
+        escaped = re.sub(
+            r"\b([A-Za-z])\^\((.*?)\)",
+            r"\1<sup>(\2)</sup>",
+            escaped,
+        )
+        escaped = re.sub(
+            r'(<span class="alg-symbol"[^>]*>ℝ</span>)\^\((.*?)\)',
+            r"\1<sup>(\2)</sup>",
             escaped,
         )
         escaped = re.sub(
@@ -2377,6 +2684,16 @@ def _render(
         document,
     )
     table_notes, table_footnote_callouts = _table_note_relations(items)
+    linked_footnote_ids = {
+        footnote_id
+        for values in footnote_callouts.values()
+        for _marker, footnote_id in values
+    }
+    linked_table_note_ids = {
+        footnote_id
+        for values in table_footnote_callouts.values()
+        for _marker, footnote_id in values
+    }
     counts = {
         "text": 0,
         "headings": 0,
@@ -2464,17 +2781,26 @@ def _render(
                 )
             elif id(item) in table_notes:
                 note_id, marker, body = table_notes[id(item)]
+                backref_html = (
+                    f' <a class="footnote-backref" href="#fnref-{note_id}" '
+                    f'aria-label="Back to table note callout">↩</a>'
+                    if note_id in linked_table_note_ids
+                    else ""
+                )
+                backref_md = (
+                    f" [↩](#fnref-{note_id})"
+                    if note_id in linked_table_note_ids
+                    else ""
+                )
                 html_parts.append(
                     f'<aside class="footnote table-note" id="fn-{note_id}">'
                     f'<span class="footnote-label">{html.escape(marker)}</span> '
-                    f"{html.escape(body)} "
-                    f'<a class="footnote-backref" href="#fnref-{note_id}" '
-                    f'aria-label="Back to table note callout">↩</a></aside>'
+                    f"{html.escape(body)}{backref_html}</aside>"
                 )
                 md_parts.extend(
                     [
                         f'<a id="fn-{note_id}"></a><sup>{marker}</sup> '
-                        f"{body} [↩](#fnref-{note_id})",
+                        f"{body}{backref_md}",
                         "",
                     ]
                 )
@@ -2503,17 +2829,26 @@ def _render(
                 )
             elif item.kind == "footnote" and id(item) in footnotes:
                 footnote_id, marker, body = footnotes[id(item)]
+                backref_html = (
+                    f' <a class="footnote-backref" href="#fnref-{footnote_id}" '
+                    f'aria-label="Back to footnote callout">↩</a>'
+                    if footnote_id in linked_footnote_ids
+                    else ""
+                )
+                backref_md = (
+                    f" [↩](#fnref-{footnote_id})"
+                    if footnote_id in linked_footnote_ids
+                    else ""
+                )
                 html_parts.append(
                     f'<aside class="footnote" id="fn-{footnote_id}">'
                     f'<span class="footnote-label">{html.escape(marker)}</span> '
-                    f"{html.escape(body)} "
-                    f'<a class="footnote-backref" href="#fnref-{footnote_id}" '
-                    f'aria-label="Back to footnote callout">↩</a></aside>'
+                    f"{html.escape(body)}{backref_html}</aside>"
                 )
                 md_parts.extend(
                     [
                         f'<a id="fn-{footnote_id}"></a><sup>{marker}</sup> '
-                        f"{body} [↩](#fnref-{footnote_id})",
+                        f"{body}{backref_md}",
                         "",
                     ]
                 )
@@ -2682,11 +3017,9 @@ def _render(
             counts["tables"] += 1
         elif item.kind == "picture":
             picture_index = picture_counter.get(id(node))
-            image_path = (
-                f"pictures/picture_{picture_index}.png"
-                if picture_index is not None
-                else ""
-            )
+            image_path = str(node.get("_semantic_picture_path") or "")
+            if not image_path and picture_index is not None:
+                image_path = f"pictures/picture_{picture_index}.png"
             caption = _caption_text(document, node)
             if not re.match(r"(?i)^Figure\s+\d+\s*:", caption):
                 caption = _source_caption(source, item, kind="picture") or caption
@@ -2751,6 +3084,10 @@ def rebuild_semantic_surfaces(
     metadata: dict[str, Any],
     status: dict[str, Any],
 ) -> dict[str, Any]:
+    if not isinstance(status.get("quality_signals"), dict):
+        status["quality_signals"] = {}
+    if not isinstance(status.get("warnings"), list):
+        status["warnings"] = []
     try:
         source = SourceReader(input_file)
     except Exception as exc:
@@ -2821,6 +3158,7 @@ def rebuild_semantic_surfaces(
             if isinstance(chunk, dict) and isinstance(chunk.get("document"), dict)
         ]
         documents = chunk_documents or [document]
+        picture_assets = _materialize_picture_assets(output_dir, documents)
         prepared_parts: list[tuple[dict[str, Any], list[FlowItem], int]] = []
         shared_reference_texts: list[tuple[int, str]] = []
         reference_offset = 0
@@ -2885,6 +3223,7 @@ def rebuild_semantic_surfaces(
         "counts": counts,
         "authoritative_surfaces": ["document.html", "document.md"],
         "source_page_images_are_review_only": True,
+        "picture_assets": picture_assets,
     }
     metadata["primary_surface"] = result
     status["quality_signals"]["primary_surface"] = result

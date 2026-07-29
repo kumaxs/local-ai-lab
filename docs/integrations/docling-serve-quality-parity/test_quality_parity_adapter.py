@@ -16,6 +16,50 @@ import semantic_reflow  # noqa: E402
 
 
 class SemanticReflowTests(unittest.TestCase):
+    def test_rebuild_initializes_quality_status_for_direct_service_output(self) -> None:
+        metadata: dict[str, object] = {}
+        status: dict[str, object] = {}
+
+        result = semantic_reflow.rebuild_semantic_surfaces(
+            Path("/tmp/unused-semantic-output"),
+            {},
+            Path("/tmp/missing-semantic-source.pdf"),
+            metadata,
+            status,
+        )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(status["quality_signals"]["primary_surface"], result)
+        self.assertEqual(status["warnings"], [result["reason"]])
+
+    def test_embedded_picture_is_materialized_as_local_asset(self) -> None:
+        png = (
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR4nGNg"
+            "YAAAAAMAASsJTYQAAAAASUVORK5CYII="
+        )
+        document = {
+            "pictures": [
+                {
+                    "image": {
+                        "uri": f"data:image/png;base64,{png}",
+                    }
+                }
+            ]
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result = semantic_reflow._materialize_picture_assets(
+                Path(tmpdir),
+                [document],
+            )
+
+            path = Path(tmpdir) / "pictures" / "picture_1.png"
+            self.assertEqual(result, {"written": 1, "skipped": 0})
+            self.assertTrue(path.is_file())
+            self.assertEqual(
+                document["pictures"][0]["_semantic_picture_path"],
+                "pictures/picture_1.png",
+            )
+
     def test_pdf_symbol_glyphs_are_restored_semantically(self) -> None:
         self.assertEqual(
             semantic_reflow._clean_glyph_text("(cid:52) (cid:53)"),
@@ -170,6 +214,13 @@ class SemanticReflowTests(unittest.TestCase):
         self.assertIn(">ℝ</span>", algorithm)
         self.assertIn('<span class="code-keyword">def</span>', python)
         self.assertIn('<span class="code-comment"># preserve comment</span>', python)
+        formatted_algorithm = semantic_reflow._highlight_algorithm_html(
+            "Require: x_out ∈ ℝ^(B×L×D)\n1 T^(k−1) ← x_out"
+        )
+        self.assertIn('<strong class="alg-keyword">Require</strong>', formatted_algorithm)
+        self.assertIn("x<sub>out</sub>", formatted_algorithm)
+        self.assertIn("T<sup>(k", formatted_algorithm)
+        self.assertIn("ℝ</span><sup>(B", formatted_algorithm)
 
     def test_formula_array_with_many_single_letter_terms_is_not_erased(self) -> None:
         class FormulaSource:
@@ -207,7 +258,49 @@ class SemanticReflowTests(unittest.TestCase):
         self.assertNotEqual(tex, r"\begin{array}{r}\end{array}")
         self.assertIsNotNone(semantic_reflow._formula_mathml(tex))
 
-    def test_formula_mathml_escapes_bare_alignment_ampersands(self) -> None:
+    def test_standalone_equation_number_is_attached_to_overlapping_formula(self) -> None:
+        class FormulaSource:
+            def text(self, _prov, *, padding=0.0):
+                return ""
+
+        document = {
+            "body": {
+                "children": [
+                    {"$ref": "#/texts/0"},
+                    {"$ref": "#/texts/1"},
+                ]
+            },
+            "texts": [
+                {
+                    "label": "formula",
+                    "text": r"x = y",
+                    "prov": [
+                        {
+                            "page_no": 1,
+                            "bbox": {"l": 100, "r": 300, "t": 500, "b": 470},
+                        }
+                    ],
+                },
+                {
+                    "label": "formula",
+                    "text": "( 1 7 )",
+                    "prov": [
+                        {
+                            "page_no": 1,
+                            "bbox": {"l": 540, "r": 558, "t": 487, "b": 478},
+                        }
+                    ],
+                },
+            ],
+        }
+
+        items = semantic_reflow._collect_items(document, FormulaSource())
+
+        formulas = [item for item in items if item.kind == "formula"]
+        self.assertEqual(len(formulas), 1)
+        self.assertEqual(formulas[0].node["_semantic_equation_number"], "17")
+
+    def test_formula_mathml_renders_alignment_ampersands_structurally(self) -> None:
         mathml = semantic_reflow._formula_mathml(
             r"\|p(x)-p(y)\|^2 &="
             r"\Pr(X<k)\|[x-y]-\gamma[\nabla h(p(x))-\nabla h(p(y))]\|^2"
@@ -217,7 +310,54 @@ class SemanticReflowTests(unittest.TestCase):
 
         self.assertIsNotNone(mathml)
         self.assertNotIn("<mi>&</mi>", mathml or "")
-        self.assertIn("&amp;", mathml or "")
+        self.assertNotIn("<mi>&amp;</mi>", mathml or "")
+        self.assertIn("<mtable>", mathml or "")
+
+    def test_formula_mathml_structures_stackrel_and_continuation_alignment(self) -> None:
+        mathml = semantic_reflow._formula_mathml(
+            r"A & \stackrel{(a)}{=} B \\ & = C"
+        )
+
+        self.assertIsNotNone(mathml)
+        self.assertNotIn("<mi>&amp;</mi>", mathml or "")
+        self.assertIn("<mtable>", mathml or "")
+
+    def test_formula_mathml_preserves_escaped_literal_ampersand(self) -> None:
+        mathml = semantic_reflow._formula_mathml(r"A\&B")
+
+        self.assertIsNotNone(mathml)
+        self.assertIn("<mi>&#x00026;</mi>", mathml or "")
+
+    def test_formula_drops_duplicate_row_after_closed_array(self) -> None:
+        class FormulaSource:
+            def equation_number(self, _prov):
+                return None
+
+            def text(self, _prov, *, padding=0.0):
+                return ""
+
+        item = semantic_reflow.FlowItem(
+            kind="formula",
+            node={
+                "text": (
+                    r"\begin{array}{rl}&{a s^2}\\&{b s}\\&{c=0.}\end{array}"
+                    r"\quad(12)\\&{c=0.}\end{array}"
+                )
+            },
+            rank=1.0,
+            page_no=1,
+            bbox={"l": 0.0, "r": 100.0, "t": 20.0, "b": 0.0},
+            prov={"page_no": 1, "bbox": {}},
+        )
+
+        tex, number = semantic_reflow._formula_tex(item, FormulaSource())
+
+        self.assertEqual(number, "12")
+        self.assertEqual(tex.count(r"\end{array}"), 1)
+        self.assertEqual(tex.count("c=0"), 1)
+        mathml = semantic_reflow._formula_mathml(tex)
+        self.assertIsNotNone(mathml)
+        self.assertNotIn("<mi>&amp;</mi>", mathml or "")
 
     def test_formula_drops_preceding_prose_misclassified_as_math(self) -> None:
         class FormulaSource:
@@ -698,6 +838,73 @@ class SemanticReflowTests(unittest.TestCase):
         self.assertIn("1   if ready then", block)
         self.assertIn("2       act()", block)
         self.assertIn("3   end if", block)
+
+    def test_algorithm_table_splits_merged_lines_and_preserves_indentation(self) -> None:
+        class AlgorithmSource:
+            def lines(self, _prov, *, padding=0.0):
+                return []
+
+        def cell(row, col, text, left):
+            return {
+                "start_row_offset_idx": row,
+                "start_col_offset_idx": col,
+                "text": text,
+                "bbox": {"l": left},
+            }
+
+        item = semantic_reflow.FlowItem(
+            kind="algorithm",
+            node={
+                "data": {
+                    "num_rows": 5,
+                    "num_cols": 2,
+                    "table_cells": [
+                        cell(0, 0, "Algorithm 1 Example", 10),
+                        cell(
+                            1,
+                            0,
+                            "Require: Input x; Ensure: x ∈ B × L × D",
+                            10,
+                        ),
+                        cell(2, 0, "1: 2:", 10),
+                        cell(2, 1, "build(x) for k = 1 to L - 1 do", 20),
+                        cell(3, 0, "3:", 10),
+                        cell(3, 1, "act()", 36),
+                        cell(4, 0, "4:", 10),
+                        cell(4, 1, "end for", 20),
+                    ],
+                }
+            },
+            rank=1.0,
+            page_no=1,
+            bbox={"l": 0.0, "r": 100.0, "t": 100.0, "b": 0.0},
+            prov={"page_no": 1, "bbox": {}},
+            source_text=(
+                "Algorithm 1 Example\n"
+                "Require: Input x; exposed generator set S = {s , . . . , s }\n"
+                "1 q\n"
+                "Ensure: x ∈ RB×L×D\n"
+                "out\n"
+                "1: init ← build(x)\n"
+                "2: for k = 1 to L - 1 do\n"
+                "3: act()\n"
+                "4: end for"
+            ),
+        )
+
+        title, block = semantic_reflow._preformatted_block(
+            AlgorithmSource(),
+            item,
+            algorithm=True,
+        )
+
+        self.assertEqual(title, "Algorithm 1 Example")
+        self.assertIn("Require: Input x", block)
+        self.assertIn("Ensure: x_out ∈ ℝ^(B×L×D)", block)
+        self.assertIn("1   init ← build(x)", block)
+        self.assertIn("2   for k = 1 to L - 1 do", block)
+        self.assertIn("3       act()", block)
+        self.assertIn("4   end for", block)
 
     def test_algorithm_heading_and_list_group_become_one_semantic_block(self) -> None:
         class AlgorithmSource:
