@@ -22,6 +22,117 @@ class SemanticReflowTests(unittest.TestCase):
             "✓ ✗",
         )
 
+    def test_detached_diacritics_and_math_overlays_are_recombined(self) -> None:
+        rendered = semantic_reflow._normalize_detached_diacritics(
+            "⃗ x 0 ̸= 1 X ̸∈ S Richt´ arik P˘ atra¸ scu D¨ utting "
+            "Pglyph[suppress] L-condition"
+        )
+
+        self.assertEqual(
+            rendered,
+            "x⃗ 0 ≠ 1 X ∉ S Richtárik Pătraşcu Dütting PL-condition",
+        )
+
+    def test_inline_citations_link_numeric_and_author_year_relations(self) -> None:
+        references = [
+            (1, "A. Author. First paper. 2020."),
+            (2, "A. Khaled and C. Jin. Faster optimization. 2023."),
+        ]
+
+        rendered = semantic_reflow._inline_replacements(
+            "See [1] and Khaled and Jin (2023).",
+            references,
+            [],
+            markdown=False,
+        )
+
+        self.assertIn('href="#ref-1">1</a>', rendered)
+        self.assertIn(
+            'href="#ref-2">Khaled and Jin (2023)</a>',
+            rendered,
+        )
+
+        split_reference = semantic_reflow._inline_replacements(
+            "See (Bach and Moulines, 2011).",
+            [
+                (1, "F. Bach and É. Moulines. Non-asymptotic analysis"),
+                (2, "for machine learning. NeurIPS, 2011."),
+            ],
+            [],
+            markdown=False,
+        )
+        self.assertIn(
+            'href="#ref-1">(Bach and Moulines, 2011)</a>',
+            split_reference,
+        )
+
+        repeated_author = semantic_reflow._inline_replacements(
+            "Defazio et al. (2014)",
+            [
+                (1, "Defazio. A practical method. 2016."),
+                (2, "Defazio, Bach, and Lacoste-Julien. SAGA. 2014."),
+            ],
+            [],
+            markdown=False,
+        )
+        self.assertIn('href="#ref-2">Defazio et al. (2014)</a>', repeated_author)
+
+    def test_footnote_relation_skips_matching_section_number(self) -> None:
+        callout = semantic_reflow.FlowItem(
+            "text", {}, 1.0, 1, {}, {}, "travel salesman problem 5"
+        )
+        heading = semantic_reflow.FlowItem(
+            "heading", {"text": "5 Conclusions"}, 2.0, 1, {}, {}, ""
+        )
+        footnote = semantic_reflow.FlowItem(
+            "footnote", {}, 3.0, 1, {}, {}, "5 https://example.test"
+        )
+
+        footnotes, callouts = semantic_reflow._footnote_relations(
+            [callout, heading, footnote],
+            {},
+        )
+
+        self.assertIn(id(footnote), footnotes)
+        self.assertEqual(callouts[id(callout)], [("5", "5-1")])
+        self.assertNotIn(id(heading), callouts)
+
+    def test_table_note_relation_links_symbol_to_explanatory_note(self) -> None:
+        table = semantic_reflow.FlowItem("table", {}, 1.0, 1, {}, {})
+        spacer = semantic_reflow.FlowItem("heading", {}, 2.0, 1, {}, {}, "")
+        note = semantic_reflow.FlowItem(
+            "text",
+            {},
+            3.0,
+            1,
+            {},
+            {},
+            "∗ Simulated Annealing is a stochastic optimizer",
+        )
+
+        notes, callouts = semantic_reflow._table_note_relations(
+            [table, spacer, note]
+        )
+
+        self.assertEqual(
+            notes[id(note)],
+            ("table-1", "∗", "Simulated Annealing is a stochastic optimizer"),
+        )
+        self.assertEqual(callouts[id(table)], [("*", "table-1")])
+
+    def test_algorithm_and_python_emphasis_remain_semantic_html(self) -> None:
+        algorithm = semantic_reflow._highlight_algorithm_html(
+            "1   Input: x\n2   if x then // keep it"
+        )
+        python = semantic_reflow._highlight_python_html(
+            "def solve(x):\n    # preserve comment\n    return x + 1\n"
+        )
+
+        self.assertIn('<strong class="alg-keyword">Input</strong>', algorithm)
+        self.assertIn('<em class="alg-comment">// keep it</em>', algorithm)
+        self.assertIn('<span class="code-keyword">def</span>', python)
+        self.assertIn('<span class="code-comment"># preserve comment</span>', python)
+
     def test_formula_eight_is_reconstructed_as_searchable_tex(self) -> None:
         class FormulaSource:
             def equation_number(self, _prov):

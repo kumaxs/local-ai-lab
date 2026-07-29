@@ -1,7 +1,12 @@
 from __future__ import annotations
 
 import html
+import io
+import keyword
 import re
+import token
+import tokenize
+import unicodedata
 from difflib import SequenceMatcher
 from dataclasses import dataclass
 from pathlib import Path
@@ -71,6 +76,42 @@ def _clean_glyph_text(value: str) -> str:
     return re.sub(r"\(cid:\d+\)", "", value)
 
 
+_DETACHED_DIACRITICS = {
+    "´": "\u0301",
+    "ˇ": "\u030c",
+    "˘": "\u0306",
+    "¸": "\u0327",
+    "¨": "\u0308",
+    "˜": "\u0303",
+    "ˆ": "\u0302",
+    "˙": "\u0307",
+}
+
+
+def _normalize_detached_diacritics(value: str) -> str:
+    """Attach PDF-extracted modifier glyphs to their intended base characters."""
+    value = re.sub(
+        r"P\s*glyph\s*\[\s*suppress\s*\]\s*L\s*-\s*condition",
+        "PL-condition",
+        value,
+        flags=re.IGNORECASE,
+    )
+    value = re.sub(r"\u0338\s*=", "≠", value)
+    value = re.sub(r"\u0338\s*∈", "∉", value)
+    value = re.sub(
+        r"\u20d7\s*([A-Za-zΑ-Ωα-ω])",
+        lambda match: match.group(1) + "\u20d7",
+        value,
+    )
+    for modifier, combining in _DETACHED_DIACRITICS.items():
+        value = re.sub(
+            re.escape(modifier) + r"\s*([A-Za-zÀ-ÖØ-öø-ÿ])",
+            lambda match, mark=combining: match.group(1) + mark,
+            value,
+        )
+    return unicodedata.normalize("NFC", value)
+
+
 def _paragraph_text(value: str) -> str:
     lines = [re.sub(r"\s+", " ", line).strip() for line in value.splitlines()]
     lines = [line for line in lines if line]
@@ -84,7 +125,7 @@ def _paragraph_text(value: str) -> str:
             merged += " " + line
     merged = re.sub(r"\s+([,.;:!?%)\]])", r"\1", merged)
     merged = re.sub(r"([(\[])\s+", r"\1", merged)
-    return merged.strip()
+    return _normalize_detached_diacritics(merged.strip())
 
 
 def _quarantine_kind(node: dict[str, Any]) -> str | None:
@@ -884,7 +925,7 @@ def _repair_algorithm_case_semantics(value: str) -> str:
     if (
         re.match(r"^Set wj\s*=", compact)
         and "k+1 k k+1 wj" in compact
-        and re.search(r"for j\s*[̸≠]\s*=\s*i k k", compact)
+        and re.search(r"for j\s*(?:≠|̸\s*=)\s*i k k", compact)
     ):
         return (
             r"Set w_{k+1}^{j} = \{ "
@@ -905,6 +946,7 @@ def _repair_algorithm_case_semantics(value: str) -> str:
 
 
 def _normalize_algorithm_semantics(value: str) -> str:
+    value = _normalize_detached_diacritics(value)
     value = value.replace("·", "•").replace("- →", "→").replace("← -", "←")
     value = _repair_algorithm_case_semantics(value)
     value = re.sub(r"\bR\s*d\b", "ℝ^d", value)
@@ -1583,12 +1625,21 @@ def _heading_level(text: str, node: dict[str, Any]) -> int:
     return min(6, max(1, int(node.get("level") or 1)))
 
 
-def _markdown_table(grid: list[list[str]]) -> str:
+def _markdown_table(
+    grid: list[list[str]],
+    reference_texts: list[tuple[int, str]] | None = None,
+    footnote_callouts: list[tuple[str, str]] | None = None,
+) -> str:
     if not grid:
         return ""
 
     def cell(value: str) -> str:
-        value = html.escape(value, quote=False)
+        value = _inline_replacements(
+            value,
+            reference_texts or [],
+            footnote_callouts or [],
+            markdown=True,
+        )
         value = value.replace("|", "&#124;")
         return "<br>".join(part.strip() for part in value.splitlines())
 
@@ -1601,14 +1652,362 @@ def _markdown_table(grid: list[list[str]]) -> str:
     return "\n".join([header, separator, *rows])
 
 
+def _reference_items(
+    items: list[FlowItem],
+) -> tuple[dict[int, int], list[tuple[int, str]]]:
+    references: dict[int, int] = {}
+    reference_texts: list[tuple[int, str]] = []
+    in_references = False
+    reference_level = 7
+    for item in items:
+        if item.kind == "heading":
+            heading = _paragraph_text(str(item.node.get("text") or item.source_text))
+            level = _heading_level(heading, item.node)
+            if re.fullmatch(r"(?i)(?:references|bibliography)", heading.strip()):
+                in_references = True
+                reference_level = level
+                continue
+            if in_references and level <= reference_level:
+                in_references = False
+        if (
+            in_references
+            and item.kind in {"text", "list_item", "footnote"}
+            and (text := _paragraph_text(item.source_text))
+        ):
+            number = len(reference_texts) + 1
+            references[id(item)] = number
+            reference_texts.append((number, re.sub(r"^\[\d+\]\s*", "", text)))
+    return references, reference_texts
+
+
+def _footnote_relations(
+    items: list[FlowItem],
+    reference_items: dict[int, int],
+) -> tuple[dict[int, tuple[str, str, str]], dict[int, list[tuple[str, str]]]]:
+    footnotes: dict[int, tuple[str, str, str]] = {}
+    callouts: dict[int, list[tuple[str, str]]] = {}
+    marker_counts: dict[str, int] = {}
+    for index, item in enumerate(items):
+        if item.kind != "footnote" or id(item) in reference_items:
+            continue
+        text = _paragraph_text(item.source_text)
+        match = re.match(r"^(\d+|[∗*†‡§]+)\s+(.+)$", text)
+        if not match:
+            continue
+        marker, body = match.groups()
+        marker_counts[marker] = marker_counts.get(marker, 0) + 1
+        marker_name = {
+            "*": "star",
+            "∗": "star",
+            "†": "dagger",
+            "‡": "double-dagger",
+            "§": "section",
+        }.get(marker, marker)
+        suffix = marker_counts[marker]
+        footnote_id = f"{marker_name}-{suffix}"
+        footnotes[id(item)] = (footnote_id, marker, body)
+        if marker.isdigit():
+            marker_pattern = re.compile(rf"(?<![\w\[])({re.escape(marker)})(?![\w\]])")
+        else:
+            marker_pattern = re.compile(re.escape(marker))
+        for candidate in reversed(items[max(0, index - 24) : index]):
+            if candidate.kind not in {"title", "heading", "text", "list_item"}:
+                continue
+            candidate_text = _paragraph_text(
+                candidate.source_text or str(candidate.node.get("text") or "")
+            )
+            if (
+                candidate.kind == "heading"
+                and marker.isdigit()
+                and re.match(rf"^{re.escape(marker)}(?:\.|\s|$)", candidate_text)
+            ):
+                continue
+            if marker_pattern.search(candidate_text):
+                callouts.setdefault(id(candidate), []).append((marker, footnote_id))
+                break
+    return footnotes, callouts
+
+
+def _table_note_relations(
+    items: list[FlowItem],
+) -> tuple[
+    dict[int, tuple[str, str, str]],
+    dict[int, list[tuple[str, str]]],
+]:
+    notes: dict[int, tuple[str, str, str]] = {}
+    table_callouts: dict[int, list[tuple[str, str]]] = {}
+    counter = 0
+    for index, item in enumerate(items):
+        if item.kind != "table":
+            continue
+        for candidate in items[index + 1 : min(len(items), index + 5)]:
+            text = _paragraph_text(candidate.source_text)
+            if not text:
+                continue
+            match = re.match(r"^([∗*†‡§]+)\s+(.+)$", text)
+            if not match or candidate.kind not in {"text", "footnote"}:
+                break
+            marker, body = match.groups()
+            counter += 1
+            note_id = f"table-{counter}"
+            notes[id(candidate)] = (note_id, marker, body)
+            callout_marker = "*" * len(marker) if set(marker) == {"∗"} else marker
+            table_callouts.setdefault(id(item), []).append(
+                (callout_marker, note_id)
+            )
+            break
+    return notes, table_callouts
+
+
+def _normalized_lookup(value: str) -> str:
+    decomposed = unicodedata.normalize("NFKD", value).casefold()
+    return "".join(char for char in decomposed if not unicodedata.combining(char))
+
+
+_AUTHOR_YEAR_PATTERNS = (
+    re.compile(
+        r"\b(?:[A-ZÀ-ÖØ-Þ][\wÀ-ÖØ-öø-ÿ'’.-]+)"
+        r"(?:\s+(?:and|&)\s+[A-ZÀ-ÖØ-Þ][\wÀ-ÖØ-öø-ÿ'’.-]+|\s+et al\.)?"
+        r"\s+\((?:19|20)\d{2}[a-z]?\)"
+    ),
+    re.compile(
+        r"\((?:[A-ZÀ-ÖØ-Þ][\wÀ-ÖØ-öø-ÿ'’.-]+)"
+        r"(?:\s+(?:and|&)\s+[A-ZÀ-ÖØ-Þ][\wÀ-ÖØ-öø-ÿ'’.-]+|\s+et al\.)?"
+        r",\s*(?:19|20)\d{2}[a-z]?\)"
+    ),
+    re.compile(
+        r"\b(?:[A-ZÀ-ÖØ-Þ][\wÀ-ÖØ-öø-ÿ'’.-]+)"
+        r"(?:\s+(?:and|&)\s+[A-ZÀ-ÖØ-Þ][\wÀ-ÖØ-öø-ÿ'’.-]+|\s+et al\.)?"
+        r",\s*(?:19|20)\d{2}[a-z]?"
+    ),
+)
+
+
+def _author_year_target(
+    label: str,
+    reference_texts: list[tuple[int, str]],
+) -> int | None:
+    year_match = re.search(r"(?:19|20)\d{2}", label)
+    names = re.findall(r"[A-ZÀ-ÖØ-Þ][\wÀ-ÖØ-öø-ÿ'’.-]+", label)
+    if not year_match or not names:
+        return None
+    surnames = [_normalized_lookup(name.rstrip(".")) for name in names]
+    year = year_match.group(0)
+    matches: list[int] = []
+    for index, (number, reference) in enumerate(reference_texts):
+        normalized_reference = _normalized_lookup(reference)
+        next_text = (
+            reference_texts[index + 1][1]
+            if index + 1 < len(reference_texts)
+            else ""
+        )
+        reference_years = re.findall(r"(?:19|20)\d{2}", reference)
+        has_names = all(surname in normalized_reference for surname in surnames)
+        if has_names and (
+            year in reference
+            or (not reference_years and year in next_text)
+        ):
+            matches.append(number)
+    return matches[0] if len(matches) == 1 else None
+
+
+def _inline_replacements(
+    text: str,
+    reference_texts: list[tuple[int, str]],
+    footnote_callouts: list[tuple[str, str]],
+    *,
+    markdown: bool,
+) -> str:
+    replacements: list[tuple[int, int, str]] = []
+    occupied: list[tuple[int, int]] = []
+
+    def available(start: int, end: int) -> bool:
+        return not any(start < other_end and end > other_start for other_start, other_end in occupied)
+
+    for marker, footnote_id in footnote_callouts:
+        pattern = (
+            re.compile(rf"(?<![\w\[])({re.escape(marker)})(?![\w\]])")
+            if marker.isdigit()
+            else re.compile(re.escape(marker))
+        )
+        matches = list(pattern.finditer(text))
+        if not matches:
+            continue
+        match = matches[-1]
+        visible = html.escape(marker, quote=False)
+        replacement = (
+            f'<sup id="fnref-{footnote_id}"><a href="#fn-{footnote_id}">{visible}</a></sup>'
+        )
+        replacements.append((match.start(), match.end(), replacement))
+        occupied.append((match.start(), match.end()))
+
+    reference_count = len(reference_texts)
+    for match in re.finditer(r"\[([0-9][0-9,\-–\s]*)\]", text):
+        numbers = [int(value) for value in re.findall(r"\d+", match.group(1))]
+        if (
+            not numbers
+            or any(number < 1 or number > reference_count for number in numbers)
+            or not available(match.start(), match.end())
+        ):
+            continue
+        if markdown:
+            linked = re.sub(
+                r"\d+",
+                lambda number: f'[{number.group(0)}](#ref-{number.group(0)})',
+                match.group(1),
+            )
+            replacement = f"[{linked}]"
+        else:
+            linked = re.sub(
+                r"\d+",
+                lambda number: (
+                    f'<a class="citation" href="#ref-{number.group(0)}">'
+                    f"{number.group(0)}</a>"
+                ),
+                html.escape(match.group(1), quote=False),
+            )
+            replacement = f"[{linked}]"
+        replacements.append((match.start(), match.end(), replacement))
+        occupied.append((match.start(), match.end()))
+
+    for pattern in _AUTHOR_YEAR_PATTERNS:
+        for match in pattern.finditer(text):
+            if not available(match.start(), match.end()):
+                continue
+            number = _author_year_target(match.group(0), reference_texts)
+            if number is None:
+                continue
+            visible = (
+                html.escape(match.group(0), quote=False)
+                if not markdown
+                else match.group(0)
+            )
+            replacement = (
+                f"[{visible}](#ref-{number})"
+                if markdown
+                else f'<a class="citation" href="#ref-{number}">{visible}</a>'
+            )
+            replacements.append((match.start(), match.end(), replacement))
+            occupied.append((match.start(), match.end()))
+
+    replacements.sort(key=lambda value: value[0])
+    output: list[str] = []
+    cursor = 0
+    for start, end, replacement in replacements:
+        if start < cursor:
+            continue
+        raw = text[cursor:start]
+        output.append(raw if markdown else html.escape(raw, quote=False))
+        output.append(replacement)
+        cursor = end
+    tail = text[cursor:]
+    output.append(tail if markdown else html.escape(tail, quote=False))
+    return "".join(output)
+
+
+_ALGORITHM_KEYWORDS = re.compile(
+    r"(?i)\b(Input|Output|Parameters?|Initialize|Set|Sample|Draw|Choose|Construct|"
+    r"Form|Accept|Stop|Return|for|do|if|then|else|end\s+if|end\s+for)\b"
+)
+
+
+def _highlight_algorithm_html(code: str) -> str:
+    rendered: list[str] = []
+    for raw_line in _normalize_detached_diacritics(code).splitlines():
+        body, separator, comment = raw_line.partition("//")
+        escaped = html.escape(body, quote=False)
+        escaped = re.sub(
+            r"^(\s*)(\d+)(\s+)",
+            r'\1<span class="line-number">\2</span>\3',
+            escaped,
+        )
+        escaped = _ALGORITHM_KEYWORDS.sub(
+            r'<strong class="alg-keyword">\1</strong>',
+            escaped,
+        )
+        if separator:
+            escaped += (
+                '<em class="alg-comment">//'
+                + html.escape(comment, quote=False)
+                + "</em>"
+            )
+        rendered.append(escaped)
+    return "\n".join(rendered)
+
+
+def _highlight_python_html(code: str) -> str:
+    code = _normalize_detached_diacritics(code)
+    lines = code.splitlines(keepends=True)
+    offsets = [0]
+    for line in lines:
+        offsets.append(offsets[-1] + len(line))
+
+    def absolute(position: tuple[int, int]) -> int:
+        row, column = position
+        return offsets[min(max(row - 1, 0), len(offsets) - 1)] + column
+
+    classes = {
+        token.COMMENT: "code-comment",
+        token.STRING: "code-string",
+        token.NUMBER: "code-number",
+    }
+    output: list[str] = []
+    cursor = 0
+    try:
+        tokens = tokenize.generate_tokens(io.StringIO(code).readline)
+        for current in tokens:
+            if current.type in {
+                token.ENDMARKER,
+                token.ENCODING,
+                token.INDENT,
+                token.DEDENT,
+            }:
+                continue
+            start = absolute(current.start)
+            end = absolute(current.end)
+            if start < cursor:
+                continue
+            output.append(html.escape(code[cursor:start], quote=False))
+            css_class = classes.get(current.type)
+            if current.type == token.NAME and keyword.iskeyword(current.string):
+                css_class = "code-keyword"
+            visible = html.escape(current.string, quote=False)
+            output.append(
+                f'<span class="{css_class}">{visible}</span>'
+                if css_class
+                else visible
+            )
+            cursor = end
+    except (IndentationError, tokenize.TokenError):
+        return html.escape(code, quote=False)
+    output.append(html.escape(code[cursor:], quote=False))
+    return "".join(output)
+
+
 def _render(
     items: list[FlowItem],
     document: dict[str, Any],
     source: SourceReader,
+    *,
+    shared_reference_texts: list[tuple[int, str]] | None = None,
+    reference_number_offset: int = 0,
 ) -> tuple[str, str, dict[str, int]]:
     title = str(document.get("name") or "Converted paper")
     html_parts: list[str] = []
     md_parts: list[str] = []
+    reference_items, local_reference_texts = _reference_items(items)
+    if reference_number_offset:
+        reference_items = {
+            item_id: number + reference_number_offset
+            for item_id, number in reference_items.items()
+        }
+        local_reference_texts = [
+            (number + reference_number_offset, text)
+            for number, text in local_reference_texts
+        ]
+    reference_texts = shared_reference_texts or local_reference_texts
+    footnotes, footnote_callouts = _footnote_relations(items, reference_items)
+    table_notes, table_footnote_callouts = _table_note_relations(items)
     counts = {
         "text": 0,
         "headings": 0,
@@ -1626,28 +2025,154 @@ def _render(
     for item in items:
         node = item.node
         if item.kind == "title":
-            text = str(node.get("text") or title).strip()
-            html_parts.append(f"<h1>{html.escape(text)}</h1>")
-            md_parts.extend([f"# {text}", ""])
+            text = _paragraph_text(str(node.get("text") or title))
+            html_parts.append(
+                "<h1>"
+                + _inline_replacements(
+                    text,
+                    reference_texts,
+                    footnote_callouts.get(id(item), []),
+                    markdown=False,
+                )
+                + "</h1>"
+            )
+            md_parts.extend(
+                [
+                    "# "
+                    + _inline_replacements(
+                        text,
+                        reference_texts,
+                        footnote_callouts.get(id(item), []),
+                        markdown=True,
+                    ),
+                    "",
+                ]
+            )
         elif item.kind == "heading":
-            text = str(node.get("text") or "").strip()
+            text = _paragraph_text(str(node.get("text") or ""))
             level = _heading_level(text, node)
-            html_parts.append(f"<h{level}>{html.escape(text)}</h{level}>")
-            md_parts.extend([f"{'#' * level} {text}", ""])
+            html_parts.append(
+                f"<h{level}>"
+                + _inline_replacements(
+                    text,
+                    reference_texts,
+                    footnote_callouts.get(id(item), []),
+                    markdown=False,
+                )
+                + f"</h{level}>"
+            )
+            md_parts.extend(
+                [
+                    f"{'#' * level} "
+                    + _inline_replacements(
+                        text,
+                        reference_texts,
+                        footnote_callouts.get(id(item), []),
+                        markdown=True,
+                    ),
+                    "",
+                ]
+            )
             counts["headings"] += 1
         elif item.kind in {"text", "list_item", "footnote"}:
             text = _paragraph_text(item.source_text)
             if not text:
                 continue
-            if item.kind == "list_item":
-                html_parts.append(f"<ul><li>{html.escape(text)}</li></ul>")
-                md_parts.extend([f"- {text}", ""])
+            reference_number = reference_items.get(id(item))
+            if reference_number is not None:
+                text = re.sub(r"^\[\d+\]\s*", "", text)
+                html_parts.append(
+                    f'<div class="reference-entry" id="ref-{reference_number}">'
+                    f'<span class="reference-number">[{reference_number}]</span> '
+                    f"{html.escape(text)}</div>"
+                )
+                md_parts.extend(
+                    [
+                        f'<a id="ref-{reference_number}"></a>'
+                        f"[{reference_number}] {text}",
+                        "",
+                    ]
+                )
+            elif id(item) in table_notes:
+                note_id, marker, body = table_notes[id(item)]
+                html_parts.append(
+                    f'<aside class="footnote table-note" id="fn-{note_id}">'
+                    f'<span class="footnote-label">{html.escape(marker)}</span> '
+                    f"{html.escape(body)} "
+                    f'<a class="footnote-backref" href="#fnref-{note_id}" '
+                    f'aria-label="Back to table note callout">↩</a></aside>'
+                )
+                md_parts.extend(
+                    [
+                        f'<a id="fn-{note_id}"></a><sup>{marker}</sup> '
+                        f"{body} [↩](#fnref-{note_id})",
+                        "",
+                    ]
+                )
+            elif item.kind == "list_item":
+                html_parts.append(
+                    "<ul><li>"
+                    + _inline_replacements(
+                        text,
+                        reference_texts,
+                        footnote_callouts.get(id(item), []),
+                        markdown=False,
+                    )
+                    + "</li></ul>"
+                )
+                md_parts.extend(
+                    [
+                        "- "
+                        + _inline_replacements(
+                            text,
+                            reference_texts,
+                            footnote_callouts.get(id(item), []),
+                            markdown=True,
+                        ),
+                        "",
+                    ]
+                )
+            elif item.kind == "footnote" and id(item) in footnotes:
+                footnote_id, marker, body = footnotes[id(item)]
+                html_parts.append(
+                    f'<aside class="footnote" id="fn-{footnote_id}">'
+                    f'<span class="footnote-label">{html.escape(marker)}</span> '
+                    f"{html.escape(body)} "
+                    f'<a class="footnote-backref" href="#fnref-{footnote_id}" '
+                    f'aria-label="Back to footnote callout">↩</a></aside>'
+                )
+                md_parts.extend(
+                    [
+                        f'<a id="fn-{footnote_id}"></a><sup>{marker}</sup> '
+                        f"{body} [↩](#fnref-{footnote_id})",
+                        "",
+                    ]
+                )
             elif item.kind == "footnote":
                 html_parts.append(f'<aside class="footnote">{html.escape(text)}</aside>')
                 md_parts.extend([f"> Footnote: {text}", ""])
             else:
-                html_parts.append(f"<p>{html.escape(text)}</p>")
-                md_parts.extend([text, ""])
+                html_parts.append(
+                    "<p>"
+                    + _inline_replacements(
+                        text,
+                        reference_texts,
+                        footnote_callouts.get(id(item), []),
+                        markdown=False,
+                    )
+                    + "</p>"
+                )
+                md_parts.extend(
+                    [
+                        _inline_replacements(
+                            text,
+                            reference_texts,
+                            footnote_callouts.get(id(item), []),
+                            markdown=True,
+                        ),
+                        "",
+                    ]
+                )
             counts["text"] += 1
         elif item.kind in {"algorithm", "code"}:
             algorithm = item.kind == "algorithm"
@@ -1662,11 +2187,26 @@ def _render(
                 html_parts.append(
                     f'<div class="{css_class}-title">{html.escape(title_text)}</div>'
                 )
-            html_parts.append(f"<pre><code>{html.escape(code)}</code></pre>")
+            highlighted = (
+                _highlight_algorithm_html(code)
+                if algorithm
+                else _highlight_python_html(code)
+            )
+            html_parts.append(f"<pre><code>{highlighted}</code></pre>")
             html_parts.append("</section>")
             if title_text:
                 md_parts.extend([f"**{title_text}**", ""])
-            md_parts.extend(["```text" if algorithm else "```python", code, "```", ""])
+            if algorithm:
+                md_parts.extend(
+                    [
+                        '<pre class="algorithm"><code>'
+                        + _highlight_algorithm_html(code)
+                        + "</code></pre>",
+                        "",
+                    ]
+                )
+            else:
+                md_parts.extend(["```python", code, "```", ""])
             counts["algorithms" if algorithm else "code_blocks"] += 1
         elif item.kind == "formula":
             tex, number = _formula_tex(item, source)
@@ -1698,8 +2238,15 @@ def _render(
                 caption = _source_caption(source, item, kind="table") or caption
             html_parts.append('<figure class="semantic-table">')
             if caption:
-                html_parts.append(f"<figcaption>{html.escape(caption)}</figcaption>")
+                html_parts.append(
+                    "<figcaption>"
+                    + _inline_replacements(
+                        caption, reference_texts, [], markdown=False
+                    )
+                    + "</figcaption>"
+                )
             html_parts.append("<div class=\"table-scroll\"><table>")
+            table_callouts = table_footnote_callouts.get(id(item), [])
             for row_index, row in enumerate(grid):
                 tag = "th" if row_index < header_rows else "td"
                 html_parts.append("<tr>")
@@ -1707,7 +2254,13 @@ def _render(
                     html_parts.append(
                         f"<{tag}>"
                         + "<br>".join(
-                            html.escape(part.strip()) for part in value.splitlines()
+                            _inline_replacements(
+                                part.strip(),
+                                reference_texts,
+                                table_callouts,
+                                markdown=False,
+                            )
+                            for part in value.splitlines()
                         )
                         + f"</{tag}>"
                     )
@@ -1715,7 +2268,16 @@ def _render(
             html_parts.append("</table></div></figure>")
             if caption:
                 md_parts.extend([f"**{caption}**", ""])
-            md_parts.extend([_markdown_table(grid), ""])
+            md_parts.extend(
+                [
+                    _markdown_table(
+                        grid,
+                        reference_texts=reference_texts,
+                        footnote_callouts=table_callouts,
+                    ),
+                    "",
+                ]
+            )
             counts["tables"] += 1
         elif item.kind == "picture":
             picture_index = picture_counter.get(id(node))
@@ -1742,24 +2304,33 @@ def _render(
 
     style = """
 body{max-width:980px;margin:0 auto;padding:2rem 2.5rem;color:#172033;
-font:17px/1.58 Georgia,"Times New Roman",serif;background:#fff}
+font:17px/1.58 Georgia,"STIX Two Text","Times New Roman","Noto Serif",serif;
+background:#fff}
 h1,h2,h3,h4,h5,h6{font-family:ui-sans-serif,system-ui,sans-serif;line-height:1.25;
 margin:1.55em 0 .65em}p{margin:.65em 0;text-align:justify}
 .formula{position:relative;display:flex;align-items:center;justify-content:center;
 gap:1rem;margin:1.25rem 0;padding:.75rem 4.5rem .5rem 1rem;overflow-x:auto}
-.formula math{font-size:1.14em}.equation-number{position:absolute;right:1rem}
+.formula math{font-size:1.14em;font-family:"STIX Two Math","Cambria Math",
+"Noto Sans Math",math}.equation-number{position:absolute;right:1rem}
 .formula details{font:12px/1.4 ui-monospace,monospace;color:#596273}
 .algorithm,.code-listing{margin:1.3rem 0;border:1px solid #aeb7c4;background:#fafafa}
 .algorithm-title,.code-listing-title{padding:.45rem .7rem;border-bottom:1px solid #aeb7c4;
 font-weight:700}.algorithm pre,.code-listing pre{margin:0;padding:.8rem 1rem;overflow:auto;
-font:14px/1.45 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;white-space:pre}
+font:14px/1.45 ui-monospace,SFMono-Regular,Menlo,Consolas,"STIX Two Math",
+"Noto Sans Math",monospace;white-space:pre}
+.alg-keyword,.code-keyword{font-weight:700;color:#7c2d12}.alg-comment,.code-comment{
+font-style:italic;color:#477052}.code-string{color:#9a3412}.code-number{color:#1d4ed8}
+.line-number{color:#64748b;font-weight:600}
 .semantic-table{margin:1.4rem 0}.semantic-table figcaption{text-align:center;
 font-weight:700;margin-bottom:.5rem}.table-scroll{overflow-x:auto}
 table{width:100%;border-collapse:collapse;font-size:.9em}th,td{border:1px solid #8f99a8;
 padding:.35rem .48rem;vertical-align:top}th{background:#eef2f6}
 .picture{text-align:center;margin:1.4rem auto}.picture img{max-width:100%;height:auto}
-.picture figcaption{margin-top:.45rem}.footnote{font-size:.86em;color:#3f4857;
-border-top:1px solid #c9cfd8;padding-top:.4rem}
+.picture figcaption{margin-top:.45rem}.citation{text-decoration:none;color:#2457a6}
+.citation:hover{text-decoration:underline}.reference-entry{padding-left:2.9rem;
+text-indent:-2.9rem;margin:.5rem 0}.reference-number{font-variant-numeric:tabular-nums}
+.footnote{font-size:.86em;color:#3f4857;border-top:1px solid #c9cfd8;
+padding-top:.4rem}.footnote-label{font-weight:700}.footnote-backref{text-decoration:none}
 @media(max-width:700px){body{padding:1rem}.formula{padding-right:3.5rem;font-size:.9em}}
 """
     html_document = (
@@ -1823,10 +2394,27 @@ def rebuild_semantic_surfaces(
             if isinstance(chunk, dict) and isinstance(chunk.get("document"), dict)
         ]
         documents = chunk_documents or [document]
-        rendered_parts: list[tuple[str, str, dict[str, int], int]] = []
+        prepared_parts: list[tuple[dict[str, Any], list[FlowItem], int]] = []
+        shared_reference_texts: list[tuple[int, str]] = []
+        reference_offset = 0
         for part in documents:
             items = _sort_items(_collect_items(part, source), part)
-            part_html, part_md, part_counts = _render(items, part, source)
+            _reference_map, local_reference_texts = _reference_items(items)
+            prepared_parts.append((part, items, reference_offset))
+            shared_reference_texts.extend(
+                (number + reference_offset, text)
+                for number, text in local_reference_texts
+            )
+            reference_offset += len(local_reference_texts)
+        rendered_parts: list[tuple[str, str, dict[str, int], int]] = []
+        for part, items, part_reference_offset in prepared_parts:
+            part_html, part_md, part_counts = _render(
+                items,
+                part,
+                source,
+                shared_reference_texts=shared_reference_texts,
+                reference_number_offset=part_reference_offset,
+            )
             rendered_parts.append((part_html, part_md, part_counts, len(items)))
         total_items = sum(value[3] for value in rendered_parts)
         if total_items == 0:
