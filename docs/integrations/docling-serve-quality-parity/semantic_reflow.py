@@ -898,6 +898,51 @@ def _sort_items(
     items: list[FlowItem],
     document: dict[str, Any],
 ) -> list[FlowItem]:
+    edge_heading_pages: dict[str, set[int]] = {}
+    edge_heading_ids: dict[str, set[int]] = {}
+    for item in items:
+        if item.kind != "heading":
+            continue
+        text = re.sub(
+            r"\s+",
+            " ",
+            str(item.node.get("text") or item.source_text),
+        ).strip()
+        if not text or len(text) > 160 or re.match(r"^\d+(?:\.\d+)*\b", text):
+            continue
+        page_record = (document.get("pages") or {}).get(str(item.page_no)) or {}
+        page_height = float(
+            ((page_record.get("size") or {}).get("height")) or 792.0
+        )
+        origin = str(
+            ((item.prov.get("bbox") or {}).get("coord_origin")) or "BOTTOMLEFT"
+        ).upper()
+        low = min(item.bbox["t"], item.bbox["b"])
+        high = max(item.bbox["t"], item.bbox["b"])
+        if origin == "TOPLEFT":
+            top_distance = low
+            bottom_distance = page_height - high
+        else:
+            top_distance = page_height - high
+            bottom_distance = low
+        if min(top_distance, bottom_distance) > page_height * 0.1:
+            continue
+        key = _normalized_lookup(text)
+        edge_heading_pages.setdefault(key, set()).add(item.page_no)
+        edge_heading_ids.setdefault(key, set()).add(id(item))
+    repeated_edge_heading_ids = {
+        item_id
+        for key, pages in edge_heading_pages.items()
+        if len(pages) >= 2
+        for item_id in edge_heading_ids[key]
+    }
+    if repeated_edge_heading_ids:
+        items = [
+            item
+            for item in items
+            if id(item) not in repeated_edge_heading_ids
+        ]
+
     by_page: dict[int, list[FlowItem]] = {}
     for item in items:
         by_page.setdefault(item.page_no, []).append(item)
@@ -2267,7 +2312,8 @@ def _reference_items(
     reference_texts: list[tuple[int, str]] = []
     in_references = False
     reference_level = 7
-    for item in items:
+    last_reference_item: FlowItem | None = None
+    for index, item in enumerate(items):
         if item.kind == "heading":
             heading = _paragraph_text(str(item.node.get("text") or item.source_text))
             level = _heading_level(heading, item.node)
@@ -2276,15 +2322,70 @@ def _reference_items(
                 reference_level = level
                 continue
             if in_references and level <= reference_level:
+                following_candidates = [
+                    candidate
+                    for candidate in items[index + 1 : index + 5]
+                    if _paragraph_text(candidate.source_text)
+                ]
+                following = (
+                    following_candidates[0]
+                    if following_candidates
+                    else None
+                )
+                following_text = (
+                    _paragraph_text(following.source_text)
+                    if following is not None
+                    else ""
+                )
+                following_window_text = " ".join(
+                    _paragraph_text(candidate.source_text)
+                    for candidate in following_candidates
+                )
+                page_header_between_references = bool(
+                    following is not None
+                    and following.kind in {"text", "list_item", "footnote"}
+                    and re.search(r"(?:19|20)\d{2}", following_window_text)
+                    and re.search(
+                        r"^[A-ZÀ-ÖØ-Þ][\wÀ-ÖØ-öø-ÿ'’.-]+",
+                        following_text,
+                    )
+                    and len(heading) <= 120
+                    and not re.match(
+                        r"(?i)^(?:appendix|supplement|acknowledg|"
+                        r"author contributions?|limitations?)\b",
+                        heading,
+                    )
+                )
+                if page_header_between_references:
+                    item.kind = "reference_page_header"
+                    continue
                 in_references = False
         if (
             in_references
             and item.kind in {"text", "list_item", "footnote"}
             and (text := _paragraph_text(item.source_text))
         ):
+            if (
+                last_reference_item is not None
+                and not re.search(r"[.!?]\s*$", last_reference_item.source_text)
+                and re.match(r"^[a-zà-öø-ÿ]", text)
+            ):
+                last_reference_item.source_text = (
+                    last_reference_item.source_text.rstrip()
+                    + " "
+                    + text.lstrip()
+                )
+                previous_number, previous_text = reference_texts[-1]
+                reference_texts[-1] = (
+                    previous_number,
+                    previous_text.rstrip() + " " + text.lstrip(),
+                )
+                item.kind = "reference_continuation"
+                continue
             number = len(reference_texts) + 1
             references[id(item)] = number
             reference_texts.append((number, re.sub(r"^\[\d+\]\s*", "", text)))
+            last_reference_item = item
     return references, reference_texts
 
 
@@ -2384,10 +2485,26 @@ def _table_note_relations(
 
 def _normalized_lookup(value: str) -> str:
     decomposed = unicodedata.normalize("NFKD", value).casefold()
-    return "".join(char for char in decomposed if not unicodedata.combining(char))
+    return "".join(
+        char
+        for char in decomposed
+        if not unicodedata.combining(char) and char.isalnum()
+    )
 
 
 _AUTHOR_YEAR_PATTERNS = (
+    re.compile(
+        r"\b[A-ZÀ-ÖØ-Þ][\wÀ-ÖØ-öø-ÿ'’.-]+\s+(?:and|&)\s+"
+        r"(?:[A-ZÀ-ÖØ-Þ][\wÀ-ÖØ-öø-ÿ'’.-]+\s+){1,2}"
+        r"[A-ZÀ-ÖØ-Þ][\wÀ-ÖØ-öø-ÿ'’.-]+\s+"
+        r"(?:\[(?:19|20)\d{2}[a-z]?\]|\((?:19|20)\d{2}[a-z]?\)|"
+        r",?\s*(?:19|20)\d{2}[a-z]?)"
+    ),
+    re.compile(
+        r"\b(?:[A-ZÀ-ÖØ-Þ][\wÀ-ÖØ-öø-ÿ'’.-]+)"
+        r"(?:\s+(?:and|&)\s+[A-ZÀ-ÖØ-Þ][\wÀ-ÖØ-öø-ÿ'’.-]+|\s+et al\.)?"
+        r"\s+\[(?:19|20)\d{2}[a-z]?\]"
+    ),
     re.compile(
         r"\b(?:[A-ZÀ-ÖØ-Þ][\wÀ-ÖØ-öø-ÿ'’.-]+)"
         r"(?:\s+(?:and|&)\s+[A-ZÀ-ÖØ-Þ][\wÀ-ÖØ-öø-ÿ'’.-]+|\s+et al\.)?"
@@ -2403,35 +2520,156 @@ _AUTHOR_YEAR_PATTERNS = (
         r"(?:\s+(?:and|&)\s+[A-ZÀ-ÖØ-Þ][\wÀ-ÖØ-öø-ÿ'’.-]+|\s+et al\.)?"
         r",\s*(?:19|20)\d{2}[a-z]?"
     ),
+    re.compile(
+        r"\b(?:[A-ZÀ-ÖØ-Þ][\wÀ-ÖØ-öø-ÿ'’.-]+)"
+        r"(?:\s+(?:and|&)\s+[A-ZÀ-ÖØ-Þ][\wÀ-ÖØ-öø-ÿ'’.-]+|\s+et al\.)?"
+        r"\.?\s+(?:19|20)\d{2}[a-z]?"
+    ),
 )
+
+_SQUARE_AUTHOR_YEAR_SEGMENT_RE = re.compile(
+    r"(?P<label>[A-ZÀ-ÖØ-Þ][\wÀ-ÖØ-öø-ÿ'’.-]+"
+    r"(?:\s+(?:and|&)\s+[A-ZÀ-ÖØ-Þ][\wÀ-ÖØ-öø-ÿ'’.-]+|\s+et al\.)?"
+    r"\s+(?:19|20)\d{2}[a-z]?)"
+)
+
+
+def _reference_author_segment(reference: str) -> str:
+    for match in re.finditer(r"\.", reference):
+        preceding = re.search(
+            r"([^\W\d_]+(?:['’.-][^\W\d_]+)*)\s*$",
+            reference[: match.start()],
+        )
+        token = (
+            re.sub(r"[\W\d_]", "", preceding.group(1))
+            if preceding
+            else ""
+        )
+        if len(token) == 1 and token.isupper():
+            continue
+        return reference[: match.start()]
+    return reference
+
+
+def _reference_first_author_raw(reference: str) -> str:
+    et_al = re.match(
+        r"\s*([^\W\d_]+(?:['’.-][^\W\d_]+)*)\s+et al\.",
+        reference,
+        flags=re.IGNORECASE,
+    )
+    if et_al:
+        return et_al.group(1)
+    first_author = re.split(
+        r",|\band\b|;",
+        _reference_author_segment(reference),
+        maxsplit=1,
+    )[0]
+    names = re.findall(r"[^\W\d_]+(?:['’.-][^\W\d_]+)*", first_author)
+    if not names:
+        return ""
+    if len(names) == 1:
+        return names[0]
+    non_initials = [
+        name
+        for name in names
+        if len(re.sub(r"[\W\d_]", "", name)) > 1
+    ]
+    return (non_initials or names)[-1]
+
+
+def _reference_first_author_surname(reference: str) -> str:
+    return _normalized_lookup(_reference_first_author_raw(reference))
 
 
 def _author_year_target(
     label: str,
     reference_texts: list[tuple[int, str]],
 ) -> int | None:
-    year_match = re.search(r"(?:19|20)\d{2}", label)
+    year_match = re.search(
+        r"((?:19|20)\d{2})([a-z]?)",
+        label,
+        flags=re.IGNORECASE,
+    )
     names = re.findall(r"[A-ZÀ-ÖØ-Þ][\wÀ-ÖØ-öø-ÿ'’.-]+", label)
     if not year_match or not names:
         return None
     surnames = [_normalized_lookup(name.rstrip(".")) for name in names]
-    year = year_match.group(0)
-    matches: list[int] = []
+    year = year_match.group(1)
+    year_suffix = year_match.group(2).casefold()
+    year_token = f"{year}{year_suffix}"
+    citation_uses_et_al = bool(re.search(r"\bet al\.", label, flags=re.IGNORECASE))
+    citation_primary_raw = unicodedata.normalize(
+        "NFC",
+        names[0].rstrip("."),
+    ).casefold()
+    matches: list[tuple[int, bool, bool]] = []
     for index, (number, reference) in enumerate(reference_texts):
         normalized_reference = _normalized_lookup(reference)
+        first_author_raw = _reference_first_author_raw(reference)
+        first_author_surname = _reference_first_author_surname(reference)
         next_text = (
             reference_texts[index + 1][1]
             if index + 1 < len(reference_texts)
             else ""
         )
-        reference_years = re.findall(r"(?:19|20)\d{2}", reference)
-        has_names = all(surname in normalized_reference for surname in surnames)
+        reference_year_tokens = [
+            value.casefold()
+            for value in re.findall(
+                r"(?:19|20)\d{2}[a-z]?",
+                reference,
+                flags=re.IGNORECASE,
+            )
+        ]
+        has_names = (
+            (
+                not first_author_surname
+                or surnames[0] == first_author_surname
+                or (
+                    first_author_surname.endswith(surnames[0])
+                    and len(first_author_surname) - len(surnames[0]) <= 16
+                )
+            )
+            and all(
+                surname in normalized_reference
+                for surname in surnames[1:]
+            )
+        )
+        supports_et_al = (
+            bool(
+                re.match(
+                    r"\s*[^\W\d_]+(?:['’.-][^\W\d_]+)*\s+et al\.",
+                    reference,
+                    flags=re.IGNORECASE,
+                )
+            )
+            or _reference_author_segment(reference).count(",") >= 2
+        )
+        exact_primary_spelling = (
+            unicodedata.normalize("NFC", first_author_raw).casefold()
+            == citation_primary_raw
+        )
+        has_year = (
+            year_token in reference_year_tokens
+            if year_suffix
+            else any(value.startswith(year) for value in reference_year_tokens)
+        )
         if has_names and (
-            year in reference
-            or (not reference_years and year in next_text)
+            has_year
+            or (
+                not reference_year_tokens
+                and re.search(
+                    rf"\b{re.escape(year_token)}\b",
+                    next_text,
+                    flags=re.IGNORECASE,
+                )
+            )
         ):
-            matches.append(number)
-    return matches[0] if len(matches) == 1 else None
+            matches.append((number, supports_et_al, exact_primary_spelling))
+    if citation_uses_et_al and any(match[1] for match in matches):
+        matches = [match for match in matches if match[1]]
+    if len(matches) > 1 and any(match[2] for match in matches):
+        matches = [match for match in matches if match[2]]
+    return matches[0][0] if len(matches) == 1 else None
 
 
 def _inline_replacements(
@@ -2492,6 +2730,49 @@ def _inline_replacements(
             replacement = f"[{linked}]"
         replacements.append((match.start(), match.end(), replacement))
         occupied.append((match.start(), match.end()))
+
+    for group in re.finditer(r"\[([^\[\]\n]{3,500})\]", text):
+        if not available(group.start(), group.end()):
+            continue
+        parts = re.split(r"(;\s*)", group.group(1))
+        linked = 0
+        rendered_parts: list[str] = []
+        for part in parts:
+            if part.startswith(";"):
+                rendered_parts.append(part)
+                continue
+            leading = part[: len(part) - len(part.lstrip())]
+            trailing = part[len(part.rstrip()) :]
+            core = part.strip()
+            segment = _SQUARE_AUTHOR_YEAR_SEGMENT_RE.fullmatch(core)
+            number = (
+                _author_year_target(segment.group("label"), reference_texts)
+                if segment
+                else None
+            )
+            if number is None:
+                rendered_core = (
+                    core if markdown else html.escape(core, quote=False)
+                )
+            else:
+                visible = (
+                    core if markdown else html.escape(core, quote=False)
+                )
+                rendered_core = (
+                    f"[{visible}](#ref-{number})"
+                    if markdown
+                    else (
+                        f'<a class="citation" href="#ref-{number}">'
+                        f"{visible}</a>"
+                    )
+                )
+                linked += 1
+            rendered_parts.append(leading + rendered_core + trailing)
+        if not linked:
+            continue
+        replacement = "[" + "".join(rendered_parts) + "]"
+        replacements.append((group.start(), group.end(), replacement))
+        occupied.append((group.start(), group.end()))
 
     for pattern in _AUTHOR_YEAR_PATTERNS:
         for match in pattern.finditer(text):
@@ -2792,15 +3073,27 @@ def _render(
                     if note_id in linked_table_note_ids
                     else ""
                 )
+                linked_body_html = _inline_replacements(
+                    body,
+                    reference_texts,
+                    [],
+                    markdown=False,
+                )
+                linked_body_md = _inline_replacements(
+                    body,
+                    reference_texts,
+                    [],
+                    markdown=True,
+                )
                 html_parts.append(
                     f'<aside class="footnote table-note" id="fn-{note_id}">'
                     f'<span class="footnote-label">{html.escape(marker)}</span> '
-                    f"{html.escape(body)}{backref_html}</aside>"
+                    f"{linked_body_html}{backref_html}</aside>"
                 )
                 md_parts.extend(
                     [
                         f'<a id="fn-{note_id}"></a><sup>{marker}</sup> '
-                        f"{body}{backref_md}",
+                        f"{linked_body_md}{backref_md}",
                         "",
                     ]
                 )
@@ -2840,21 +3133,53 @@ def _render(
                     if footnote_id in linked_footnote_ids
                     else ""
                 )
+                linked_body_html = _inline_replacements(
+                    body,
+                    reference_texts,
+                    [],
+                    markdown=False,
+                )
+                linked_body_md = _inline_replacements(
+                    body,
+                    reference_texts,
+                    [],
+                    markdown=True,
+                )
                 html_parts.append(
                     f'<aside class="footnote" id="fn-{footnote_id}">'
                     f'<span class="footnote-label">{html.escape(marker)}</span> '
-                    f"{html.escape(body)}{backref_html}</aside>"
+                    f"{linked_body_html}{backref_html}</aside>"
                 )
                 md_parts.extend(
                     [
                         f'<a id="fn-{footnote_id}"></a><sup>{marker}</sup> '
-                        f"{body}{backref_md}",
+                        f"{linked_body_md}{backref_md}",
                         "",
                     ]
                 )
             elif item.kind == "footnote":
-                html_parts.append(f'<aside class="footnote">{html.escape(text)}</aside>')
-                md_parts.extend([f"> Footnote: {text}", ""])
+                html_parts.append(
+                    '<aside class="footnote">'
+                    + _inline_replacements(
+                        text,
+                        reference_texts,
+                        [],
+                        markdown=False,
+                    )
+                    + "</aside>"
+                )
+                md_parts.extend(
+                    [
+                        "> Footnote: "
+                        + _inline_replacements(
+                            text,
+                            reference_texts,
+                            [],
+                            markdown=True,
+                        ),
+                        "",
+                    ]
+                )
             else:
                 html_parts.append(
                     "<p>"
@@ -3029,11 +3354,33 @@ def _render(
                     f'<img src="{image_path}" alt="{html.escape(caption or "Figure", quote=True)}">'
                 )
                 if caption:
-                    html_parts.append(f"<figcaption>{html.escape(caption)}</figcaption>")
+                    html_parts.append(
+                        "<figcaption>"
+                        + _inline_replacements(
+                            caption,
+                            reference_texts,
+                            footnote_callouts.get(id(item), []),
+                            markdown=False,
+                        )
+                        + "</figcaption>"
+                    )
                 html_parts.append("</figure>")
-                md_parts.extend(
-                    [f"![{caption or 'Figure'}]({image_path})", ""]
+                markdown_caption = (
+                    _inline_replacements(
+                        caption,
+                        reference_texts,
+                        footnote_callouts.get(id(item), []),
+                        markdown=True,
+                    )
+                    if caption
+                    else "Figure"
                 )
+                md_parts.append(
+                    f"![{caption or 'Figure'}]({image_path})"
+                )
+                if caption:
+                    md_parts.append(f"*{markdown_caption}*")
+                md_parts.append("")
                 counts["pictures"] += 1
 
     style = """
