@@ -125,6 +125,173 @@ class SemanticReflowTests(unittest.TestCase):
         )
         self.assertIn('href="#ref-2">Defazio et al. (2014)</a>', repeated_author)
 
+        square_year = semantic_reflow._inline_replacements(
+            "Demené et al. [2015]",
+            [(1, "Demené et al. Spatiotemporal clutter filtering. 2015.")],
+            [],
+            markdown=False,
+        )
+        self.assertIn('href="#ref-1">Demené et al. [2015]</a>', square_year)
+
+        square_group = semantic_reflow._inline_replacements(
+            "[Blattmann et al. 2023; Wan et al. 2025; Unknown et al. 2024]",
+            [
+                (1, "Blattmann et al. Stable Video Diffusion. 2023."),
+                (2, "Wan et al. Video generation. 2025."),
+            ],
+            [],
+            markdown=False,
+        )
+        self.assertIn(
+            '[<a class="citation" href="#ref-1">Blattmann et al. 2023</a>; '
+            '<a class="citation" href="#ref-2">Wan et al. 2025</a>; '
+            "Unknown et al. 2024]",
+            square_group,
+        )
+
+        suffixed_year = semantic_reflow._inline_replacements(
+            "Peters et al. [2018b]",
+            [
+                (1, "Peters et al. First study. 2018a."),
+                (2, "Peters et al. Second study. 2018b."),
+            ],
+            [],
+            markdown=False,
+        )
+        self.assertIn('href="#ref-2">Peters et al. [2018b]</a>', suffixed_year)
+
+        generalized_styles = semantic_reflow._inline_replacements(
+            (
+                "NVIDIA Corporation [2026]; Golub and Van Loan [2013]; "
+                "Nedić et al. (2017); Kim et al. 2025"
+            ),
+            [
+                (1, "NVIDIA Corporation. cuSOLVER Library, 2026."),
+                (2, "Gene H Golub and Charles F Van Loan. Matrix computations. 2013."),
+                (
+                    3,
+                    "Nedic, A., Olshevsky, A., and Shi, W. "
+                    "(2017). Distributed optimization.",
+                ),
+                (
+                    4,
+                    "Nedić, A., Olshevsky, A., and Uribe, C. "
+                    "(2017). Distributed learning.",
+                ),
+                (
+                    5,
+                    "Hoiyeong Jin, Hyojin Jang, Jeongho Kim, and Jaegul Choo. "
+                    "2025. Insert Anywhere.",
+                ),
+                (
+                    6,
+                    "GeonungKim, Janghyeok Han, and Sunghyun Cho. "
+                    "2025. Video From 3D.",
+                ),
+            ],
+            [],
+            markdown=False,
+        )
+        self.assertIn(
+            'href="#ref-1">Corporation [2026]</a>',
+            generalized_styles,
+        )
+        self.assertIn(
+            'href="#ref-2">Golub and Van Loan [2013]</a>',
+            generalized_styles,
+        )
+        self.assertIn(
+            'href="#ref-4">Nedić et al. (2017)</a>',
+            generalized_styles,
+        )
+        self.assertIn(
+            'href="#ref-6">Kim et al. 2025</a>',
+            generalized_styles,
+        )
+
+    def test_reference_page_header_does_not_end_bibliography(self) -> None:
+        def item(kind: str, text: str, rank: float) -> semantic_reflow.FlowItem:
+            return semantic_reflow.FlowItem(
+                kind=kind,
+                node={"text": text},
+                rank=rank,
+                page_no=1,
+                bbox={"l": 0.0, "r": 100.0, "t": 100.0, "b": 0.0},
+                prov={"page_no": 1, "bbox": {}},
+                source_text=text,
+            )
+
+        first = item(
+            "list_item",
+            "Simon Batzner et al. Equivariant networks. 2022.",
+            2.0,
+        )
+        second = item(
+            "list_item",
+            "Yair Schiff et al. Caduceus. In Proceedings, volume 235",
+            4.0,
+        )
+        continuation = item(
+            "list_item",
+            "of Proceedings of Machine Learning Research, PMLR, 2024.",
+            5.0,
+        )
+        page_header = item("heading", "Li and Cheng", 3.0)
+        items = [
+            item("heading", "References", 1.0),
+            first,
+            page_header,
+            second,
+            continuation,
+        ]
+
+        references, texts = semantic_reflow._reference_items(items)
+
+        self.assertEqual(references[id(first)], 1)
+        self.assertEqual(references[id(second)], 2)
+        self.assertNotIn(id(continuation), references)
+        self.assertEqual(continuation.kind, "reference_continuation")
+        self.assertEqual(page_header.kind, "reference_page_header")
+        self.assertEqual(len(texts), 2)
+        self.assertIn("PMLR, 2024.", texts[1][1])
+
+    def test_repeated_page_edge_heading_is_removed_as_running_header(self) -> None:
+        def heading(text: str, page: int, top: float) -> semantic_reflow.FlowItem:
+            bbox = {
+                "l": 200.0,
+                "r": 350.0,
+                "t": top,
+                "b": top - 8.0,
+            }
+            return semantic_reflow.FlowItem(
+                kind="heading",
+                node={"text": text},
+                rank=float(page),
+                page_no=page,
+                bbox=bbox,
+                prov={
+                    "page_no": page,
+                    "bbox": {**bbox, "coord_origin": "BOTTOMLEFT"},
+                },
+            )
+
+        repeated_one = heading("Li and Cheng", 1, 755.0)
+        repeated_two = heading("Li and Cheng", 2, 755.0)
+        real_heading = heading("Related Work", 2, 620.0)
+        document = {
+            "pages": {
+                "1": {"size": {"width": 612.0, "height": 792.0}},
+                "2": {"size": {"width": 612.0, "height": 792.0}},
+            }
+        }
+
+        result = semantic_reflow._sort_items(
+            [repeated_one, repeated_two, real_heading],
+            document,
+        )
+
+        self.assertEqual(result, [real_heading])
+
     def test_footnote_relation_skips_matching_section_number(self) -> None:
         callout = semantic_reflow.FlowItem(
             "text", {}, 1.0, 1, {}, {}, "travel salesman problem 5"
