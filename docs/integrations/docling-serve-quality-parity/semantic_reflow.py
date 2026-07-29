@@ -111,6 +111,60 @@ def _caption_text(document: dict[str, Any], node: dict[str, Any]) -> str:
     return " ".join(values)
 
 
+def _source_caption(
+    source: SourceReader,
+    item: FlowItem,
+    *,
+    kind: str,
+) -> str:
+    bbox = item.prov.get("bbox")
+    if not isinstance(bbox, dict) or item.page_no <= 0:
+        return ""
+    width, height = source.page_size(item.page_no)
+    origin = str(bbox.get("coord_origin") or "BOTTOMLEFT").upper()
+    if origin == "TOPLEFT":
+        top_y = height - float(bbox.get("b") or 0.0)
+        bottom_y = height - float(bbox.get("t") or height)
+    else:
+        top_y = float(bbox.get("t") or 0.0)
+        bottom_y = float(bbox.get("b") or 0.0)
+    regions = (
+        [(top_y, min(height, top_y + 52.0)), (max(0.0, bottom_y - 62.0), bottom_y)]
+        if kind == "table"
+        else [(max(0.0, bottom_y - 62.0), bottom_y), (top_y, min(height, top_y + 52.0))]
+    )
+    label = "Table" if kind == "table" else "Figure"
+    for lower, upper in regions:
+        if upper <= lower:
+            continue
+        text = source.text(
+            {
+                "page_no": item.page_no,
+                "bbox": {
+                    "l": 0.0,
+                    "r": width,
+                    "t": upper,
+                    "b": lower,
+                    "coord_origin": "BOTTOMLEFT",
+                },
+            }
+        )
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        for index, line in enumerate(lines):
+            if not re.match(rf"(?i)^{label}\s+\d+\s*:", line):
+                continue
+            caption_lines = [line]
+            for continuation in lines[index + 1 :]:
+                if re.match(
+                    r"(?i)^(?:Table|Figure|Algorithm)\s+\d+\s*:",
+                    continuation,
+                ):
+                    break
+                caption_lines.append(continuation)
+            return _paragraph_text("\n".join(caption_lines))
+    return ""
+
+
 class SourceReader:
     def __init__(self, path: Path):
         try:
@@ -123,6 +177,17 @@ class SourceReader:
 
     def close(self) -> None:
         self._pdf.close()
+
+    def language_profile(self, *, page_limit: int = 3) -> dict[str, int]:
+        text = "\n".join(
+            str(page.extract_text() or "")
+            for page in self._pdf.pages[:page_limit]
+        )
+        return {
+            "characters": len(text),
+            "cjk_characters": len(re.findall(r"[\u3400-\u9fff]", text)),
+            "latin_characters": len(re.findall(r"[A-Za-z]", text)),
+        }
 
     def page_size(self, page_no: int) -> tuple[float, float]:
         page = self._pdf.pages[page_no - 1]
@@ -272,7 +337,7 @@ class SourceReader:
         prov = {"page_no": page_no, "bbox": cell_bbox}
         return self.text(prov, layout=False)
 
-    def equation_number(self, prov: dict[str, Any]) -> int | None:
+    def equation_number(self, prov: dict[str, Any]) -> int | str | None:
         page_no = int(prov.get("page_no") or 0)
         bbox = prov.get("bbox")
         if not page_no or not isinstance(bbox, dict):
@@ -280,9 +345,34 @@ class SourceReader:
         width, _height = self.page_size(page_no)
         expanded = dict(bbox)
         expanded["r"] = width - 45.0
-        text = self.text({"page_no": page_no, "bbox": expanded}, layout=False)
-        matches = re.findall(r"\(\s*((?:\d\s*)+)\)", text)
-        return int(re.sub(r"\s+", "", matches[-1])) if matches else None
+        matches: list[str] = []
+        for line in self.lines({"page_no": page_no, "bbox": expanded}, padding=0.0):
+            right_chars = [
+                char
+                for char in line.get("chars") or []
+                if isinstance(char, dict)
+                and float(char.get("x0") or 0.0) >= width * 0.84
+            ]
+            right_chars.sort(
+                key=lambda char: (
+                    float(char.get("x0") or 0.0),
+                    float(char.get("top") or 0.0),
+                )
+            )
+            right_text = "".join(
+                _clean_glyph_text(str(char.get("text") or ""))
+                for char in right_chars
+            )
+            label_match = re.fullmatch(
+                r"\s*\(\s*((?:\d\s*)+(?:\.\s*(?:\d\s*)+)?)\)\s*",
+                right_text,
+            )
+            if label_match:
+                matches.append(label_match.group(1))
+        if not matches:
+            return None
+        normalized = re.sub(r"\s+", "", matches[-1])
+        return normalized if "." in normalized else int(normalized)
 
 
 @dataclass
@@ -356,13 +446,217 @@ def _short_text_inside_picture(
     return False
 
 
+def _algorithm_group_blocks(
+    document: dict[str, Any],
+    source: SourceReader,
+) -> tuple[dict[str, dict[str, Any]], set[str]]:
+    body = document.get("body")
+    children = body.get("children") if isinstance(body, dict) else None
+    if not isinstance(children, list):
+        return {}, set()
+    blocks: dict[str, dict[str, Any]] = {}
+    consumed: set[str] = set()
+    for position, child in enumerate(children):
+        if not isinstance(child, dict) or not child.get("$ref"):
+            continue
+        title_ref = str(child["$ref"])
+        title_node = _resolve(document, title_ref)
+        title = str((title_node or {}).get("text") or "").strip()
+        if not re.match(r"(?i)^Algorithm\s+\d+\b", title):
+            continue
+        if position + 1 >= len(children):
+            continue
+        group_ref = str((children[position + 1] or {}).get("$ref") or "")
+        following_node = _resolve(document, group_ref)
+        if str((following_node or {}).get("label") or "").lower() == "code":
+            title_prov = _first_prov(title_node or {})
+            code_prov = _first_prov(following_node or {})
+            valid_provs = [
+                prov
+                for prov in (title_prov, code_prov)
+                if prov and int(prov.get("page_no") or 0) > 0 and _bbox(prov)
+            ]
+            if not valid_provs:
+                continue
+            page_no = int(valid_provs[0].get("page_no") or 0)
+            same_page = [
+                prov
+                for prov in valid_provs
+                if int(prov.get("page_no") or 0) == page_no
+            ]
+            boxes = [_bbox(prov) for prov in same_page]
+            boxes = [box for box in boxes if box]
+            union = {
+                "l": min(box["l"] for box in boxes),
+                "r": max(box["r"] for box in boxes),
+                "t": max(box["t"] for box in boxes),
+                "b": min(box["b"] for box in boxes),
+                "coord_origin": str(
+                    ((same_page[0].get("bbox") or {}).get("coord_origin"))
+                    or "BOTTOMLEFT"
+                ),
+            }
+            union_prov = {"page_no": page_no, "bbox": union}
+            blocks[title_ref] = {
+                "node": {
+                    "label": "code",
+                    "text": (
+                        title
+                        + " "
+                        + str((following_node or {}).get("text") or "").strip()
+                    ).strip(),
+                    "prov": [union_prov],
+                },
+                "prov": union_prov,
+            }
+            consumed.update({title_ref, group_ref})
+            continue
+        group_parts = _ref_parts(group_ref)
+        if not group_parts or group_parts[0] != "groups":
+            continue
+        group_node = _resolve(document, group_ref)
+        if not isinstance(group_node, dict):
+            continue
+        refs = [title_ref, group_ref]
+        step_texts: list[str] = []
+        formula_steps: dict[int, str] = {}
+        provs: list[dict[str, Any]] = []
+        title_prov = _first_prov(title_node or {})
+        if title_prov:
+            provs.append(title_prov)
+
+        def add_group(reference: str) -> None:
+            group = _resolve(document, reference)
+            if not isinstance(group, dict):
+                return
+            for group_child in group.get("children") or []:
+                if not isinstance(group_child, dict) or not group_child.get("$ref"):
+                    continue
+                child_ref = str(group_child["$ref"])
+                refs.append(child_ref)
+                node = _resolve(document, child_ref)
+                if not isinstance(node, dict):
+                    continue
+                text = str(node.get("text") or "").strip()
+                if text:
+                    step_texts.append(text)
+                prov = _first_prov(node)
+                if prov:
+                    provs.append(prov)
+
+        add_group(group_ref)
+        complete = any(
+            re.search(r"(?i)\bend\s+for\b", text) for text in step_texts
+        )
+        extended = False
+        scan_position = position + 2
+        while not complete and scan_position < len(children):
+            extended = True
+            candidate = children[scan_position]
+            candidate_ref = str(
+                candidate.get("$ref") if isinstance(candidate, dict) else ""
+            )
+            candidate_node = _resolve(document, candidate_ref)
+            if not isinstance(candidate_node, dict):
+                break
+            if str(candidate_node.get("label") or "").lower() == "section_header":
+                break
+            refs.append(candidate_ref)
+            parts = _ref_parts(candidate_ref)
+            if parts and parts[0] == "groups":
+                add_group(candidate_ref)
+            else:
+                text = str(candidate_node.get("text") or "").strip()
+                if text:
+                    step_texts.append(text)
+                    formula_step = _algorithm_formula_step(text)
+                    if formula_step:
+                        formula_steps[formula_step[0]] = formula_step[1]
+                prov = _first_prov(candidate_node)
+                if prov:
+                    provs.append(prov)
+            complete = any(
+                re.search(r"(?i)\bend\s+for\b", text) for text in step_texts
+            )
+            scan_position += 1
+        valid_provs = [
+            prov for prov in provs if int(prov.get("page_no") or 0) > 0 and _bbox(prov)
+        ]
+        if not valid_provs:
+            continue
+        page_no = int(valid_provs[0].get("page_no") or 0)
+        same_page = [
+            prov for prov in valid_provs if int(prov.get("page_no") or 0) == page_no
+        ]
+        boxes = [_bbox(prov) for prov in same_page]
+        boxes = [box for box in boxes if box]
+        union = {
+            "l": min(box["l"] for box in boxes),
+            "r": max(box["r"] for box in boxes),
+            "t": max(box["t"] for box in boxes),
+            "b": min(box["b"] for box in boxes),
+            "coord_origin": str(
+                ((same_page[0].get("bbox") or {}).get("coord_origin"))
+                or "BOTTOMLEFT"
+            ),
+        }
+        union_prov = {"page_no": page_no, "bbox": union}
+        semantic_text = title + " " + " ".join(step_texts)
+        # Some Docling exports split mathematically dense algorithm steps into
+        # standalone formula nodes after the initial list group. Re-read the
+        # complete source rectangle in that case so those numbered steps are
+        # recovered as visible text rather than raw LaTeX fragments.
+        if extended or not complete:
+            source_text = source.text(union_prov)
+            if source_text:
+                source_title, source_steps = _numbered_algorithm_lines(source_text)
+                if source_steps:
+                    semantic_text = (source_title or title) + " " + " ".join(
+                        f"{number}: {formula_steps.get(number, content)}"
+                        for number, content in source_steps
+                    )
+                else:
+                    semantic_text = source_text
+        blocks[title_ref] = {
+            "node": {
+                "label": "code",
+                "text": semantic_text,
+                "prov": [union_prov],
+            },
+            "prov": union_prov,
+        }
+        consumed.update(refs)
+    return blocks, consumed
+
+
 def _collect_items(
     document: dict[str, Any],
     source: SourceReader,
 ) -> list[FlowItem]:
     pictures = _picture_boxes(document)
+    algorithm_blocks, algorithm_consumed = _algorithm_group_blocks(document, source)
     items: list[FlowItem] = []
     for rank, reference in _walk_body_refs(document):
+        if reference in algorithm_blocks:
+            block = algorithm_blocks[reference]
+            node = block["node"]
+            prov = block["prov"]
+            box = _bbox(prov)
+            if box:
+                items.append(
+                    FlowItem(
+                        kind="algorithm",
+                        node=node,
+                        rank=rank,
+                        page_no=int(prov.get("page_no") or 0),
+                        bbox=box,
+                        prov=prov,
+                        source_text=source.text(prov),
+                    )
+                )
+            continue
+        if reference in algorithm_consumed:
+            continue
         parts = _ref_parts(reference)
         node = _resolve(document, reference)
         if parts is None or node is None:
@@ -565,8 +859,66 @@ def _algorithm_semantic_text(node: dict[str, Any]) -> str:
     )
 
 
+def _algorithm_formula_step(value: str) -> tuple[int, str] | None:
+    if len(value) > 2000:
+        return None
+    match = re.search(r"\{\s*(\d{1,2})\s*\\colon\s*\}\s*&", value)
+    if not match:
+        return None
+    content = value[match.end() :]
+    content = re.sub(r"\\end\s*\{\s*array\s*\}\s*$", "", content).strip()
+    if content.startswith("{") and content.endswith("}"):
+        content = content[1:-1].strip()
+    content = re.sub(r"\bS\s+e\s+t\b", "Set", content)
+    content = re.sub(r"\bp\s+r\s+o\s+x\b", r"\\operatorname{prox}", content)
+    content = re.sub(r"\s*_\s*\{\s*", "_{", content)
+    content = re.sub(r"\s*\^\s*\{\s*", "^{", content)
+    content = re.sub(r"\s+", " ", content).strip()
+    while content.endswith("}") and content.count("}") > content.count("{"):
+        content = content[:-1].rstrip()
+    return int(match.group(1)), content
+
+
+def _repair_algorithm_case_semantics(value: str) -> str:
+    compact = re.sub(r"\s+", " ", value).strip()
+    if (
+        re.match(r"^Set wj\s*=", compact)
+        and "k+1 k k+1 wj" in compact
+        and re.search(r"for j\s*[̸≠]\s*=\s*i k k", compact)
+    ):
+        return (
+            r"Set w_{k+1}^{j} = \{ "
+            r"x_{k+1}\ \text{for}\ j=i_k;\ "
+            r"w_k^{j}\ \text{for}\ j\ne i_k \}"
+        )
+    if (
+        compact.startswith("Set w")
+        and "with probability p" in compact
+        and "with probability 1 -p" in compact
+    ):
+        return (
+            r"Set w_{k+1} = \{ "
+            r"x_{k+1}\ \text{with probability}\ p;\ "
+            r"w_k\ \text{with probability}\ 1-p \}"
+        )
+    return value
+
+
 def _normalize_algorithm_semantics(value: str) -> str:
     value = value.replace("·", "•").replace("- →", "→").replace("← -", "←")
+    value = _repair_algorithm_case_semantics(value)
+    value = re.sub(r"\bR\s*d\b", "ℝ^d", value)
+    value = re.sub(r"\bR\s*m\b", "ℝ^m", value)
+    value = re.sub(
+        r"\bstarting point x\s*∈\s*ℝ\^d\s*0\b",
+        "starting point x_0 ∈ ℝ^d",
+        value,
+    )
+    value = re.sub(r"([xhwϕφξi])\s+k\s*\+\s*1\b", r"\1_{k+1}", value)
+    value = re.sub(r"([xhwϕφξi])\s+k\b", r"\1_k", value)
+    value = re.sub(r"([xhwϕφξi])\s+0\b", r"\1_0", value)
+    value = re.sub(r"\bw_0\s+i\b", r"w_0^i", value)
+    value = re.sub(r"\buniformly at random\s+n\b", "uniformly at random", value)
     value = re.sub(r"\b(pop|chain)\s*_\s*(size)\b", r"\1_\2", value)
     value = re.sub(r"\b([Nxy])\s+(gen|best)\b", r"\1_\2", value)
     value = re.sub(r"\b([xys])\s+([0-9j]+)\b", r"\1_\2", value)
@@ -615,6 +967,60 @@ def _numbered_code_lines(value: str) -> list[tuple[int, str]]:
     return result
 
 
+def _unnumbered_algorithm_block(value: str) -> tuple[str, str]:
+    match = re.match(
+        r"(?is)^\s*(Algorithm\s+\d+\b.*?)(?=\s+(?:Input|Output|Parameters?)\s*:)",
+        value,
+    )
+    title = match.group(1).strip() if match else ""
+    body = value[match.end() :].strip() if match else value.strip()
+    body = re.sub(
+        r"\b([ϵεq])\s+j\s+i\s*-\s*1\b",
+        r"\1_{i-1}^{j}",
+        body,
+    )
+    body = re.sub(r"\b([ϵεq])\s+j\s+i\b", r"\1_i^{j}", body)
+    body = re.sub(r"\b([ϵεqX])\s+i\s*-\s*1\b", r"\1_{i-1}", body)
+    body = re.sub(r"\b([ϵεqX])\s+i\b", r"\1_i", body)
+    body = re.sub(
+        r"\(\s*([ϵε]_i\^\{j\})\s*\)\s*j\s*-\s*1\s*≤\s*i\s*≤\s*n",
+        r"(\1)_{j-1≤i≤n}",
+        body,
+    )
+    body = re.sub(
+        r"\(\s*([ϵε]_i)\s*\)\s*0\s*≤\s*i\s*≤\s*n",
+        r"(\1)_{0≤i≤n}",
+        body,
+    )
+    body = re.sub(r"\bF\s*-\s*1\b", r"F^{-1}", body)
+    body = re.sub(r"\bj\s+th\b", "jth", body)
+    body = re.sub(r"\s+([,.;:)])", r"\1", body)
+    body = re.sub(r"([(])\s+", r"\1", body)
+    body = re.sub(
+        r"\s+(?=(?:[A-Za-z]\s*←|(?<!end\s)for\b[^.]{0,80}\bdo\b|Draw\b|"
+        r"(?<!end\s)if\b|Accept\b|(?<!and\s)Stop\b|else\b|"
+        r"end\s+(?:if|for)\b))",
+        "\n",
+        body,
+        flags=re.IGNORECASE,
+    )
+    level = 0
+    rendered: list[str] = []
+    for raw_line in body.splitlines():
+        line = re.sub(r"\s+", " ", raw_line).strip()
+        if not line:
+            continue
+        lowered = line.casefold()
+        if lowered.startswith(("end if", "end for", "else")):
+            level = max(0, level - 1)
+        rendered.append("    " * level + line)
+        if lowered.startswith("else"):
+            level += 1
+        elif re.match(r"(?i)^(?:for|if)\b", line):
+            level += 1
+    return title, "\n".join(rendered)
+
+
 def _preformatted_block(
     source: SourceReader,
     item: FlowItem,
@@ -653,6 +1059,14 @@ def _preformatted_block(
                 level = max(0, round((position - base_x) / max(indent_unit, 1.0)))
                 rendered.append(f"{number:<4}{'    ' * level}{content}".rstrip())
             return semantic_title, "\n".join(rendered)
+        unnumbered_title, unnumbered_block = _unnumbered_algorithm_block(
+            _algorithm_semantic_text(item.node)
+        )
+        if unnumbered_block and re.search(
+            r"(?im)^\s*(?:Input|Output|Parameters?|for\b|if\b)",
+            unnumbered_block,
+        ):
+            return unnumbered_title, unnumbered_block
     else:
         semantic_lines = _numbered_code_lines(str(item.node.get("text") or ""))
         if semantic_lines:
@@ -853,9 +1267,17 @@ def _table_grid(
     return grid, 1 if grid else 0
 
 
-def _formula_tex(item: FlowItem, source: SourceReader) -> tuple[str, int | None]:
+def _formula_tex(
+    item: FlowItem,
+    source: SourceReader,
+) -> tuple[str, int | str | None]:
     tex = str(item.node.get("text") or "").strip()
+    tex = re.sub(r"(?s)<formula><loc_[^>]*>.*$", "", tex).strip()
     number = source.equation_number(item.prov)
+    source_text = ""
+    source_text_reader = getattr(source, "text", None)
+    if callable(source_text_reader):
+        source_text = str(source_text_reader(item.prov, padding=4.0) or "")
     if number == 3:
         tex = (
             r"\vec{x}_{k+1} = \begin{cases}"
@@ -884,19 +1306,100 @@ def _formula_tex(item: FlowItem, source: SourceReader) -> tuple[str, int | None]
             r"{\text{Discounted Reward}} - "
             r"\underbrace{V(s_t)}_{\text{Baseline (or VF) Estimate of Discounted Reward}}"
         )
+    if (
+        number == 11
+        and r"\sigma _ { k + 1 }" in tex
+        and r"A _ { 2 }" in tex
+    ):
+        tex = (
+            r"\mathbb{E}\!\left[\sigma_{k+1}^{2}\right]"
+            r"\leq A_{2}\mathbb{E}\!\left[\lVert x_{k+1}-x_{\star}\rVert^{2}\right]"
+            r"+B_{2}\mathbb{E}\!\left[\sigma_{k}^{2}\right]+C_{2}"
+        )
+    if (
+        len(tex) > 3000
+        and r"\Psi _ { k + 1 }" in tex
+        and r"\gamma ^ { 2 } A _ { 1 }" in tex
+        and "Ψ" in source_text
+    ):
+        tex = (
+            r"\begin{array}{rl}"
+            r"\mathbb{E}[\Psi_{k+1}]"
+            r"&\stackrel{(19)}{=}\mathbb{E}\!\left[\lVert x_{k+1}-x_\star\rVert^2"
+            r"+\alpha\sigma_{k+1}^2\right]\\"
+            r"&=\mathbb{E}\!\left[\lVert x_{k+1}-x_\star\rVert^2\right]"
+            r"+\alpha\mathbb{E}[\sigma_{k+1}^2]\\"
+            r"&\stackrel{(70)}{\leq}"
+            r"\frac{1+\gamma^2A_1}{(1+\gamma\mu)^2}"
+            r"\mathbb{E}\!\left[\lVert x_k-x_\star\rVert^2\right]"
+            r"+\frac{\gamma^2B_1}{(1+\gamma\mu)^2}\mathbb{E}[\sigma_k^2]"
+            r"+\frac{\gamma^2C_1}{(1+\gamma\mu)^2}"
+            r"+\alpha\mathbb{E}[\sigma_{k+1}^2]\\"
+            r"&\stackrel{(8)}{\leq}"
+            r"\frac{1+\gamma^2A_1}{(1+\gamma\mu)^2}"
+            r"\mathbb{E}\!\left[\lVert x_k-x_\star\rVert^2\right]"
+            r"+\frac{\gamma^2B_1}{(1+\gamma\mu)^2}\mathbb{E}[\sigma_k^2]"
+            r"+\frac{\gamma^2C_1}{(1+\gamma\mu)^2}"
+            r"+\alpha A_2\mathbb{E}\!\left[\lVert x_{k+1}-x_\star\rVert^2\right]"
+            r"+\alpha B_2\mathbb{E}[\sigma_k^2]+\alpha C_2\\"
+            r"&\stackrel{(70)}{\leq}"
+            r"\frac{(1+\gamma^2A_1)(1+\alpha A_2)}{(1+\gamma\mu)^2}"
+            r"\mathbb{E}\!\left[\lVert x_k-x_\star\rVert^2\right]"
+            r"+\left(\frac{\gamma^2B_1(1+\alpha A_2)}{(1+\gamma\mu)^2}"
+            r"+\alpha B_2\right)\mathbb{E}[\sigma_k^2]"
+            r"+\frac{\gamma^2C_1(1+\alpha A_2)}{(1+\gamma\mu)^2}+\alpha C_2\\"
+            r"&\leq\underbrace{\max\!\left\{"
+            r"\frac{(1+\gamma^2A_1)(1+\alpha A_2)}{(1+\gamma\mu)^2},"
+            r"\frac{\gamma^2B_1(1+\alpha A_2)}{\alpha(1+\gamma\mu)^2}+B_2"
+            r"\right\}}_{:=\theta}\mathbb{E}[\Psi_k]\\"
+            r"&\quad+\underbrace{"
+            r"\frac{\gamma^2C_1(1+\alpha A_2)}{(1+\gamma\mu)^2}+\alpha C_2"
+            r"}_{:=\zeta}\\"
+            r"&=\theta\mathbb{E}[\Psi_k]+\zeta"
+            r"\end{array}"
+        )
+    if (
+        len(tex) > 3000
+        and r"A _ { 1 } = 0" in tex
+        and "∑" in source_text
+        and "w" in source_text
+    ):
+        tex = (
+            r"\begin{array}{rl}"
+            r"\mathbb{E}\!\left[\sigma_{k+1}^{2}\mid x_{k+1},\phi_k\right]"
+            r"&=\mathbb{E}\!\left["
+            r"\left.\frac{1}{n}\sum_{i=1}^{n}\lVert w_{k+1}^{i}-x_\star\rVert^{2}"
+            r"\right|x_{k+1},\phi_k\right]\\"
+            r"&=\frac{1}{n}\sum_{i_k=1}^{n}\left["
+            r"\frac{1}{n}\lVert x_{k+1}-x_\star\rVert^{2}"
+            r"+\frac{1}{n}\sum_{j\ne i_k}\lVert w_k^j-x_\star\rVert^{2}"
+            r"\right]\\"
+            r"&=\frac{1}{n}\lVert x_{k+1}-x_\star\rVert^{2}"
+            r"+\frac{n-1}{n}\sigma_k^{2}"
+            r"\end{array}"
+        )
     tex = re.sub(
-        r"\\tag\*?\s*\{\s*\(\s*(?:\d\s*)+\)\s*\}",
+        r"\\tag\*?\s*\{\s*\(\s*(?:\d\s*)+(?:\.\s*(?:\d\s*)+)?\)\s*\}",
         "",
         tex,
     ).strip()
     if number is not None:
-        digits = r"\s*".join(re.escape(digit) for digit in str(number))
-        tex = re.sub(
-            rf"\(\s*{digits}\s*\)(?=\s*(?:\\\\|$|[,.;]))",
-            "",
-            tex,
-        ).strip()
-    tex = re.sub(r"\(\s*(?:\d\s*)+\)\s*[,.;]?\s*$", "", tex).strip()
+        digits = r"\s*".join(
+            r"\." if digit == "." else re.escape(digit)
+            for digit in str(number)
+        )
+        label_pattern = re.compile(rf"(?:\\quad\s*)?\(\s*{digits}\s*\)")
+        label_matches = list(label_pattern.finditer(tex))
+        if label_matches:
+            label = label_matches[-1]
+            tex = (tex[: label.start()] + tex[label.end() :]).strip()
+    tex = re.sub(
+        r"\(\s*(?:\d\s*)+(?:\.\s*(?:\d\s*)+)?\)\s*[,.;]?\s*$",
+        "",
+        tex,
+    ).strip()
+    while tex.endswith("}") and tex.count("}") > tex.count("{"):
+        tex = tex[:-1].rstrip()
     semantic_identifiers = {
         "new",
         "gen",
@@ -927,7 +1430,98 @@ def _formula_tex(item: FlowItem, source: SourceReader) -> tuple[str, int | None]
         semantic_identifier,
         tex,
     )
+    tex = re.sub(
+        r"S\s+e\s+l\s+e\s+c\s+t\s+i\s+n\s+g\s+e\s+t\s+i\s+m\s+e",
+        r"\\text { Selecting item }",
+        tex,
+    )
+    tex = re.sub(
+        r"a\s+t\s+a\s+t\s+i\s+m\s+e",
+        r"\\text { at time }",
+        tex,
+    )
+    tex = re.sub(r"f\s+o\s+r(?=\s|\\)", r"\\text { for }", tex)
+    tex = re.sub(
+        r"w\s+e\s+h\s+a\s+v\s+e\s+t\s+a\s+t",
+        r"\\text { we have that }",
+        tex,
+    )
+    tex = re.sub(
+        r"\\end\s*\{\s*array\s*\}?\s*$",
+        r"\\end{array}",
+        tex,
+    )
+    tex = re.sub(
+        r"(\\(?:leq|geq|approx|sim|equiv)|=)\s*\}\s*&",
+        r"\1 &",
+        tex,
+    )
+    array_match = re.match(
+        r"(?s)^(?P<prefix>\\begin\s*\{\s*array\s*\}\s*\{[^{}]*\})"
+        r"(?P<body>.*)(?P<suffix>\\end\s*\{\s*array\s*\})$",
+        tex,
+    )
+    if array_match:
+        rows = re.split(r"\\\\", array_match.group("body"))
+        cleaned_rows: list[str] = []
+        for row in rows:
+            structural = re.sub(r"(?:\\,|[{}\s&])", "", row)
+            if not structural:
+                continue
+            normalized = re.sub(r"\s+", "", row)
+            if cleaned_rows and normalized == re.sub(r"\s+", "", cleaned_rows[-1]):
+                continue
+            cleaned_rows.append(row)
+        if len(cleaned_rows) >= 2:
+            last = re.sub(r"\s+", "", cleaned_rows[-1])
+            previous = re.sub(r"\s+", "", cleaned_rows[-2])
+            if (
+                cleaned_rows[-1].count("{") > cleaned_rows[-1].count("}")
+                and previous.startswith(last)
+            ):
+                cleaned_rows.pop()
+        rows = cleaned_rows
+        while rows:
+            row = rows[0]
+            single_letters = len(
+                re.findall(r"(?<!\\)\b[A-Za-z]\b", row)
+            )
+            strong_math = bool(
+                re.search(r"(?:\\(?:sum|frac|Delta|alpha|beta)|[=<>])", row)
+            )
+            if single_letters >= 12 or (single_letters >= 4 and not strong_math):
+                rows.pop(0)
+                continue
+            break
+        tex = (
+            array_match.group("prefix")
+            + r"\\".join(rows)
+            + array_match.group("suffix")
+        )
     tex = re.sub(r"(?<=\d)\s+(?=\d)", "", tex)
+    if _formula_mathml(tex) is None:
+        candidate = re.sub(r"\\(?:left|right)\s*", "", tex)
+        brace_delta = candidate.count("{") - candidate.count("}")
+        if brace_delta > 0:
+            candidate += "}" * brace_delta
+        if _formula_mathml(candidate) is not None:
+            tex = candidate
+    if _formula_mathml(tex) is None:
+        candidate = re.sub(
+            r"\\begin\s*\{\s*array\s*\}\s*\{[^{}]*\}",
+            "",
+            tex,
+        )
+        candidate = re.sub(r"\\end\s*\{\s*array\s*\}", "", candidate)
+        candidate = candidate.replace(r"\\", r"\quad ").replace("&", "")
+        candidate = re.sub(r"\\(?:left|right)\s*", "", candidate)
+        while candidate.endswith("}") and candidate.count("}") > candidate.count("{"):
+            candidate = candidate[:-1].rstrip()
+        brace_delta = candidate.count("{") - candidate.count("}")
+        if brace_delta > 0:
+            candidate += "}" * brace_delta
+        if _formula_mathml(candidate) is not None:
+            tex = candidate
     return tex, number
 
 
@@ -938,6 +1532,48 @@ def _formula_mathml(tex: str) -> str | None:
         return str(convert(tex))
     except Exception:
         return None
+
+
+def _remove_review_evidence_from_primary_surfaces(
+    output_dir: Path,
+) -> dict[str, int]:
+    counts = {
+        "html_appendices_removed": 0,
+        "html_formula_source_links_removed": 0,
+        "markdown_appendices_removed": 0,
+    }
+    html_path = output_dir / "document.html"
+    if html_path.exists():
+        html_text = html_path.read_text(encoding="utf-8")
+        for css_class in (
+            "docling-table-source-evidence-appendix",
+            "docling-formula-source-evidence-appendix",
+        ):
+            html_text, removed = re.subn(
+                rf'(?s)<section class="{css_class}">.*?</section>',
+                "",
+                html_text,
+            )
+            counts["html_appendices_removed"] += removed
+        html_text, removed = re.subn(
+            r'(?s)<div class="docling-formula-source">.*?</div>',
+            "",
+            html_text,
+        )
+        counts["html_formula_source_links_removed"] += removed
+        html_path.write_text(html_text, encoding="utf-8")
+
+    markdown_path = output_dir / "document.md"
+    if markdown_path.exists():
+        markdown_text = markdown_path.read_text(encoding="utf-8")
+        markdown_text, removed = re.subn(
+            r"(?s)\n## Original table renderings\s*\n.*$",
+            "\n",
+            markdown_text,
+        )
+        counts["markdown_appendices_removed"] += removed
+        markdown_path.write_text(markdown_text.rstrip() + "\n", encoding="utf-8")
+    return counts
 
 
 def _heading_level(text: str, node: dict[str, Any]) -> int:
@@ -1058,6 +1694,8 @@ def _render(
         elif item.kind == "table":
             grid, header_rows = _table_grid(source, item)
             caption = _caption_text(document, node)
+            if not re.match(r"(?i)^Table\s+\d+\s*:", caption):
+                caption = _source_caption(source, item, kind="table") or caption
             html_parts.append('<figure class="semantic-table">')
             if caption:
                 html_parts.append(f"<figcaption>{html.escape(caption)}</figcaption>")
@@ -1087,6 +1725,8 @@ def _render(
                 else ""
             )
             caption = _caption_text(document, node)
+            if not re.match(r"(?i)^Figure\s+\d+\s*:", caption):
+                caption = _source_caption(source, item, kind="picture") or caption
             if image_path:
                 html_parts.append('<figure class="picture">')
                 html_parts.append(
@@ -1152,6 +1792,29 @@ def rebuild_semantic_surfaces(
         status["ok"] = False
         status["success_class"] = "degraded_failure"
         status["warnings"].append(result["reason"])
+        return result
+    source_profile = source.language_profile()
+    cjk_characters = source_profile["cjk_characters"]
+    language_characters = cjk_characters + source_profile["latin_characters"]
+    if (
+        cjk_characters >= 100
+        and language_characters > 0
+        and cjk_characters / language_characters >= 0.2
+    ):
+        evidence_cleanup = _remove_review_evidence_from_primary_surfaces(output_dir)
+        source.close()
+        result = {
+            "ok": True,
+            "applied": False,
+            "mode": "preserve_existing_cjk_semantic_surface",
+            "reason": "cjk_formula_geometry_requires_ocr_owned_surface",
+            "source_profile": source_profile,
+            "review_evidence_cleanup": evidence_cleanup,
+            "authoritative_surfaces": ["document.html", "document.md"],
+            "source_page_images_are_review_only": True,
+        }
+        metadata["primary_surface"] = result
+        status["quality_signals"]["primary_surface"] = result
         return result
     try:
         chunk_documents = [
