@@ -207,6 +207,50 @@ class SemanticReflowTests(unittest.TestCase):
         self.assertNotEqual(tex, r"\begin{array}{r}\end{array}")
         self.assertIsNotNone(semantic_reflow._formula_mathml(tex))
 
+    def test_formula_mathml_escapes_bare_alignment_ampersands(self) -> None:
+        mathml = semantic_reflow._formula_mathml(
+            r"\|p(x)-p(y)\|^2 &="
+            r"\Pr(X<k)\|[x-y]-\gamma[\nabla h(p(x))-\nabla h(p(y))]\|^2"
+            r"\\ &="
+            r"\|x-y\|^2+\gamma^2\|\nabla h(p(x))-\nabla h(p(y))\|^2"
+        )
+
+        self.assertIsNotNone(mathml)
+        self.assertNotIn("<mi>&</mi>", mathml or "")
+        self.assertIn("&amp;", mathml or "")
+
+    def test_formula_drops_preceding_prose_misclassified_as_math(self) -> None:
+        class FormulaSource:
+            def equation_number(self, _prov):
+                return None
+
+            def text(self, _prov, *, padding=0.0):
+                return "For lambda less than ell we have"
+
+        item = semantic_reflow.FlowItem(
+            kind="formula",
+            node={
+                "text": (
+                    r"\text {$\forall < \ell$ we have} \\ "
+                    r"\frac{\ell^2}{\lambda^2}"
+                    r"\frac{\Pr(\text{Poisson}(\lambda)>k)}"
+                    r"{\Pr(\text{Poisson}(\lambda)<k)}"
+                    r"&=\frac{\sum_{j>k}\lambda^{j-2}/j!}"
+                    r"{\sum_{j>k}\ell^{j-2}/j!}"
+                )
+            },
+            rank=1.0,
+            page_no=38,
+            bbox={"l": 0.0, "r": 1.0, "t": 1.0, "b": 0.0},
+            prov={"page_no": 38, "bbox": {}},
+        )
+
+        tex, _number = semantic_reflow._formula_tex(item, FormulaSource())
+
+        self.assertNotIn(r"\text {$", tex)
+        self.assertTrue(tex.startswith(r"\frac{\ell^2}{\lambda^2}"))
+        self.assertIsNotNone(semantic_reflow._formula_mathml(tex))
+
     def test_formula_eight_is_reconstructed_as_searchable_tex(self) -> None:
         class FormulaSource:
             def equation_number(self, _prov):
@@ -505,6 +549,125 @@ class SemanticReflowTests(unittest.TestCase):
             self.assertEqual(counts["markdown_appendices_removed"], 1)
             self.assertEqual(html_text, "<p>semantic body</p>")
             self.assertEqual(markdown_text, "semantic body\n")
+
+    def test_legacy_cjk_formulas_use_native_mathml_without_mathjax(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output_dir = Path(directory)
+            (output_dir / "document.html").write_text(
+                (
+                    "<!doctype html><html><head>"
+                    '<style id="docling-formula-second-pass-style">legacy</style>'
+                    '<script id="docling-formula-second-pass-mathjax">legacy</script>'
+                    '<script defer src="https://cdn.jsdelivr.net/npm/'
+                    'mathjax@3/es5/tex-svg.js"></script></head><body>'
+                    "<p>中文正文保持不变。</p>"
+                    '<div class="docling-formula-second-pass" '
+                    'data-formula-index="1" data-formula-status="cn_final_polish">'
+                    '<div class="docling-formula-second-pass-label">'
+                    "Formula 1 patched by formula second pass</div>"
+                    '<div class="docling-formula-render">'
+                    r"\[x_1=y\quad(1)\]</div>"
+                    '<pre class="docling-formula-tex">'
+                    r"x_1=y\quad(1)</pre></div>"
+                    '<div class="docling-formula-second-pass" '
+                    'data-formula-index="2" data-formula-status="cn_final_polish">'
+                    '<div class="docling-formula-second-pass-label">'
+                    "Formula 2 patched by formula second pass</div>"
+                    '<div class="docling-formula-render">'
+                    r"\[\frac{a}{b}=c\quad(2)\]</div>"
+                    '<pre class="docling-formula-tex">'
+                    r"\frac{a}{b}=c\quad(2)</pre></div>"
+                    "</body></html>"
+                ),
+                encoding="utf-8",
+            )
+            (output_dir / "document.md").write_text(
+                (
+                    "中文正文保持不变。\n\n"
+                    r"$$x_1=y\quad(1)$$"
+                    "\n\n"
+                    r"$$\frac{a}{b}=c\quad(2)$$"
+                    "\n"
+                ),
+                encoding="utf-8",
+            )
+
+            result = semantic_reflow._normalize_legacy_formula_surfaces(
+                output_dir
+            )
+            html_text = (output_dir / "document.html").read_text(
+                encoding="utf-8"
+            )
+            markdown_text = (output_dir / "document.md").read_text(
+                encoding="utf-8"
+            )
+
+        self.assertTrue(result["applied"])
+        self.assertEqual(result["formula_count"], 2)
+        self.assertEqual(result["mathml_count"], 2)
+        self.assertEqual(result["tex_fallback_count"], 0)
+        self.assertIn("中文正文保持不变。", html_text)
+        self.assertEqual(html_text.count('<div class="formula"'), 2)
+        self.assertEqual(html_text.count("<math "), 2)
+        self.assertIn('<span class="equation-number">(1)</span>', html_text)
+        self.assertIn("<details><summary>LaTeX</summary>", html_text)
+        self.assertNotIn("docling-formula-second-pass", html_text)
+        self.assertNotIn("MathJax", html_text)
+        self.assertNotIn("cdn.jsdelivr.net", html_text)
+        self.assertIn("$$\nx_1=y\\tag{1}\n$$", markdown_text)
+        self.assertIn("$$\n\\frac{a}{b}=c\\tag{2}\n$$", markdown_text)
+
+    def test_legacy_formula_normalization_rejects_surface_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output_dir = Path(directory)
+            original_html = (
+                "<html><head></head><body>"
+                '<div class="docling-formula-second-pass" '
+                'data-formula-index="1">'
+                '<pre class="docling-formula-tex">x=y\\quad(1)</pre>'
+                "</div></body></html>"
+            )
+            (output_dir / "document.html").write_text(
+                original_html,
+                encoding="utf-8",
+            )
+            (output_dir / "document.md").write_text(
+                "$$a=b\\quad(1)$$\n",
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "formula content mismatch",
+            ):
+                semantic_reflow._normalize_legacy_formula_surfaces(output_dir)
+
+            self.assertEqual(
+                (output_dir / "document.html").read_text(encoding="utf-8"),
+                original_html,
+            )
+
+    def test_cn_tskt_source_verified_formula_set_is_complete_mathml(self) -> None:
+        formulas = semantic_reflow._CN_TSKT_FORMULA_TEX
+
+        self.assertEqual(
+            list(formulas),
+            [str(number) for number in range(1, 25)],
+        )
+        self.assertTrue(
+            all(
+                semantic_reflow._formula_mathml(tex) is not None
+                for tex in formulas.values()
+            )
+        )
+        self.assertIn(r"C^{\mathrm T}", formulas["3"])
+        self.assertIn(r"Q_{t,:}", formulas["3"])
+        self.assertIn(r"l_{q_i}", formulas["4"])
+        self.assertIn(r"e_{q_i\to c_p}", formulas["7"])
+        self.assertIn(r"W_v^e", formulas["9"])
+        self.assertIn(r"\alpha_{uv}", formulas["12"])
+        self.assertIn(r"\sum_{k=1}^{t-1}h_k", formulas["16"])
+        self.assertIn(r"W_f+b_f", formulas["22"])
 
     def test_algorithm_preformatted_block_preserves_geometry_indentation(self) -> None:
         class AlgorithmSource:
