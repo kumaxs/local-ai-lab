@@ -7,6 +7,8 @@ import unittest
 from contextlib import redirect_stdout
 from io import StringIO
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -40,6 +42,24 @@ class AdapterTests(unittest.TestCase):
 
     def test_is_docling_available_returns_bool(self) -> None:
         self.assertIsInstance(docling_adapter.is_docling_available(), bool)
+
+    def test_formula_enrichment_uses_bounded_point_padding(self) -> None:
+        class FakeCodeFormulaModel:
+            expansion_factor = 0.18
+
+        module = SimpleNamespace(CodeFormulaVlmModel=FakeCodeFormulaModel)
+        with patch.object(docling_adapter, "import_module", return_value=module):
+            docling_adapter._configure_formula_crop_padding()
+
+        self.assertEqual(FakeCodeFormulaModel.expansion_factor, 0.0)
+        self.assertEqual(
+            FakeCodeFormulaModel.tight_crop_padding_points,
+            docling_adapter.FORMULA_CROP_PADDING_POINTS,
+        )
+        self.assertIs(
+            FakeCodeFormulaModel.prepare_element,
+            docling_adapter._prepare_formula_with_tight_padding,
+        )
 
     def test_convert_with_docling_rejects_remote_url(self) -> None:
         with self.assertRaises(docling_adapter.DoclingAdapterError):
