@@ -1,0 +1,32 @@
+FROM python:3.12-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    DOCLING_RELEASE_PROFILE=docker \
+    DOCLING_QUALITY_ADAPTER=/opt/docling-quality/quality_parity_adapter.py \
+    DOCLING_API_HOST=0.0.0.0 \
+    DOCLING_API_PORT=8000
+
+RUN groupadd --gid 10001 docling \
+    && useradd --uid 10001 --gid 10001 --create-home docling
+
+COPY services/docling-service/requirements.txt /tmp/docling-service-requirements.txt
+RUN python -m pip install --no-cache-dir -r /tmp/docling-service-requirements.txt
+
+COPY services/docling-service/pyproject.toml /opt/docling-service/pyproject.toml
+COPY services/docling-service/docling_service /opt/docling-service/docling_service
+COPY docs/integrations/docling-serve-quality-parity/quality_parity_adapter.py /opt/docling-quality/quality_parity_adapter.py
+COPY docs/integrations/docling-serve-quality-parity/semantic_reflow.py /opt/docling-quality/semantic_reflow.py
+COPY docs/integrations/docling-serve-quality-parity/formula_only_second_pass.py /opt/docling-quality/formula_only_second_pass.py
+
+RUN python -m pip install --no-cache-dir --no-deps /opt/docling-service \
+    && python -m pip check \
+    && mkdir -p /data/inputs /data/outputs /data/state \
+    && chown -R docling:docling /data /opt/docling-quality
+
+USER 10001:10001
+EXPOSE 8000
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+  CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=3)"
+
+CMD ["docling-service-api"]

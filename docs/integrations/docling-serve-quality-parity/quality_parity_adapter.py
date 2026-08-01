@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Minimal Docling Server quality parity adapter boundary.
+"""Quality-first Docling Server conversion and release adapter.
 
-This script is the narrow n8n-callable boundary between Local AI Lab automation
-and Docling Server. Docling Server remains the model execution backend; this
-adapter owns only the quality policy and contract-output mapping.
+This script is the shared conversion boundary between Local AI Lab services and
+Docling Server. Docling Server remains the model execution backend; this adapter
+owns the accepted quality policy and contract-output mapping.
 """
 
 from __future__ import annotations
@@ -44,12 +44,10 @@ V1_GXX_FAILURE_MIN_DENSITY = 0.002
 FORMULA_SOURCE_PADDING_PX = 2
 FORMULA_CONTEXT_PADDING_PX = 96
 DEFAULT_REVIEW_PADDING_PX = 18
-UNRESOLVED_V1_PARITY_WARNINGS = [
-    "v1_parity_gap_footnotes_not_improved_by_server_adapter",
-    "v1_parity_gap_pdf_links_not_preserved_or_exported_as_links_json",
-    "v1_parity_gap_inline_formula_html_rendering_requires_review",
-    "v1_parity_gap_math_symbol_rendering_requires_review",
-]
+# These gaps were closed by the accepted semantic output layer. Keep the field in
+# the output contract for compatibility, but do not emit stale warnings.
+UNRESOLVED_V1_PARITY_WARNINGS: list[str] = []
+
 CN_FINAL_POLISH_FORMULA_NUMBERS = (1, 2, 12)
 CN_ACCEPTED_BASELINE = {
     "name": "accepted_cn_0854aa1",
@@ -133,7 +131,6 @@ GRANITE_MLX_CODE_FORMULA_CONFIG: dict[str, Any] = {
     "extract_formulas": True,
 }
 
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--serve-url", default="http://127.0.0.1:5001")
@@ -207,9 +204,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--formula-policy",
-        choices=["granite_mlx", "off"],
+        choices=["granite_mlx", "granite_transformers", "off"],
         default="granite_mlx",
-        help="Use granite_mlx to request Granite-Docling-CodeFormula through MLX.",
+        help=(
+            "Select Granite-Docling-CodeFormula through MLX, the portable "
+            "Transformers preset, or disable formula enrichment."
+        ),
     )
     parser.add_argument(
         "--enable-formula-mlx",
@@ -341,7 +341,14 @@ def post_json(
                 return json.loads(response.read())
         except urllib.error.HTTPError as exc:
             if exc.code not in {503, 504} or attempt >= retries:
-                raise
+                try:
+                    detail = exc.read().decode("utf-8", errors="replace")
+                except OSError:
+                    detail = ""
+                message = f"Docling Serve HTTP {exc.code}"
+                if detail:
+                    message += f": {detail[:4000]}"
+                raise RuntimeError(message) from exc
             time.sleep(retry_sleep_seconds * (attempt + 1))
     raise RuntimeError("unreachable retry state")
 
@@ -581,7 +588,9 @@ def base_options(
         "table_cell_matching": True,
         "include_images": True,
         "images_scale": 2.0,
-        "do_formula_enrichment": effective_formula_policy(args) == "granite_mlx",
+        "document_timeout": float(getattr(args, "timeout_seconds", 1200)),
+        "do_formula_enrichment": effective_formula_policy(args)
+        in {"granite_mlx", "granite_transformers"},
         "do_code_enrichment": False,
     }
     selected_page_range = page_range_override or page_range(args)
@@ -591,7 +600,26 @@ def base_options(
         apply_cn_ocr_options(options, args)
     if effective_formula_policy(args) == "granite_mlx":
         options["code_formula_custom_config"] = GRANITE_MLX_CODE_FORMULA_CONFIG
+    elif effective_formula_policy(args) == "granite_transformers":
+        # Server-side presets retain enum-typed Transformers overrides. Sending
+        # the same overrides through JSON turns those enum values into strings
+        # and Docling 2.95 fails later in the worker. On Linux auto_inline
+        # deterministically selects Transformers; macOS keeps its accepted MLX
+        # custom configuration above.
+        options["code_formula_preset"] = "granite_docling"
     return options
+
+
+def custom_config_mapping(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+    return {}
 
 
 def request_payload(args: argparse.Namespace, options: dict[str, Any]) -> dict[str, Any]:
@@ -14385,6 +14413,7 @@ def summarize_response(
     broken_refs = broken_local_refs(output_dir, document)
     selected_formula_policy = effective_formula_policy(args)
     selected_ocr_policy = effective_ocr_fallback_policy(args)
+    ocr_custom_config = custom_config_mapping(options.get("ocr_custom_config"))
 
     metadata = {
         "parser": "docling_serve",
@@ -14399,18 +14428,24 @@ def summarize_response(
         "client_wall_time": wall_time,
         "page_range": options.get("page_range"),
         "ocr_backend": options.get("ocr_preset")
-        or (options.get("ocr_custom_config") or {}).get("kind"),
+        or ocr_custom_config.get("kind"),
         "ocr_lang": options.get("ocr_lang")
-        or (options.get("ocr_custom_config") or {}).get("lang"),
-        "ocr_custom_config_kind": (options.get("ocr_custom_config") or {}).get("kind"),
+        or ocr_custom_config.get("lang"),
+        "ocr_custom_config_kind": ocr_custom_config.get("kind"),
         "force_ocr": bool(options.get("force_ocr")),
         "ocr_fallback_policy": selected_ocr_policy,
         "gxx_count_threshold": args.gxx_count_threshold,
         "gxx_density_threshold": args.gxx_density_threshold,
         "ocr_fallback_used": bool(options.get("force_ocr")),
-        "formula_model": "granite_docling_mlx"
-        if options.get("code_formula_custom_config")
-        else None,
+        "formula_model": (
+            "granite_docling_mlx"
+            if selected_formula_policy == "granite_mlx"
+            else (
+                "granite_docling_transformers"
+                if selected_formula_policy == "granite_transformers"
+                else None
+            )
+        ),
         "formula_policy": selected_formula_policy,
         "image_export_mode": options.get("image_export_mode"),
         "table_count": len(table_nodes),
@@ -14490,8 +14525,11 @@ def run_conversion(
     )
     wall_time = time.perf_counter() - start
     warnings: list[str] = []
-    if effective_formula_policy(args) == "granite_mlx":
+    selected_formula_policy = effective_formula_policy(args)
+    if selected_formula_policy == "granite_mlx":
         warnings.append("formula_enrichment_requested_granite_docling_mlx")
+    elif selected_formula_policy == "granite_transformers":
+        warnings.append("formula_enrichment_requested_granite_docling_transformers")
     if force_ocr:
         warnings.append("ocr_fallback_force_ocr_request")
     if cn_ocr_parity and force_ocr:
@@ -14764,6 +14802,54 @@ def failure_response(message: str, error: BaseException | None = None) -> dict[s
     }
 
 
+def reconcile_final_surface_status(
+    output_dir: Path,
+    metadata: dict[str, Any],
+    status: dict[str, Any],
+) -> dict[str, Any]:
+    """Reconcile pre-reflow diagnostics with the authoritative HTML surface."""
+
+    html_path = output_dir / "document.html"
+    html_text = html_path.read_text(encoding="utf-8") if html_path.exists() else ""
+    defined_ids = set(re.findall(r'id="(fn-[^"]+)"', html_text))
+    referenced_ids = set(re.findall(r'href="#(fn-[^"]+)"', html_text))
+    linked_ids = defined_ids & referenced_ids
+    quality_signals = status.setdefault("quality_signals", {})
+    structural = quality_signals.get("structural_quarantine_qc") or {}
+    unresolved_count = int(structural.get("unresolved_footnote_count") or 0)
+    final_surface_resolved = bool(
+        status.get("ok")
+        and (quality_signals.get("primary_surface") or {}).get("ok")
+        and unresolved_count > 0
+        and len(linked_ids) >= unresolved_count
+    )
+    removed: list[str] = []
+    if final_surface_resolved:
+        stale_prefixes = (
+            "suspicious_footnote:",
+            "unresolved_note_reference:",
+            "structural_quarantine_applied:",
+        )
+        retained = []
+        for warning in status.get("warnings") or []:
+            if str(warning).startswith(stale_prefixes):
+                removed.append(str(warning))
+            else:
+                retained.append(warning)
+        status["warnings"] = retained
+    result = {
+        "authoritative_surface": "document.html",
+        "defined_footnote_count": len(defined_ids),
+        "linked_footnote_count": len(linked_ids),
+        "pre_reflow_unresolved_footnote_count": unresolved_count,
+        "pre_reflow_diagnostics_resolved": final_surface_resolved,
+        "removed_stale_warning_count": len(removed),
+    }
+    metadata["final_surface_reconciliation"] = result
+    quality_signals["final_surface_reconciliation"] = result
+    return result
+
+
 def main() -> int:
     args = parse_args()
     try:
@@ -14983,14 +15069,11 @@ def main() -> int:
                 ),
             )
 
-    gaps = [
-        "Review artifacts are adapter-owned post-processing outputs, not native Docling Server outputs.",
-        "This adapter is a minimal n8n-callable boundary, not a product decision to make it the long-term service.",
+    metadata["known_gaps"] = []
+    metadata["processing_notes"] = [
+        "HTML and Markdown are authoritative semantic surfaces produced by the quality adapter.",
+        "Rendered page images are review evidence and are not embedded as primary document content.",
     ]
-    status["warnings"].extend(gaps)
-    if gaps and status["ok"]:
-        status["success_class"] = "degraded_success"
-    metadata["known_gaps"] = gaps
     metadata["n8n_callable"] = True
     metadata["effective_page_range"] = selected_page_range
 
@@ -15024,6 +15107,7 @@ def main() -> int:
         status["warnings"].append(
             "semantic_source_reflow_not_applied:document_json_missing"
         )
+    reconcile_final_surface_status(output_dir, metadata, status)
     record_cn_accepted_baseline(output_dir, metadata, status, conversion_args)
     refresh_final_broken_local_refs(output_dir, metadata, status)
     (output_dir / "metadata.json").write_text(

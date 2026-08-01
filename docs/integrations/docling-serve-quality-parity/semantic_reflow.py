@@ -2389,6 +2389,26 @@ def _reference_items(
     return references, reference_texts
 
 
+_STAR_FOOTNOTE_MARKERS = "*∗⋆★✶⁎"
+
+
+def _canonical_footnote_marker(marker: str) -> str:
+    if marker and all(char in _STAR_FOOTNOTE_MARKERS for char in marker):
+        return "*" * len(marker)
+    return marker
+
+
+def _footnote_marker_pattern(marker: str) -> re.Pattern[str]:
+    canonical = _canonical_footnote_marker(marker)
+    if canonical and set(canonical) == {"*"}:
+        return re.compile(
+            rf"[{re.escape(_STAR_FOOTNOTE_MARKERS)}]{{{len(canonical)}}}"
+        )
+    if marker.isdigit():
+        return re.compile(rf"(?<![\w\[])({re.escape(marker)})(?![\w\]])")
+    return re.compile(re.escape(marker))
+
+
 def _footnote_relations(
     items: list[FlowItem],
     reference_items: dict[int, int],
@@ -2401,25 +2421,25 @@ def _footnote_relations(
         if item.kind != "footnote" or id(item) in reference_items:
             continue
         text = _paragraph_text(item.source_text)
-        match = re.match(r"^(\d+|[∗*†‡§]+)\s+(.+)$", text)
+        match = re.match(
+            rf"^(\d+|[{re.escape(_STAR_FOOTNOTE_MARKERS)}†‡§]+)\s+(.+)$",
+            text,
+        )
         if not match:
             continue
         marker, body = match.groups()
-        marker_counts[marker] = marker_counts.get(marker, 0) + 1
+        canonical_marker = _canonical_footnote_marker(marker)
+        marker_counts[canonical_marker] = marker_counts.get(canonical_marker, 0) + 1
         marker_name = {
             "*": "star",
-            "∗": "star",
             "†": "dagger",
             "‡": "double-dagger",
             "§": "section",
-        }.get(marker, marker)
-        suffix = marker_counts[marker]
+        }.get(canonical_marker, canonical_marker)
+        suffix = marker_counts[canonical_marker]
         footnote_id = f"{marker_name}-{suffix}"
         footnotes[id(item)] = (footnote_id, marker, body)
-        if marker.isdigit():
-            marker_pattern = re.compile(rf"(?<![\w\[])({re.escape(marker)})(?![\w\]])")
-        else:
-            marker_pattern = re.compile(re.escape(marker))
+        marker_pattern = _footnote_marker_pattern(marker)
         linked = False
         for candidate in reversed(items[max(0, index - 24) : index]):
             if candidate.kind not in {"title", "heading", "text", "list_item"}:
@@ -2433,8 +2453,11 @@ def _footnote_relations(
                 and re.match(rf"^{re.escape(marker)}(?:\.|\s|$)", candidate_text)
             ):
                 continue
-            if marker_pattern.search(candidate_text):
-                callouts.setdefault(id(candidate), []).append((marker, footnote_id))
+            marker_match = marker_pattern.search(candidate_text)
+            if marker_match:
+                callouts.setdefault(id(candidate), []).append(
+                    (marker_match.group(0), footnote_id)
+                )
                 linked = True
                 break
         if linked or document is None:
@@ -2447,8 +2470,11 @@ def _footnote_relations(
                 candidate_text = _paragraph_text(
                     candidate.source_text or str(candidate.node.get("text") or "")
                 )
-            if marker_pattern.search(candidate_text):
-                callouts.setdefault(id(candidate), []).append((marker, footnote_id))
+            marker_match = marker_pattern.search(candidate_text)
+            if marker_match:
+                callouts.setdefault(id(candidate), []).append(
+                    (marker_match.group(0), footnote_id)
+                )
                 break
     return footnotes, callouts
 

@@ -62,6 +62,8 @@ venv/
 **/venv/
 node_modules/
 **/node_modules/
+*.egg-info/
+**/*.egg-info/
 
 # macOS and editor noise
 .DS_Store
