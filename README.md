@@ -22,7 +22,8 @@ n8n 容器
 - n8n-paper-pipeline 已迁入 `/Users/zeyuan/Projects/local-ai-lab/services/n8n-paper-pipeline`。
 - worker 容器内挂载路径仍为 `/pipelines/n8n-paper-pipeline`。
 - 旧路径 `/Users/zeyuan/Projects/n8n-paper-pipeline` 暂时保留作为回滚来源。
-- 当前没有部署 Docling。
+- Docling 论文转换服务已有 macOS 与 Docker 两套正式发行配置，入口见
+  [`services/docling-service/README.md`](services/docling-service/README.md)。
 - 当前没有修改 n8n 容器或 n8n workflow。
 
 ## 不应提交的内容

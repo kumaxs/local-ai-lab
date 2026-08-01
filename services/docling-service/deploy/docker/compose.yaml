@@ -1,0 +1,54 @@
+name: local-ai-lab-docling
+
+services:
+  backend:
+    build:
+      context: ../../../..
+      dockerfile: services/docling-service/deploy/docker/Dockerfile.backend
+    image: local-ai-lab/docling-backend:1.0.0
+    init: true
+    restart: unless-stopped
+    environment:
+      DOCLING_DEVICE: ${DOCLING_DEVICE:-cpu}
+      DOCLING_SERVE_MAX_SYNC_WAIT: ${DOCLING_CONVERSION_TIMEOUT_SECONDS:-7200}
+      OMP_NUM_THREADS: ${DOCLING_CPU_THREADS:-4}
+      MKL_NUM_THREADS: ${DOCLING_CPU_THREADS:-4}
+    shm_size: 1gb
+    volumes:
+      - docling-models:/models
+
+  api:
+    build:
+      context: ../../../..
+      dockerfile: services/docling-service/deploy/docker/Dockerfile.api
+    image: local-ai-lab/docling-api:1.0.0
+    init: true
+    restart: unless-stopped
+    depends_on:
+      backend:
+        condition: service_healthy
+    ports:
+      - "${DOCLING_API_BIND:-127.0.0.1}:${DOCLING_API_PORT:-8766}:8000"
+    environment:
+      DOCLING_RELEASE_PROFILE: docker
+      DOCLING_SERVE_URL: http://backend:5001
+      DOCLING_INPUT_ROOT: /data/inputs
+      DOCLING_OUTPUT_ROOT: /data/outputs
+      DOCLING_STATE_ROOT: /data/state
+      DOCLING_FORMULA_POLICY: granite_transformers
+      DOCLING_CN_OCR_PARITY: "false"
+      DOCLING_IMAGE_EXPORT_MODE: referenced
+      DOCLING_MAX_CONCURRENT_JOBS: ${DOCLING_MAX_CONCURRENT_JOBS:-1}
+      DOCLING_CONVERSION_TIMEOUT_SECONDS: ${DOCLING_CONVERSION_TIMEOUT_SECONDS:-7200}
+      DOCLING_MAX_UPLOAD_BYTES: ${DOCLING_MAX_UPLOAD_BYTES:-268435456}
+      DOCLING_SERVICE_API_TOKEN: ${DOCLING_SERVICE_API_TOKEN:-}
+    volumes:
+      - docling-inputs:/data/inputs
+      - docling-outputs:/data/outputs
+      - docling-state:/data/state
+
+volumes:
+  docling-models:
+  docling-inputs:
+  docling-outputs:
+  docling-state:

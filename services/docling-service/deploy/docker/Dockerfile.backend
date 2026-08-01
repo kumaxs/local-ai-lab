@@ -1,0 +1,58 @@
+FROM python:3.12-slim
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    HF_HOME=/models/huggingface \
+    DOCLING_SERVE_ARTIFACTS_PATH=/models/docling \
+    DOCLING_DEVICE=cpu \
+    UVICORN_WORKERS=1 \
+    DOCLING_SERVE_ALLOW_CUSTOM_CODE_FORMULA_CONFIG=true \
+    DOCLING_SERVE_ALLOW_CUSTOM_OCR_CONFIG=true \
+    DOCLING_SERVE_ENG_KIND=local \
+    DOCLING_SERVE_ENG_LOC_NUM_WORKERS=1 \
+    DOCLING_SERVE_ENG_LOC_SHARE_MODELS=true \
+    DOCLING_SERVE_LOAD_MODELS_AT_BOOT=true \
+    DOCLING_SERVE_OPTIONS_CACHE_SIZE=2 \
+    OMP_NUM_THREADS=4 \
+    MKL_NUM_THREADS=4
+
+RUN sed -i 's|http://deb.debian.org|https://deb.debian.org|g' /etc/apt/sources.list.d/debian.sources \
+    && apt-get -o Acquire::Retries=5 -o Acquire::https::Timeout=30 update \
+    && apt-get -o Acquire::Retries=5 -o Acquire::https::Timeout=30 install -y --no-install-recommends \
+       libgl1 libglib2.0-0 fonts-dejavu-core fonts-noto-cjk fonts-noto-mono fonts-stix \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --gid 10001 docling \
+    && useradd --uid 10001 --gid 10001 --create-home docling
+
+ARG PYTORCH_INDEX_URL=https://download.pytorch.org/whl/cpu
+RUN python -m pip install --no-cache-dir --index-url ${PYTORCH_INDEX_URL} \
+      torch==2.12.0 torchvision==0.27.0
+
+COPY services/docling-service/deploy/docker/backend-constraints.txt /tmp/backend-constraints.txt
+COPY services/docling-service/deploy/docker/backend-runtime.txt /tmp/backend-runtime.txt
+
+RUN python -m pip install --no-cache-dir -c /tmp/backend-constraints.txt \
+      -r /tmp/backend-runtime.txt \
+    && python -m pip install --no-cache-dir --no-deps docling-serve==1.20.0 \
+    && python -m pip check
+
+COPY services/docling-service/deploy/docker/backend-entrypoint.sh /usr/local/bin/docling-backend-entrypoint
+
+RUN mkdir -p /models/docling /models/huggingface \
+    && chmod 0755 /usr/local/bin/docling-backend-entrypoint \
+    && chown -R docling:docling /models
+
+ENV HF_HUB_DISABLE_XET=1 \
+    HF_HUB_DOWNLOAD_TIMEOUT=600 \
+    DOCLING_INFERENCE_COMPILE_TORCH_MODELS=false \
+    DOCLING_SERVE_ALLOWED_CODE_FORMULA_PRESETS=default,granite_docling \
+    DOCLING_SERVE_MAX_SYNC_WAIT=7200
+
+USER 10001:10001
+EXPOSE 5001
+HEALTHCHECK --interval=30s --timeout=5s --start-period=900s --retries=6 \
+  CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:5001/version', timeout=3)"
+
+ENTRYPOINT ["docling-backend-entrypoint"]
+CMD ["docling-serve", "run", "--host", "0.0.0.0", "--port", "5001", "--artifacts-path", "/models/docling"]

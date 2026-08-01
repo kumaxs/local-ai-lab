@@ -1,4 +1,9 @@
-# The initial skeleton had no external dependencies.
-# Install only inside an isolated service venv for the Docling adapter spike.
-docling
-pdfplumber
+# Locked shared/API dependencies for the 1.0 release. Platform model runtimes
+# are selected through pyproject extras or the Docker backend image.
+pdfplumber==0.11.9
+pypdfium2==5.8.0
+pillow==12.2.0
+fastapi==0.136.3
+uvicorn==0.48.0
+python-multipart==0.0.29
+httpx==0.28.1

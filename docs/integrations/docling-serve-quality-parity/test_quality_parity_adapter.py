@@ -15,6 +15,46 @@ import formula_only_second_pass as formula_second_pass  # noqa: E402
 import semantic_reflow  # noqa: E402
 
 
+class FinalSurfaceStatusTests(unittest.TestCase):
+    def test_resolved_footnote_removes_stale_pre_reflow_warnings(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            (output_dir / "document.html").write_text(
+                '<a id="fnref-star-1" href="#fn-star-1">∗</a>'
+                '<aside id="fn-star-1">⋆ Corresponding author</aside>',
+                encoding="utf-8",
+            )
+            metadata: dict[str, object] = {}
+            status: dict[str, object] = {
+                "ok": True,
+                "warnings": [
+                    "suspicious_footnote:1:near_page_bottom_footnote",
+                    "unresolved_note_reference:page=1:marker=*",
+                    "structural_quarantine_applied:candidates=1",
+                    "formula_second_pass_skipped:no_formula_candidates",
+                ],
+                "quality_signals": {
+                    "primary_surface": {"ok": True},
+                    "structural_quarantine_qc": {
+                        "unresolved_footnote_count": 1,
+                    },
+                },
+            }
+
+            result = adapter.reconcile_final_surface_status(
+                output_dir, metadata, status
+            )
+
+        self.assertTrue(result["pre_reflow_diagnostics_resolved"])
+        self.assertEqual(result["linked_footnote_count"], 1)
+        self.assertEqual(result["removed_stale_warning_count"], 3)
+        self.assertEqual(
+            status["warnings"],
+            ["formula_second_pass_skipped:no_formula_candidates"],
+        )
+        self.assertEqual(metadata["final_surface_reconciliation"], result)
+
+
 class SemanticReflowTests(unittest.TestCase):
     def test_rebuild_initializes_quality_status_for_direct_service_output(self) -> None:
         metadata: dict[str, object] = {}
@@ -341,6 +381,22 @@ class SemanticReflowTests(unittest.TestCase):
         )
 
         self.assertEqual(callouts[id(table)], [("8", "8-1")])
+
+    def test_footnote_relation_normalizes_star_glyph_variants(self) -> None:
+        authors = semantic_reflow.FlowItem(
+            "text", {}, 1.0, 1, {}, {}, "Qiuchen Tian ∗ Li Chai ∗ Jinming Xu ∗"
+        )
+        footnote = semantic_reflow.FlowItem(
+            "footnote", {}, 2.0, 1, {}, {}, "⋆ Corresponding author: Li Chai."
+        )
+
+        footnotes, callouts = semantic_reflow._footnote_relations(
+            [authors, footnote],
+            {},
+        )
+
+        self.assertEqual(footnotes[id(footnote)][0], "star-1")
+        self.assertEqual(callouts[id(authors)], [("∗", "star-1")])
 
     def test_table_note_relation_links_symbol_to_explanatory_note(self) -> None:
         table = semantic_reflow.FlowItem("table", {}, 1.0, 1, {}, {})
@@ -1430,6 +1486,31 @@ class EnglishReviewPolishTests(unittest.TestCase):
         self.assertTrue(adapter.effective_cn_ocr_parity(args))
         self.assertTrue(adapter.is_cn_accepted_path(args))
         self.assertEqual(adapter.effective_formula_second_pass_policy(args), "apply-all")
+
+    def test_transformers_formula_uses_server_side_granite_preset(self) -> None:
+        args = Namespace(
+            formula_policy="granite_transformers",
+            enable_formula_mlx=False,
+            image_export_mode="referenced",
+            page_start=None,
+            page_end=None,
+        )
+
+        options = adapter.base_options(args, force_ocr=False)
+
+        self.assertEqual("granite_docling", options["code_formula_preset"])
+        self.assertNotIn("code_formula_custom_config", options)
+        self.assertEqual(1200.0, options["document_timeout"])
+
+    def test_custom_ocr_config_remains_typed_for_source_api(self) -> None:
+        args = Namespace(cn_ocr_request_shape="custom")
+        options: dict[str, object] = {}
+
+        adapter.apply_cn_ocr_options(options, args)
+
+        config = options["ocr_custom_config"]
+        self.assertEqual("ocrmac", config["kind"])
+        self.assertEqual(adapter.CN_OCR_LANG, config["lang"])
 
     def test_english_apply_all_policy_remains_isolated(self) -> None:
         args = Namespace(

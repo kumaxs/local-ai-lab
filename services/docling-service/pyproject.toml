@@ -1,9 +1,33 @@
 [project]
 name = "docling-service"
-version = "0.0.0"
-description = "Minimal local CLI skeleton for Local AI Lab document parsing."
-requires-python = ">=3.11"
-dependencies = ["pdfplumber"]
+version = "1.0.0"
+description = "Quality-first PDF to semantic HTML, Markdown, and JSON service."
+requires-python = ">=3.11,<3.14"
+dependencies = ["pdfplumber==0.11.9", "pypdfium2==5.8.0", "pillow==12.2.0"]
+
+[project.optional-dependencies]
+api = [
+  "fastapi==0.136.3",
+  "uvicorn==0.48.0",
+  "python-multipart==0.0.29",
+  "httpx==0.28.1",
+]
+macos = [
+  "docling==2.95.0",
+  "mlx-vlm==0.5.0; platform_system == 'Darwin' and platform_machine == 'arm64'",
+  "ocrmac==1.0.1; platform_system == 'Darwin'",
+]
+
+[project.scripts]
+docling-service-api = "docling_service.api:main"
+docling-service-cli = "docling_service.cli:main"
+
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["docling_service"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -1,6 +1,6 @@
 # Docling Server Quality Parity Adapter Boundary
 
-This directory documents a minimal parity adapter/spec for using Docling Server
+This directory documents the quality-first adapter for using Docling Server
 (`docling-serve`) as the model execution backend while preserving the
 quality-first behavior that was previously proven in Docling V1
 (`services/docling-service`).
@@ -12,9 +12,9 @@ Project naming:
 - Route A: the current Docling Server quality-parity adapter.
 - Route B: the `VlmPipeline` evaluation route only.
 
-It is also the minimal n8n-callable command boundary for the next integration
-phase. It is not a live n8n workflow change and it does not modify
-`docling-mcp`.
+It remains n8n-callable, and it is also the conversion core used by the formal
+macOS and Docker service releases. It does not modify `docling-mcp` or any live
+n8n workflow.
 
 Route A is acceptable only after Docling V1 parity is preserved. Do not use a
 naked Docling Server API response as the user-facing contract.
