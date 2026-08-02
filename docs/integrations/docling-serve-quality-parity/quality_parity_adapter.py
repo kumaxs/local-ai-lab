@@ -13,11 +13,13 @@ import base64
 import csv
 import difflib
 import html
+import io
 import json
 import re
 import shutil
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Any
@@ -30,7 +32,7 @@ from formula_only_second_pass import (
     run_formula_second_pass,
     validate_candidate_latex,
 )
-from semantic_reflow import rebuild_semantic_surfaces
+from semantic_reflow import _formula_mathml, rebuild_semantic_surfaces
 
 GXX_RE = re.compile(r"/G[0-9A-Fa-f]{2}")
 DATA_IMAGE_RE = re.compile(r"data:image/[^\"')\s]+")
@@ -170,6 +172,11 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--legacy-cn-accepted-baseline",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
         "--cn-ocr-request-shape",
         choices=["preset", "custom"],
         default="preset",
@@ -204,11 +211,27 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--formula-policy",
-        choices=["granite_mlx", "granite_transformers", "off"],
+        choices=[
+            "granite_mlx",
+            "granite_transformers",
+            "codeformula_transformers",
+            "formula_service",
+            "off",
+        ],
         default="granite_mlx",
         help=(
             "Select Granite-Docling-CodeFormula through MLX, the portable "
-            "Transformers preset, or disable formula enrichment."
+            "Granite Transformers preset, the portable CodeFormulaV2 "
+            "Transformers preset, the Docker-isolated guarded formula service, or "
+            "disable formula enrichment."
+        ),
+    )
+    parser.add_argument(
+        "--formula-ocr-url",
+        default=None,
+        help=(
+            "Private guarded formula service URL. Required when "
+            "--formula-policy=formula_service."
         ),
     )
     parser.add_argument(
@@ -297,6 +320,26 @@ def effective_formula_policy(args: argparse.Namespace) -> str:
     return args.formula_policy
 
 
+def validated_private_formula_ocr_url(value: str | None) -> str | None:
+    """Allow formula crops to leave the process only for a local/private sidecar."""
+
+    if not value:
+        return None
+    parsed = urllib.parse.urlsplit(value.rstrip("/"))
+    if (
+        parsed.scheme != "http"
+        or parsed.hostname not in {"formula", "localhost", "127.0.0.1", "::1"}
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError(
+            "formula OCR URL must be an unauthenticated local Docker/loopback HTTP endpoint"
+        )
+    return value.rstrip("/")
+
+
 def effective_ocr_fallback_policy(args: argparse.Namespace) -> str:
     if args.force_ocr_on_gxx:
         return "gxx"
@@ -304,7 +347,7 @@ def effective_ocr_fallback_policy(args: argparse.Namespace) -> str:
 
 
 def effective_cn_ocr_parity(args: argparse.Namespace) -> bool:
-    return bool(args.cn_ocr_parity or args.input_file.name == "CN.pdf")
+    return bool(args.cn_ocr_parity)
 
 
 def page_range(args: argparse.Namespace) -> list[int] | None:
@@ -318,7 +361,18 @@ def page_range(args: argparse.Namespace) -> list[int] | None:
 
 
 def is_transient_http_error(exc: BaseException) -> bool:
-    return isinstance(exc, urllib.error.HTTPError) and exc.code in {503, 504}
+    current: BaseException | None = exc
+    while current is not None:
+        if isinstance(current, urllib.error.HTTPError) and current.code in {503, 504}:
+            return True
+        current = current.__cause__
+    return False
+
+
+def _is_transient_docling_response(code: int, detail: str) -> bool:
+    if code in {503, 504}:
+        return True
+    return code == 404 and "Task result not found" in detail
 
 
 def post_json(
@@ -340,11 +394,11 @@ def post_json(
             with urllib.request.urlopen(request, timeout=timeout) as response:
                 return json.loads(response.read())
         except urllib.error.HTTPError as exc:
-            if exc.code not in {503, 504} or attempt >= retries:
-                try:
-                    detail = exc.read().decode("utf-8", errors="replace")
-                except OSError:
-                    detail = ""
+            try:
+                detail = exc.read().decode("utf-8", errors="replace")
+            except OSError:
+                detail = ""
+            if not _is_transient_docling_response(exc.code, detail) or attempt >= retries:
                 message = f"Docling Serve HTTP {exc.code}"
                 if detail:
                     message += f": {detail[:4000]}"
@@ -356,6 +410,33 @@ def post_json(
 def get_json(url: str, timeout: int = 10) -> dict[str, Any]:
     with urllib.request.urlopen(url, timeout=timeout) as response:
         return json.loads(response.read())
+
+
+def release_backend_converter_cache(args: argparse.Namespace) -> dict[str, Any]:
+    """Release Linux parser models before the isolated formula stage starts."""
+
+    if effective_formula_policy(args) != "formula_service":
+        return {"ok": True, "applied": False, "reason": "not_docker_formula_profile"}
+    url = f"{args.serve_url.rstrip('/')}/v1/clear/converters"
+    started = time.perf_counter()
+    try:
+        response = get_json(url, timeout=120)
+    except Exception as exc:
+        return {
+            "ok": False,
+            "applied": True,
+            "url": url,
+            "elapsed_seconds": time.perf_counter() - started,
+            "error_type": exc.__class__.__name__,
+            "error": str(exc),
+        }
+    return {
+        "ok": True,
+        "applied": True,
+        "url": url,
+        "elapsed_seconds": time.perf_counter() - started,
+        "response": response,
+    }
 
 
 def iter_nodes(value: Any):
@@ -590,7 +671,7 @@ def base_options(
         "images_scale": 2.0,
         "document_timeout": float(getattr(args, "timeout_seconds", 1200)),
         "do_formula_enrichment": effective_formula_policy(args)
-        in {"granite_mlx", "granite_transformers"},
+        in {"granite_mlx", "granite_transformers", "codeformula_transformers"},
         "do_code_enrichment": False,
     }
     selected_page_range = page_range_override or page_range(args)
@@ -607,6 +688,8 @@ def base_options(
         # deterministically selects Transformers; macOS keeps its accepted MLX
         # custom configuration above.
         options["code_formula_preset"] = "granite_docling"
+    elif effective_formula_policy(args) == "codeformula_transformers":
+        options["code_formula_preset"] = "codeformulav2"
     return options
 
 
@@ -10346,7 +10429,7 @@ def _repair_left_right_delimiter_artifacts(formula_text: str) -> tuple[str, list
 
 def _downgrade_unbalanced_left_right_commands(formula_text: str) -> tuple[str, list[str]]:
     left_count = len(re.findall(r"\\left(?=\s|[\(\[\{\\])", formula_text))
-    right_count = len(re.findall(r"\\right(?=\s|[\)\]\}\\])", formula_text))
+    right_count = len(re.findall(r"\\right(?=\s|[\)\]\}\\.])", formula_text))
     if left_count == right_count:
         return formula_text, []
     repaired = re.sub(r"\\left\s*(?P<delimiter>\\\||[()\[\]{}])", r"\g<delimiter>", formula_text)
@@ -10355,6 +10438,10 @@ def _downgrade_unbalanced_left_right_commands(formula_text: str) -> tuple[str, l
 
 
 def _repair_unmatched_formula_parentheses(formula_text: str) -> tuple[str, list[str]]:
+    left_count = len(re.findall(r"\\left(?=\s|[\(\[\{\\])", formula_text))
+    right_count = len(re.findall(r"\\right(?=\s|[\)\]\}\\.])", formula_text))
+    if left_count and left_count == right_count:
+        return formula_text, []
     trailing_number = re.search(r"\s*\\quad\s*\(\s*\d{1,3}\s*\)\s*$", formula_text)
     body = formula_text[: trailing_number.start()] if trailing_number else formula_text
     suffix = formula_text[trailing_number.start() :] if trailing_number else ""
@@ -11581,7 +11668,11 @@ def run_unified_review_qc(
 
 
 def is_cn_accepted_path(args: argparse.Namespace) -> bool:
-    return args.input_file.name == "CN.pdf" and effective_cn_ocr_parity(args)
+    return bool(
+        getattr(args, "legacy_cn_accepted_baseline", False)
+        and args.input_file.name == "CN.pdf"
+        and effective_cn_ocr_parity(args)
+    )
 
 
 def effective_formula_second_pass_policy(args: argparse.Namespace) -> str:
@@ -12195,7 +12286,15 @@ def _formula_output_safety_reasons(text: str) -> list[str]:
         reasons.append("algorithm_like_formula_array")
     reasons.extend(formula_hallucination_reasons(body))
     reasons.extend(f"latex_{reason}" for reason in _validated_latex_reasons(body))
-    if re.search(r"(?<![A-Za-z])(?:[A-Za-z]\s+){4,}[A-Za-z](?![A-Za-z])", body):
+    garble_probe = re.sub(
+        r"\\begin\s*\{\s*array\s*\}\s*\{[^{}]*\}",
+        " ",
+        body,
+    )
+    if re.search(
+        r"(?<![A-Za-z])(?:[A-Za-z]\s+){4,}[A-Za-z](?![A-Za-z])",
+        garble_probe,
+    ):
         reasons.append("garbled_letter_spaced_text")
     if CN_CHAR_RE.search(body):
         reasons.append("formula_contains_cjk_prose")
@@ -12219,6 +12318,8 @@ def _formula_output_safety_reasons(text: str) -> list[str]:
     numbers = _compact_formula_numbers(body)
     if len(numbers) != len(set(numbers)):
         reasons.append("duplicate_equation_number")
+    if body and _formula_mathml(body) is None:
+        reasons.append("mathml_render_failed")
     return list(dict.fromkeys(reasons))
 
 
@@ -13217,7 +13318,29 @@ def _patch_markdown_formula_blocks(output_dir: Path, formula_texts: dict[int, st
         return []
     md_text = md_path.read_text(encoding="utf-8")
     patched: list[int] = []
+    # Docling emits a mixture of decoded ``$$`` blocks and explicit
+    # ``formula-not-decoded`` placeholders for difficult pages.  Treat the
+    # combined sequence as the document's formula order so a guarded visual
+    # recognizer can restore formulas without appending them out of context.
+    formula_slots = list(
+        re.finditer(
+            r"(?s)\$\$.*?\$\$|<!--\s*formula-not-decoded\s*-->",
+            md_text,
+        )
+    )
+    ordered_edits: list[tuple[int, int, str]] = []
     for formula_no, formula_text in formula_texts.items():
+        if 0 < formula_no <= len(formula_slots):
+            slot = formula_slots[formula_no - 1]
+            ordered_edits.append(
+                (slot.start(), slot.end(), f"$$\n{formula_text}\n$$")
+            )
+            patched.append(formula_no)
+    for start, end, replacement in reversed(ordered_edits):
+        md_text = md_text[:start] + replacement + md_text[end:]
+    for formula_no, formula_text in formula_texts.items():
+        if formula_no in patched:
+            continue
         md_text, changed = _replace_markdown_formula_block(md_text, formula_no, formula_text)
         if not changed:
             blocks = list(re.finditer(r"\$\$.*?\$\$", md_text, re.DOTALL))
@@ -13712,8 +13835,12 @@ def apply_cn_final_document_polish(
     sidecar_dir: Path,
     args: argparse.Namespace,
 ) -> dict[str, Any]:
-    if args.input_file.name != "CN.pdf":
-        return {"ok": True, "applied": False, "reason": "not_cn_pdf"}
+    if not is_cn_accepted_path(args):
+        return {
+            "ok": True,
+            "applied": False,
+            "reason": "legacy_cn_compatibility_not_enabled",
+        }
     if not args.formula_second_pass_guarded_fallback_dir and not _default_cn_guarded_fallback_dirs():
         return {
             "ok": True,
@@ -13811,7 +13938,7 @@ def apply_current_formula_display_fallback(
             json.dumps(status, indent=2, ensure_ascii=False), encoding="utf-8"
         )
 
-    if args.input_file.name == "CN.pdf":
+    if is_cn_accepted_path(args):
         result = {"ok": True, "applied": False, "reason": "skip_cn_accepted_formula_path"}
         metadata["current_formula_display_fallback"] = result
         status["quality_signals"]["current_formula_display_fallback"] = result
@@ -13967,6 +14094,529 @@ def apply_current_formula_display_fallback(
     return result
 
 
+def _high_resolution_formula_png(
+    pdf_path: Path | None,
+    prov: dict[str, Any],
+    *,
+    scale: float = 6.0,
+) -> bytes | None:
+    """Render a formula bbox for guarded fallback OCR without exporting a screenshot."""
+
+    if pdf_path is None or not pdf_path.is_file():
+        return None
+    bbox = prov.get("bbox") if isinstance(prov, dict) else None
+    page_no = prov.get("page_no") if isinstance(prov, dict) else None
+    if not isinstance(bbox, dict) or not isinstance(page_no, int):
+        return None
+    try:
+        import pypdfium2 as pdfium  # type: ignore
+    except Exception:
+        return None
+    pdf = None
+    page = None
+    bitmap = None
+    try:
+        pdf = pdfium.PdfDocument(str(pdf_path))
+        if not (1 <= page_no <= len(pdf)):
+            return None
+        page = pdf[page_no - 1]
+        width, height = page.get_size()
+        bbox_left = float(bbox.get("l", 0.0))
+        bbox_right = float(bbox.get("r", width))
+        midpoint = width / 2.0
+        if bbox_right <= midpoint + 6.0:
+            column_left, column_right = 0.0, midpoint
+        elif bbox_left >= midpoint - 6.0:
+            column_left, column_right = midpoint, width
+        else:
+            column_left, column_right = 0.0, width
+        # Formula bboxes can omit a left-hand side even when their vertical
+        # position is accurate. Expand within the detected column only.
+        left = max(column_left, bbox_left - 80.0)
+        bottom = max(0.0, float(bbox.get("b", 0.0)) - 3.0)
+        right_edge = min(column_right, bbox_right + 24.0)
+        top_edge = min(height, float(bbox.get("t", height)) + 3.0)
+        if right_edge <= left or top_edge <= bottom:
+            return None
+        bitmap = page.render(
+            scale=scale,
+            crop=(left, bottom, width - right_edge, height - top_edge),
+        )
+        image = bitmap.to_pil().convert("RGB")
+        buffer = io.BytesIO()
+        image.save(buffer, format="PNG", optimize=True)
+        return buffer.getvalue()
+    except Exception:
+        return None
+    finally:
+        for resource in (bitmap, page, pdf):
+            close = getattr(resource, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    pass
+
+
+def _tighten_formula_ocr_crop(image_bytes: bytes) -> tuple[bytes, dict[str, Any]]:
+    """Remove clearly detached prose/edge fragments from a formula OCR crop.
+
+    Layout engines sometimes assign the preceding prose line to a formula
+    node.  We only tighten when horizontal ink bands provide unambiguous
+    evidence: a single non-edge band remains, or one band has a substantially
+    larger left margin than every competing full line.  Ambiguous crops are
+    returned byte-for-byte unchanged.
+    """
+
+    unchanged = {"applied": False, "reason": "ambiguous_or_single_band"}
+    if not image_bytes:
+        return image_bytes, {"applied": False, "reason": "empty_crop"}
+    try:
+        from PIL import Image
+
+        image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+        gray = image.convert("L")
+    except Exception as exc:
+        return image_bytes, {
+            "applied": False,
+            "reason": f"image_decode_failed:{type(exc).__name__}",
+        }
+    width, height = gray.size
+    if width < 24 or height < 12:
+        return image_bytes, {"applied": False, "reason": "crop_too_small"}
+    pixels = gray.load()
+    ink_x = [
+        x
+        for y in range(height)
+        for x in range(width)
+        if pixels[x, y] < 210
+    ]
+    edge_clipped = bool(
+        ink_x and (min(ink_x) <= 1 or max(ink_x) >= width - 2)
+    )
+    unchanged = {
+        "applied": False,
+        "reason": "ambiguous_or_single_band",
+        "edge_clipped": edge_clipped,
+    }
+    minimum_ink = max(2, width // 500)
+    row_ink = [
+        sum(pixels[x, y] < 210 for x in range(width))
+        for y in range(height)
+    ]
+    bands: list[tuple[int, int]] = []
+    start: int | None = None
+    for y, count in enumerate([*row_ink, 0]):
+        if count >= minimum_ink and start is None:
+            start = y
+        elif count < minimum_ink and start is not None:
+            if y - start >= 2:
+                bands.append((start, y - 1))
+            start = None
+    if len(bands) < 2:
+        return image_bytes, unchanged
+    groups: list[tuple[int, int]] = []
+    for band_start, band_end in bands:
+        if groups and band_start - groups[-1][1] - 1 <= 3:
+            groups[-1] = (groups[-1][0], band_end)
+        else:
+            groups.append((band_start, band_end))
+    candidates = [
+        group
+        for group in groups
+        if not (
+            (group[0] <= 1 or group[1] >= height - 2)
+            and group[1] - group[0] + 1 <= max(6, int(height * 0.22))
+        )
+    ]
+    if not candidates:
+        return image_bytes, unchanged
+
+    metrics: list[tuple[tuple[int, int], int, int, int]] = []
+    for top, bottom in candidates:
+        xs = [
+            x
+            for y in range(top, bottom + 1)
+            for x in range(width)
+            if pixels[x, y] < 210
+        ]
+        if xs:
+            metrics.append(((top, bottom), min(xs), max(xs), len(xs)))
+    if not metrics:
+        return image_bytes, unchanged
+    metrics.sort(key=lambda item: item[1], reverse=True)
+    selected = metrics[0]
+    if len(metrics) > 1 and selected[1] - metrics[1][1] < width * 0.12:
+        return image_bytes, unchanged
+    (top, bottom), left, right, _ink = selected
+    padding = max(3, int(round(min(width, height) * 0.035)))
+    crop_box = (
+        max(0, left - padding),
+        max(0, top - padding),
+        min(width, right + padding + 1),
+        min(height, bottom + padding + 1),
+    )
+    if crop_box == (0, 0, width, height):
+        return image_bytes, unchanged
+    buffer = io.BytesIO()
+    image.crop(crop_box).save(buffer, format="PNG", optimize=True)
+    return buffer.getvalue(), {
+        "applied": True,
+        "reason": "detached_nonformula_bands_removed",
+        "original_size": [width, height],
+        "crop_box": list(crop_box),
+        "output_size": [crop_box[2] - crop_box[0], crop_box[3] - crop_box[1]],
+        "band_count": len(groups),
+        "edge_clipped": edge_clipped,
+    }
+
+
+def run_portable_formula_ocr(
+    output_dir: Path,
+    metadata: dict[str, Any],
+    status: dict[str, Any],
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    """Replace Docker formula placeholders using the private guarded sidecar."""
+
+    if effective_formula_policy(args) != "formula_service":
+        result = {"ok": True, "applied": False, "reason": "policy_not_formula_service"}
+        metadata["portable_formula_ocr"] = result
+        status.setdefault("quality_signals", {})["portable_formula_ocr"] = result
+        return result
+
+    document = _load_json_file(output_dir / "document.json")
+    formulas = extract_label_nodes(document, "formula") if isinstance(document, dict) else []
+    if not formulas:
+        result = {
+            "ok": True,
+            "applied": False,
+            "reason": "no_formula_candidates",
+            "formula_count": 0,
+        }
+        metadata["portable_formula_ocr"] = result
+        status.setdefault("quality_signals", {})["portable_formula_ocr"] = result
+        return result
+
+    try:
+        service_url = validated_private_formula_ocr_url(
+            getattr(args, "formula_ocr_url", None)
+        )
+    except ValueError as exc:
+        service_url = None
+        url_error = str(exc)
+    else:
+        url_error = None
+    if not service_url:
+        result = {
+            "ok": False,
+            "applied": False,
+            "reason": url_error or "formula_ocr_url_required",
+            "formula_count": len(formulas),
+        }
+        metadata["portable_formula_ocr"] = result
+        status.setdefault("quality_signals", {})["portable_formula_ocr"] = result
+        status["ok"] = False
+        status["success_class"] = "degraded_failure"
+        status.setdefault("warnings", []).append(
+            "portable_formula_ocr_failed:invalid_or_missing_private_url"
+        )
+        return result
+
+    request_items: list[dict[str, Any]] = []
+    equation_numbers: dict[int, int | None] = {}
+    missing_crops: list[int] = []
+    high_resolution_crop_indexes: list[int] = []
+    high_resolution_crop_failures: list[int] = []
+    crop_tightening: dict[int, dict[str, Any]] = {}
+    source_semantic_gate_enabled = (
+        metadata.get("ocr_fallback_reason") != "gxx_quality_failure"
+    )
+    source_semantic_gate = {
+        "enabled": source_semantic_gate_enabled,
+        "reason": (
+            "pdf_text_layer_available"
+            if source_semantic_gate_enabled
+            else "disabled_bad_pdf_text_layer_gxx_quality_failure"
+        ),
+    }
+    for index, formula in enumerate(formulas, start=1):
+        crop_path = output_dir / "formulas" / f"formula_{index}.png"
+        if not crop_path.is_file():
+            missing_crops.append(index)
+            continue
+        prov = first_prov(formula) or {}
+        equation_number = _pdf_formula_number_for_bbox(
+            args.input_file,
+            prov,
+        )
+        equation_numbers[index] = equation_number
+        primary_crop, primary_tightening = _tighten_formula_ocr_crop(
+            crop_path.read_bytes()
+        )
+        crop_tightening[index] = {"primary": primary_tightening}
+        request_item = {
+            "id": str(index),
+            "image_base64": base64.b64encode(primary_crop).decode("ascii"),
+            "source_text": (
+                _pdf_text_for_bbox(args.input_file, prov, padding=3.0)
+                if source_semantic_gate_enabled
+                else None
+            ),
+            "equation_number": equation_number,
+        }
+        fallback_crop = _high_resolution_formula_png(args.input_file, prov)
+        if fallback_crop:
+            fallback_crop, fallback_tightening = _tighten_formula_ocr_crop(
+                fallback_crop
+            )
+            crop_tightening[index]["fallback"] = fallback_tightening
+            use_expanded_crop = bool(
+                primary_tightening.get("edge_clipped")
+                and not fallback_tightening.get("edge_clipped")
+            )
+            if use_expanded_crop:
+                # Only replace the preview when its ink visibly touches an
+                # edge and the column-bounded PDF render restores a complete,
+                # separable formula line.
+                request_item["image_base64"] = base64.b64encode(
+                    fallback_crop
+                ).decode("ascii")
+                crop_tightening[index]["selected_primary"] = (
+                    "tightened_high_resolution_pdf_crop"
+                )
+            else:
+                crop_tightening[index]["selected_primary"] = (
+                    "page_preview_formula_crop"
+                )
+            guarded_fallback_crop = (
+                fallback_crop if use_expanded_crop else primary_crop
+            )
+            crop_tightening[index]["selected_fallback"] = (
+                "tightened_expanded_pdf_crop"
+                if use_expanded_crop
+                else "page_preview_formula_crop"
+            )
+            request_item["fallback_image_base64"] = base64.b64encode(
+                guarded_fallback_crop
+            ).decode("ascii")
+            high_resolution_crop_indexes.append(index)
+        else:
+            crop_tightening[index]["fallback"] = {
+                "applied": False,
+                "reason": "high_resolution_crop_unavailable",
+            }
+            crop_tightening[index]["selected_primary"] = (
+                "page_preview_formula_crop"
+            )
+            crop_tightening[index]["selected_fallback"] = (
+                "page_preview_formula_crop"
+            )
+            high_resolution_crop_failures.append(index)
+        request_items.append(request_item)
+
+    response: dict[str, Any] = {}
+    service_error: str | None = None
+    if request_items:
+        try:
+            response = post_json(
+                f"{service_url}/v1/recognize",
+                {"items": request_items},
+                timeout=max(60, int(args.timeout_seconds)),
+                retries=args.http_retries,
+                retry_sleep_seconds=args.http_retry_sleep_seconds,
+            )
+        except Exception as exc:
+            service_error = f"{type(exc).__name__}: {exc}"
+
+    by_index: dict[int, dict[str, Any]] = {}
+    for item in response.get("results") or []:
+        try:
+            index = int(item.get("id"))
+        except (TypeError, ValueError):
+            continue
+        by_index[index] = item
+
+    post_validation_fallback_indexes: list[int] = []
+    post_validation_fallback_error: str | None = None
+    for index, item in sorted(by_index.items()):
+        if not item.get("ok"):
+            continue
+        raw_latex = str(item.get("latex") or "").strip()
+        normalized, _repairs = canonicalize_formula_output(
+            raw_latex,
+            equation_numbers.get(index),
+        )
+        display, _display_repairs = sanitize_formula_display_text(normalized)
+        adapter_reasons = _formula_output_safety_reasons(display)
+        if adapter_reasons:
+            post_validation_fallback_indexes.append(index)
+    if post_validation_fallback_indexes:
+        request_by_index = {
+            int(item["id"]): item
+            for item in request_items
+            if str(item.get("id") or "").isdigit()
+        }
+        retry_items = [
+            {**request_by_index[index], "force_fallback": True}
+            for index in post_validation_fallback_indexes
+            if index in request_by_index
+        ]
+        try:
+            retry_response = post_json(
+                f"{service_url}/v1/recognize",
+                {"items": retry_items},
+                timeout=max(60, int(args.timeout_seconds)),
+                retries=args.http_retries,
+                retry_sleep_seconds=args.http_retry_sleep_seconds,
+            )
+        except Exception as exc:
+            post_validation_fallback_error = f"{type(exc).__name__}: {exc}"
+        else:
+            for retry_item in retry_response.get("results") or []:
+                try:
+                    retry_index = int(retry_item.get("id"))
+                except (TypeError, ValueError):
+                    continue
+                by_index[retry_index] = retry_item
+
+    formula_texts: dict[int, str] = {}
+    unsafe: list[dict[str, Any]] = []
+    details: list[dict[str, Any]] = []
+    for index, _formula in enumerate(formulas, start=1):
+        item = by_index.get(index)
+        if item is None:
+            unsafe.append({"index": index, "reasons": ["missing_service_result"]})
+            continue
+        raw_latex = str(item.get("latex") or "").strip()
+        normalized, repairs = canonicalize_formula_output(
+            raw_latex,
+            equation_numbers.get(index),
+        )
+        display, display_repairs = sanitize_formula_display_text(normalized)
+        reasons = list(item.get("safety_reasons") or [])
+        reasons.extend(_formula_output_safety_reasons(display))
+        reasons = list(dict.fromkeys(str(reason) for reason in reasons if reason))
+        detail = {
+            "index": index,
+            "equation_number": equation_numbers.get(index),
+            "ok": bool(item.get("ok")) and not reasons,
+            "variant": item.get("variant"),
+            "repairs": list(
+                dict.fromkeys(
+                    [*(item.get("repairs") or []), *repairs, *display_repairs]
+                )
+            ),
+            "safety_reasons": reasons,
+            "ambiguity_reasons": item.get("ambiguity_reasons") or [],
+            "latex": display,
+            "semantic_coverage": item.get("semantic_coverage"),
+            "primary": item.get("primary"),
+            "fallback": item.get("fallback"),
+        }
+        details.append(detail)
+        if detail["ok"] and display:
+            formula_texts[index] = display
+        else:
+            unsafe.append({"index": index, "reasons": reasons or ["service_rejected"]})
+
+    patched = _patch_formula_json_nodes(
+        output_dir,
+        formula_texts,
+        candidate_source="guarded_private_formula_service",
+        prefer_index_anchor=True,
+    )
+    patched_document = _load_json_file(output_dir / "document.json")
+    patched_nodes = (
+        extract_label_nodes(patched_document, "formula")
+        if isinstance(patched_document, dict)
+        else []
+    )
+    verified = [
+        index
+        for index, formula in enumerate(patched_nodes, start=1)
+        if str(formula.get("text") or "") == formula_texts.get(index)
+    ]
+    missing_results = sorted(set(range(1, len(formulas) + 1)) - set(formula_texts))
+    surface_sidecar_dir = output_dir / "formula_display_portable"
+    markdown_patched = _patch_markdown_formula_blocks(output_dir, formula_texts)
+    html_patch = _patch_html_formula_blocks(
+        output_dir,
+        surface_sidecar_dir,
+        formula_texts,
+        status_label="portable_formula_ocr",
+        complete_missing_sequence=True,
+        allow_formula_number_match=True,
+    )
+    surface_sync_ok = bool(
+        len(markdown_patched) == len(formulas)
+        and html_patch.get("ok")
+        and len(html_patch.get("patched_indexes") or []) == len(formulas)
+    )
+    recognition_ok = bool(
+        not service_error
+        and not missing_crops
+        and not unsafe
+        and len(verified) == len(formulas)
+    )
+    result = {
+        "ok": recognition_ok,
+        "applied": bool(patched),
+        "service_url": service_url,
+        "model": response.get("model"),
+        "source_semantic_gate": source_semantic_gate,
+        "formula_count": len(formulas),
+        "request_count": len(request_items),
+        "high_resolution_crop_indexes": high_resolution_crop_indexes,
+        "high_resolution_crop_failures": high_resolution_crop_failures,
+        "crop_tightening": crop_tightening,
+        "post_validation_fallback_indexes": post_validation_fallback_indexes,
+        "post_validation_fallback_error": post_validation_fallback_error,
+        "patched_count": len(patched),
+        "patched_indexes": patched,
+        "verified_count": len(verified),
+        "verified_indexes": verified,
+        "missing_crop_indexes": missing_crops,
+        "missing_or_unsafe_indexes": missing_results,
+        "document_md_patched": markdown_patched,
+        "document_html_patch": html_patch,
+        "surface_sync_ok": surface_sync_ok,
+        "surface_sync_deferred_to_final_reflow": not surface_sync_ok,
+        "unsafe": unsafe,
+        "details": details,
+        "service_error": service_error,
+    }
+    metadata["portable_formula_ocr"] = result
+    status.setdefault("quality_signals", {})["portable_formula_ocr"] = result
+    status.setdefault("warnings", []).append(
+        "portable_formula_ocr:"
+        f"recognized={len(formula_texts)}/{len(formulas)}:patched={len(patched)}"
+    )
+    if not recognition_ok:
+        status["ok"] = False
+        status["success_class"] = "degraded_failure"
+        status["warnings"].append(
+            "portable_formula_ocr_failed:"
+            + (
+                service_error
+                or ",".join(str(index) for index in missing_results)
+                or "incomplete_patch"
+            )
+        )
+    elif not surface_sync_ok:
+        status["warnings"].append(
+            "portable_formula_pre_reflow_surface_incomplete:"
+            "deferred_to_final_formula_surface_gate"
+        )
+    (output_dir / "metadata.json").write_text(
+        json.dumps(metadata, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
+    (output_dir / "status.json").write_text(
+        json.dumps(status, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
+    return result
+
+
 def run_optional_formula_second_pass(
     output_dir: Path,
     metadata: dict[str, Any],
@@ -13985,6 +14635,30 @@ def run_optional_formula_second_pass(
             f"formula_second_pass_policy_resolved:{requested_policy}->{policy}:"
             "preserve_accepted_cn_0854aa1_path"
         )
+    portable_formula = status.get("quality_signals", {}).get("portable_formula_ocr")
+    if (
+        effective_formula_policy(args) == "formula_service"
+        and isinstance(portable_formula, dict)
+        and portable_formula.get("ok")
+    ):
+        result = {
+            "ok": True,
+            "skipped": True,
+            "reason": "guarded_private_formula_service_is_authoritative",
+            "formula_count": portable_formula.get("formula_count", 0),
+        }
+        metadata["formula_second_pass"] = result
+        status["quality_signals"]["formula_second_pass"] = result
+        status["warnings"].append(
+            "formula_second_pass_skipped:guarded_private_formula_service_is_authoritative"
+        )
+        (output_dir / "metadata.json").write_text(
+            json.dumps(metadata, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+        (output_dir / "status.json").write_text(
+            json.dumps(status, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+        return
     if policy == "off":
         apply_current_formula_display_fallback(
             output_dir,
@@ -14443,7 +15117,15 @@ def summarize_response(
             else (
                 "granite_docling_transformers"
                 if selected_formula_policy == "granite_transformers"
-                else None
+                else (
+                    "codeformulav2_transformers"
+                    if selected_formula_policy == "codeformula_transformers"
+                    else (
+                        "guarded_private_formula_service"
+                        if selected_formula_policy == "formula_service"
+                        else None
+                    )
+                )
             )
         ),
         "formula_policy": selected_formula_policy,
@@ -14524,14 +15206,24 @@ def run_conversion(
         retry_sleep_seconds=args.http_retry_sleep_seconds,
     )
     wall_time = time.perf_counter() - start
+    backend_cache_release = release_backend_converter_cache(args)
     warnings: list[str] = []
     selected_formula_policy = effective_formula_policy(args)
     if selected_formula_policy == "granite_mlx":
         warnings.append("formula_enrichment_requested_granite_docling_mlx")
     elif selected_formula_policy == "granite_transformers":
         warnings.append("formula_enrichment_requested_granite_docling_transformers")
+    elif selected_formula_policy == "codeformula_transformers":
+        warnings.append("formula_enrichment_requested_codeformulav2_transformers")
+    elif selected_formula_policy == "formula_service":
+        warnings.append("formula_enrichment_requested_guarded_private_formula_service")
     if force_ocr:
         warnings.append("ocr_fallback_force_ocr_request")
+    if backend_cache_release.get("applied") and not backend_cache_release.get("ok"):
+        warnings.append(
+            "docker_backend_converter_cache_release_failed:"
+            f"{backend_cache_release.get('error_type')}"
+        )
     if cn_ocr_parity and force_ocr:
         warnings.append(
             "ocr_fallback_cn_ocrmac_full_page_requested:"
@@ -14541,6 +15233,10 @@ def run_conversion(
     metadata, status = summarize_response(
         name, response, wall_time, options, warnings, args, output_dir
     )
+    metadata["backend_converter_cache_release"] = backend_cache_release
+    status.setdefault("quality_signals", {})[
+        "backend_converter_cache_release"
+    ] = backend_cache_release
     return response, metadata, status
 
 
@@ -14850,6 +15546,88 @@ def reconcile_final_surface_status(
     return result
 
 
+def validate_final_formula_surfaces(
+    output_dir: Path,
+    metadata: dict[str, Any],
+    status: dict[str, Any],
+) -> dict[str, Any]:
+    """Reject successful jobs whose final formula surface is not renderable."""
+
+    html_path = output_dir / "document.html"
+    markdown_path = output_dir / "document.md"
+    html_text = html_path.read_text(encoding="utf-8") if html_path.exists() else ""
+    markdown_text = (
+        markdown_path.read_text(encoding="utf-8") if markdown_path.exists() else ""
+    )
+    quality_signals = status.setdefault("quality_signals", {})
+    primary = quality_signals.get("primary_surface") or {}
+    document = _load_json_file(output_dir / "document.json")
+    document_formula_count = (
+        len(extract_label_nodes(document, "formula"))
+        if isinstance(document, dict)
+        else 0
+    )
+    portable_formula_count = int(
+        (quality_signals.get("portable_formula_ocr") or {}).get("formula_count")
+        or 0
+    )
+    formula_count = max(
+        int((primary.get("counts") or {}).get("formulas") or 0),
+        document_formula_count,
+        portable_formula_count,
+    )
+    html_math_count = len(re.findall(r"<math(?:\s|>)", html_text))
+    html_fallback_count = len(
+        re.findall(
+            r'<(?:div|span|p)\b[^>]*class="[^"]*\bformula-tex-fallback\b',
+            html_text,
+            re.IGNORECASE,
+        )
+    )
+    markdown_math_block_count = markdown_text.count("$$") // 2
+    raw_model_token_count = len(
+        re.findall(r"</?formula\b", html_text + "\n" + markdown_text, re.IGNORECASE)
+    )
+    undecoded_placeholder_count = len(
+        re.findall(
+            r"<!--\s*formula-not-decoded\s*-->|"
+            r'<(?:div|span|p)\b[^>]*class="[^"]*\bformula-not-decoded\b',
+            html_text + "\n" + markdown_text,
+            re.IGNORECASE,
+        )
+    )
+    failure_reasons: list[str] = []
+    if html_math_count < formula_count:
+        failure_reasons.append("incomplete_mathml_coverage")
+    if html_fallback_count:
+        failure_reasons.append("html_formula_tex_fallback_present")
+    if markdown_math_block_count < formula_count:
+        failure_reasons.append("incomplete_markdown_math_coverage")
+    if raw_model_token_count:
+        failure_reasons.append("raw_formula_model_tokens")
+    if undecoded_placeholder_count:
+        failure_reasons.append("undecoded_formula_placeholders")
+    result = {
+        "ok": not failure_reasons,
+        "formula_count": formula_count,
+        "html_math_count": html_math_count,
+        "html_tex_fallback_count": html_fallback_count,
+        "markdown_math_block_count": markdown_math_block_count,
+        "raw_model_token_count": raw_model_token_count,
+        "undecoded_placeholder_count": undecoded_placeholder_count,
+        "failure_reasons": failure_reasons,
+    }
+    metadata["final_formula_surface"] = result
+    quality_signals["final_formula_surface"] = result
+    if failure_reasons and status.get("ok"):
+        status["ok"] = False
+        status["success_class"] = "degraded_failure"
+        status.setdefault("warnings", []).append(
+            "final_formula_surface_failed:" + ",".join(failure_reasons)
+        )
+    return result
+
+
 def main() -> int:
     args = parse_args()
     try:
@@ -15079,6 +15857,7 @@ def main() -> int:
 
     write_contract_outputs(output_dir, response, metadata, status)
     restore_review_artifact_layer(output_dir, response, metadata, status, conversion_args)
+    run_portable_formula_ocr(output_dir, metadata, status, conversion_args)
     run_optional_formula_second_pass(output_dir, metadata, status, conversion_args)
     recovered_document = _load_json_file(output_dir / "document.json")
     recover_algorithm_blocks_in_outputs(
@@ -15107,6 +15886,7 @@ def main() -> int:
         status["warnings"].append(
             "semantic_source_reflow_not_applied:document_json_missing"
         )
+    validate_final_formula_surfaces(output_dir, metadata, status)
     reconcile_final_surface_status(output_dir, metadata, status)
     record_cn_accepted_baseline(output_dir, metadata, status, conversion_args)
     refresh_final_broken_local_refs(output_dir, metadata, status)

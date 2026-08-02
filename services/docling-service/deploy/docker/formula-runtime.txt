@@ -1,0 +1,13 @@
+# Kept in a dedicated image because the guarded ensemble uses a Transformers
+# stack that is intentionally isolated from the Docling parser runtime.
+numpy==1.26.4
+unimernet==0.2.3
+paddlepaddle==3.2.2
+paddleocr==3.7.0
+paddlex==3.7.2
+tokenizers==0.19.1
+ftfy==6.3.1
+fastapi==0.136.3
+uvicorn==0.48.0
+pydantic==2.13.4
+huggingface-hub==0.36.2

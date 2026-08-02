@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import io
 import json
 import tempfile
 import sys
 import unittest
+import urllib.error
 from argparse import Namespace
 from pathlib import Path
 from unittest.mock import patch
@@ -15,7 +17,200 @@ import formula_only_second_pass as formula_second_pass  # noqa: E402
 import semantic_reflow  # noqa: E402
 
 
+class _JsonResponse:
+    def __init__(self, payload: dict[str, object]):
+        self.payload = payload
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return False
+
+    def read(self) -> bytes:
+        return json.dumps(self.payload).encode("utf-8")
+
+
+class DoclingHttpRetryTests(unittest.TestCase):
+    def test_wrapped_transient_http_error_remains_classifiable(self) -> None:
+        transient = urllib.error.HTTPError(
+            "http://127.0.0.1:5001/v1/convert/source",
+            503,
+            "Unavailable",
+            {},
+            None,
+        )
+        wrapped = RuntimeError("Docling Serve HTTP 503")
+        wrapped.__cause__ = transient
+
+        self.assertTrue(adapter.is_transient_http_error(wrapped))
+
+    def test_result_visibility_404_is_retried(self) -> None:
+        url = "http://127.0.0.1:5001/v1/convert/source"
+        pending = urllib.error.HTTPError(
+            url,
+            404,
+            "Not Found",
+            {},
+            io.BytesIO(b'{"detail":"Task result not found. Please wait."}'),
+        )
+        with (
+            patch.object(
+                adapter.urllib.request,
+                "urlopen",
+                side_effect=[pending, _JsonResponse({"status": "success"})],
+            ) as urlopen,
+            patch.object(adapter.time, "sleep") as sleep,
+        ):
+            result = adapter.post_json(
+                url,
+                {"sources": []},
+                timeout=10,
+                retries=1,
+                retry_sleep_seconds=0.01,
+            )
+
+        self.assertEqual(result, {"status": "success"})
+        self.assertEqual(urlopen.call_count, 2)
+        sleep.assert_called_once_with(0.01)
+
+    def test_unrelated_404_is_not_retried(self) -> None:
+        url = "http://127.0.0.1:5001/v1/convert/source"
+        missing = urllib.error.HTTPError(
+            url,
+            404,
+            "Not Found",
+            {},
+            io.BytesIO(b'{"detail":"unknown endpoint"}'),
+        )
+        with patch.object(adapter.urllib.request, "urlopen", side_effect=missing) as urlopen:
+            with self.assertRaisesRegex(RuntimeError, "unknown endpoint"):
+                adapter.post_json(
+                    url,
+                    {"sources": []},
+                    timeout=10,
+                    retries=2,
+                    retry_sleep_seconds=0.01,
+                )
+
+        self.assertEqual(urlopen.call_count, 1)
+
+
 class FinalSurfaceStatusTests(unittest.TestCase):
+    def test_formula_fallback_css_selector_is_not_counted_as_output(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            (output_dir / "document.html").write_text(
+                "<style>.formula-tex-fallback{font-family:math}</style>"
+                '<div class="formula"><math><mi>x</mi></math></div>',
+                encoding="utf-8",
+            )
+            (output_dir / "document.md").write_text("$$\nx\n$$\n", encoding="utf-8")
+            metadata: dict[str, object] = {}
+            status: dict[str, object] = {
+                "ok": True,
+                "success_class": "success",
+                "warnings": [],
+                "quality_signals": {
+                    "primary_surface": {"counts": {"formulas": 1}}
+                },
+            }
+
+            result = adapter.validate_final_formula_surfaces(
+                output_dir, metadata, status
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["html_tex_fallback_count"], 0)
+
+    def test_unrenderable_formula_surface_fails_quality_gate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            (output_dir / "document.html").write_text(
+                '<div class="formula formula-tex-fallback"><code>x</formula</code></div>',
+                encoding="utf-8",
+            )
+            (output_dir / "document.md").write_text(
+                "$$\nx</formula\n$$\n", encoding="utf-8"
+            )
+            metadata: dict[str, object] = {}
+            status: dict[str, object] = {
+                "ok": True,
+                "success_class": "success",
+                "warnings": [],
+                "quality_signals": {
+                    "primary_surface": {"counts": {"formulas": 1}}
+                },
+            }
+
+            result = adapter.validate_final_formula_surfaces(
+                output_dir, metadata, status
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["html_math_count"], 0)
+        self.assertEqual(result["raw_model_token_count"], 2)
+        self.assertFalse(status["ok"])
+        self.assertEqual(status["success_class"], "degraded_failure")
+
+    def test_partial_formula_coverage_fails_quality_gate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            (output_dir / "document.html").write_text(
+                "<div><math><mi>x</mi></math></div>", encoding="utf-8"
+            )
+            (output_dir / "document.md").write_text(
+                "$$x$$\n", encoding="utf-8"
+            )
+            metadata: dict[str, object] = {}
+            status: dict[str, object] = {
+                "ok": True,
+                "success_class": "success",
+                "warnings": [],
+                "quality_signals": {
+                    "primary_surface": {"counts": {"formulas": 2}}
+                },
+            }
+
+            result = adapter.validate_final_formula_surfaces(
+                output_dir, metadata, status
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertIn("incomplete_mathml_coverage", result["failure_reasons"])
+        self.assertIn(
+            "incomplete_markdown_math_coverage", result["failure_reasons"]
+        )
+
+    def test_document_formula_count_and_placeholders_survive_failed_reflow(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            (output_dir / "document.json").write_text(
+                json.dumps({"texts": [{"label": "formula", "text": "x=y"}]}),
+                encoding="utf-8",
+            )
+            (output_dir / "document.html").write_text(
+                "<html><body></body></html>", encoding="utf-8"
+            )
+            (output_dir / "document.md").write_text(
+                "<!-- formula-not-decoded -->\n", encoding="utf-8"
+            )
+            metadata: dict[str, object] = {}
+            status: dict[str, object] = {
+                "ok": False,
+                "success_class": "degraded_failure",
+                "warnings": [],
+                "quality_signals": {"primary_surface": {"ok": False}},
+            }
+
+            result = adapter.validate_final_formula_surfaces(
+                output_dir, metadata, status
+            )
+
+        self.assertEqual(result["formula_count"], 1)
+        self.assertEqual(result["undecoded_placeholder_count"], 1)
+        self.assertIn("undecoded_formula_placeholders", result["failure_reasons"])
+
     def test_resolved_footnote_removes_stale_pre_reflow_warnings(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             output_dir = Path(tmpdir)
@@ -53,6 +248,116 @@ class FinalSurfaceStatusTests(unittest.TestCase):
             ["formula_second_pass_skipped:no_formula_candidates"],
         )
         self.assertEqual(metadata["final_surface_reconciliation"], result)
+
+
+class PortableFormulaOcrTests(unittest.TestCase):
+    def test_formula_crop_tightening_removes_detached_prose_lines(self) -> None:
+        try:
+            from PIL import Image, ImageDraw
+        except ModuleNotFoundError:
+            self.skipTest("Pillow unavailable")
+        image = Image.new("RGB", (300, 100), "white")
+        draw = ImageDraw.Draw(image)
+        draw.rectangle((5, 8, 294, 19), fill="black")
+        draw.rectangle((5, 34, 294, 45), fill="black")
+        draw.rectangle((125, 76, 255, 90), fill="black")
+        draw.rectangle((280, 76, 294, 90), fill="black")
+        payload = io.BytesIO()
+        image.save(payload, format="PNG")
+
+        tightened, diagnostic = adapter._tighten_formula_ocr_crop(
+            payload.getvalue()
+        )
+        tightened_image = Image.open(io.BytesIO(tightened))
+
+        self.assertTrue(diagnostic["applied"])
+        self.assertLess(tightened_image.height, image.height // 2)
+        self.assertLess(tightened_image.width, image.width)
+
+    def test_formula_service_url_is_restricted_to_private_sidecar(self) -> None:
+        self.assertEqual(
+            adapter.validated_private_formula_ocr_url("http://formula:8001/"),
+            "http://formula:8001",
+        )
+        with self.assertRaisesRegex(ValueError, "local Docker/loopback"):
+            adapter.validated_private_formula_ocr_url("https://example.com/formulas")
+
+    def test_private_formula_service_patches_placeholder_json(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            (output_dir / "formulas").mkdir()
+            (output_dir / "formulas" / "formula_1.png").write_bytes(b"png")
+            (output_dir / "document.json").write_text(
+                json.dumps(
+                    {
+                        "texts": [
+                            {
+                                "label": "formula",
+                                "text": "",
+                                "prov": [],
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (output_dir / "document.html").write_text(
+                "<html><head></head><body><p>Formula follows.</p></body></html>",
+                encoding="utf-8",
+            )
+            (output_dir / "document.md").write_text(
+                "Formula follows.\n\n<!-- formula-not-decoded -->\n",
+                encoding="utf-8",
+            )
+            metadata: dict[str, object] = {
+                "ocr_fallback_reason": "gxx_quality_failure"
+            }
+            status: dict[str, object] = {
+                "ok": True,
+                "success_class": "success",
+                "warnings": [],
+                "quality_signals": {},
+            }
+            args = Namespace(
+                formula_policy="formula_service",
+                enable_formula_mlx=False,
+                formula_ocr_url="http://formula:8001",
+                input_file=output_dir / "source.pdf",
+                timeout_seconds=60,
+                http_retries=0,
+                http_retry_sleep_seconds=0,
+            )
+            response = {
+                "ok": True,
+                "model": "test/guarded-ensemble",
+                "results": [
+                    {
+                        "id": "1",
+                        "latex": "x = y",
+                        "ok": True,
+                        "safety_reasons": [],
+                        "variant": "source_crop",
+                    }
+                ],
+            }
+            with patch.object(adapter, "post_json", return_value=response) as post:
+                result = adapter.run_portable_formula_ocr(
+                    output_dir, metadata, status, args
+                )
+
+            document = json.loads((output_dir / "document.json").read_text())
+            markdown = (output_dir / "document.md").read_text(encoding="utf-8")
+            request_payload = post.call_args.args[1]
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["patched_indexes"], [1])
+        self.assertEqual(document["texts"][0]["text"], "x = y")
+        self.assertEqual(result["document_md_patched"], [1])
+        self.assertIn("$$\nx = y\n$$", markdown)
+        self.assertNotIn("formula-not-decoded", markdown)
+        self.assertFalse(result["source_semantic_gate"]["enabled"])
+        self.assertIsNone(request_payload["items"][0]["source_text"])
+        self.assertTrue(status["ok"])
 
 
 class SemanticReflowTests(unittest.TestCase):
@@ -1010,27 +1315,33 @@ class SemanticReflowTests(unittest.TestCase):
                 original_html,
             )
 
-    def test_cn_tskt_source_verified_formula_set_is_complete_mathml(self) -> None:
-        formulas = semantic_reflow._CN_TSKT_FORMULA_TEX
-
-        self.assertEqual(
-            list(formulas),
-            [str(number) for number in range(1, 25)],
-        )
-        self.assertTrue(
-            all(
-                semantic_reflow._formula_mathml(tex) is not None
-                for tex in formulas.values()
+    def test_legacy_formula_normalization_does_not_invent_equation_number(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output_dir = Path(directory)
+            (output_dir / "document.html").write_text(
+                "<html><head></head><body>"
+                '<div class="docling-formula-second-pass" data-formula-index="1">'
+                '<pre class="docling-formula-tex">x=y</pre>'
+                "</div></body></html>",
+                encoding="utf-8",
             )
-        )
-        self.assertIn(r"C^{\mathrm T}", formulas["3"])
-        self.assertIn(r"Q_{t,:}", formulas["3"])
-        self.assertIn(r"l_{q_i}", formulas["4"])
-        self.assertIn(r"e_{q_i\to c_p}", formulas["7"])
-        self.assertIn(r"W_v^e", formulas["9"])
-        self.assertIn(r"\alpha_{uv}", formulas["12"])
-        self.assertIn(r"\sum_{k=1}^{t-1}h_k", formulas["16"])
-        self.assertIn(r"W_f+b_f", formulas["22"])
+            (output_dir / "document.md").write_text(
+                "$$x=y$$\n", encoding="utf-8"
+            )
+
+            result = semantic_reflow._normalize_legacy_formula_surfaces(
+                output_dir
+            )
+            html_text = (output_dir / "document.html").read_text(
+                encoding="utf-8"
+            )
+            markdown_text = (output_dir / "document.md").read_text(
+                encoding="utf-8"
+            )
+
+        self.assertEqual(result["equation_numbers"], [])
+        self.assertNotIn('<span class="equation-number">', html_text)
+        self.assertNotIn(r"\tag{1}", markdown_text)
 
     def test_algorithm_preformatted_block_preserves_geometry_indentation(self) -> None:
         class AlgorithmSource:
@@ -1476,16 +1787,27 @@ class EnglishReviewPolishTests(unittest.TestCase):
         self.assertFalse(recovery["applied"])
         self.assertEqual(recovery["reason"], "not_image_only_pdf")
 
-    def test_cn_apply_all_uses_same_formula_policy_as_english(self) -> None:
+    def test_cn_filename_does_not_select_macos_only_or_legacy_behavior(self) -> None:
         args = Namespace(
             input_file=Path("/tmp/CN.pdf"),
             cn_ocr_parity=False,
+            legacy_cn_accepted_baseline=False,
             formula_second_pass_policy="apply-all",
+        )
+
+        self.assertFalse(adapter.effective_cn_ocr_parity(args))
+        self.assertFalse(adapter.is_cn_accepted_path(args))
+        self.assertEqual(adapter.effective_formula_second_pass_policy(args), "apply-all")
+
+    def test_legacy_cn_baseline_requires_explicit_compatibility_switch(self) -> None:
+        args = Namespace(
+            input_file=Path("/tmp/CN.pdf"),
+            cn_ocr_parity=True,
+            legacy_cn_accepted_baseline=True,
         )
 
         self.assertTrue(adapter.effective_cn_ocr_parity(args))
         self.assertTrue(adapter.is_cn_accepted_path(args))
-        self.assertEqual(adapter.effective_formula_second_pass_policy(args), "apply-all")
 
     def test_transformers_formula_uses_server_side_granite_preset(self) -> None:
         args = Namespace(
@@ -1501,6 +1823,51 @@ class EnglishReviewPolishTests(unittest.TestCase):
         self.assertEqual("granite_docling", options["code_formula_preset"])
         self.assertNotIn("code_formula_custom_config", options)
         self.assertEqual(1200.0, options["document_timeout"])
+
+    def test_docker_formula_profile_releases_backend_converter_cache(self) -> None:
+        args = Namespace(
+            formula_policy="formula_service",
+            enable_formula_mlx=False,
+            serve_url="http://backend:5001",
+        )
+        with patch.object(
+            adapter, "get_json", return_value={"status": "success"}
+        ) as get_json:
+            result = adapter.release_backend_converter_cache(args)
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["applied"])
+        get_json.assert_called_once_with(
+            "http://backend:5001/v1/clear/converters", timeout=120
+        )
+
+    def test_macos_formula_profile_keeps_backend_cache(self) -> None:
+        args = Namespace(
+            formula_policy="granite_mlx",
+            enable_formula_mlx=False,
+            serve_url="http://127.0.0.1:5001",
+        )
+        with patch.object(adapter, "get_json") as get_json:
+            result = adapter.release_backend_converter_cache(args)
+
+        self.assertTrue(result["ok"])
+        self.assertFalse(result["applied"])
+        get_json.assert_not_called()
+
+    def test_portable_formula_uses_codeformulav2_default_preset(self) -> None:
+        args = Namespace(
+            formula_policy="codeformula_transformers",
+            enable_formula_mlx=False,
+            image_export_mode="referenced",
+            page_start=None,
+            page_end=None,
+        )
+
+        options = adapter.base_options(args, force_ocr=False)
+
+        self.assertTrue(options["do_formula_enrichment"])
+        self.assertEqual("codeformulav2", options["code_formula_preset"])
+        self.assertNotIn("code_formula_custom_config", options)
 
     def test_custom_ocr_config_remains_typed_for_source_api(self) -> None:
         args = Namespace(cn_ocr_request_shape="custom")
@@ -1836,6 +2203,33 @@ class EnglishReviewPolishTests(unittest.TestCase):
 
         self.assertNotIn("repaired_pm_bold_variable_ocr_artifact", reasons)
         self.assertEqual(display_text, formula)
+
+    def test_formula_tex_qc_preserves_half_open_interval(self) -> None:
+        formula = (
+            r"\lim _ { k \to \infty } \rho ^ { - k } "
+            r"\left\| x ( k ) - x ^ { * } \right\| = 0, "
+            r"\forall \rho \in \left( \gamma , 1 \right] ."
+        )
+
+        display_text, reasons = adapter.sanitize_formula_display_text(formula)
+
+        self.assertNotIn("repaired_unmatched_display_parentheses", reasons)
+        self.assertEqual(display_text, formula)
+
+    def test_formula_tex_qc_preserves_invisible_right_delimiter(self) -> None:
+        formula = (
+            r"\left\{ \begin{array}{l} x_i = 1 \\ y_i = 2 "
+            r"\end{array} \right. \quad ( 2 )"
+        )
+
+        display_text, reasons = adapter.sanitize_formula_display_text(formula)
+
+        self.assertNotIn("downgraded_unbalanced_left_right_commands", reasons)
+        self.assertEqual(display_text, formula)
+        self.assertNotIn(
+            "latex_left_right_mismatch",
+            adapter._formula_output_safety_reasons(display_text),
+        )
 
     def test_formula_tex_qc_repairs_log_argument_and_stale_number_artifact(self) -> None:
         formula = (
@@ -2245,6 +2639,17 @@ class EnglishReviewPolishTests(unittest.TestCase):
         self.assertIn(
             "malformed_nested_subscript",
             adapter._formula_output_safety_reasons(r"c' _ { \, _ { p } } = O(c_p)"),
+        )
+
+    def test_formula_safety_does_not_treat_array_columns_as_spaced_prose(self) -> None:
+        formula = (
+            r"\begin{array}{r l r l r l} & \min_x f(x) \\ "
+            r"& \mathrm{subject\,to} \\ & g_i(x) \ge 0 \end{array}"
+        )
+
+        self.assertNotIn(
+            "garbled_letter_spaced_text",
+            adapter._formula_output_safety_reasons(formula),
         )
         self.assertNotIn(
             "unnecessary_single_formula_array",

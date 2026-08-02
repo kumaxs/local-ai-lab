@@ -6,8 +6,9 @@ Metal, MPS, Apple Vision, or macOS frameworks.
 ## Requirements
 
 - Docker Engine with Compose v2.
-- At least 12 GB memory and 15 GB free disk space for the CPU profile and model
-  cache. Complex or long papers may require more memory.
+- At least 8 GB Docker memory (12 GB recommended) and 15 GB free disk space for
+  the CPU profile and persistent model caches. Complex or long papers may
+  require more memory.
 - Network access during the initial image build and first model download.
 
 ## Build and start
@@ -18,14 +19,14 @@ docker compose \
   up -d --build
 ```
 
-On the first start, the backend initializes the portable layout, table,
-CodeFormulaV2, Granite Docling Transformers, and RapidOCR models in the named
-`docling_models` volume before opening port 5001. This can take several minutes
-and requires network access.
-Subsequent starts reuse the volume. Follow initialization with:
+On the first start, the parser initializes the portable layout, table, and
+RapidOCR models in `docling_models`. A separate private formula container
+downloads UniMERNet-Small and PP-FormulaNet-L into `docling_formula_models`.
+The first start can take 10 minutes or more and requires network access;
+subsequent starts reuse both named volumes. Follow initialization with:
 
 ```bash
-docker compose -f services/docling-service/deploy/docker/compose.yaml logs -f backend
+docker compose -f services/docling-service/deploy/docker/compose.yaml logs -f backend formula
 ```
 
 The API is bound to `127.0.0.1:8766`. The Docling backend is private to the
@@ -75,6 +76,37 @@ Inputs are retained so result provenance remains auditable. Apply an external
 retention policy appropriate to the documents; do not remove a running job's
 files.
 
-The default formula engine is `granite_transformers`; OCR fallback is automatic
-and the image installs RapidOCR plus CJK, monospaced, and mathematical fonts.
-The actual engine and any quality warnings are recorded per job.
+The backend transfers figure bytes to the API with `image_export_mode=embedded`.
+The semantic writer externalizes those bytes into per-job `pictures/` assets
+where possible. A plain referenced filename would point at the backend
+container's private filesystem and produce broken images in downloaded output.
+
+The default formula policy is `formula_service`. Docling performs formula layout
+detection without its unreliable Linux formula generator. The private sidecar
+uses UniMERNet-Small as the primary recognizer and compares its semantic symbols
+with text extracted from the same PDF bounding box. Formula crops are tightened
+to visible ink before recognition so adjacent prose does not pollute TeX. The
+same tightened crop is used by PP-FormulaNet-L when structure, source coverage,
+or an ambiguous symbol pattern needs an independent visual cross-check. A
+column-bounded crop rendered at six times the source PDF resolution is used only
+when the preview crop is visibly clipped at an edge. The primary model is
+released before the fallback loads, the batch size is one, and the two model
+peaks therefore do not accumulate.
+After every parser response the API also calls Docling Serve's converter-cache
+release endpoint before formula recognition. This prevents completed layout/OCR
+pipelines from retaining model memory while the isolated formula model loads.
+When the document's original text layer has already failed the `/Gxx` quality
+gate, that corrupt text is not treated as formula ground truth: recognition is
+accepted only through the visual model plus strict TeX structure checks.
+
+This separation also prevents the parser's Transformers dependency from
+constraining the formula engines. The sidecar has no published host port, and
+non-local formula service URLs are rejected. Any high-resolution crop is an
+internal OCR input and review evidence only; it is never used as HTML or
+Markdown paper content.
+
+OCR fallback is automatic, and the parser image installs RapidOCR plus CJK,
+monospaced, and mathematical fonts. The actual engine, formula patch count, and
+all quality warnings are recorded per job. A missing, rejected, or non-renderable
+formula, insufficient reliable source-semantic coverage, or incomplete MathML coverage
+makes the job fail rather than silently falling back to malformed text.

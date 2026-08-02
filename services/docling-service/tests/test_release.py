@@ -31,13 +31,29 @@ def make_config(root: Path, *, profile: str = "docker") -> ReleaseConfig:
         max_concurrent_jobs=1,
         conversion_timeout_seconds=60,
         image_export_mode="referenced",
-        formula_policy="granite_transformers" if profile == "docker" else "granite_mlx",
+        formula_policy=(
+            "formula_service" if profile == "docker" else "granite_mlx"
+        ),
         cn_ocr_parity=profile == "macos",
         api_token=None,
+        formula_ocr_url="http://formula:8001" if profile == "docker" else None,
     )
 
 
 class ReleaseConfigTests(unittest.TestCase):
+    def test_default_image_transport_crosses_process_boundaries(self) -> None:
+        for profile in ("docker", "macos"):
+            with self.subTest(profile=profile):
+                with patch.dict(
+                    "os.environ",
+                    {"DOCLING_RELEASE_PROFILE": profile},
+                    clear=True,
+                ):
+                    self.assertEqual(
+                        "embedded",
+                        ReleaseConfig.from_env().image_export_mode,
+                    )
+
     def test_profile_specific_timeout_defaults(self) -> None:
         with patch.dict("os.environ", {"DOCLING_RELEASE_PROFILE": "docker"}, clear=True):
             self.assertEqual(7200, ReleaseConfig.from_env().conversion_timeout_seconds)
@@ -56,6 +72,18 @@ class ReleaseConfigTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "MLX"):
                 invalid.validate()
 
+    def test_formula_sidecar_rejects_external_endpoint(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = make_config(Path(directory))
+            invalid = ReleaseConfig(
+                **{
+                    **config.__dict__,
+                    "formula_ocr_url": "https://example.com/formulas",
+                }
+            )
+            with self.assertRaisesRegex(ValueError, "local Docker/loopback"):
+                invalid.validate()
+
     def test_platform_commands_keep_output_contract_but_change_runtime(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -71,7 +99,8 @@ class ReleaseConfigTests(unittest.TestCase):
             mac_command = build_adapter_command(
                 make_config(root / "mac", profile="macos"), record
             )
-            self.assertIn("granite_transformers", docker_command)
+            self.assertIn("formula_service", docker_command)
+            self.assertIn("http://formula:8001", docker_command)
             self.assertNotIn("--cn-ocr-parity", docker_command)
             self.assertIn("granite_mlx", mac_command)
             self.assertIn("--cn-ocr-parity", mac_command)

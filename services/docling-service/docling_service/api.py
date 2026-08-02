@@ -9,7 +9,13 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
-from .release import RELEASE_VERSION, JobManager, ReleaseConfig, probe_backend
+from .release import (
+    RELEASE_VERSION,
+    JobManager,
+    ReleaseConfig,
+    probe_backend,
+    probe_formula_service,
+)
 
 
 def create_app(config: ReleaseConfig | None = None, manager: JobManager | None = None) -> Any:
@@ -48,13 +54,15 @@ def create_app(config: ReleaseConfig | None = None, manager: JobManager | None =
     @app.get("/healthz", tags=["system"])
     def healthz() -> Any:
         backend = probe_backend(actual_config)
+        formula = probe_formula_service(actual_config)
         payload = {
-            "ok": bool(backend["ok"]),
+            "ok": bool(backend["ok"] and formula["ok"]),
             "service": "docling-service",
             "profile": actual_config.profile,
             "backend": backend,
+            "formula": formula,
         }
-        if not backend["ok"]:
+        if not payload["ok"]:
             raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=payload)
         return payload
 

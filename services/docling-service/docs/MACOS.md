@@ -78,6 +78,9 @@ defaults are:
 - `DOCLING_DEVICE=cpu` for the standard PDF pipeline; this avoids known MPS
   numeric incompatibilities while the formula submodel still uses MLX.
 - `DOCLING_MAX_CONCURRENT_JOBS=1` to avoid competing large model loads.
+- `DOCLING_IMAGE_EXPORT_MODE=embedded` so figures survive the backend/API
+  process boundary and can be written into each job output directory.
 
 Set `DOCLING_FORMULA_POLICY=granite_transformers` to diagnose an MLX-specific
-problem without changing the output contract.
+problem without changing the output contract. This is a diagnostic mode, not
+the accepted Apple Silicon release default.

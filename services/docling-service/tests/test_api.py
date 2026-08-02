@@ -38,9 +38,10 @@ class ApiTests(unittest.TestCase):
                 max_concurrent_jobs=1,
                 conversion_timeout_seconds=60,
                 image_export_mode="referenced",
-                formula_policy="granite_transformers",
+                formula_policy="formula_service",
                 cn_ocr_parity=False,
                 api_token="test-token",
+                formula_ocr_url="http://formula:8001",
             )
 
             def runner(command, **_kwargs):

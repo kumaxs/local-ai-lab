@@ -1,4 +1,4 @@
-# docling-service 1.0.0
+# docling-service 1.0.1
 
 Formal quality-first PDF conversion service for Local AI Lab. It produces
 semantic HTML, Markdown, Docling JSON, quality metadata, review evidence, and
@@ -9,9 +9,10 @@ Two deployments implement one API and one output contract:
 
 - macOS: OCRMac for required OCR fallback and Granite Docling through MLX on
   Apple Silicon.
-- Docker/Linux: portable automatic OCR (RapidOCR in the supplied image) and
-  Granite Docling through Transformers. It has no imports or runtime dependency
-  on OCRMac, MLX, Metal, Vision, or other macOS frameworks.
+- Docker/Linux: portable automatic OCR (RapidOCR in the supplied image) and a
+  guarded UniMERNet-Small/PP-FormulaNet-L ensemble in an isolated private
+  formula container. It has no imports or runtime dependency on OCRMac, MLX,
+  Metal, Vision, or other macOS frameworks.
 
 Start here:
 

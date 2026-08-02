@@ -11,6 +11,7 @@ import subprocess
 import sys
 import threading
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -20,7 +21,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 
-RELEASE_VERSION = "1.0.0"
+RELEASE_VERSION = "1.0.1"
 TERMINAL_STATES = {"succeeded", "failed", "interrupted"}
 
 
@@ -56,6 +57,7 @@ class ReleaseConfig:
     formula_policy: str
     cn_ocr_parity: bool
     api_token: str | None
+    formula_ocr_url: str | None = None
 
     @classmethod
     def from_env(cls) -> "ReleaseConfig":
@@ -73,11 +75,16 @@ class ReleaseConfig:
             if profile == "docker"
             else _repo_root() / ".runtime/docling-release"
         )
-        formula_default = (
-            "granite_mlx"
-            if profile == "macos" and platform.machine() == "arm64"
-            else "granite_transformers"
-        )
+        if profile == "docker":
+            formula_default = "formula_service"
+        elif platform.machine() == "arm64":
+            formula_default = "granite_mlx"
+        else:
+            formula_default = "granite_transformers"
+        formula_policy = os.getenv("DOCLING_FORMULA_POLICY", formula_default)
+        formula_ocr_url = os.getenv("DOCLING_FORMULA_OCR_URL")
+        if formula_ocr_url is None and profile == "docker" and formula_policy == "formula_service":
+            formula_ocr_url = "http://formula:8001"
         timeout_default = "7200" if profile == "docker" else "3600"
         return cls(
             profile=profile,
@@ -92,10 +99,11 @@ class ReleaseConfig:
                 60,
                 int(os.getenv("DOCLING_CONVERSION_TIMEOUT_SECONDS", timeout_default)),
             ),
-            image_export_mode=os.getenv("DOCLING_IMAGE_EXPORT_MODE", "referenced"),
-            formula_policy=os.getenv("DOCLING_FORMULA_POLICY", formula_default),
+            image_export_mode=os.getenv("DOCLING_IMAGE_EXPORT_MODE", "embedded"),
+            formula_policy=formula_policy,
             cn_ocr_parity=_env_bool("DOCLING_CN_OCR_PARITY", profile == "macos"),
             api_token=os.getenv("DOCLING_SERVICE_API_TOKEN") or None,
+            formula_ocr_url=formula_ocr_url.rstrip("/") if formula_ocr_url else None,
         )
 
     def validate(self) -> None:
@@ -104,6 +112,8 @@ class ReleaseConfig:
         if self.formula_policy not in {
             "granite_mlx",
             "granite_transformers",
+            "codeformula_transformers",
+            "formula_service",
             "off",
         }:
             raise ValueError("DOCLING_FORMULA_POLICY is invalid")
@@ -111,6 +121,21 @@ class ReleaseConfig:
             raise ValueError("Docker profile cannot use the macOS-only MLX formula engine")
         if self.profile == "docker" and self.cn_ocr_parity:
             raise ValueError("Docker profile cannot use the macOS-only OCRMac fallback")
+        if self.formula_policy == "formula_service" and not self.formula_ocr_url:
+            raise ValueError("formula service policy requires DOCLING_FORMULA_OCR_URL")
+        if self.formula_ocr_url:
+            parsed = urllib.parse.urlsplit(self.formula_ocr_url)
+            if (
+                parsed.scheme != "http"
+                or parsed.hostname not in {"formula", "localhost", "127.0.0.1", "::1"}
+                or parsed.username is not None
+                or parsed.password is not None
+                or parsed.query
+                or parsed.fragment
+            ):
+                raise ValueError(
+                    "DOCLING_FORMULA_OCR_URL must be a local Docker/loopback HTTP endpoint"
+                )
         if not self.adapter_path.is_file():
             raise ValueError(f"quality adapter not found: {self.adapter_path}")
 
@@ -123,7 +148,12 @@ class ReleaseConfig:
             "release_version": RELEASE_VERSION,
             "profile": self.profile,
             "accepted_input_formats": ["application/pdf"],
-            "formula_engine": self.formula_policy,
+            "formula_engine": (
+                "unimernet-small+pp-formulanet-l-guarded"
+                if self.formula_policy == "formula_service"
+                else self.formula_policy
+            ),
+            "formula_policy": self.formula_policy,
             "ocr_fallback": "ocrmac" if self.cn_ocr_parity else "portable_auto",
             "table_mode": "accurate_with_cell_matching",
             "semantic_reflow": True,
@@ -176,6 +206,8 @@ def build_adapter_command(config: ReleaseConfig, record: JobRecord) -> list[str]
     ]
     if config.cn_ocr_parity:
         command.append("--cn-ocr-parity")
+    if config.formula_ocr_url:
+        command.extend(["--formula-ocr-url", config.formula_ocr_url])
     return command
 
 
@@ -186,6 +218,25 @@ def probe_backend(config: ReleaseConfig, timeout: float = 3.0) -> dict[str, Any]
     except (OSError, TimeoutError, ValueError, urllib.error.URLError) as exc:
         return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
     return {"ok": True, "version": payload}
+
+
+def probe_formula_service(config: ReleaseConfig, timeout: float = 3.0) -> dict[str, Any]:
+    if config.formula_policy != "formula_service":
+        return {"ok": True, "enabled": False}
+    if not config.formula_ocr_url:
+        return {"ok": False, "enabled": True, "error": "formula OCR URL is missing"}
+    try:
+        with urllib.request.urlopen(
+            f"{config.formula_ocr_url}/healthz", timeout=timeout
+        ) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except (OSError, TimeoutError, ValueError, urllib.error.URLError) as exc:
+        return {
+            "ok": False,
+            "enabled": True,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+    return {"ok": bool(payload.get("ok")), "enabled": True, "details": payload}
 
 
 def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
