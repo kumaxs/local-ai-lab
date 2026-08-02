@@ -812,7 +812,9 @@ def validate_candidate_latex(candidate_text: str | None) -> tuple[bool, list[str
     if begins != ends:
         reasons.append("environment_mismatch")
     left_count = len(re.findall(r"\\left(?=\s|[\(\[\{\\])", text))
-    right_count = len(re.findall(r"\\right(?=\s|[\)\]\}\\])", text))
+    # ``\right.`` is a valid invisible delimiter, commonly paired with
+    # ``\left\{`` around an array of equations.
+    right_count = len(re.findall(r"\\right(?=\s|[\)\]\}\\.])", text))
     if left_count != right_count:
         reasons.append("left_right_mismatch")
     if "&" in text and not re.search(

@@ -27,6 +27,7 @@ mkdir -p ${RUNTIME_DIR}/logs ${RUNTIME_DIR}/pids ${RUNTIME_DIR}/data/{inputs,out
 ${PYTHON_BIN} -m venv ${VENV_DIR}
 ${VENV_DIR}/bin/python -m pip install --upgrade pip wheel 'setuptools<82'
 ${VENV_DIR}/bin/python -m pip install \
+  --no-build-isolation \
   --constraint ${SHARED_CONSTRAINTS} \
   --constraint ${MACOS_CONSTRAINTS} \
   -e "${SERVICE_DIR}[api,macos]" \
@@ -52,5 +53,5 @@ if [[ ! -f "${MODEL_MARKER}" ]]; then
   touch "${MODEL_MARKER}"
 fi
 
-print "Installed docling-service 1.0.0 into ${VENV_DIR}"
+print "Installed docling-service 1.0.1 into ${VENV_DIR}"
 print "Start it with: ${SCRIPT_DIR}/start.sh"

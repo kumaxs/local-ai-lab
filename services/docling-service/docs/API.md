@@ -14,8 +14,9 @@ container health checks. It does not expose document data.
 
 ## `GET /healthz`
 
-Returns HTTP `200` only when the API and Docling backend are reachable. Returns
-`503` while models are starting or the backend is unavailable.
+Returns HTTP `200` only when the API, Docling backend, and the active formula
+sidecar are reachable. Returns `503` while models are starting or a required
+private backend is unavailable.
 
 ## `GET /v1/capabilities`
 
@@ -68,7 +69,7 @@ absolute paths and traversal outside it are rejected.
 | `404` | Unknown job or output file |
 | `413` | Upload exceeds `DOCLING_MAX_UPLOAD_BYTES` |
 | `415` | Missing, empty, non-PDF, or falsely named input |
-| `503` | Docling backend not ready |
+| `503` | Docling or formula backend not ready |
 
 ## Runtime variables
 
@@ -84,5 +85,16 @@ absolute paths and traversal outside it are rejected.
 | `DOCLING_MAX_UPLOAD_BYTES` | `268435456` | upload limit |
 | `DOCLING_MAX_CONCURRENT_JOBS` | `1` | conversion workers |
 | `DOCLING_CONVERSION_TIMEOUT_SECONDS` | `3600` macOS / `7200` Docker | model request timeout |
-| `DOCLING_IMAGE_EXPORT_MODE` | `referenced` | `referenced`, `embedded`, or `placeholder` |
+| `DOCLING_IMAGE_EXPORT_MODE` | `embedded` | `embedded` reliably crosses process/container boundaries; `referenced` requires a deliberately shared filesystem; `placeholder` omits image bytes |
+| `DOCLING_FORMULA_POLICY` | platform-specific | macOS: `granite_mlx`; Docker: `formula_service`; diagnostic options are `codeformula_transformers`, `granite_transformers`, and `off` |
+| `DOCLING_FORMULA_OCR_URL` | Docker: `http://formula:8001` | private sidecar URL; only the Compose service name or loopback is accepted |
+| `DOCLING_FORMULA_MODEL` | `wanderkid/unimernet_small` | Docker sidecar primary model |
+| `DOCLING_FORMULA_FALLBACK_MODEL` | `PP-FormulaNet-L` | Docker sidecar guarded high-accuracy fallback |
+| `DOCLING_FORMULA_MIN_SOURCE_COVERAGE` | `0.82` | minimum semantic-token recall against the original PDF bbox |
 | `DOCLING_SERVICE_API_TOKEN` | unset | optional bearer token |
+
+Formula crop data never uses the public API or an arbitrary remote formula
+endpoint. The adapter accepts only the private Compose hostname `formula` or a
+loopback address and rejects credentials, HTTPS hosts, query strings, and
+fragments in this internal URL. The formula endpoint is private implementation
+detail rather than part of the supported `/v1` public contract.

@@ -1965,81 +1965,6 @@ _LEGACY_SECOND_PASS_FORMULA_RE = re.compile(
     r'(?P<body>.*?</pre>)\s*</div>'
 )
 
-_CN_TSKT_FORMULA_TEX = {
-    "1": r"c'_p = O(c_p) \times W_c",
-    "2": r"q'_t = O(q_t) \times W_q",
-    "3": r"w_t = \operatorname{softmax}\left[(q'_t \times C^{\mathrm T}) \cdot Q_{t,:}\right]",
-    "4": r"l_{q_i} = O(l_{q_i}) \times W_l",
-    "5": (
-        r"r_{h\to p} = "
-        r"\frac{\sum_{k=1}^{d}(c'_p(k)-\overline{c'_p})"
-        r"(c'_h(k)-\overline{c'_h})}"
-        r"{\sqrt{\sum_{k=1}^{d}(c'_p(k)-\overline{c'_p})^2}"
-        r"\sqrt{\sum_{k=1}^{d}(c'_h(k)-\overline{c'_h})^2}}"
-    ),
-    "6": r"e_{h\to p} = \operatorname{ReLU}\left(W_1^{\mathrm T}[c'_h\cdot r_{h\to p}] + b_1\right)",
-    "7": r"e_{q_i\to c_p} = \sum_{h=1}^{N}e_{h\to p},\quad Q_{i,h}=1",
-    "8": r"el_{q_i\to c_p} = e_{q_i\to c_p} + l_{q_i}",
-    "9": (
-        r"et_{q_i\to c_p} = \operatorname{softmax}\left("
-        r"\frac{(el_{q_i\to c_p}W_q^e)(el_{q_i\to c_p}W_k^e)^{\mathrm T}}"
-        r"{\sqrt d}\right)(el_{q_i\to c_p}W_v^e)"
-    ),
-    "10": (
-        r"c_p = \operatorname{ReLU}\left("
-        r"W_2^{\mathrm T}\left[c'_p\oplus"
-        r"\sum_{i=1}^{t-1}et_{q_i\to c_p}\right]+b_2\right)"
-    ),
-    "11": (
-        r"\alpha_{uv} = "
-        r"\frac{\exp(\operatorname{LeakyReLU}(a^{\mathrm T}"
-        r"[W_Gc_u\oplus W_Gc_v]))}"
-        r"{\sum_{w\in\mathcal N_v}\exp(\operatorname{LeakyReLU}"
-        r"(a^{\mathrm T}[W_Gc_w\oplus W_Gc_v]))}"
-    ),
-    "12": (
-        r"cs_v = \sigma\left(\frac{1}{K}\sum_{k=1}^{K}"
-        r"\sum_{u\in\mathcal N_v}\alpha_{uv}W_Gc_v\right)"
-    ),
-    "13": (
-        r"qs_i = \operatorname{MLP}\left("
-        r"\sum_{c_v\in V_i}\left["
-        r"\operatorname{MLP}_{\mathrm{sigmoid}}(cs_v)\times"
-        r"\operatorname{MLP}_{\mathrm{tanh}}(cs_v)\right]\right)"
-    ),
-    "14": (
-        r"qr_i = \begin{cases}"
-        r"\operatorname{ReLU}(W_3^{\mathrm T}[qs_i\oplus r_i]+b_3),&r_i=1\\"
-        r"\operatorname{ReLU}(W_3^{\mathrm T}[r_i\oplus qs_i]+b_3),&r_i=0"
-        r"\end{cases}"
-    ),
-    "15": (
-        r"h_i = \operatorname{softmax}\left("
-        r"\frac{(qr_iW_q^h)(qr_iW_k^h)^{\mathrm T}}{\sqrt d}"
-        r"\right)(qr_iW_v^h)"
-    ),
-    "16": (
-        r"w_i = \frac{h_i}{\sum_{k=1}^{t-1}h_k},"
-        r"\quad i\in[1,t)\cap i\in\mathbb N"
-    ),
-    "17": (
-        r"h'_t = \operatorname{ReLU}\left("
-        r"W_4^{\mathrm T}\left[h_t\oplus"
-        r"\sum_{i=1}^{t-1}w_ih_i\right]+b_4\right)"
-    ),
-    "18": r"i_t = \tanh\left(W_i^{\mathrm T}[h'_t\oplus qs_t]+b_i\right)",
-    "19": r"y_t = \operatorname{sigmoid}(W_y^{\mathrm T}i_t+b_y)",
-    "20": r"K_t = K_{t-1}+w_t^{\mathrm T}h'_t-F_t",
-    "21": (
-        r"o'_i = \ln o_i^t\times W_o,"
-        r"\quad i\in[1,N]\cap i\in\mathbb N"
-    ),
-    "22": r"f_t = \operatorname{sigmoid}(O'W_f+b_f)",
-    "23": r"F_t = K_{t-1}f_t",
-    "24": r"L=-\sum_t\left(r_t\ln y_t+(1-r_t)\ln(1-y_t)\right)",
-}
-
-
 def _formula_without_trailing_number(tex: str, number: str) -> str:
     tex = tex.strip()
     digits = r"\s*".join(
@@ -2064,7 +1989,14 @@ def _formula_without_trailing_number(tex: str, number: str) -> str:
 def _semantic_formula_html(tex: str, number: str) -> tuple[str, bool]:
     mathml = _formula_mathml(tex)
     number_text = html.escape(number, quote=True)
-    number_html = f'<span class="equation-number">({number_text})</span>'
+    number_html = (
+        f'<span class="equation-number">({number_text})</span>'
+        if number_text
+        else ""
+    )
+    number_attribute = (
+        f' data-equation="{number_text}"' if number_text else ""
+    )
     escaped_tex = html.escape(tex)
     if mathml:
         formula_body = f'<span class="formula-math">{mathml}</span>'
@@ -2074,7 +2006,7 @@ def _semantic_formula_html(tex: str, number: str) -> tuple[str, bool]:
             f"<code>{escaped_tex}</code></span>"
         )
     return (
-        f'<div class="formula" data-equation="{number_text}">'
+        f'<div class="formula"{number_attribute}>'
         f"{formula_body}{number_html}"
         f"<details><summary>LaTeX</summary><code>{escaped_tex}</code></details>"
         "</div>",
@@ -2102,12 +2034,6 @@ def _normalize_legacy_formula_surfaces(output_dir: Path) -> dict[str, Any]:
     records: list[dict[str, str]] = []
     replacements: list[tuple[int, int, str]] = []
     mathml_count = 0
-    cn_tskt = (
-        "时空相关性融合表征的知识追踪模型" in html_text
-        and [match.group("number") for match in matches]
-        == [str(number) for number in range(1, 25)]
-    )
-    corrected_formula_numbers: list[str] = []
     for match in matches:
         number = html.unescape(match.group("number")).strip()
         tex_versions = re.findall(
@@ -2120,14 +2046,17 @@ def _normalize_legacy_formula_surfaces(output_dir: Path) -> dict[str, Any]:
         source_tex = _formula_without_trailing_number(raw_tex, number)
         if not source_tex:
             raise RuntimeError(f"legacy formula {number} has no semantic TeX")
-        tex = _CN_TSKT_FORMULA_TEX[number] if cn_tskt else source_tex
-        if tex != source_tex:
-            corrected_formula_numbers.append(number)
-        replacement, has_mathml = _semantic_formula_html(tex, number)
+        # The recognized document formula is authoritative.  Never select a
+        # paper-specific replacement based on title, filename, or equation
+        # count; formal releases must generalize to unseen papers.
+        tex = source_tex
+        equation_number = number if source_tex != raw_tex else ""
+        replacement, has_mathml = _semantic_formula_html(tex, equation_number)
         mathml_count += int(has_mathml)
         records.append(
             {
                 "number": number,
+                "equation_number": equation_number,
                 "tex": tex,
                 "source_tex": source_tex,
             }
@@ -2155,13 +2084,18 @@ def _normalize_legacy_formula_surfaces(output_dir: Path) -> dict[str, Any]:
                 "legacy HTML/Markdown formula content mismatch:"
                 + record["number"]
             )
+        markdown_tag = (
+            rf"\tag{{{record['equation_number']}}}"
+            if record["equation_number"]
+            else ""
+        )
         markdown_replacements.append(
             (
                 match.start(),
                 match.end(),
                 "$$\n"
                 + record["tex"]
-                + rf"\tag{{{record['number']}}}"
+                + markdown_tag
                 + "\n$$",
             )
         )
@@ -2212,8 +2146,12 @@ gap:1rem;margin:1.25rem 0;padding:.75rem 4.5rem .5rem 1rem;overflow-x:auto}
         "mathml_count": mathml_count,
         "tex_fallback_count": len(records) - mathml_count,
         "markdown_formula_count": len(markdown_matches),
-        "equation_numbers": [record["number"] for record in records],
-        "source_verified_formula_corrections": corrected_formula_numbers,
+        "equation_numbers": [
+            record["equation_number"]
+            for record in records
+            if record["equation_number"]
+        ],
+        "source_verified_formula_corrections": [],
         "external_mathjax_removed": True,
     }
 
