@@ -1,4 +1,4 @@
-# docling-service 1.0.1
+# docling-service 1.0.2
 
 Formal quality-first PDF conversion service for Local AI Lab. It produces
 semantic HTML, Markdown, Docling JSON, quality metadata, review evidence, and

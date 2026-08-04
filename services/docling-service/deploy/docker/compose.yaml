@@ -5,10 +5,11 @@ services:
     build:
       context: ../../../..
       dockerfile: services/docling-service/deploy/docker/Dockerfile.backend
-    image: local-ai-lab/docling-backend:1.0.1
+    image: local-ai-lab/docling-backend:1.0.2
     init: true
     restart: unless-stopped
     environment:
+      HF_ENDPOINT: "${HF_ENDPOINT:-https://hf-mirror.com}"
       DOCLING_DEVICE: ${DOCLING_DEVICE:-cpu}
       DOCLING_SERVE_MAX_SYNC_WAIT: ${DOCLING_CONVERSION_TIMEOUT_SECONDS:-7200}
       OMP_NUM_THREADS: ${DOCLING_CPU_THREADS:-4}
@@ -21,10 +22,11 @@ services:
     build:
       context: ../../../..
       dockerfile: services/docling-service/deploy/docker/Dockerfile.formula
-    image: local-ai-lab/docling-formula:1.0.1
+    image: local-ai-lab/docling-formula:1.0.2
     init: true
     restart: unless-stopped
     environment:
+      HF_ENDPOINT: "${HF_ENDPOINT:-https://hf-mirror.com}"
       DOCLING_FORMULA_MODEL: ${DOCLING_FORMULA_MODEL:-wanderkid/unimernet_small}
       DOCLING_FORMULA_FALLBACK_MODEL: ${DOCLING_FORMULA_FALLBACK_MODEL:-PP-FormulaNet-L}
       DOCLING_FORMULA_BATCH_SIZE: "1"
@@ -38,7 +40,7 @@ services:
     build:
       context: ../../../..
       dockerfile: services/docling-service/deploy/docker/Dockerfile.api
-    image: local-ai-lab/docling-api:1.0.1
+    image: local-ai-lab/docling-api:1.0.2
     init: true
     restart: unless-stopped
     depends_on:
