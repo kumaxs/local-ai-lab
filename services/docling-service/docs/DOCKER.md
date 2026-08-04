@@ -13,7 +13,7 @@ Metal, MPS, Apple Vision, or macOS frameworks.
 
 ## Pull and start on another machine
 
-Download and verify the `docling-service-1.0.1` bundle from the `v1.0.1` GitHub
+Download and verify the `docling-service-1.0.2` bundle from the `v1.0.2` GitHub
 Release, extract it, and run:
 
 ```bash
@@ -42,7 +42,7 @@ Stop without deleting persisted models, jobs, or outputs with:
 ## Build from tagged source
 
 The source-build fallback remains available from an intact release bundle or
-the exact `v1.0.1` repository checkout:
+the exact `v1.0.2` repository checkout:
 
 ```bash
 docker compose \
@@ -60,6 +60,12 @@ with:
 ```bash
 docker compose -f services/docling-service/deploy/docker/compose.yaml logs -f backend formula
 ```
+
+Hugging Face downloads from both Docker model containers default to
+`https://hf-mirror.com`. Set `HF_ENDPOINT` before `docker compose up` to use a
+different compatible endpoint, for example `https://huggingface.co`. The
+PP-FormulaNet-L fallback continues to use Paddle BOS independently of this
+setting.
 
 The API is bound to `127.0.0.1:8766`. The Docling backend is private to the
 Compose network and is not published on the host. The API sends PDF content to

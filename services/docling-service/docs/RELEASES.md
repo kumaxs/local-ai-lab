@@ -1,8 +1,8 @@
 # Release architecture
 
-Version `1.0.1` ships as two runtime profiles with one public contract.
+Version `1.0.2` ships as two runtime profiles with one public contract.
 
-The distributable release is anchored by Git tag `v1.0.1`. Release automation
+The distributable release is anchored by Git tag `v1.0.2`. Release automation
 produces SHA-256-verified `.tar.gz` and `.zip` bundles, verifies the macOS bundle
 from a clean runner, publishes all three Docker images for `linux/amd64` and
 `linux/arm64`, and attaches the bundles and checksums to a GitHub Release.

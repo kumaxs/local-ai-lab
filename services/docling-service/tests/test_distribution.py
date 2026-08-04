@@ -24,7 +24,7 @@ class DistributionTests(unittest.TestCase):
         project_text = (SERVICE_ROOT / "pyproject.toml").read_text(encoding="utf-8")
         project_version = re.search(r'^version = "([^"]+)"$', project_text, re.MULTILINE)
         self.assertIsNotNone(project_version)
-        self.assertEqual("1.0.1", project_version.group(1))
+        self.assertEqual("1.0.2", project_version.group(1))
         self.assertEqual(project_version.group(1), RELEASE_VERSION)
         self.assertEqual(RELEASE_VERSION, FORMULA_SERVICE_VERSION)
         for path in (
@@ -46,6 +46,13 @@ class DistributionTests(unittest.TestCase):
         self.assertIn("docling-formula", compose)
         for forbidden in ("ocrmac", "granite_mlx", "Metal", "Apple Vision"):
             self.assertNotIn(forbidden, compose)
+
+    def test_docker_compose_defaults_hugging_face_to_mirror_with_override(self) -> None:
+        expected = 'HF_ENDPOINT: "${HF_ENDPOINT:-https://hf-mirror.com}"'
+        for relative in ("deploy/docker/compose.yaml", "deploy/docker/compose.release.yaml"):
+            with self.subTest(compose=relative):
+                compose = (SERVICE_ROOT / relative).read_text(encoding="utf-8")
+                self.assertEqual(2, compose.count(expected))
 
     def test_release_workflow_publishes_assets_and_multiarch_images(self) -> None:
         workflow_path = REPO_ROOT / ".github/workflows/docling-service-release.yml"

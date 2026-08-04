@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 
-RELEASE_VERSION = "1.0.1"
+RELEASE_VERSION = "1.0.2"
 TERMINAL_STATES = {"succeeded", "failed", "interrupted"}
 
 
