@@ -19,7 +19,18 @@ part of this single-Mac service.
 
 ## Install
 
-From the repository root:
+For another machine, download and verify the `docling-service-1.0.1` bundle from
+the `v1.0.1` GitHub Release, extract it, and run from the extracted directory:
+
+```bash
+./install-macos.sh
+```
+
+This copies the release into a stable versioned directory under
+`~/Library/Application Support/Local AI Lab/` before installing dependencies.
+It is then safe to remove the downloaded archive and extraction directory.
+
+For development from a complete repository checkout:
 
 ```bash
 zsh services/docling-service/deploy/macos/install.sh
@@ -44,8 +55,10 @@ zsh services/docling-service/deploy/macos/status.sh
 zsh services/docling-service/deploy/macos/stop.sh
 ```
 
-The API defaults to `http://127.0.0.1:8000`. Runtime data and logs are under
-`.runtime/docling-release/macos/` and are ignored by Git.
+The API defaults to `http://127.0.0.1:8000`. Runtime data and logs are under the
+installed release's `.runtime/docling-release/macos/` directory. For a release
+bundle installation this is below the stable versioned installation path; for a
+repository checkout it is below the repository root.
 
 To require a bearer token, export it before starting both processes:
 

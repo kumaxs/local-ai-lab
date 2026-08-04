@@ -2,6 +2,14 @@
 
 Version `1.0.1` ships as two runtime profiles with one public contract.
 
+The distributable release is anchored by Git tag `v1.0.1`. Release automation
+produces SHA-256-verified `.tar.gz` and `.zip` bundles, verifies the macOS bundle
+from a clean runner, publishes all three Docker images for `linux/amd64` and
+`linux/arm64`, and attaches the bundles and checksums to a GitHub Release.
+Prebuilt images include OCI revision metadata, provenance, and SBOM
+attestations. See [DISTRIBUTION.md](DISTRIBUTION.md) for installation and
+integrity verification.
+
 | Capability | macOS release | Docker release |
 | --- | --- | --- |
 | Public API | `/v1/jobs` and `/v1/jobs/{id}` | identical |

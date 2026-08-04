@@ -16,6 +16,7 @@ Two deployments implement one API and one output contract:
 
 Start here:
 
+- [cross-machine distribution and integrity verification](docs/DISTRIBUTION.md)
 - [macOS installation and operation](docs/MACOS.md)
 - [Docker installation and operation](docs/DOCKER.md)
 - [HTTP API](docs/API.md)
@@ -24,6 +25,11 @@ Start here:
 
 The HTTP service listens on loopback by default. Swagger UI is available at
 `/docs` after startup.
+
+Tagged releases publish deterministic `.tar.gz` and `.zip` bundles, per-file
+integrity manifests, SHA-256 checksums, and prebuilt `linux/amd64` and
+`linux/arm64` images in GitHub Container Registry. The release archive is the
+supported entry point on machines that do not have a repository checkout.
 
 ## Development validation
 
