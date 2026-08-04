@@ -1,0 +1,69 @@
+name: local-ai-lab-docling
+
+services:
+  backend:
+    image: "${DOCLING_IMAGE_NAMESPACE:-ghcr.io/kumaxs}/local-ai-lab-docling-backend:${DOCLING_VERSION:-1.0.1}"
+    pull_policy: always
+    init: true
+    restart: unless-stopped
+    environment:
+      DOCLING_DEVICE: ${DOCLING_DEVICE:-cpu}
+      DOCLING_SERVE_MAX_SYNC_WAIT: ${DOCLING_CONVERSION_TIMEOUT_SECONDS:-7200}
+      OMP_NUM_THREADS: ${DOCLING_CPU_THREADS:-4}
+      MKL_NUM_THREADS: ${DOCLING_CPU_THREADS:-4}
+    shm_size: 1gb
+    volumes:
+      - docling-models:/models
+
+  formula:
+    image: "${DOCLING_IMAGE_NAMESPACE:-ghcr.io/kumaxs}/local-ai-lab-docling-formula:${DOCLING_VERSION:-1.0.1}"
+    pull_policy: always
+    init: true
+    restart: unless-stopped
+    environment:
+      DOCLING_FORMULA_MODEL: ${DOCLING_FORMULA_MODEL:-wanderkid/unimernet_small}
+      DOCLING_FORMULA_FALLBACK_MODEL: ${DOCLING_FORMULA_FALLBACK_MODEL:-PP-FormulaNet-L}
+      DOCLING_FORMULA_BATCH_SIZE: "1"
+      DOCLING_FORMULA_MIN_SOURCE_COVERAGE: ${DOCLING_FORMULA_MIN_SOURCE_COVERAGE:-0.82}
+      OMP_NUM_THREADS: "1"
+      MKL_NUM_THREADS: "1"
+    volumes:
+      - docling-formula-models:/models
+
+  api:
+    image: "${DOCLING_IMAGE_NAMESPACE:-ghcr.io/kumaxs}/local-ai-lab-docling-api:${DOCLING_VERSION:-1.0.1}"
+    pull_policy: always
+    init: true
+    restart: unless-stopped
+    depends_on:
+      backend:
+        condition: service_healthy
+      formula:
+        condition: service_healthy
+    ports:
+      - "${DOCLING_API_BIND:-127.0.0.1}:${DOCLING_API_PORT:-8766}:8000"
+    environment:
+      DOCLING_RELEASE_PROFILE: docker
+      DOCLING_SERVE_URL: http://backend:5001
+      DOCLING_INPUT_ROOT: /data/inputs
+      DOCLING_OUTPUT_ROOT: /data/outputs
+      DOCLING_STATE_ROOT: /data/state
+      DOCLING_FORMULA_POLICY: formula_service
+      DOCLING_FORMULA_OCR_URL: http://formula:8001
+      DOCLING_CN_OCR_PARITY: "false"
+      DOCLING_IMAGE_EXPORT_MODE: embedded
+      DOCLING_MAX_CONCURRENT_JOBS: ${DOCLING_MAX_CONCURRENT_JOBS:-1}
+      DOCLING_CONVERSION_TIMEOUT_SECONDS: ${DOCLING_CONVERSION_TIMEOUT_SECONDS:-7200}
+      DOCLING_MAX_UPLOAD_BYTES: ${DOCLING_MAX_UPLOAD_BYTES:-268435456}
+      DOCLING_SERVICE_API_TOKEN: ${DOCLING_SERVICE_API_TOKEN:-}
+    volumes:
+      - docling-inputs:/data/inputs
+      - docling-outputs:/data/outputs
+      - docling-state:/data/state
+
+volumes:
+  docling-models:
+  docling-formula-models:
+  docling-inputs:
+  docling-outputs:
+  docling-state:

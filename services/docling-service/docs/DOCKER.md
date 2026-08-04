@@ -11,7 +11,38 @@ Metal, MPS, Apple Vision, or macOS frameworks.
   require more memory.
 - Network access during the initial image build and first model download.
 
-## Build and start
+## Pull and start on another machine
+
+Download and verify the `docling-service-1.0.1` bundle from the `v1.0.1` GitHub
+Release, extract it, and run:
+
+```bash
+./docker-up.sh
+```
+
+The release Compose file pulls the versioned `docling-api`, `docling-backend`,
+and `docling-formula` images from the `ghcr.io/kumaxs` namespace. Image
+manifests support `linux/amd64` and `linux/arm64`. If the package is private,
+authenticate first with a GitHub token that has `read:packages` permission.
+
+Follow initialization with:
+
+```bash
+docker compose \
+  -f services/docling-service/deploy/docker/compose.release.yaml \
+  logs -f backend formula
+```
+
+Stop without deleting persisted models, jobs, or outputs with:
+
+```bash
+./docker-down.sh
+```
+
+## Build from tagged source
+
+The source-build fallback remains available from an intact release bundle or
+the exact `v1.0.1` repository checkout:
 
 ```bash
 docker compose \
@@ -23,7 +54,8 @@ On the first start, the parser initializes the portable layout, table, and
 RapidOCR models in `docling_models`. A separate private formula container
 downloads UniMERNet-Small and PP-FormulaNet-L into `docling_formula_models`.
 The first start can take 10 minutes or more and requires network access;
-subsequent starts reuse both named volumes. Follow initialization with:
+subsequent starts reuse both named volumes. Source-build logs can be followed
+with:
 
 ```bash
 docker compose -f services/docling-service/deploy/docker/compose.yaml logs -f backend formula
@@ -41,7 +73,8 @@ curl -fsS http://127.0.0.1:8766/healthz
 docker compose -f services/docling-service/deploy/docker/compose.yaml logs -f
 ```
 
-Stop without deleting persisted models, jobs, or outputs:
+Stop a source-build deployment without deleting persisted models, jobs, or
+outputs:
 
 ```bash
 docker compose -f services/docling-service/deploy/docker/compose.yaml down

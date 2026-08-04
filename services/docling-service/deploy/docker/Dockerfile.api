@@ -24,6 +24,16 @@ RUN python -m pip install --no-cache-dir --no-deps /opt/docling-service \
     && mkdir -p /data/inputs /data/outputs /data/state \
     && chown -R docling:docling /data /opt/docling-quality
 
+ARG RELEASE_VERSION=1.0.1
+ARG VCS_REF=unknown
+ARG BUILD_DATE=unknown
+LABEL org.opencontainers.image.title="Local AI Lab Docling API" \
+      org.opencontainers.image.description="Quality-first Docling job API and semantic output writer" \
+      org.opencontainers.image.version="${RELEASE_VERSION}" \
+      org.opencontainers.image.revision="${VCS_REF}" \
+      org.opencontainers.image.created="${BUILD_DATE}" \
+      org.opencontainers.image.source="https://github.com/kumaxs/local-ai-lab"
+
 USER 10001:10001
 EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
