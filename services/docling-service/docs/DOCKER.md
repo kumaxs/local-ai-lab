@@ -13,12 +13,28 @@ Metal, MPS, Apple Vision, or macOS frameworks.
 
 ## Pull and start on another machine
 
-Download and verify the `docling-service-1.0.2` bundle from the `v1.0.2` GitHub
+Download and verify the `docling-service-1.1.0` bundle from the `v1.1.0` GitHub
 Release, extract it, and run:
 
 ```bash
 ./docker-up.sh
 ```
+
+On a device that cannot execute shell scripts, use the release Compose file
+directly; it has no `build:` entries and no repository-relative build context:
+
+```bash
+docker compose \
+  -f services/docling-service/deploy/docker/compose.release.yaml \
+  pull
+docker compose \
+  -f services/docling-service/deploy/docker/compose.release.yaml \
+  up -d
+```
+
+Only the developer/source-build `compose.yaml` contains `../../../..`, because
+its Docker build context must include shared project files. That is normal for
+the source tree but is not required by the cross-machine release Compose file.
 
 The release Compose file pulls the versioned `docling-api`, `docling-backend`,
 and `docling-formula` images from the `ghcr.io/kumaxs` namespace. Image
@@ -42,7 +58,7 @@ Stop without deleting persisted models, jobs, or outputs with:
 ## Build from tagged source
 
 The source-build fallback remains available from an intact release bundle or
-the exact `v1.0.2` repository checkout:
+the exact `v1.1.0` repository checkout:
 
 ```bash
 docker compose \
@@ -107,13 +123,20 @@ For bearer authentication, set `DOCLING_SERVICE_API_TOKEN` in the shell before
   conservative CPU default covers formula-dense papers; lower it only after
   measuring the target hardware and corpus.
 - `DOCLING_MAX_UPLOAD_BYTES=268435456`: maximum upload size.
+- `DOCLING_MAX_PENDING_JOBS=20`: maximum queued plus running jobs.
+- `DOCLING_MAX_OUTPUT_BYTES=5368709120`: maximum published output per job.
+- `DOCLING_MAX_DATA_BYTES=53687091200`: total managed input, output, and
+  reserved-output budget.
+- `DOCLING_MIN_FREE_BYTES=2147483648`: filesystem free-space floor.
 - `DOCLING_API_BIND=127.0.0.1`: host bind address. Do not use `0.0.0.0` without
   TLS and authentication.
 
 Named volumes preserve `/models`, uploaded inputs, outputs, and job state.
-Inputs are retained so result provenance remains auditable. Apply an external
-retention policy appropriate to the documents; do not remove a running job's
-files.
+The built-in lifecycle manager removes inputs after 24 hours, successful output
+after 7 days, failed/interrupted output after 2 days, and task metadata after 30
+days by default. These intervals are configurable through the `DOCLING_*_TTL_SECONDS`
+variables documented in [API.md](API.md). Active downloads are protected by
+short leases.
 
 The backend transfers figure bytes to the API with `image_export_mode=embedded`.
 The semantic writer externalizes those bytes into per-job `pictures/` assets

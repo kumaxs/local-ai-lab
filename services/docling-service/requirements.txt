@@ -1,4 +1,4 @@
-# Locked shared/API dependencies for the 1.0 release. Platform model runtimes
+# Locked shared/API dependencies for the 1.1 release. Platform model runtimes
 # are selected through pyproject extras or the Docker backend image.
 pdfplumber==0.11.9
 pypdfium2==5.8.0

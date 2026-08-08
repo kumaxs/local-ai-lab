@@ -19,8 +19,8 @@ part of this single-Mac service.
 
 ## Install
 
-For another machine, download and verify the `docling-service-1.0.2` bundle from
-the `v1.0.2` GitHub Release, extract it, and run from the extracted directory:
+For another machine, download and verify the `docling-service-1.1.0` bundle from
+the `v1.1.0` GitHub Release, extract it, and run from the extracted directory:
 
 ```bash
 ./install-macos.sh

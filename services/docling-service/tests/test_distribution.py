@@ -24,7 +24,7 @@ class DistributionTests(unittest.TestCase):
         project_text = (SERVICE_ROOT / "pyproject.toml").read_text(encoding="utf-8")
         project_version = re.search(r'^version = "([^"]+)"$', project_text, re.MULTILINE)
         self.assertIsNotNone(project_version)
-        self.assertEqual("1.0.2", project_version.group(1))
+        self.assertEqual("1.1.0", project_version.group(1))
         self.assertEqual(project_version.group(1), RELEASE_VERSION)
         self.assertEqual(RELEASE_VERSION, FORMULA_SERVICE_VERSION)
         for path in (
@@ -46,6 +46,21 @@ class DistributionTests(unittest.TestCase):
         self.assertIn("docling-formula", compose)
         for forbidden in ("ocrmac", "granite_mlx", "Metal", "Apple Vision"):
             self.assertNotIn(forbidden, compose)
+        for required in (
+            "DOCLING_INPUT_TTL_SECONDS",
+            "DOCLING_SUCCESS_OUTPUT_TTL_SECONDS",
+            "DOCLING_FAILED_OUTPUT_TTL_SECONDS",
+            "DOCLING_JOB_TTL_SECONDS",
+            "DOCLING_MAX_PENDING_JOBS",
+            "DOCLING_MAX_OUTPUT_BYTES",
+            "DOCLING_MAX_DATA_BYTES",
+            "DOCLING_MIN_FREE_BYTES",
+            "DOCLING_IDEMPOTENCY_TTL_SECONDS",
+            "DOCLING_DOWNLOAD_LEASE_SECONDS",
+            "DOCLING_WEBHOOK_ALLOWED_HOSTS",
+            "DOCLING_WEBHOOK_MAX_ATTEMPTS",
+        ):
+            self.assertIn(required, compose)
 
     def test_docker_compose_defaults_hugging_face_to_mirror_with_override(self) -> None:
         expected = 'HF_ENDPOINT: "${HF_ENDPOINT:-https://hf-mirror.com}"'

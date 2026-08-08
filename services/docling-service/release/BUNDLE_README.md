@@ -1,7 +1,7 @@
-# Docling Service 1.0.2 distribution bundle
+# Docling Service 1.1.0 distribution bundle
 
 This archive contains the exact source, deployment definitions, dependency
-locks, and quality adapter required by the Local AI Lab Docling Service 1.0.2
+locks, and quality adapter required by the Local AI Lab Docling Service 1.1.0
 release. The bundle preserves repository-relative paths so both deployment
 profiles use the same accepted semantic output implementation.
 
@@ -9,7 +9,7 @@ Before installation, download the matching `.sha256` sidecar from the same
 GitHub Release and verify the archive, for example:
 
 ```bash
-shasum -a 256 -c docling-service-1.0.2.tar.gz.sha256
+shasum -a 256 -c docling-service-1.1.0.tar.gz.sha256
 ```
 
 The combined `SHA256SUMS` file is also provided when both archive formats are
@@ -41,7 +41,14 @@ space, and initial model-download network access are required.
 curl -fsS http://127.0.0.1:8766/healthz
 ```
 
-The script pulls the immutable `1.0.2` image tags from GitHub Container
+If the target cannot execute shell scripts, run Compose directly:
+
+```bash
+docker compose -f services/docling-service/deploy/docker/compose.release.yaml pull
+docker compose -f services/docling-service/deploy/docker/compose.release.yaml up -d
+```
+
+The script pulls the immutable `1.1.0` image tags from GitHub Container
 Registry and starts the API, parser, and private formula service. If the GitHub
 package is private, first authenticate with a token that has `read:packages`:
 

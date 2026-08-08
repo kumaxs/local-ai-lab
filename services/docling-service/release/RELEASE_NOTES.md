@@ -1,27 +1,34 @@
-# Docling Service 1.0.2
+# Docling Service 1.1.0
 
-Patch release of the cross-machine Local AI Lab Docling Service distribution.
-It keeps the accepted API and output contract from 1.0.1 and changes Docker
-Hugging Face model downloads to use `https://hf-mirror.com` by default.
-`HF_ENDPOINT` remains configurable for users who need the official service or
-another compatible endpoint.
+This release turns the conversion endpoint into a bounded, automatable task
+service while preserving the existing `/v1/jobs` paths and output contract.
 
-The two deployment profiles remain:
+Highlights:
 
-- macOS Apple Silicon with Granite Docling MLX and OCRMac;
-- Docker/Linux with portable OCR and an isolated, guarded
-  UniMERNet-Small/PP-FormulaNet-L formula service.
+- OpenAPI 3.1 at `/openapi.json`, Swagger UI at `/docs`, ReDoc at `/redoc`,
+  typed schemas, bearer security declarations, and RFC 9457 errors;
+- SQLite WAL task authority with the v1.0.2 ten-field JSON rollback mirror;
+- cursor-paginated task and webhook-delivery lists;
+- configurable input, output, metadata, staging, temporary-data, and webhook
+  retention with periodic cleanup and download leases;
+- queue, per-job output, total-data, and free-space limits;
+- CloudEvents 1.0 webhooks with stable IDs, HMAC-SHA256 signatures, retries,
+  delivery history, manual retry, redirect rejection, and host allowlisting;
+- one-request streaming ZIP downloads containing all published outputs and a
+  manifest, but never the source PDF;
+- atomic staged output publication and restart recovery for interrupted work;
+- optional 24-hour `Idempotency-Key` handling for safe workflow retries.
 
-Release assets contain deterministic `.tar.gz` and `.zip` installation bundles,
-matching `.sha256` sidecars, combined `SHA256SUMS`, a per-file release manifest,
-and one-command installation helpers.
+Docker model downloads still default to `https://hf-mirror.com`. Set
+`HF_ENDPOINT` before startup to select the official Hugging Face endpoint or
+another compatible mirror.
+
 Docker images are published for `linux/amd64` and `linux/arm64` at:
 
-- `ghcr.io/kumaxs/local-ai-lab-docling-api:1.0.2`
-- `ghcr.io/kumaxs/local-ai-lab-docling-backend:1.0.2`
-- `ghcr.io/kumaxs/local-ai-lab-docling-formula:1.0.2`
+- `ghcr.io/kumaxs/local-ai-lab-docling-api:1.1.0`
+- `ghcr.io/kumaxs/local-ai-lab-docling-backend:1.1.0`
+- `ghcr.io/kumaxs/local-ai-lab-docling-formula:1.1.0`
 
-Docker requires at least 8 GB of assigned memory; 12 GB is recommended. The
-macOS acceptance target is Apple Silicon with macOS 26.4 or newer. Both profiles
-download model weights during first startup and therefore require network access
-for initial installation.
+The release bundle contains a Compose file that references only those prebuilt
+images. A target machine needs Docker Engine with Compose v2; it does not need
+Git, Python, or a shell script when the Compose YAML is supplied directly.

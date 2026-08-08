@@ -109,6 +109,28 @@ class ReleaseConfigTests(unittest.TestCase):
 
 
 class JobManagerTests(unittest.TestCase):
+    def test_unexpected_runner_error_converges_to_failed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = make_config(root)
+
+            def runner(_command, **_kwargs):
+                raise RuntimeError("synthetic adapter crash")
+
+            manager = JobManager(config, runner=runner)
+            upload = root / "crash.pdf"
+            upload.write_bytes(b"%PDF-1.7\n%%EOF\n")
+            record = manager.create_job(upload, "crash.pdf")
+            for _attempt in range(100):
+                current = manager.get_job(record.job_id)
+                if current and current.state == "failed":
+                    break
+                time.sleep(0.01)
+            else:
+                self.fail("unexpected runner failure did not become terminal")
+            self.assertIn("RuntimeError", current.error or "")
+            manager.shutdown()
+
     def test_job_state_is_persisted_and_outputs_are_confined(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -116,9 +138,16 @@ class JobManagerTests(unittest.TestCase):
 
             def runner(command, **_kwargs):
                 job_id = command[command.index("--job-id") + 1]
-                output_dir = config.output_root / job_id
+                output_root = Path(command[command.index("--output-root") + 1])
+                output_dir = output_root / job_id
                 output_dir.mkdir(parents=True)
                 (output_dir / "document.html").write_text("<p>ok</p>", encoding="utf-8")
+                (output_dir / "document.md").write_text("ok", encoding="utf-8")
+                (output_dir / "document.json").write_text("{}", encoding="utf-8")
+                (output_dir / "metadata.json").write_text("{}", encoding="utf-8")
+                (output_dir / "status.json").write_text(
+                    json.dumps({"ok": True}), encoding="utf-8"
+                )
                 return subprocess.CompletedProcess(command, 0, "{}", "")
 
             manager = JobManager(config, runner=runner)
@@ -149,15 +178,15 @@ class JobManagerTests(unittest.TestCase):
             config = make_config(root)
             config.ensure_directories()
             state_path = config.state_root / "jobs" / "81e32a59-0e6e-4bff-9155-f98609dbf597.json"
-            state_path.parent.mkdir(parents=True)
+            state_path.parent.mkdir(parents=True, exist_ok=True)
             state_path.write_text(
                 json.dumps(
                     {
                         "job_id": state_path.stem,
                         "state": "running",
                         "original_name": "paper.pdf",
-                        "input_path": "/tmp/input.pdf",
-                        "output_dir": "/tmp/output",
+                        "input_path": str(config.input_root / state_path.stem / "source.pdf"),
+                        "output_dir": str(config.output_root / state_path.stem),
                         "created_at": "2026-08-01T00:00:00+00:00",
                         "started_at": None,
                         "finished_at": None,

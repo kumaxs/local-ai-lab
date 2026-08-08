@@ -5,7 +5,7 @@ services:
     build:
       context: ../../../..
       dockerfile: services/docling-service/deploy/docker/Dockerfile.backend
-    image: local-ai-lab/docling-backend:1.0.2
+    image: local-ai-lab/docling-backend:1.1.0
     init: true
     restart: unless-stopped
     environment:
@@ -22,7 +22,7 @@ services:
     build:
       context: ../../../..
       dockerfile: services/docling-service/deploy/docker/Dockerfile.formula
-    image: local-ai-lab/docling-formula:1.0.2
+    image: local-ai-lab/docling-formula:1.1.0
     init: true
     restart: unless-stopped
     environment:
@@ -40,7 +40,7 @@ services:
     build:
       context: ../../../..
       dockerfile: services/docling-service/deploy/docker/Dockerfile.api
-    image: local-ai-lab/docling-api:1.0.2
+    image: local-ai-lab/docling-api:1.1.0
     init: true
     restart: unless-stopped
     depends_on:
@@ -66,6 +66,23 @@ services:
       DOCLING_MAX_CONCURRENT_JOBS: ${DOCLING_MAX_CONCURRENT_JOBS:-1}
       DOCLING_CONVERSION_TIMEOUT_SECONDS: ${DOCLING_CONVERSION_TIMEOUT_SECONDS:-7200}
       DOCLING_MAX_UPLOAD_BYTES: ${DOCLING_MAX_UPLOAD_BYTES:-268435456}
+      DOCLING_INPUT_TTL_SECONDS: ${DOCLING_INPUT_TTL_SECONDS:-86400}
+      DOCLING_SUCCESS_OUTPUT_TTL_SECONDS: ${DOCLING_SUCCESS_OUTPUT_TTL_SECONDS:-604800}
+      DOCLING_FAILED_OUTPUT_TTL_SECONDS: ${DOCLING_FAILED_OUTPUT_TTL_SECONDS:-172800}
+      DOCLING_JOB_TTL_SECONDS: ${DOCLING_JOB_TTL_SECONDS:-2592000}
+      DOCLING_WEBHOOK_DELIVERY_TTL_SECONDS: ${DOCLING_WEBHOOK_DELIVERY_TTL_SECONDS:-604800}
+      DOCLING_STAGING_TTL_SECONDS: ${DOCLING_STAGING_TTL_SECONDS:-3600}
+      DOCLING_TEMP_TTL_SECONDS: ${DOCLING_TEMP_TTL_SECONDS:-3600}
+      DOCLING_CLEANUP_INTERVAL_SECONDS: ${DOCLING_CLEANUP_INTERVAL_SECONDS:-300}
+      DOCLING_MAX_PENDING_JOBS: ${DOCLING_MAX_PENDING_JOBS:-20}
+      DOCLING_MAX_OUTPUT_BYTES: ${DOCLING_MAX_OUTPUT_BYTES:-5368709120}
+      DOCLING_MAX_DATA_BYTES: ${DOCLING_MAX_DATA_BYTES:-53687091200}
+      DOCLING_MIN_FREE_BYTES: ${DOCLING_MIN_FREE_BYTES:-2147483648}
+      DOCLING_IDEMPOTENCY_TTL_SECONDS: ${DOCLING_IDEMPOTENCY_TTL_SECONDS:-86400}
+      DOCLING_DOWNLOAD_LEASE_SECONDS: ${DOCLING_DOWNLOAD_LEASE_SECONDS:-300}
+      DOCLING_WEBHOOK_MAX_ATTEMPTS: ${DOCLING_WEBHOOK_MAX_ATTEMPTS:-6}
+      DOCLING_WEBHOOK_ALLOWED_HOSTS: ${DOCLING_WEBHOOK_ALLOWED_HOSTS:-}
+      DOCLING_WEBHOOK_ALLOW_PRIVATE_HOSTS: ${DOCLING_WEBHOOK_ALLOW_PRIVATE_HOSTS:-false}
       DOCLING_SERVICE_API_TOKEN: ${DOCLING_SERVICE_API_TOKEN:-}
     volumes:
       - docling-inputs:/data/inputs
