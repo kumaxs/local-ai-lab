@@ -11,6 +11,7 @@
 !docs/integrations/docling-serve-quality-parity/formula_only_second_pass.py
 
 services/docling-service/.venv
+# Defense in depth if a generated local review corpus is recreated by mistake.
 services/docling-service/reports
 services/docling-service/docs
 services/docling-service/tests

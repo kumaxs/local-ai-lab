@@ -5,6 +5,12 @@
 可审计元数据，并通过标准 HTTP API、Webhook 和一次性 ZIP 下载对接 n8n
 或其他业务系统。
 
+Canonical path: `/Users/zeyuan/Projects/local-ai-lab`
+Canonical GitHub: `https://github.com/kumaxs/local-ai-lab`
+
+`/Users/zeyuan/Local-AI-Lab` 已退役（墓碑目录），当前会话 handoff 快照为唯一
+可信传递文件 `HANDOFF.md`。
+
 [最新 Release](https://github.com/kumaxs/local-ai-lab/releases/latest) ·
 [API 文档](services/docling-service/docs/API.md) ·
 [Docker 部署](services/docling-service/docs/DOCKER.md) ·

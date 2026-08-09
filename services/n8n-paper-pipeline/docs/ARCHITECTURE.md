@@ -10,7 +10,7 @@ It should not grow into a standalone PDF reader. Direct PDF text extraction is n
 
 ## Runtime Relationship
 
-The current observed runtime relationship is:
+The current configured runtime relationship is:
 
 ```text
 n8n
@@ -19,19 +19,18 @@ local-ai-python-worker
   -> project bind mount
 /pipelines/n8n-paper-pipeline
   -> host project
-/Users/zeyuan/Projects/n8n-paper-pipeline
+/Users/zeyuan/Projects/local-ai-lab/services/n8n-paper-pipeline
 ```
 
-Observed containers:
+Expected containers (configuration only; execution state not re-validated in this cleanup cycle):
 
-- `n8n`: running on host port `5678`.
-- `local-ai-python-worker`: running on host port `8765`.
+- `n8n`: expected host port `5678`.
+- `local-ai-python-worker`: expected host port `8765`.
 
-Observed non-Docker schedulers:
+Configured non-Docker schedulers:
 
-- No related LaunchAgents were found.
-- No related cron jobs were found.
-- No direct host process for the paper pipeline was found.
+- No LaunchAgent/cron orchestration is declared in repository scope.
+- No direct host process for the paper pipeline is defined in repository docs/configs.
 
 ## Current Entry Point
 
@@ -81,6 +80,8 @@ This is useful for compatibility, smoke tests, and fallback behavior. It should 
 
 ## Future Docling-Ready Boundary
 
+Docling Service v1.1.0 is released, but this pipeline is not yet auto-integrated with it.
+
 The future path should separate intake orchestration from document parsing:
 
 ```text
@@ -94,13 +95,7 @@ process_inbox.py or successor
   -> Obsidian-ready note material
 ```
 
-The future artifact root is:
-
-```text
-future/docling-ready/
-```
-
-This structure is intentionally not wired into the current runtime yet.
+This future artifact structure is intentionally kept isolated and is not wired into the current runtime yet.
 
 ## Operational Guardrails
 
@@ -111,3 +106,4 @@ Until the runtime migration is explicit:
 - Do not modify Docker Compose as part of documentation-only cleanup.
 - Do not assume `n8n` directly mounts this project.
 - Keep future Docling artifacts isolated from current `n8n_outputs`.
+- Preserve compatibility boundary for `scripts/process_inbox.py`, `scripts/intake_detect.py`, and `scripts/pdf_extract.py` until migration decision is finalized.

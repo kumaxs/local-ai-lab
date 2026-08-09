@@ -95,7 +95,7 @@ The image installs CPU-only PyTorch wheels and omits the unused
 Kubernetes and Ray execution backends from Docling JobKit. Docling Serve imports
 its RQ orchestrator module at process startup, so the image retains only RQ's
 small import dependency set; no Redis/RQ service is started and conversions use
-only the local engine. The build context excludes the 66 MB development report
+only the local engine. The build context excludes the generated report/review
 corpus, tests, caches, and local environments; the API image also separates its
 locked dependency layer from application source so code-only rebuilds stay fast.
 

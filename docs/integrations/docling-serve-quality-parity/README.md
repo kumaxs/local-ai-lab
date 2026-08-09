@@ -34,10 +34,7 @@ DOCLING_SERVE_ENG_LOC_SHARE_MODELS=true \
 DOCLING_SERVE_ARTIFACTS_PATH=/Users/zeyuan/.cache/docling/models \
 DOCLING_SERVE_LOAD_MODELS_AT_BOOT=true \
 DOCLING_SERVE_OPTIONS_CACHE_SIZE=2 \
-.runtime/docling-serve/.venv/bin/docling-serve run \
-  --host 127.0.0.1 \
-  --port 5001 \
-  --artifacts-path /Users/zeyuan/.cache/docling/models
+zsh /Users/zeyuan/Projects/local-ai-lab/services/docling-service/deploy/macos/start.sh
 ```
 
 `DOCLING_DEVICE=cpu` keeps the standard PDF pipeline off the currently failing
@@ -45,11 +42,17 @@ Apple MPS float64 path. Formula enrichment still uses Granite MLX through the
 request-level `code_formula_custom_config`.
 
 For CN OCR parity, the Docling Server virtual environment must include
-`ocrmac`. Install it only into the project-local Serve venv, not globally:
+`ocrmac`. The macOS installer provisions it in the release runtime; do not
+install it globally:
 
 ```bash
-.runtime/docling-serve/.venv/bin/python -m pip install ocrmac
+PYTHON_BIN=/opt/homebrew/bin/python3.13 \
+  zsh /Users/zeyuan/Projects/local-ai-lab/services/docling-service/deploy/macos/install.sh
 ```
+
+The installer requires Python 3.11, 3.12, or 3.13. See
+[`services/docling-service/docs/MACOS.md`](../../../services/docling-service/docs/MACOS.md)
+for release installation and lifecycle commands.
 
 ## n8n-Callable Boundary
 
@@ -183,11 +186,12 @@ The adapter preserves:
 The review artifact layer is intentionally post-processing owned by this
 adapter. Docling Server remains the execution backend for Route A.
 
-## Optional Formula Second Pass
+## Formula Second Pass
 
-`quality_parity_adapter.py` can optionally run `formula_only_second_pass.py`
-after the Route A adapter output and review artifacts are written. This is off
-by default and remains evidence-first:
+`quality_parity_adapter.py` runs `formula_only_second_pass.py` after the Route A
+adapter output and review artifacts are written. The current helper and formal
+release default is `apply-all`; pass `--formula-second-pass-policy off` to
+disable it. Replacement remains evidence- and quality-gated:
 
 - Route A remains the document backbone.
 - Route B is used only as a formula candidate source.
@@ -205,7 +209,7 @@ CN reviewed command shape:
 ```bash
 python3 docs/integrations/docling-serve-quality-parity/quality_parity_adapter.py \
   --serve-url http://127.0.0.1:5001 \
-  --input-file /Users/zeyuan/Projects/n8n-paper-pipeline/test_pdfs/CN.pdf \
+  --input-file /Users/zeyuan/Projects/local-ai-lab/services/n8n-paper-pipeline/test_pdfs/CN.pdf \
   --output-root /tmp/docling-serve-quality-parity \
   --job-id CN \
   --cn-ocr-parity \
@@ -233,16 +237,12 @@ adapter marks the result as a `degraded_failure`. The default sidecar output is:
   review_index.html
 ```
 
-See `docling_v1_parity_checklist.md` before making further parser improvements.
-For the current `CN.pdf` formula `(3)` and `(5)` investigation, see
-`cn_formula_quality_diagnostics.md`.
-
 Formula sample:
 
 ```bash
 python3 docs/integrations/docling-serve-quality-parity/quality_parity_adapter.py \
   --serve-url http://127.0.0.1:5001 \
-  --input-file /Users/zeyuan/Projects/n8n-paper-pipeline/test_pdfs/two-col-arxiv-ai-transformers-gnn.pdf \
+  --input-file /Users/zeyuan/Projects/local-ai-lab/services/n8n-paper-pipeline/test_pdfs/two-col-arxiv-ai-transformers-gnn.pdf \
   --output-root /tmp/docling-serve-quality-parity \
   --job-id transformers_gnn_p2_formula \
   --page-start 2 \
@@ -254,7 +254,7 @@ For CN bad text-layer detection:
 ```bash
 python3 docs/integrations/docling-serve-quality-parity/quality_parity_adapter.py \
   --serve-url http://127.0.0.1:5001 \
-  --input-file /Users/zeyuan/Projects/n8n-paper-pipeline/test_pdfs/CN.pdf \
+  --input-file /Users/zeyuan/Projects/local-ai-lab/services/n8n-paper-pipeline/test_pdfs/CN.pdf \
   --output-root /tmp/docling-serve-quality-parity \
   --job-id CN_p1 \
   --cn-ocr-parity
@@ -265,7 +265,7 @@ For a table page:
 ```bash
 python3 docs/integrations/docling-serve-quality-parity/quality_parity_adapter.py \
   --serve-url http://127.0.0.1:5001 \
-  --input-file /Users/zeyuan/Projects/n8n-paper-pipeline/test_pdfs/table-heavy-ai-table-transformer.pdf \
+  --input-file /Users/zeyuan/Projects/local-ai-lab/services/n8n-paper-pipeline/test_pdfs/table-heavy-ai-table-transformer.pdf \
   --output-root /tmp/docling-serve-quality-parity \
   --job-id table_transformer_p1 \
   --page-start 1 \
@@ -288,15 +288,15 @@ Example:
 
 ```bash
 python3 docs/integrations/docling-serve-quality-parity/batch_full_dir_review.py \
-  --input-dir /Users/zeyuan/Projects/n8n-paper-pipeline/test_pdfs \
+  --input-dir /Users/zeyuan/Projects/local-ai-lab/services/n8n-paper-pipeline/test_pdfs \
   --output-root /Users/zeyuan/Projects/local-ai-lab/.runtime/review/docling-serve-full-dir-review-2026-06-01 \
   --serve-url http://127.0.0.1:5001 \
   --adapter /Users/zeyuan/Projects/local-ai-lab/docs/integrations/docling-serve-quality-parity/quality_parity_adapter.py \
   --timeout-seconds 1800
 ```
 
-Use an ignored output root. The preferred `services/docling-service/reports/samples/`
-path is not currently ignored for new generated files.
+Use an ignored output root under `.runtime/review/`. Generated review corpora
+must not be committed.
 
 ## Route B: VLM Pipeline Evaluation Helper
 
@@ -325,9 +325,12 @@ document does not stop the batch.
 Example:
 
 ```bash
-.runtime/docling-serve/.venv/bin/python \
+ROUTE_B_PYTHON=.runtime/docling-release/macos/venv/bin/python
+"$ROUTE_B_PYTHON" -c 'import docling'
+"$ROUTE_B_PYTHON" \
   docs/integrations/docling-serve-quality-parity/vlm_full_dir_review.py \
-  --input-dir /Users/zeyuan/Projects/n8n-paper-pipeline/test_pdfs \
+  --python "$ROUTE_B_PYTHON" \
+  --input-dir /Users/zeyuan/Projects/local-ai-lab/services/n8n-paper-pipeline/test_pdfs \
   --output-root /Users/zeyuan/Projects/local-ai-lab/.runtime/review/docling-vlm-full-dir-review-2026-06-01 \
   --timeout-seconds 900 \
   --document-timeout 780

@@ -69,7 +69,3 @@ node_modules/
 .DS_Store
 .idea/
 .vscode/
-
-# Future Docling placeholder is not part of this initialization
-future/docling-ready/
-**/future/docling-ready/

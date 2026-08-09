@@ -81,18 +81,8 @@ ALIGNMENT_ENV_RE = re.compile(
 )
 
 START_COMMAND = (
-    "UVICORN_WORKERS=1 DOCLING_DEVICE=cpu "
-    "DOCLING_SERVE_ALLOW_CUSTOM_CODE_FORMULA_CONFIG=true "
-    "DOCLING_SERVE_ALLOW_CUSTOM_OCR_CONFIG=true "
-    "DOCLING_SERVE_ENG_KIND=local "
-    "DOCLING_SERVE_ENG_LOC_NUM_WORKERS=1 "
-    "DOCLING_SERVE_ENG_LOC_SHARE_MODELS=true "
-    "DOCLING_SERVE_ARTIFACTS_PATH=/Users/zeyuan/.cache/docling/models "
-    "DOCLING_SERVE_LOAD_MODELS_AT_BOOT=true "
-    "DOCLING_SERVE_OPTIONS_CACHE_SIZE=2 "
-    ".runtime/docling-serve/.venv/bin/docling-serve run "
-    "--host 127.0.0.1 --port 5001 "
-    "--artifacts-path /Users/zeyuan/.cache/docling/models"
+    "Recover the Docling backend for the active deployment profile; see "
+    "services/docling-service/docs/DOCKER.md or MACOS.md."
 )
 
 GRANITE_MLX_CODE_FORMULA_CONFIG: dict[str, Any] = {

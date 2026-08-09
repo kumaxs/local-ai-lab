@@ -1,9 +1,0 @@
-Table 1: GLUE Test results, scored by the evaluation server ( https://gluebenchmark.com/leaderboard ). The number below each task denotes the number of training examples. The 'Average' column is slightly different than the official GLUE score, since we exclude the problematic WNLI set. 8 BERT and OpenAI GPT are singlemodel, single task. F1 scores are reported for QQP and MRPC, Spearman correlations are reported for STS-B, and accuracy scores are reported for the other tasks. We exclude entries that use BERT as one of their components.
-
-| System           | MNLI-(m/mm) 392k   |   QQP 363k |   QNLI 108k |   SST-2 67k |   CoLA 8.5k |   STS-B 5.7k |   MRPC 3.5k |   RTE 2.5k |   Average - |
-|------------------|--------------------|------------|-------------|-------------|-------------|--------------|-------------|------------|-------------|
-| Pre-OpenAI SOTA  | 80.6/80.1          |       66.1 |        82.3 |        93.2 |        35.0 |         81.0 |        86.0 |       61.7 |        74.0 |
-| BiLSTM+ELMo+Attn | 76.4/76.1          |       64.8 |        79.8 |        90.4 |        36.0 |         73.3 |        84.9 |       56.8 |        71.0 |
-| OpenAI GPT       | 82.1/81.4          |       70.3 |        87.4 |        91.3 |        45.4 |         80.0 |        82.3 |       56.0 |        75.1 |
-| BERT BASE        | 84.6/83.4          |       71.2 |        90.5 |        93.5 |        52.1 |         85.8 |        88.9 |       66.4 |        79.6 |
-| BERT LARGE       | 86.7/85.9          |       72.1 |        92.7 |        94.9 |        60.5 |         86.5 |        89.3 |       70.1 |        82.1 |

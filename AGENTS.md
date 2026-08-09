@@ -10,13 +10,21 @@ Canonical local path:
 /Users/zeyuan/Projects/local-ai-lab
 ```
 
-GitHub remote:
+GitHub:
 
 ```text
-git@github.com:kumaxs/local-ai-lab.git
+https://github.com/kumaxs/local-ai-lab
 ```
 
+Legacy path `/Users/zeyuan/Local-AI-Lab` is retired as a tombstone; avoid
+using it for active source-of-truth work.
+
 Local AI Lab covers local AI automation, n8n orchestration, local Python worker utilities, paper intake pipeline work, Docling validation, OpenClaw, EXO, Obsidian/Zotero workflow support, and recovery/sync documentation.
+
+Session handoff snapshot policy:
+
+`HANDOFF.md` is the single current handoff snapshot for this repository.
+Do not create timestamped handoff copies or duplicate snapshots.
 
 ## Roles
 
@@ -92,7 +100,7 @@ Important paths:
 
 ```text
 docs/
-inventory/
+docs/integrations/docling-serve-quality-parity/
 services/n8n-paper-pipeline/
 services/docling-service/
 ```
@@ -111,55 +119,19 @@ n8n -> local-ai-python-worker -> services/n8n-paper-pipeline
 
 ## Current Docling state
 
-`services/docling-service` exists and has a working local CLI.
+`services/docling-service` is the canonical v1.1.0 product line and is now shipped
+as an official asynchronous HTTP API (`POST /v1/jobs`) with release workflow and
+official package distribution.
 
-Current user-facing command shape:
-
-```bash
-PYTHONPATH=services/docling-service services/docling-service/.venv/bin/python -m docling_service.cli \
-  --converter docling \
-  --job-uuid <uuidv4> \
-  --input-file-path <local-pdf> \
-  --output-root <output-root>
-```
-
-Docling version installed in the service venv:
+Production user path is now API-first (`/v1` plus webhooks and download APIs); the
+legacy local CLI is retained only as a contract-test surface and is not the user-facing
+entrypoint.
 
 ```text
-2.95.0
-```
-
-Known local support paths:
-
-```text
-venv: services/docling-service/.venv
-model cache: /Users/zeyuan/.cache/docling/models
-hf mirror cache: /Users/zeyuan/.cache/docling/hf-mirror
-hfd tool: /Users/zeyuan/Local-AI-Lab/hfd.sh
-test PDFs: /Users/zeyuan/Projects/n8n-paper-pipeline/test_pdfs
-```
-
-The real Docling writer can run and produce contract outputs, but output quality is not yet acceptable for final paper intake.
-
-Known quality blockers:
-
-```text
-- Chinese PDFs may contain many /G21 /G28 /Gxx tokens.
-- Tables may lose row/column correspondence.
-- Pictures, formulas, and important visual regions may not be exported as useful artifacts.
-- Previous fast smoke path disabled OCR and table structure and did not export assets.
-```
-
-Next Docling priority:
-
-```text
-Implement a user-transparent quality-first conversion policy.
-```
-
-The user should not need to choose internal profiles such as fast / structure / ocr_zh. The user-facing interface should remain:
-
-```text
---converter docling
+Canonical Docling acceptance points:
+- services/docling-service/
+- services/docling-service/docs/
+- docs/integrations/docling-serve-quality-parity/
 ```
 
 ## Safety boundaries
@@ -168,7 +140,7 @@ Unless a task explicitly authorizes it, do not modify:
 
 ```text
 docs/
-inventory/
+docs/integrations/docling-serve-quality-parity/
 services/n8n-paper-pipeline/
 local-ai-python-worker runtime logic
 n8n workflows
@@ -187,6 +159,10 @@ original PDFs
 runtime logs
 secrets or tokens
 ```
+
+Generated review artifacts (regression reports, parity outputs, review captures) must
+only be written under `.runtime/review/` and should not be committed unless
+explicitly authorized.
 
 Do not globally install dependencies.
 
@@ -227,36 +203,45 @@ If push fails because the remote changed, stop and report. Do not pull, merge, r
 
 ## Testing rules
 
-For `services/docling-service`, run both:
+For `services/docling-service`, use an isolated Python 3.11, 3.12, or 3.13
+environment with the project API dependencies installed. Set `TEST_PYTHON` to
+that environment's interpreter, then run both suites:
 
 ```bash
-PYTHONPATH=services/docling-service python3 -m unittest discover services/docling-service/tests
-PYTHONPATH=services/docling-service services/docling-service/.venv/bin/python -m unittest discover services/docling-service/tests
+TEST_PYTHON=/absolute/path/to/supported-venv/bin/python
+PYTHONPATH=services/docling-service "$TEST_PYTHON" -m unittest discover services/docling-service/tests
+PYTHONPATH=docs/integrations/docling-serve-quality-parity "$TEST_PYTHON" -m unittest discover -s docs/integrations/docling-serve-quality-parity -p 'test_*.py'
 ```
+
+The GitHub CI/release workflows provision Python 3.12 and run the same suites.
 
 When changing real Docling conversion behavior, also run smoke tests on:
 
 ```text
-/Users/zeyuan/Projects/n8n-paper-pipeline/test_pdfs/CN.pdf
+/Users/zeyuan/Projects/local-ai-lab/services/n8n-paper-pipeline/test_pdfs/CN.pdf
 ```
 
 and at least one English or two-column paper from:
 
 ```text
-/Users/zeyuan/Projects/n8n-paper-pipeline/test_pdfs
+/Users/zeyuan/Projects/local-ai-lab/services/n8n-paper-pipeline/test_pdfs
 ```
 
 Use temporary output directories for smoke tests.
 
-Do not commit temporary outputs unless the task explicitly asks for curated review samples under:
+Do not commit temporary or review outputs. Write review runs only under:
 
 ```text
-services/docling-service/reports/samples/
+.runtime/review/
 ```
+
+If a task needs durable acceptance evidence, commit a small textual manifest or
+summary instead of generated papers, page renders, model outputs, or source PDFs.
 
 ## Quality-first Docling requirements
 
-For user-facing `--converter docling`, prefer quality over speed.
+For the internal Docling conversion contract (`--converter docling`), prefer quality
+over speed.
 
 The service may internally:
 
@@ -270,7 +255,7 @@ The service may internally:
 - record quality metrics in metadata/status
 ```
 
-The user should not be required to choose an internal profile.
+API users should not be required to choose an internal profile.
 
 Metadata/status should record internal decisions, including where feasible:
 

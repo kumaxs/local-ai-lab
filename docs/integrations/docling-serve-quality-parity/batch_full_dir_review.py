@@ -25,7 +25,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--input-dir",
         type=Path,
-        default=Path("/Users/zeyuan/Projects/n8n-paper-pipeline/test_pdfs"),
+        default=Path("/Users/zeyuan/Projects/local-ai-lab/services/n8n-paper-pipeline/test_pdfs"),
     )
     parser.add_argument("--output-root", required=True, type=Path)
     parser.add_argument("--serve-url", default="http://127.0.0.1:5001")

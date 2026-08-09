@@ -18,7 +18,7 @@
 
 ## 当前运行关系
 
-当前审计结果显示，运行关系大致是：
+当前文档基于静态配置关系：
 
 ```text
 n8n
@@ -27,10 +27,10 @@ local-ai-python-worker
 ↓ 挂载项目目录
 /pipelines/n8n-paper-pipeline
 ↓ 宿主机真实路径
-/Users/zeyuan/Projects/n8n-paper-pipeline
+/Users/zeyuan/Projects/local-ai-lab/services/n8n-paper-pipeline
 ```
 
-运行中的 `local-ai-python-worker` 容器把本项目挂载到 `/pipelines/n8n-paper-pipeline`。运行中的 `n8n` 容器目前只挂载 n8n 数据目录，没有直接挂载本项目。
+本轮未对容器运行态进行验证，以上为本项目当前配置关系。
 
 ## 当前入口脚本
 
@@ -69,10 +69,12 @@ python3 scripts/process_inbox.py \
 
 ## Future: Docling-Ready
 
-新的 Docling-ready 目录结构已经建立在：
+Docling Service v1.1.0 已发布，但尚未自动接入该 pipeline。当前 pipeline 仍沿用现有入口。
+
+项目保留未来 Docling-ready 的演进边界，预期结构包括：
 
 ```text
-future/docling-ready/
+future-artifacts-root (planned)
 ├── inbox/
 ├── staging/
 ├── outputs/
@@ -81,25 +83,16 @@ future/docling-ready/
 │   ├── assets/
 │   ├── tables/
 │   └── logs/
-├── paper-cards/
-├── openclaw-ready/
-└── obsidian-ready/
 ```
 
-这个目录暂时是未来结构占位，不接管当前运行入口，也不改变 Docker Compose。
+该结构暂时为未来占位，不接管当前运行入口，也不改变 Docker Compose。
 
 ## 文档
 
 - `docs/ARCHITECTURE.md`: 当前架构、入口、legacy 和未来 Docling-ready 方向。
 - `docs/LEGACY_PDF_EXTRACTION.md`: 旧 PDF 提取链路说明。
-- `future/docling-ready/README.md`: 未来 Docling-ready 输出约定。
 
 ## 安全边界
 
-本次整理没有：
-
-- 删除文件；
-- 停止服务；
-- 修改 Docker Compose；
-- 移动当前入口脚本；
-- 改变正在运行的容器配置。
+迁移前不要移动当前入口脚本、改变输出合同或假设容器运行状态；服务状态和
+挂载关系必须从实际运行环境另行核验。

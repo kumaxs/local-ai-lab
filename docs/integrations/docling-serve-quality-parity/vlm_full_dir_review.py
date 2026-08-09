@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Any
 
 
-DEFAULT_INPUT_DIR = Path("/Users/zeyuan/Projects/n8n-paper-pipeline/test_pdfs")
+DEFAULT_INPUT_DIR = Path("/Users/zeyuan/Projects/local-ai-lab/services/n8n-paper-pipeline/test_pdfs")
 DEFAULT_ARTIFACTS_PATH = Path("/Users/zeyuan/.cache/docling/models")
 GRANITE_MLX_CACHE = DEFAULT_ARTIFACTS_PATH / "ibm-granite--granite-docling-258M-mlx"
 
@@ -435,6 +435,24 @@ def write_markdown_summary(output_root: Path, rows: list[dict[str, Any]]) -> Non
     (output_root / "run_summary.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+def validate_worker_python(python_bin: str) -> str | None:
+    """Return a clear error when the selected worker cannot import Docling."""
+    try:
+        result = subprocess.run(
+            [python_bin, "-c", "import docling"],
+            text=True,
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return f"{python_bin}: {exc}"
+    if result.returncode == 0:
+        return None
+    detail = result.stderr.strip() or result.stdout.strip() or "import docling failed"
+    return f"{python_bin}: {detail}"
+
+
 def run_batch(args: argparse.Namespace) -> int:
     args.output_root.mkdir(parents=True, exist_ok=True)
     pdfs = sorted(args.input_dir.glob("*.pdf"))
@@ -489,6 +507,10 @@ def main() -> int:
     args = parse_args()
     if args.worker_pdf is not None:
         return run_worker(args)
+    worker_error = validate_worker_python(args.python)
+    if worker_error:
+        print(f"Worker Python preflight failed: {worker_error}", file=sys.stderr)
+        return 2
     return run_batch(args)
 
 

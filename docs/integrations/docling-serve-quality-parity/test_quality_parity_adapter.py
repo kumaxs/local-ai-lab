@@ -15,6 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import quality_parity_adapter as adapter  # noqa: E402
 import formula_only_second_pass as formula_second_pass  # noqa: E402
 import semantic_reflow  # noqa: E402
+import vlm_full_dir_review as vlm_review  # noqa: E402
 
 
 class _JsonResponse:
@@ -32,6 +33,11 @@ class _JsonResponse:
 
 
 class DoclingHttpRetryTests(unittest.TestCase):
+    def test_recovery_guidance_is_deployment_neutral(self) -> None:
+        self.assertNotIn("/Users/", adapter.START_COMMAND)
+        self.assertIn("DOCKER.md", adapter.START_COMMAND)
+        self.assertIn("MACOS.md", adapter.START_COMMAND)
+
     def test_wrapped_transient_http_error_remains_classifiable(self) -> None:
         transient = urllib.error.HTTPError(
             "http://127.0.0.1:5001/v1/convert/source",
@@ -94,6 +100,52 @@ class DoclingHttpRetryTests(unittest.TestCase):
                 )
 
         self.assertEqual(urlopen.call_count, 1)
+
+
+class VlmWorkerPreflightTests(unittest.TestCase):
+    def test_supported_worker_can_import_docling(self) -> None:
+        completed = Namespace(returncode=0, stdout="", stderr="")
+        with patch.object(vlm_review.subprocess, "run", return_value=completed) as run:
+            error = vlm_review.validate_worker_python("/tmp/python3.12")
+
+        self.assertIsNone(error)
+        run.assert_called_once_with(
+            ["/tmp/python3.12", "-c", "import docling"],
+            text=True,
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+
+    def test_missing_docling_fails_preflight_before_batch(self) -> None:
+        completed = Namespace(
+            returncode=1,
+            stdout="",
+            stderr="ModuleNotFoundError: No module named 'docling'",
+        )
+        with patch.object(vlm_review.subprocess, "run", return_value=completed):
+            error = vlm_review.validate_worker_python("python3")
+
+        self.assertIn("python3", error or "")
+        self.assertIn("No module named 'docling'", error or "")
+
+    def test_main_stops_before_batch_when_worker_preflight_fails(self) -> None:
+        args = Namespace(worker_pdf=None, python="python3")
+        with (
+            patch.object(vlm_review, "parse_args", return_value=args),
+            patch.object(
+                vlm_review,
+                "validate_worker_python",
+                return_value="python3: No module named 'docling'",
+            ),
+            patch.object(vlm_review, "run_batch") as run_batch,
+            patch.object(vlm_review.sys, "stderr", io.StringIO()) as stderr,
+        ):
+            result = vlm_review.main()
+
+        self.assertEqual(result, 2)
+        self.assertIn("Worker Python preflight failed", stderr.getvalue())
+        run_batch.assert_not_called()
 
 
 class FinalSurfaceStatusTests(unittest.TestCase):
