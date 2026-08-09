@@ -38,6 +38,54 @@ Stop only when a stop condition is reached.
 
 Do not ask the user to approve each internal step. Ask for user input only when a decision, credential, missing local file, forbidden-scope change, or destructive action is required.
 
+## Session handoff protocol
+
+The root-level handoff file is:
+
+```text
+HANDOFF.md
+```
+
+It lives beside `AGENTS.md` and is the single current handoff snapshot. Do not
+create timestamped handoff copies elsewhere in the repository.
+
+When the user says `准备交接`:
+
+1. Continue only long enough to leave the current operation in a safe,
+   internally consistent state. Do not start a new workstream.
+2. Inspect the actual repository and runtime state instead of relying only on
+   conversation memory. At minimum check the current branch and HEAD, Git
+   status, relevant diffs, tests already run, active processes or external
+   jobs when applicable, and any untracked task artifacts.
+3. Replace `HANDOFF.md` with a self-contained snapshot using its documented
+   structure. Record exact paths, commands, commit/tag/run identifiers, test
+   results, incomplete work, blockers, risks, and the next recommended action.
+4. Clearly distinguish completed, verified, in-progress, unverified, and
+   blocked work. Preserve important failed attempts when they affect the next
+   decision.
+5. Never put secrets, tokens, credentials, private document contents, user
+   PDFs, model/cache data, or large generated output in `HANDOFF.md`.
+6. Verify that every referenced local path still exists where relevant, then
+   report that the handoff snapshot is ready. Do not claim the underlying task
+   is complete merely because the handoff document was written.
+
+When the user says `交接继续`:
+
+1. Before changing files or resuming commands, read `AGENTS.md` and
+   `HANDOFF.md` completely.
+2. Validate the snapshot against current reality: check Git branch/HEAD/status,
+   referenced files, and external job or service state when applicable.
+3. Treat `HANDOFF.md` as context, not unquestionable truth. Resolve stale or
+   conflicting information from the repository and tell the user about any
+   material discrepancy.
+4. Resume from the recorded next action without repeating work already marked
+   completed and verified.
+5. Keep `HANDOFF.md` until a later `准备交接` replaces it. Do not delete it as
+   routine cleanup.
+
+The two trigger phrases are project-level commands and apply in every future
+session for this repository.
+
 ## Repository map
 
 Important paths:
