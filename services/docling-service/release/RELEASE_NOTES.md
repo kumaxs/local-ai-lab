@@ -1,5 +1,19 @@
 # Docling Service 1.1.0
 
+## Storage lifecycle hardening
+
+- orphan inputs created by a crash before SQLite registration are reclaimed;
+- successful cleanup claims are retired instead of accumulating indefinitely;
+- concurrent multipart uploads reserve bounded temporary space and share the
+  managed state temporary directory;
+- Docker cross-volume uploads use a flushed same-volume partial file before
+  atomic input publication;
+- the production converter is stopped while running if staging output exceeds
+  its per-job limit or the filesystem free-space floor;
+- abandoned file/ZIP downloads close producers and release download leases;
+- Docker and macOS service logs use bounded rotation;
+- webhook subscription count, headers, and filters have explicit bounds.
+
 This release turns the conversion endpoint into a bounded, automatable task
 service while preserving the existing `/v1/jobs` paths and output contract.
 

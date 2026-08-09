@@ -1,14 +1,19 @@
 from __future__ import annotations
 
+import asyncio
 import importlib.util
 import io
 import json
+import hashlib
 import subprocess
 import tempfile
 import time
 import unittest
 import zipfile
+from types import SimpleNamespace
+from unittest.mock import patch
 from pathlib import Path
+from typing import Any
 
 from docling_service.release import JobManager, ReleaseConfig
 
@@ -47,6 +52,7 @@ class ApiTests(unittest.TestCase):
                 formula_ocr_url="http://formula:8001",
                 webhook_allowed_hosts=("localhost",),
                 webhook_allow_private_hosts=True,
+                max_webhook_subscriptions=1,
             )
 
             def runner(command, **_kwargs):
@@ -208,6 +214,16 @@ class ApiTests(unittest.TestCase):
                 subscription_id = subscription.json()["id"]
                 self.assertNotIn("secret", subscription.json())
                 self.assertTrue(subscription.json()["secret_set"])
+                subscription_limit = client.post(
+                    "/v1/webhooks/subscriptions",
+                    headers=headers,
+                    json={
+                        "callback_url": "http://localhost:9999/second",
+                        "event_types": ["docling.job.succeeded"],
+                        "secret": "fedcba9876543210",
+                    },
+                )
+                self.assertEqual(429, subscription_limit.status_code)
                 subscriptions = client.get(
                     "/v1/webhooks/subscriptions", headers=headers
                 )
@@ -224,6 +240,25 @@ class ApiTests(unittest.TestCase):
                 )
                 self.assertEqual(422, invalid_subscription.status_code)
                 self.assertNotIn(invalid_secret, invalid_subscription.text)
+                too_many_events = client.post(
+                    "/v1/webhooks/subscriptions",
+                    headers=headers,
+                    json={
+                        "callback_url": "http://localhost:9999/webhook",
+                        "event_types": ["docling.job.succeeded"] * 4,
+                        "secret": "0123456789abcdef",
+                    },
+                )
+                self.assertEqual(422, too_many_events.status_code)
+                oversized_webhook_body = client.post(
+                    "/v1/webhooks/subscriptions",
+                    headers={**headers, "Content-Type": "application/json"},
+                    content=json.dumps({"ignored": "x" * (65 * 1024)}).encode("utf-8"),
+                )
+                self.assertEqual(413, oversized_webhook_body.status_code)
+                self.assertEqual(
+                    "request_too_large", oversized_webhook_body.json()["code"]
+                )
                 unsafe_header = client.post(
                     "/v1/webhooks/subscriptions",
                     headers=headers,
@@ -251,6 +286,406 @@ class ApiTests(unittest.TestCase):
                 self.assertEqual("deleted", after_delete.json()["artifact_state"])
                 self.assertIsNotNone(after_delete.json()["deleted_at"])
                 self.assertEqual([], list(config.temp_root.glob("docling-upload-*")))
+
+    def test_archive_stream_disconnect_releases_download_lease(self) -> None:
+        from docling_service import api
+        from docling_service.api import create_app
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            adapter = root / "adapter.py"
+            adapter.write_text("# test\n", encoding="utf-8")
+            config = ReleaseConfig(
+                profile="docker",
+                serve_url="http://backend:5001",
+                adapter_path=adapter,
+                input_root=root / "inputs",
+                output_root=root / "outputs",
+                state_root=root / "state",
+                max_upload_bytes=1024,
+                max_concurrent_jobs=1,
+                conversion_timeout_seconds=60,
+                image_export_mode="referenced",
+                formula_policy="formula_service",
+                cn_ocr_parity=False,
+                api_token="test-token",
+                formula_ocr_url="http://localhost:8001",
+                webhook_allowed_hosts=("localhost",),
+                webhook_allow_private_hosts=True,
+            )
+
+            job_id = "00000000-0000-4abc-0000-000000000000"
+            output_root = root / "outputs" / job_id
+            output_root.mkdir(parents=True)
+            content = b"x" * 8192
+            (output_root / "document.md").write_bytes(content)
+            manifest = [
+                {
+                    "path": "document.md",
+                    "size_bytes": len(content),
+                    "sha256": hashlib.sha256(content).hexdigest(),
+                    "media_type": "text/markdown",
+                }
+            ]
+
+            class Lease:
+                def __init__(self) -> None:
+                    self.renew_count = 0
+                    self.release_count = 0
+                    self.cancel_count = 0
+
+                def renew(self) -> None:
+                    self.renew_count += 1
+
+                def release(self) -> None:
+                    self.release_count += 1
+
+                def cancel(self) -> None:
+                    self.cancel_count += 1
+
+            lease = Lease()
+
+            class FakeManager:
+                def get_job_details(self, requested_job_id: str) -> dict[str, Any]:
+                    if requested_job_id != job_id:
+                        return {}
+                    return {
+                        "job_id": job_id,
+                        "state": "succeeded",
+                        "output_dir": str(output_root),
+                        "output_deleted_at": None,
+                    }
+
+                def acquire_download_lease(
+                    self, requested_job_id: str, _relative_path: str, **_kwargs: Any
+                ) -> Lease:
+                    if requested_job_id != job_id:
+                        raise FileNotFoundError(_relative_path)
+                    return lease
+
+                def output_files(self, requested_job_id: str) -> list[dict[str, Any]]:
+                    if requested_job_id != job_id:
+                        return []
+                    return manifest
+
+                def shutdown(self) -> None:
+                    return None
+
+            class FakeArchiveIterator:
+                def __init__(self) -> None:
+                    self.closed = False
+                    self.calls = 0
+
+                def __iter__(self) -> "FakeArchiveIterator":
+                    return self
+
+                def __next__(self) -> bytes:
+                    if self.closed:
+                        raise StopIteration
+                    self.calls += 1
+                    return b"\x80" * 4096
+
+                def close(self) -> None:
+                    if self.closed:
+                        return
+                    self.closed = True
+                    lease.cancel()
+                    lease.release()
+
+            fake_archive = FakeArchiveIterator()
+            original_iter_archive = api.iter_archive
+            api.iter_archive = lambda *_args, **_kwargs: fake_archive
+            try:
+                app = create_app(config=config, manager=FakeManager())
+
+                scope = {
+                    "type": "http",
+                    "asgi": {"version": "3.0", "spec_version": "2.4"},
+                    "http_version": "1.1",
+                    "method": "GET",
+                    "scheme": "http",
+                    "path": f"/v1/jobs/{job_id}/archive",
+                    "raw_path": f"/v1/jobs/{job_id}/archive".encode("ascii"),
+                    "query_string": b"",
+                    "root_path": "",
+                    "headers": [(b"authorization", b"Bearer test-token")],
+                    "client": ("127.0.0.1", 12345),
+                    "server": ("127.0.0.1", 8766),
+                }
+                sent: list[dict[str, Any]] = []
+
+                async def receive() -> dict[str, Any]:
+                    return {"type": "http.request", "body": b"", "more_body": False}
+
+                async def send(message: dict[str, Any]) -> None:
+                    sent.append(message)
+                    if message["type"] == "http.response.body" and message.get("body"):
+                        raise OSError("simulated client disconnect")
+
+                async def invoke() -> None:
+                    try:
+                        await app(scope, receive, send)
+                    except Exception:
+                        # Starlette surfaces ClientDisconnect after the response starts.
+                        pass
+
+                asyncio.run(invoke())
+
+                self.assertTrue(fake_archive.closed)
+                self.assertEqual(1, lease.cancel_count)
+                self.assertEqual(1, lease.release_count)
+                self.assertGreater(lease.renew_count, 0)
+                self.assertTrue(
+                    any(
+                        message.get("type") == "http.response.start"
+                        and message.get("status") == 200
+                        for message in sent
+                    )
+                )
+            finally:
+                api.iter_archive = original_iter_archive
+
+    def test_request_body_limit_middleware_tracks_concurrency_and_releases_slot(self) -> None:
+        from docling_service.api import _RequestBodyLimitMiddleware
+
+        with tempfile.TemporaryDirectory() as directory:
+            temp_root = Path(directory)
+            started = asyncio.Event()
+            release = asyncio.Event()
+
+            async def slow_app(
+                _scope: dict[str, Any], _receive: Any, send: Any
+            ) -> None:
+                started.set()
+                await release.wait()
+                await send(
+                    {"type": "http.response.start", "status": 202, "headers": []}
+                )
+                await send(
+                    {"type": "http.response.body", "body": b"processing", "more_body": False}
+                )
+
+            async def invoke(handler: Any) -> list[dict[str, Any]]:
+                response: list[dict[str, Any]] = []
+
+                async def receive() -> dict[str, Any]:
+                    return {"type": "http.request", "body": b"", "more_body": False}
+
+                async def send(message: dict[str, Any]) -> None:
+                    response.append(message)
+
+                scope = {
+                    "type": "http",
+                    "method": "POST",
+                    "path": "/v1/jobs",
+                    "headers": [],
+                }
+                await handler(scope, receive, send)
+                return response
+
+            middleware = _RequestBodyLimitMiddleware(
+                slow_app,
+                max_body_bytes=1024 * 1024,
+                max_concurrent_uploads=1,
+                temp_root=temp_root,
+                spool_root=temp_root,
+                min_free_bytes=1,
+            )
+
+            async def run_concurrency_scenario() -> None:
+                first = asyncio.create_task(invoke(middleware))
+                await asyncio.sleep(0)
+                self.assertTrue(started.is_set())
+
+                blocked = await invoke(middleware)
+                self.assertEqual(429, blocked[0]["status"])
+                self.assertEqual(
+                    "upload_concurrency_exhausted",
+                    json.loads(blocked[1]["body"].decode("utf-8"))["code"],
+                )
+
+                release.set()
+                first_result = await first
+                self.assertEqual(202, first_result[0]["status"])
+                reused = await invoke(middleware)
+                self.assertEqual(202, reused[0]["status"])
+
+            asyncio.run(run_concurrency_scenario())
+
+    def test_request_body_limit_middleware_rejects_when_disk_space_is_low(self) -> None:
+        from docling_service.api import _RequestBodyLimitMiddleware
+
+        async def app(scope: dict[str, Any], _receive: Any, send: Any) -> None:
+            await send({"type": "http.response.start", "status": 200, "headers": []})
+            await send({"type": "http.response.body", "body": b"ok"})
+
+        with tempfile.TemporaryDirectory() as directory:
+            temp_root = Path(directory)
+            middleware = _RequestBodyLimitMiddleware(
+                app,
+                max_body_bytes=64,
+                max_concurrent_uploads=4,
+                temp_root=temp_root,
+                spool_root=temp_root,
+                min_free_bytes=1024,
+            )
+
+            async def invoke() -> list[dict[str, Any]]:
+                responses: list[dict[str, Any]] = []
+
+                async def receive() -> dict[str, Any]:
+                    return {"type": "http.request", "body": b"", "more_body": False}
+
+                async def send(message: dict[str, Any]) -> None:
+                    responses.append(message)
+
+                scope = {
+                    "type": "http",
+                    "method": "POST",
+                    "path": "/v1/jobs",
+                    "headers": [],
+                }
+                await middleware(scope, receive, send)
+                return responses
+
+            with patch(
+                "docling_service.api.shutil.disk_usage",
+                return_value=SimpleNamespace(free=16, total=1024, used=1008),
+            ):
+                blocked = asyncio.run(invoke())
+                self.assertEqual(507, blocked[0]["status"])
+                self.assertEqual(
+                    "upload_storage_exhausted",
+                    json.loads(blocked[1]["body"].decode("utf-8"))["code"],
+                )
+
+    def test_request_body_limit_preserves_413_for_chunked_body(self) -> None:
+        from docling_service.api import _RequestBodyLimitMiddleware
+
+        async def parser_like_app(_scope: Any, receive: Any, send: Any) -> None:
+            try:
+                while True:
+                    message = await receive()
+                    if not message.get("more_body", False):
+                        break
+            except Exception:
+                # Mirrors FastAPI converting a receive failure into a 400.
+                await send({"type": "http.response.start", "status": 400, "headers": []})
+                await send({"type": "http.response.body", "body": b"bad request"})
+
+        with tempfile.TemporaryDirectory() as directory:
+            middleware = _RequestBodyLimitMiddleware(
+                parser_like_app,
+                max_body_bytes=8,
+                max_concurrent_uploads=1,
+                temp_root=Path(directory),
+                spool_root=Path(directory),
+                min_free_bytes=0,
+            )
+            chunks = iter(
+                [
+                    {"type": "http.request", "body": b"12345", "more_body": True},
+                    {"type": "http.request", "body": b"67890", "more_body": False},
+                ]
+            )
+            sent: list[dict[str, Any]] = []
+
+            async def receive() -> dict[str, Any]:
+                return next(chunks)
+
+            async def send(message: dict[str, Any]) -> None:
+                sent.append(message)
+
+            scope = {
+                "type": "http",
+                "method": "POST",
+                "path": "/v1/jobs",
+                "headers": [],
+            }
+            asyncio.run(middleware(scope, receive, send))
+            self.assertEqual(413, sent[0]["status"])
+            self.assertEqual(
+                "request_too_large",
+                json.loads(sent[1]["body"].decode("utf-8"))["code"],
+            )
+
+    def test_real_fastapi_chunked_multipart_returns_413_and_releases_slot(self) -> None:
+        from fastapi import FastAPI, File
+
+        from docling_service.api import _RequestBodyLimitMiddleware
+
+        inner = FastAPI()
+
+        @inner.post("/v1/jobs")
+        async def accept(file: Any = File(...)) -> dict[str, bool]:
+            await file.close()
+            return {"ok": True}
+
+        boundary = b"docling-boundary"
+
+        def multipart(file_content: bytes) -> bytes:
+            return (
+                b"--"
+                + boundary
+                + b'\r\nContent-Disposition: form-data; name="file"; filename="paper.pdf"'
+                + b"\r\nContent-Type: application/pdf\r\n\r\n"
+                + file_content
+                + b"\r\n--"
+                + boundary
+                + b"--\r\n"
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            middleware = _RequestBodyLimitMiddleware(
+                inner,
+                max_body_bytes=256,
+                max_concurrent_uploads=1,
+                temp_root=Path(directory),
+                spool_root=Path(directory),
+                min_free_bytes=0,
+            )
+
+            async def invoke(body: bytes) -> list[dict[str, Any]]:
+                chunks = iter(
+                    [
+                        {"type": "http.request", "body": body[:128], "more_body": True},
+                        {"type": "http.request", "body": body[128:], "more_body": False},
+                    ]
+                )
+                sent: list[dict[str, Any]] = []
+
+                async def receive() -> dict[str, Any]:
+                    return next(chunks)
+
+                async def send(message: dict[str, Any]) -> None:
+                    sent.append(message)
+
+                scope = {
+                    "type": "http",
+                    "asgi": {"version": "3.0", "spec_version": "2.4"},
+                    "http_version": "1.1",
+                    "method": "POST",
+                    "scheme": "http",
+                    "path": "/v1/jobs",
+                    "raw_path": b"/v1/jobs",
+                    "query_string": b"",
+                    "root_path": "",
+                    "headers": [
+                        (
+                            b"content-type",
+                            b"multipart/form-data; boundary=" + boundary,
+                        )
+                    ],
+                    "client": ("127.0.0.1", 12345),
+                    "server": ("127.0.0.1", 8766),
+                }
+                await middleware(scope, receive, send)
+                return sent
+
+            oversized = asyncio.run(invoke(multipart(b"%PDF-" + b"x" * 300)))
+            self.assertEqual(413, oversized[0]["status"])
+            accepted = asyncio.run(invoke(multipart(b"%PDF-1.7\n%%EOF\n")))
+            self.assertEqual(200, accepted[0]["status"])
 
 
 if __name__ == "__main__":

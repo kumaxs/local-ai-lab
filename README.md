@@ -1,275 +1,239 @@
 # Local AI Lab
 
-Local AI Lab 是一个面向本地部署的文档 AI 与自动化实验仓库。当前正式交付组件是
-**Docling Service 1.1.0**：它把 PDF 转换成结构化 HTML、Markdown、Docling JSON、
-图片、表格、质量报告与可复核证据，并通过任务 API、Webhook 和 ZIP 下载接口供
-n8n 或其他网络客户端调用。
+本地优先的文档理解与自动化工程。当前主要交付是 **Docling Service
+1.1.0**：接收 PDF，异步生成 HTML、Markdown、结构化 JSON、图片、公式与
+可审计元数据，并通过标准 HTTP API、Webhook 和一次性 ZIP 下载对接 n8n
+或其他业务系统。
 
 [最新 Release](https://github.com/kumaxs/local-ai-lab/releases/latest) ·
-[Docling Service 文档](services/docling-service/README.md) ·
-[HTTP API](services/docling-service/docs/API.md) ·
+[API 文档](services/docling-service/docs/API.md) ·
 [Docker 部署](services/docling-service/docs/DOCKER.md) ·
 [macOS 部署](services/docling-service/docs/MACOS.md)
 
-## 项目组成
+同一版本提供两种运行方式：
 
-| 目录 | 定位 | 发布状态 |
-| --- | --- | --- |
-| `services/docling-service/` | 高质量 PDF 转换服务、任务 API、Docker/macOS 发行配置 | 正式发布 |
-| `services/n8n-paper-pipeline/` | 文档摄取、去重、路由及 n8n/worker 集成代码 | 集成与演进中 |
-| `docs/integrations/` | Docling 质量对齐、公式识别和回归验证材料 | 工程证据 |
-| `docs/`、`inventory/` | 架构决策、运行状态和历史审计记录 | 文档；部分记录具有时间点属性 |
+- Docker Compose：Linux `amd64` / `arm64`，适合服务器、NAS 和跨机器部署；
+- macOS 安装包：Apple Silicon 为验收基线，保留本机 MLX/OCRMac 能力。
 
-本仓库不包含模型权重、用户 PDF、n8n 数据库、Obsidian/Zotero 私人数据、访问
-令牌或生产运行结果。
+## 项目内容
 
-## Docling Service 架构
+| 路径 | 用途 |
+| --- | --- |
+| [`services/docling-service/`](services/docling-service/) | Docling API、任务队列、转换与发布逻辑 |
+| [`services/docling-service/docs/API.md`](services/docling-service/docs/API.md) | API、Webhook、配额和环境变量 |
+| [`services/docling-service/docs/DOCKER.md`](services/docling-service/docs/DOCKER.md) | Docker 部署与镜像说明 |
+| [`services/docling-service/docs/MACOS.md`](services/docling-service/docs/MACOS.md) | macOS 安装与运行说明 |
+| [`services/docling-service/docs/OUTPUTS.md`](services/docling-service/docs/OUTPUTS.md) | 输出文件合同 |
+| [`services/docling-service/docs/DISTRIBUTION.md`](services/docling-service/docs/DISTRIBUTION.md) | 发布包、校验和与平台矩阵 |
+| [`services/n8n-paper-pipeline/`](services/n8n-paper-pipeline/) | n8n 摄取与调用示例 |
 
-```text
-客户端 / n8n
-    |
-    |  HTTP multipart、任务查询、文件或 ZIP 下载
-    v
-Docling API :8766
-    |-- SQLite WAL：任务、清单、幂等键、下载租约、Webhook outbox
-    |-- /data/inputs：上传的源 PDF
-    |-- /data/outputs/.staging：尚未发布的转换结果
-    |-- /data/outputs/<job_id>：验证后发布的结果
-    |
-    +--> Docling backend :5001（Compose 私有网络）
-    +--> Formula sidecar :8001（Compose 私有网络）
-    +--> Webhook / CloudEvents --> n8n 或其他允许的主机
-```
+仓库和发布包不内置模型权重、用户文档、生产数据库或密钥。
 
-Docker 发行版由三个相互隔离的镜像组成：
+## 获取与部署
 
-- `ghcr.io/kumaxs/local-ai-lab-docling-api:1.1.0`
-- `ghcr.io/kumaxs/local-ai-lab-docling-backend:1.1.0`
-- `ghcr.io/kumaxs/local-ai-lab-docling-formula:1.1.0`
+正式版本由一个 Git 标签 `v1.1.0` 统一锚定。标签触发测试、多架构镜像、
+macOS/通用分发包和 GitHub Release；Docker 与 macOS 不再使用两个会漂移的
+平台标签。
 
-Release 工作流发布 `linux/amd64` 与 `linux/arm64` 镜像，以及可校验的 `.zip`、
-`.tar.gz`、`SHA256SUMS` 和逐文件完整性清单。macOS 发行路径使用 Apple Silicon
-原生组件；Docker/Linux 路径不依赖 OCRMac、MLX、Metal 或 Apple Vision。
+### Docker：直接用 Compose 部署
 
-## 在另一台机器上部署
-
-### Docker：不执行 shell 脚本
-
-从 [v1.1.0 Release](https://github.com/kumaxs/local-ai-lab/releases/tag/v1.1.0)
-下载并解压 `docling-service-1.1.0.zip`，进入解压目录后直接运行 Compose：
+从 [GitHub Release v1.1.0](https://github.com/kumaxs/local-ai-lab/releases/tag/v1.1.0)
+下载并校验 `docling-service-1.1.0.zip` 或 `.tar.gz`。目标机器只需 Docker
+Engine 和 Compose v2；不需要 Git、Python，也不必执行 `.sh` 文件：
 
 ```bash
 docker compose \
   -f services/docling-service/deploy/docker/compose.release.yaml \
   pull
-
 docker compose \
   -f services/docling-service/deploy/docker/compose.release.yaml \
   up -d
 ```
 
-`compose.release.yaml` 只引用预构建 GHCR 镜像，没有 `build:`，也没有 `../../`
-构建上下文，因此适合不能执行项目 shell 脚本的设备。源码开发用的
-`compose.yaml` 才会使用仓库相对构建上下文。
+如果设备没有 Shell，可在 Portainer、NAS 容器管理器或其他 Compose UI 中
+导入同一份 `compose.release.yaml`，填写环境变量后点击部署。
 
-默认只在 `127.0.0.1:8766` 暴露 API。若要向局域网或公网开放，必须同时配置
-Bearer token、TLS/可信反向代理、防火墙和访问控制，不能只把绑定地址改成
-`0.0.0.0`。
+Release Compose 拉取以下 GHCR 镜像：
+
+- `ghcr.io/kumaxs/local-ai-lab-docling-api:1.1.0`
+- `ghcr.io/kumaxs/local-ai-lab-docling-backend:1.1.0`
+- `ghcr.io/kumaxs/local-ai-lab-docling-formula:1.1.0`
+
+源码版 [`compose.yaml`](services/docling-service/deploy/docker/compose.yaml)
+中的 `../../../..` 是合法的相对 build context：它让 Docker 构建能读取仓库
+共享代码。跨机器交付使用的 `compose.release.yaml` 只有 `image:`，没有
+`build:`，因此不依赖这些相对路径。
+
+首次启动会把模型下载到 Docker named volumes。Hugging Face 默认站点为
+`https://hf-mirror.com`；需要官方站点或其他兼容镜像时，在 Compose 环境中
+覆盖：
+
+```text
+HF_ENDPOINT=https://huggingface.co
+```
+
+已下载模型会被复用。下载失败时容器重启会继续利用缓存重新尝试，但两个
+站点之间不会在单次下载中自动切换；应通过 `HF_ENDPOINT` 明确选择可达站点。
 
 ### macOS
 
-从同一 Release 下载并验证归档，在 Apple Silicon Mac 上运行：
+从同一 Release 下载、校验并解压后运行：
 
 ```bash
-zsh install-macos.sh
+./install-macos.sh
 ```
 
-安装、启动、停止、日志路径和回滚方式见
-[macOS 部署说明](services/docling-service/docs/MACOS.md)。
-
-## 模型从哪里下载
-
-Docker 首次启动时，backend 和 formula 容器会把模型下载到独立 Docker named
-volumes。Hugging Face 端点默认是：
-
-```text
-https://hf-mirror.com
-```
-
-需要切换到官方站点或其他兼容镜像时，在启动前覆盖：
+开发环境也可从完整仓库执行：
 
 ```bash
-export HF_ENDPOINT=https://huggingface.co
+zsh services/docling-service/deploy/macos/install.sh
 ```
 
-Docling/RapidOCR 模型保存在 `docling-models`，UniMERNet/PP-FormulaNet 模型保存在
-`docling-formula-models`。模型卷不会随普通 `docker compose down` 删除，避免每次
-启动重复下载。
+安装器把每个版本放在
+`~/Library/Application Support/Local AI Lab/docling-service/<version>`，模型缓存
+位于 `~/.cache/docling/models`。详见
+[`MACOS.md`](services/docling-service/docs/MACOS.md)。
 
-## API 快速开始
+## HTTP API
 
-服务启动后可直接通过网络读取完整 OpenAPI 3.1 文档：
+服务运行后可通过网络直接取得完整合同：
 
-- Swagger UI：`http://127.0.0.1:8766/docs`
-- ReDoc：`http://127.0.0.1:8766/redoc`
-- OpenAPI JSON：`http://127.0.0.1:8766/openapi.json`
+- OpenAPI 3.1：`GET /openapi.json`
+- Swagger UI：`GET /docs`
+- ReDoc：`GET /redoc`
+- 健康检查：`GET /healthz`
 
 提交 PDF：
 
 ```bash
 curl -sS -X POST http://127.0.0.1:8766/v1/jobs \
-  -H 'Authorization: Bearer TOKEN' \
+  -H 'Authorization: Bearer YOUR_TOKEN' \
   -H 'Idempotency-Key: n8n-run-123' \
-  -F 'client_reference=paper-intake' \
+  -F 'client_reference=paper-flow' \
   -F 'file=@/absolute/path/paper.pdf;type=application/pdf'
 ```
 
-任务创建后可查询列表和状态，也可分别下载文件或一次请求下载完整 ZIP：
+响应为 `202 Accepted`，包含 `job_id`、状态、文件清单和 ZIP 链接。主要接口：
 
-```text
-GET    /v1/jobs
-GET    /v1/jobs/{job_id}
-DELETE /v1/jobs/{job_id}
-GET    /v1/jobs/{job_id}/outputs
-GET    /v1/jobs/{job_id}/manifest
-GET    /v1/jobs/{job_id}/files/{relative_path}
-GET    /v1/jobs/{job_id}/archive
-GET    /v1/system/storage
-```
+| 接口 | 作用 |
+| --- | --- |
+| `POST /v1/jobs` | multipart 上传 PDF、创建或幂等复用任务 |
+| `GET /v1/jobs` | 按状态/业务引用分页查询任务列表 |
+| `GET /v1/jobs/{job_id}` | 状态、错误、时间和生命周期截止点 |
+| `DELETE /v1/jobs/{job_id}` | 主动删除终态任务的输入和输出 |
+| `GET /v1/jobs/{job_id}/outputs` | 输出路径、大小、类型、SHA-256 和下载地址 |
+| `GET /v1/jobs/{job_id}/manifest` | 不可变 manifest 及其摘要 |
+| `GET /v1/jobs/{job_id}/files/{relative_path}` | 下载单个已发布文件 |
+| `GET /v1/jobs/{job_id}/archive` | 流式生成一个 ZIP，不包含源 PDF |
+| `GET /v1/system/storage` | 任务管理范围内的用量、预留量和磁盘余量 |
+| `/v1/webhooks/subscriptions` | 创建、查看、修改和删除 Webhook 订阅 |
+| `/v1/webhooks/deliveries` | 查看投递记录和手动重试 |
 
-`archive` 中包含所有已发布结果及 `manifest.json`，不包含用户上传的源 PDF。每个
-文件在下载前或流式传输期间都会按照清单检查路径、大小和 SHA-256；ZIP 可在输出
-过期前重复请求。
+错误统一使用 `application/problem+json`。配置
+`DOCLING_SERVICE_API_TOKEN` 后，所有 `/v1` 请求必须使用 Bearer Token。
 
 ## 一次任务的完整工作流程
 
-1. API 在接收 multipart 请求时限制请求体和 PDF 大小，并先写入受管临时目录。
-2. 文件头、大小和参数通过校验后，服务计算 SHA-256 与幂等指纹。
-3. 队列容量、总数据预算和磁盘剩余空间通过检查后，PDF 原子移动到任务输入目录，
-   SQLite 同一事务登记任务和幂等键。
-4. Worker 把转换结果写到 `.staging/<job_id>`；这时结果对下载接口不可见。
-5. 只有必需文件、`status.json.ok=true`、路径、单任务总大小和清单校验全部通过，
-   staging 目录才会原子发布为 `/outputs/<job_id>`，任务才进入 `succeeded`。
-6. 失败或超时任务进入 `failed`，服务异常重启时未结束任务会恢复为
-   `interrupted`；可验证的部分输出仍按较短保留期管理。
-7. 终态、不可变 manifest 和 Webhook outbox 在数据库中一起落盘。Webhook 使用
-   CloudEvents 1.0、稳定事件 ID、HMAC-SHA256 和最多六次投递。
-8. 调用方查询任务、下载单文件或 ZIP；下载期间的可续租 lease 阻止清理线程移除
-   正在传输的结果。
-9. 后台 janitor 周期性删除过期输入、输出、孤立临时数据和历史记录。终态任务也可
-   通过 `DELETE /v1/jobs/{job_id}` 提前清理。
-
-任务状态只有 `queued`、`running`、`succeeded`、`failed` 和 `interrupted`。
-SQLite WAL 是权威状态源；`state/jobs/` 下同时保存严格的兼容 JSON 镜像。一个数据
-目录只能运行一个 API 实例。
-
-## 文件和临时文件生命周期
-
-默认清理周期为 5 分钟。所有时间和配额都可通过 `DOCLING_*` 环境变量调整。
-
-| 数据 | 位置（Docker） | 默认生命周期 | 删除方式 |
-| --- | --- | ---: | --- |
-| multipart 临时上传 | `/data/state/temp` | 正常请求结束立即删除；崩溃遗留 1 小时 | API `finally` + janitor |
-| 源 PDF | `/data/inputs/<job_id>/source.pdf` | 24 小时 | janitor 或终态任务 DELETE |
-| 转换 staging | `/data/outputs/.staging/<job_id>` | 活跃任务保留；孤立数据 1 小时 | janitor；活跃任务不会被误删 |
-| 成功输出 | `/data/outputs/<job_id>` | 7 天 | janitor 或终态任务 DELETE |
-| 失败/中断输出 | `/data/outputs/<job_id>` | 2 天 | janitor 或终态任务 DELETE |
-| 任务元数据/兼容 JSON | SQLite、`/data/state/jobs` | 30 天 | tombstone 清理 |
-| 幂等键 | SQLite | 24 小时 | janitor maintenance |
-| 下载 lease | SQLite | 5 分钟并在传输时续租 | 正常释放或过期清理 |
-| Webhook 投递历史 | SQLite | 7 天 | janitor maintenance |
-| 模型缓存 | Docker model volumes | 无自动 TTL | 运维人员显式清理 |
-
-清理失败不会被当作成功：失败原因写回清理记录，并在租约过期后的后续扫描中重试。
-清理路径必须位于配置的输入、输出或状态根目录内；符号链接和目录穿越不会被跟随。
-
-## 存储膨胀与泄漏边界
-
-任务受管数据不是无限增长的。默认保护线如下：
-
-| 控制项 | 默认值 |
-| --- | ---: |
-| 单次上传上限 | 256 MiB |
-| queued + running 任务数 | 20 |
-| 单任务发布输出上限 | 5 GiB |
-| 输入、输出和预留输出总预算 | 50 GiB |
-| 文件系统最小剩余空间 | 2 GiB |
-
-新任务会在突破任一保护线前被拒绝，`GET /v1/system/storage` 可查看当前受管字节、
-预留空间、空闲空间和配置上限。任务完成时，最坏 5 GiB 的输出预留会释放并换成
-实际 manifest 大小，避免配额长期虚占。
-
-需要明确区分以下边界：
-
-- **服务停止时不会清理。** Docker volumes 在停机期间仍然保留；服务重启后
-  janitor 才会继续处理已过期数据。
-- **模型卷不计入 50 GiB 任务预算。** 它们是有意持久化的下载缓存，升级或更换
-  模型后可能增长，需要使用 `docker system df -v` 定期观察。
-- **Docker 容器日志不属于任务生命周期。** 生产主机应配置 Docker 日志轮转；
-  否则长时间运行的 stdout/stderr 可以独立占用磁盘。
-- **SQLite 文件会复用已释放页，但通常不会自动缩小到历史最小尺寸。** 这不是活动
-  数据泄漏；经历异常大流量后，数据库文件可能保持高水位，维护窗口内可备份后执行
-  SQLite `VACUUM`。
-- **手工写入 named volume 的文件不受数据库配额追踪。** 不要绕过 API 向
-  `/data/inputs`、`/data/outputs` 或 `/data/state` 放置文件。
-- `docker compose down` 保留数据；`docker compose down -v` 会不可恢复地删除模型、
-  任务、输入和输出卷，只应在确认不再需要任何数据时使用。
-
-因此，在正常 API 路径、服务持续或定期启动、没有人为绕过受管目录的前提下，输入、
-临时文件、任务输出和 Webhook 历史都有明确上限与清理路径，不会无限增长。需要单独
-运维的是模型缓存、Docker 日志和 SQLite 高水位。
-
-## Webhook 与 n8n
-
-Webhook 默认关闭。只有在 `DOCLING_WEBHOOK_ALLOWED_HOSTS` 显式列出回调主机后才能
-创建订阅。事件包括：
-
-- `docling.job.succeeded`
-- `docling.job.failed`
-- `docling.job.interrupted`
-
-本机 n8n 使用私网地址时，还必须显式设置
-`DOCLING_WEBHOOK_ALLOW_PRIVATE_HOSTS=true`。n8n 应在原始请求体上验证 HMAC，仅在
-事件已经可靠入库后返回 2xx，并按 `X-Docling-Event-Id` 去重。完整订阅、投递查询和
-手工重试接口见 [API 文档](services/docling-service/docs/API.md#webhooks)。
-
-## 质量和安全原则
-
-- 成功状态必须经过必需输出集、质量状态和不可变 manifest 校验，不能“有文件就算
-  成功”。
-- backend 和 formula sidecar 只在 Compose 私有网络中通信，不对宿主机发布端口。
-- 输出路径被限制在任务目录内，拒绝符号链接、绝对路径和 `..` 穿越。
-- Webhook 使用主机白名单、DNS 复查、私网阻断和禁止重定向来降低 SSRF 风险。
-- API 支持 Bearer token；错误使用 RFC 9457 `application/problem+json`。
-- 原 PDF 是证据源，所有 HTML、Markdown、JSON 和图片都是可重新生成的派生工件。
-
-## 开发与验证
-
-```bash
-PYTHONPATH=services/docling-service \
-  python3 -m unittest discover services/docling-service/tests
-
-docker compose \
-  -f services/docling-service/deploy/docker/compose.release.yaml \
-  config --quiet
+```text
+客户端 / n8n
+  │ multipart PDF
+  ▼
+上传准入 ── 大小、并发槽、临时盘余量、PDF 头校验
+  │
+  ▼
+state/temp ── 校验副本 ── 同卷临时副本/原子发布 ── inputs/<job_id>/source.pdf
+  │                                      │ SQLite 登记 + 入队
+  │                                      ▼
+  │                            outputs/.staging/<job_id>
+  │                                      │ 转换中持续监测大小/余量
+  │                                      ▼
+  │                            必需文件、status、路径、哈希校验
+  │                                      │
+  │                                      ▼ 原子发布
+  │                              outputs/<job_id>
+  │                                      │
+  └──────── 即时清理失败路径              ├─ manifest / 单文件 / ZIP
+                                         ├─ CloudEvents Webhook
+                                         └─ Janitor 按 TTL 回收
 ```
 
-发行标签必须与代码版本完全一致。推送 `vMAJOR.MINOR.PATCH` 标签后，GitHub Actions
-会执行测试、Python 编译、Compose/脚本验证、macOS 包验证、多架构镜像构建、SBOM/
-provenance 生成和 GitHub Release 发布。
+任务状态固定为 `queued`、`running`、`succeeded`、`failed`、`interrupted`。
+只有完整输出通过校验并原子发布后才会成为 `succeeded`。
 
-## 更多文档
+## 文件与临时文件生命周期
 
-- [跨机器分发与完整性验证](services/docling-service/docs/DISTRIBUTION.md)
-- [Docker 安装和运维](services/docling-service/docs/DOCKER.md)
-- [macOS 安装和运维](services/docling-service/docs/MACOS.md)
-- [HTTP API 1.1](services/docling-service/docs/API.md)
-- [输出契约](services/docling-service/docs/OUTPUTS.md)
-- [发行架构与平台边界](services/docling-service/docs/RELEASES.md)
-- [v1.1.0 Release Notes](services/docling-service/release/RELEASE_NOTES.md)
+默认目录（Docker）：
 
-## 隐私与仓库边界
+| 数据 | 位置 | 默认生命周期 | 自动治理 |
+| --- | --- | --- | --- |
+| multipart spool、API 校验副本 | `/data/state/temp` | 请求结束立即删；异常残留 1 小时 | 是 |
+| 已登记输入 PDF | `/data/inputs/<job_id>` | 24 小时 | 是 |
+| 崩溃窗口产生的孤儿输入 | `/data/inputs/<uuid>` | 未登记且超过 1 小时 | 是 |
+| 转换中间产物 | `/data/outputs/.staging/<job_id>` | 成功时原子移动；异常残留 1 小时 | 是 |
+| 成功输出 | `/data/outputs/<job_id>` | 7 天 | 是 |
+| 失败/中断输出 | `/data/outputs/<job_id>` | 2 天 | 是 |
+| 任务 tombstone/元数据 | `/data/state` SQLite + JSON mirror | 30 天 | 是 |
+| Webhook 投递历史 | SQLite | 7 天 | 是 |
+| Webhook 订阅 | SQLite | 直到显式 DELETE；默认最多 100 条 | 数量受限 |
+| 单文件/ZIP 流 | 不生成持久 ZIP | 请求生命周期 | 关闭时释放租约 |
+| Docker 服务日志 | Docker `json-file` | 默认 10 MB × 3/容器 | 是 |
+| macOS 服务日志 | `.runtime/.../logs` | 默认 10 MiB × 当前文件和 3 个备份 | 是 |
+| 模型缓存 | Docker model volumes / `~/.cache/docling/models` | 持久复用 | 否 |
+| Docker 镜像缓存 | Docker Engine | 由 Docker 主机管理 | 否 |
+| 旧 macOS 版本目录 | `Application Support/.../<version>` | 持久 | 否 |
 
-不要提交 `.env`、token、secret、credential、SQLite/数据库文件、用户 PDF、运行时
-输入输出、模型缓存、n8n 数据目录、Obsidian Vault 或 Zotero 私人资料。仓库的
-`.gitignore` 已覆盖常见路径，但提交前仍应检查 `git status` 和 staged diff。
+Janitor 默认每 5 分钟运行。清理采用持久化 claim，失败会保留并重试；下载
+期间的短租约会阻止输出被删除。路径必须位于配置根目录内，符号链接不会被
+跟随，staging/output 的任务根本身也不得是符号链接。正在复制的上传会登记为
+受保护临时文件，不会被短 TTL 的清理轮次误删。服务停止时 Janitor 也停止，
+重启后会恢复清理；正常关机必须等清理线程退出后才关闭 SQLite。
+
+### 容量边界
+
+默认值：单 PDF 256 MiB、并发上传 2、排队/运行任务 20、单任务输出 5 GiB、
+任务管理数据 50 GiB、磁盘最低保留 2 GiB。上传准入按“multipart spool +
+校验副本”预留两倍请求空间；转换器运行时持续检查 staging 大小和磁盘余量，
+越界即终止并清除不完整输出。转换日志只保留 stdout/stderr 各 4 MiB 尾部。
+
+`DOCLING_MAX_DATA_BYTES` 的 50 GiB 统计任务输入、已发布输出和输出预留，
+**不统计**模型、Docker 镜像、日志、SQLite/WAL 本身以及开发目录 `.runtime`
+中的质量回归材料。`GET /v1/system/storage` 也只报告这一任务管理口径。
+
+SQLite 删除记录后会复用空闲页，但数据库物理文件可能保持历史高水位；这不
+等于数据继续泄漏，如需缩小文件应在停机维护窗口执行 checkpoint/VACUUM。
+
+结论：正式 API 路径中的任务文件、临时文件、staging、下载和投递历史均有
+边界，不存在已知的无限任务存储泄漏。仍需运维主动治理的是模型缓存、Docker
+镜像缓存、旧 macOS 安装和 SQLite 物理高水位。开发/历史 CLI 不承诺这套 API
+生命周期，生产自动化应只调用 `/v1`。
+
+> `docker compose down` 保留 named volumes；`docker compose down -v` 会
+> 删除模型、任务、输入和输出卷，是不可恢复的破坏性操作。
+
+## Webhook / n8n
+
+Webhook 默认关闭。设置 `DOCLING_WEBHOOK_ALLOWED_HOSTS` 后可登记回调地址；
+内网/loopback 还需要显式设置 `DOCLING_WEBHOOK_ALLOW_PRIVATE_HOSTS=true`。
+事件采用 CloudEvents 1.0 structured JSON，支持成功、失败和中断事件，使用
+HMAC-SHA256 签名、稳定事件 ID、至少一次投递和默认最多 6 次重试。n8n 应在
+持久接收后返回 2xx，并按事件 ID 去重。
+
+## 安全与隐私
+
+Docker 默认只把 API 绑定到 `127.0.0.1:8766`，macOS 默认绑定到
+`127.0.0.1:8000`。向局域网或公网开放前，应同时启用 Bearer Token、TLS/可信
+反向代理、防火墙和访问控制。不要提交 `.env`、token、Webhook secret、SQLite
+数据库、用户 PDF、运行时输出、模型缓存、n8n 数据目录或私人知识库；提交前仍
+应检查 `git status` 和 staged diff。
+
+## 开发验证
+
+```bash
+cd services/docling-service
+PYTHONPATH=. python3 -m unittest discover -s tests -v
+docker compose -f deploy/docker/compose.yaml config --quiet
+docker compose -f deploy/docker/compose.release.yaml config --quiet
+```
+
+更多质量合同、真实论文验收与发布架构见
+[`services/docling-service/README.md`](services/docling-service/README.md)。

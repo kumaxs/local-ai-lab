@@ -14,6 +14,7 @@ from abc import abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Protocol
+from uuid import UUID
 
 
 TERMINAL_STATES = {"succeeded", "failed", "interrupted"}
@@ -25,6 +26,7 @@ CLEANUP_KIND_TOMBSTONE = "tombstone"
 CLEANUP_KIND_TOMB_DIR = "tombstone_dir"
 CLEANUP_KIND_STAGING = "staging_dir"
 CLEANUP_KIND_TEMP = "temp_dir"
+CLEANUP_KIND_ORPHAN_INPUT = "orphan_input"
 
 
 class QueueFullError(RuntimeError):
@@ -199,9 +201,17 @@ def _is_symlink_in_path(root: Path, target: Path) -> bool:
     cursor = root
     for part in rel.parts:
         cursor = cursor / part
-        if cursor.exists() and cursor.is_symlink():
+        if cursor.is_symlink():
             return True
     return False
+
+
+def _is_uuid(value: str) -> bool:
+    try:
+        UUID(str(value), version=4)
+        return True
+    except (TypeError, ValueError):
+        return False
 
 
 def safe_resolve(root: Path | str, target: Path | str) -> Path:
@@ -244,7 +254,17 @@ def safe_delete_tree(root: Path | str, target: Path | str) -> int:
     Returns deleted byte count when deletion occurs. Missing paths return ``0``.
     """
 
-    resolved = safe_resolve(root, target)
+    try:
+        resolved = safe_resolve(root, target)
+    except PermissionError as exc:
+        raw_target = Path(target)
+        if "symlink" in str(exc) and raw_target.is_symlink():
+            # Removing the link itself is safe after independently validating
+            # its parent; never resolve or traverse the link target.
+            safe_resolve(root, raw_target.parent)
+            raw_target.unlink(missing_ok=True)
+            return 0
+        raise
     if resolved == Path(root).resolve():
         raise PermissionError("refusing to delete root directory")
 
@@ -334,6 +354,8 @@ class Janitor:
         scan_interval_seconds: float = 300.0,
         now: Callable[[], float] = time.time,
         cleanup_delete_fn: Callable[[Path, Path | str], int] | None = None,
+        pending_inputs: Callable[[], set[str]] | None = None,
+        protected_temp_entries: Callable[[], set[str]] | None = None,
         maintenance: Iterable[Callable[[], Any]] = (),
     ) -> None:
         self._store = store
@@ -349,6 +371,8 @@ class Janitor:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._delete_fn = cleanup_delete_fn or safe_delete_tree
+        self._pending_inputs = pending_inputs or (lambda: set())
+        self._protected_temp_entries = protected_temp_entries or (lambda: set())
         self._maintenance = tuple(maintenance)
 
     def _is_active_download(self, job_id: str) -> bool:
@@ -361,6 +385,14 @@ class Janitor:
             if normalized.state in ACTIVE_STATES:
                 active.add(normalized.job_id)
         return active
+
+    def _all_job_ids(self) -> set[str]:
+        jobs: set[str] = set()
+        for record in self._store.list_records():
+            normalized = _coerce_record(record)
+            if _is_uuid(normalized.job_id):
+                jobs.add(normalized.job_id)
+        return jobs
 
     def _coerce_finish_or_create(
         self,
@@ -485,8 +517,13 @@ class Janitor:
             return
 
         for entry in list(root.iterdir()):
-            if kind == CLEANUP_KIND_STAGING and entry.name in active_ids:
+            if not entry.exists():
                 continue
+            if kind in {CLEANUP_KIND_STAGING, CLEANUP_KIND_TEMP} and entry.name in active_ids:
+                continue
+            if kind == CLEANUP_KIND_ORPHAN_INPUT:
+                if entry.is_symlink() or not entry.is_dir() or entry.name in active_ids or not _is_uuid(entry.name):
+                    continue
 
             try:
                 mtime = os.path.getmtime(entry)
@@ -522,12 +559,23 @@ class Janitor:
     def run_once(self) -> None:
         now = self._now()
         active_job_ids = self._active_job_ids()
+        all_job_ids = self._all_job_ids()
+        pending_input_ids = set(self._pending_inputs())
+        protected_temp_entries = set(self._protected_temp_entries())
 
         for record in list(self._store.list_records()):
             normalized = _coerce_record(record)
             if normalized.state not in TERMINAL_STATES:
                 continue
             self._cleanup_record(normalized, now)
+
+        self._cleanup_directory(
+            self._input_root,
+            self._retention.temp_ttl,
+            now,
+            CLEANUP_KIND_ORPHAN_INPUT,
+            all_job_ids.union(pending_input_ids),
+        )
 
         self._cleanup_directory(
             self._tombstone_root,
@@ -548,7 +596,7 @@ class Janitor:
             self._retention.temp_ttl,
             now,
             CLEANUP_KIND_TEMP,
-            active_job_ids,
+            protected_temp_entries,
         )
         for callback in self._maintenance:
             try:

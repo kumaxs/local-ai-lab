@@ -21,7 +21,7 @@ for service in backend api; do
   fi
 done
 
-nohup zsh ${SCRIPT_DIR}/run-backend.sh >${RUNTIME_DIR}/logs/backend.log 2>&1 &
+nohup ${VENV_DIR}/bin/python ${SCRIPT_DIR}/logging_wrapper.py --log-path ${RUNTIME_DIR}/logs/backend.log -- ${SCRIPT_DIR}/run-backend.sh >/dev/null 2>&1 &
 print $! >${RUNTIME_DIR}/pids/backend.pid
 
 for attempt in {1..120}; do
@@ -36,7 +36,7 @@ for attempt in {1..120}; do
   sleep 1
 done
 
-nohup zsh ${SCRIPT_DIR}/run-api.sh >${RUNTIME_DIR}/logs/api.log 2>&1 &
+nohup ${VENV_DIR}/bin/python ${SCRIPT_DIR}/logging_wrapper.py --log-path ${RUNTIME_DIR}/logs/api.log -- ${SCRIPT_DIR}/run-api.sh >/dev/null 2>&1 &
 print $! >${RUNTIME_DIR}/pids/api.pid
 
 for attempt in {1..30}; do

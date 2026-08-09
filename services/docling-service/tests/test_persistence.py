@@ -35,6 +35,14 @@ class SQLiteStoreTests(unittest.TestCase):
             output_root=output_root,
         )
 
+    def _cleanup_claim_count(self, store: SQLiteStore, job_id: str) -> int:
+        return len(
+            store._conn.execute(
+                "SELECT 1 FROM cleanup_claims WHERE job_id = ?",
+                (job_id,),
+            ).fetchall()
+        )
+
     def test_migrations_are_idempotent_and_concurrent(self) -> None:
         root = _tmp_db_root()
         store = self._new_store(root)
@@ -467,6 +475,124 @@ class SQLiteStoreTests(unittest.TestCase):
             )
             self.assertEqual({}, store.get_job(job_id))
 
+    def test_non_job_cleanup_claim_retries_then_clears_on_success(self) -> None:
+        root = _tmp_db_root()
+        with self._new_store(root) as store:
+            marker = _make_job_ids()[0]
+            now = datetime.now(timezone.utc).timestamp()
+
+            staging_lease = store.claim_cleanup(marker, "staging_dir", now)
+            self.assertTrue(staging_lease)
+            store.complete_cleanup(
+                marker,
+                "staging_dir",
+                lease_id=str(staging_lease),
+                deleted_bytes=0,
+                error="busy",
+            )
+            self.assertEqual(1, self._cleanup_claim_count(store, marker))
+            staging_retry_lease = store.claim_cleanup(marker, "staging_dir", now + 1)
+            self.assertTrue(staging_retry_lease)
+            self.assertNotEqual(staging_lease, staging_retry_lease)
+            store.complete_cleanup(
+                marker,
+                "staging_dir",
+                lease_id=str(staging_retry_lease),
+                deleted_bytes=11,
+                error=None,
+            )
+            self.assertEqual(0, self._cleanup_claim_count(store, marker))
+
+    def test_orphan_input_cleanup_claim_retries_then_clears_on_success(self) -> None:
+        root = _tmp_db_root()
+        with self._new_store(root) as store:
+            marker = _make_job_ids()[0]
+            now = datetime.now(timezone.utc).timestamp()
+
+            first_lease = store.claim_cleanup(marker, "orphan_input", now)
+            self.assertTrue(first_lease)
+            store.complete_cleanup(
+                marker,
+                "orphan_input",
+                lease_id=str(first_lease),
+                deleted_bytes=0,
+                error="transient",
+            )
+            self.assertEqual(1, self._cleanup_claim_count(store, marker))
+
+            second_lease = store.claim_cleanup(marker, "orphan_input", now + 1)
+            self.assertTrue(second_lease)
+            self.assertNotEqual(first_lease, second_lease)
+            store.complete_cleanup(
+                marker,
+                "orphan_input",
+                lease_id=str(second_lease),
+                deleted_bytes=17,
+                error=None,
+            )
+            self.assertEqual(0, self._cleanup_claim_count(store, marker))
+
+            temp_lease = store.claim_cleanup(marker, "temp_dir", now + 401)
+            self.assertTrue(temp_lease)
+            store.complete_cleanup(
+                marker,
+                "temp_dir",
+                lease_id=str(temp_lease),
+                deleted_bytes=12,
+                error=None,
+            )
+            self.assertEqual(0, self._cleanup_claim_count(store, marker))
+
+    def test_tombstone_success_clears_all_job_cleanup_claims(self) -> None:
+        root = _tmp_db_root()
+        with self._new_store(root) as store:
+            job_id = _make_job_ids()[0]
+            store.create_job(
+                job_id=job_id,
+                original_name="cleanup_all.pdf",
+                input_path=f"{root}/input/cleanup_all.pdf",
+                output_dir=f"{root}/output/cleanup_all",
+                state="succeeded",
+                input_size_bytes=20,
+                output_size_bytes=30,
+            )
+
+            now = datetime.now(timezone.utc).timestamp()
+            kinds = [
+                "input",
+                "output",
+                "tombstone_dir",
+                "staging_dir",
+                "temp_dir",
+            ]
+            leases: dict[str, str] = {}
+            for index, kind in enumerate(kinds):
+                lease = store.claim_cleanup(job_id, kind, now + index)
+                self.assertTrue(lease)
+                leases[kind] = str(lease)
+
+            for kind in kinds:
+                store.complete_cleanup(
+                    job_id,
+                    kind,
+                    lease_id=leases[kind],
+                    deleted_bytes=0,
+                    error=None,
+                )
+            self.assertEqual(2, self._cleanup_claim_count(store, job_id))
+
+            tombstone_lease = store.claim_cleanup(job_id, "tombstone", now + 100)
+            self.assertTrue(tombstone_lease)
+            store.complete_cleanup(
+                job_id,
+                "tombstone",
+                lease_id=str(tombstone_lease),
+                deleted_bytes=0,
+            )
+
+            self.assertEqual({}, store.get_job(job_id))
+            self.assertEqual(0, self._cleanup_claim_count(store, job_id))
+
     def test_cleanup_lease_fences_stale_workers_and_downloads(self) -> None:
         root = _tmp_db_root()
         with self._new_store(root) as store:
@@ -614,6 +740,63 @@ class SQLiteStoreTests(unittest.TestCase):
             self.assertEqual(1, pending["count"])
             retry_item = store.retry_webhook_delivery(int(pending["items"][0]["id"]), error="downstream issue")
             self.assertEqual("retrying", retry_item["status"])
+
+    def test_webhook_subscription_limit_is_atomic(self) -> None:
+        root = _tmp_db_root()
+        db_path = Path(root) / "docling.sqlite"
+        input_root = Path(root) / "input"
+        output_root = Path(root) / "output"
+        input_root.mkdir()
+        output_root.mkdir()
+        stores = [
+            SQLiteStore(
+                db_path,
+                input_root=input_root,
+                output_root=output_root,
+                max_webhook_subscriptions=1,
+            )
+            for _index in range(2)
+        ]
+        results: list[dict] = []
+        errors: list[BaseException] = []
+        ready = threading.Barrier(2)
+        lock = threading.Lock()
+
+        def worker(index: int) -> None:
+            try:
+                ready.wait(timeout=5)
+                results.append(
+                    stores[index - 1].create_webhook_subscription(
+                        callback_url=f"https://example.test/{index}",
+                        event_types=["job.completed"],
+                    )
+                )
+            except BaseException as exc:  # pragma: no cover - unexpected concurrency path
+                with lock:
+                    errors.append(exc)
+
+        workers = [threading.Thread(target=worker, args=(index,)) for index in (1, 2)]
+        for worker_thread in workers:
+            worker_thread.start()
+        for worker_thread in workers:
+            worker_thread.join(timeout=10)
+            self.assertFalse(worker_thread.is_alive())
+        for store in stores:
+            store.close()
+
+        self.assertEqual([], errors)
+        created = [result for result in results if result.get("id")]
+        rejected = [result for result in results if result.get("error") == "subscription_limit"]
+        self.assertEqual(1, len(created))
+        self.assertEqual(1, len(rejected))
+
+        with SQLiteStore(
+            db_path,
+            input_root=input_root,
+            output_root=output_root,
+            max_webhook_subscriptions=1,
+        ) as store:
+            self.assertEqual(1, store.list_webhook_subscriptions(include_disabled=True)["count"])
 
 
 if __name__ == "__main__":

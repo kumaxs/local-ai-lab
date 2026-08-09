@@ -2,6 +2,11 @@ name: local-ai-lab-docling
 
 services:
   backend:
+    logging:
+      driver: json-file
+      options:
+        max-size: "${DOCLING_DOCKER_LOG_MAX_SIZE:-10m}"
+        max-file: "${DOCLING_DOCKER_LOG_MAX_FILE:-3}"
     build:
       context: ../../../..
       dockerfile: services/docling-service/deploy/docker/Dockerfile.backend
@@ -19,6 +24,11 @@ services:
       - docling-models:/models
 
   formula:
+    logging:
+      driver: json-file
+      options:
+        max-size: "${DOCLING_DOCKER_LOG_MAX_SIZE:-10m}"
+        max-file: "${DOCLING_DOCKER_LOG_MAX_FILE:-3}"
     build:
       context: ../../../..
       dockerfile: services/docling-service/deploy/docker/Dockerfile.formula
@@ -37,6 +47,11 @@ services:
       - docling-formula-models:/models
 
   api:
+    logging:
+      driver: json-file
+      options:
+        max-size: "${DOCLING_DOCKER_LOG_MAX_SIZE:-10m}"
+        max-file: "${DOCLING_DOCKER_LOG_MAX_FILE:-3}"
     build:
       context: ../../../..
       dockerfile: services/docling-service/deploy/docker/Dockerfile.api
@@ -66,6 +81,7 @@ services:
       DOCLING_MAX_CONCURRENT_JOBS: ${DOCLING_MAX_CONCURRENT_JOBS:-1}
       DOCLING_CONVERSION_TIMEOUT_SECONDS: ${DOCLING_CONVERSION_TIMEOUT_SECONDS:-7200}
       DOCLING_MAX_UPLOAD_BYTES: ${DOCLING_MAX_UPLOAD_BYTES:-268435456}
+      DOCLING_MAX_CONCURRENT_UPLOADS: ${DOCLING_MAX_CONCURRENT_UPLOADS:-2}
       DOCLING_INPUT_TTL_SECONDS: ${DOCLING_INPUT_TTL_SECONDS:-86400}
       DOCLING_SUCCESS_OUTPUT_TTL_SECONDS: ${DOCLING_SUCCESS_OUTPUT_TTL_SECONDS:-604800}
       DOCLING_FAILED_OUTPUT_TTL_SECONDS: ${DOCLING_FAILED_OUTPUT_TTL_SECONDS:-172800}
@@ -81,6 +97,7 @@ services:
       DOCLING_IDEMPOTENCY_TTL_SECONDS: ${DOCLING_IDEMPOTENCY_TTL_SECONDS:-86400}
       DOCLING_DOWNLOAD_LEASE_SECONDS: ${DOCLING_DOWNLOAD_LEASE_SECONDS:-300}
       DOCLING_WEBHOOK_MAX_ATTEMPTS: ${DOCLING_WEBHOOK_MAX_ATTEMPTS:-6}
+      DOCLING_MAX_WEBHOOK_SUBSCRIPTIONS: ${DOCLING_MAX_WEBHOOK_SUBSCRIPTIONS:-100}
       DOCLING_WEBHOOK_ALLOWED_HOSTS: ${DOCLING_WEBHOOK_ALLOWED_HOSTS:-}
       DOCLING_WEBHOOK_ALLOW_PRIVATE_HOSTS: ${DOCLING_WEBHOOK_ALLOW_PRIVATE_HOSTS:-false}
       DOCLING_SERVICE_API_TOKEN: ${DOCLING_SERVICE_API_TOKEN:-}

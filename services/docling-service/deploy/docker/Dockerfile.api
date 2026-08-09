@@ -1,11 +1,12 @@
-FROM python:3.12-slim
+FROM python:3.12-slim-bookworm
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     DOCLING_RELEASE_PROFILE=docker \
     DOCLING_QUALITY_ADAPTER=/opt/docling-quality/quality_parity_adapter.py \
     DOCLING_API_HOST=0.0.0.0 \
-    DOCLING_API_PORT=8000
+    DOCLING_API_PORT=8000 \
+    TMPDIR=/data/state/temp
 
 RUN groupadd --gid 10001 docling \
     && useradd --uid 10001 --gid 10001 --create-home docling
@@ -21,7 +22,7 @@ COPY docs/integrations/docling-serve-quality-parity/formula_only_second_pass.py 
 
 RUN python -m pip install --no-cache-dir --no-deps /opt/docling-service \
     && python -m pip check \
-    && mkdir -p /data/inputs /data/outputs /data/state \
+    && mkdir -p /data/inputs /data/outputs /data/state/temp \
     && chown -R docling:docling /data /opt/docling-quality
 
 ARG RELEASE_VERSION=1.1.0

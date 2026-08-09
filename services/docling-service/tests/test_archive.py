@@ -8,7 +8,13 @@ import unittest
 import zipfile
 from pathlib import Path
 
-from docling_service.archive import _build_zip_info, ArchiveChangedError, ArchiveError, iter_archive
+from docling_service.archive import (
+    _ArchiveIterator,
+    _build_zip_info,
+    ArchiveChangedError,
+    ArchiveError,
+    iter_archive,
+)
 
 
 def _build_entry(root: Path, path: Path, media_type: str = "text/plain") -> dict[str, object]:
@@ -131,6 +137,33 @@ class ArchiveTests(unittest.TestCase):
             output_iter = iter(iterator)
             next(output_iter)
             iterator.close()
+            self.assertIn("cancel", events)
+            self.assertIn("release", events)
+
+    def test_close_releases_lease_and_stops_thread(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / "target.txt"
+            target.write_text("x" * 50000, encoding="utf-8")
+            manifest = [_build_entry(root, target)]
+            events: list[str] = []
+
+            class Lease:
+                def renew(self) -> None:
+                    events.append("renew")
+
+                def release(self) -> None:
+                    events.append("release")
+
+                def cancel(self) -> None:
+                    events.append("cancel")
+
+            iterator = _ArchiveIterator(root, manifest, chunk_size=1024, lease=Lease())
+            iterator_thread = iterator._thread
+            output_iter = iter(iterator)
+            next(output_iter)
+            iterator.close()
+            self.assertFalse(iterator_thread.is_alive())
             self.assertIn("cancel", events)
             self.assertIn("release", events)
 

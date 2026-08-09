@@ -5,6 +5,7 @@ import json
 import subprocess
 import sys
 import tarfile
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -20,6 +21,24 @@ RELEASE_ROOT = SERVICE_ROOT / "release"
 
 
 class DistributionTests(unittest.TestCase):
+
+    def _get_service_block(self, compose_text: str, service: str) -> str:
+        lines = compose_text.splitlines()
+        start = None
+        next_service = None
+        for i, line in enumerate(lines):
+            if line.startswith(f"  {service}:"):
+                start = i
+                break
+        if start is None:
+            raise AssertionError(f"Service {service} not found")
+        for i in range(start + 1, len(lines)):
+            if re.match(r"^  [a-zA-Z][^:]*:$", lines[i]):
+                next_service = i
+                break
+        end = next_service if next_service is not None else len(lines)
+        return "\n".join(lines[start:end]) + "\n"
+
     def test_release_versions_are_aligned(self) -> None:
         project_text = (SERVICE_ROOT / "pyproject.toml").read_text(encoding="utf-8")
         project_version = re.search(r'^version = "([^"]+)"$', project_text, re.MULTILINE)
@@ -51,6 +70,7 @@ class DistributionTests(unittest.TestCase):
             "DOCLING_SUCCESS_OUTPUT_TTL_SECONDS",
             "DOCLING_FAILED_OUTPUT_TTL_SECONDS",
             "DOCLING_JOB_TTL_SECONDS",
+            "DOCLING_MAX_CONCURRENT_UPLOADS",
             "DOCLING_MAX_PENDING_JOBS",
             "DOCLING_MAX_OUTPUT_BYTES",
             "DOCLING_MAX_DATA_BYTES",
@@ -59,8 +79,17 @@ class DistributionTests(unittest.TestCase):
             "DOCLING_DOWNLOAD_LEASE_SECONDS",
             "DOCLING_WEBHOOK_ALLOWED_HOSTS",
             "DOCLING_WEBHOOK_MAX_ATTEMPTS",
+            "DOCLING_MAX_WEBHOOK_SUBSCRIPTIONS",
         ):
             self.assertIn(required, compose)
+
+    def test_docker_python_base_is_pinned_to_debian_suite(self) -> None:
+        for name in ("Dockerfile.api", "Dockerfile.backend", "Dockerfile.formula"):
+            with self.subTest(dockerfile=name):
+                first = (SERVICE_ROOT / "deploy/docker" / name).read_text(
+                    encoding="utf-8"
+                ).splitlines()[0]
+                self.assertEqual("FROM python:3.12-slim-bookworm", first)
 
     def test_docker_compose_defaults_hugging_face_to_mirror_with_override(self) -> None:
         expected = 'HF_ENDPOINT: "${HF_ENDPOINT:-https://hf-mirror.com}"'
@@ -68,6 +97,101 @@ class DistributionTests(unittest.TestCase):
             with self.subTest(compose=relative):
                 compose = (SERVICE_ROOT / relative).read_text(encoding="utf-8")
                 self.assertEqual(2, compose.count(expected))
+
+    def test_docker_compose_logging_limits_are_configured(self) -> None:
+        for relative in ("deploy/docker/compose.yaml", "deploy/docker/compose.release.yaml"):
+            with self.subTest(compose=relative):
+                compose = (SERVICE_ROOT / relative).read_text(encoding="utf-8")
+                for service in ("backend", "formula", "api"):
+                    with self.subTest(service=service):
+                        block = self._get_service_block(compose, service)
+                        self.assertIn("    logging:", block)
+                        self.assertIn("      driver: json-file", block)
+                        self.assertIn(
+                            '        max-size: "${DOCLING_DOCKER_LOG_MAX_SIZE:-10m}"',
+                            block,
+                        )
+                        self.assertIn(
+                            '        max-file: "${DOCLING_DOCKER_LOG_MAX_FILE:-3}"',
+                            block,
+                        )
+
+    def test_macos_start_uses_logging_wrapper(self) -> None:
+        start_script = (SERVICE_ROOT / "deploy/macos/start.sh").read_text(encoding="utf-8")
+        self.assertIn("logging_wrapper.py", start_script)
+        self.assertIn("--log-path", start_script)
+
+    def test_upload_spooling_uses_managed_state_temp(self) -> None:
+        dockerfile = (SERVICE_ROOT / "deploy/docker/Dockerfile.api").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("TMPDIR=/data/state/temp", dockerfile)
+        self.assertIn("mkdir -p /data/inputs /data/outputs /data/state/temp", dockerfile)
+        macos_script = (SERVICE_ROOT / "deploy/macos/run-api.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("mkdir -p ${DOCLING_STATE_ROOT}/temp", macos_script)
+        self.assertIn("export TMPDIR=${DOCLING_STATE_ROOT}/temp", macos_script)
+
+    def test_macos_logging_wrapper_bounds_output(self) -> None:
+        wrapper = str(SERVICE_ROOT / "deploy/macos/logging_wrapper.py")
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = Path(directory)
+            output = runtime / "docling-macos-logging-wrapper-test.log"
+            # Simulate upgrading from the previous unbounded log behavior.
+            output.write_bytes(b"legacy-log-data\n" * 1000)
+            producer = runtime / "docling-macos-logging-wrapper-source.py"
+            producer.write_text(
+                "\n".join(
+                    [
+                        "import sys",
+                        "for i in range(80):",
+                        "    sys.stdout.write('stdout-%03d-' % i + 'A' * 300)",
+                        "    sys.stdout.write('\\n')",
+                        "    sys.stderr.write('stderr-%03d-' % i + 'B' * 300)",
+                        "    sys.stderr.write('\\n')",
+                        "    sys.stdout.flush()",
+                        "    sys.stderr.flush()",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            env = os.environ.copy()
+            env["DOCLING_MACOS_LOG_MAX_BYTES"] = "4096"
+            env["DOCLING_MACOS_LOG_BACKUP_COUNT"] = "2"
+            command = [
+                sys.executable,
+                wrapper,
+                "--log-path",
+                str(output),
+                "--",
+                sys.executable,
+                str(producer),
+            ]
+            subprocess.run(command, check=True, env=env, capture_output=True, text=True)
+
+            logs = sorted(runtime.glob("docling-macos-logging-wrapper-test.log*"))
+            self.assertGreaterEqual(len(logs), 2)
+            self.assertLessEqual(len(logs), 3)
+            for path in logs:
+                self.assertLessEqual(path.stat().st_size, 4096)
+            content = "".join(path.read_text(encoding="utf-8") for path in logs)
+            self.assertIn("stdout-079", content)
+            self.assertIn("stderr-079", content)
+
+    def test_macos_logging_wrapper_script_is_syntax_valid(self) -> None:
+        wrapper = str(SERVICE_ROOT / "deploy/macos/logging_wrapper.py")
+        subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "from pathlib import Path; compile(Path(__import__('sys').argv[1]).read_text(encoding='utf-8'), __import__('sys').argv[1], 'exec')",
+                wrapper,
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
 
     def test_release_workflow_publishes_assets_and_multiarch_images(self) -> None:
         workflow_path = REPO_ROOT / ".github/workflows/docling-service-release.yml"
@@ -136,6 +260,10 @@ class DistributionTests(unittest.TestCase):
             self.assertEqual(["linux/amd64", "linux/arm64"], manifest["docker_platforms"])
             self.assertFalse(any("/.runtime/" in name or "/reports/" in name for name in names))
             self.assertFalse(any(name.endswith((".pdf", ".log", ".pyc")) for name in names))
+            self.assertIn(
+                f"docling-service-{RELEASE_VERSION}/services/docling-service/deploy/macos/logging_wrapper.py",
+                names,
+            )
 
 
 if __name__ == "__main__":

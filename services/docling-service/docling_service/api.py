@@ -7,7 +7,9 @@ import json
 import logging
 import mimetypes
 import os
+import shutil
 import tempfile
+import threading
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -49,66 +51,160 @@ from .release import (
 LOGGER = logging.getLogger(__name__)
 
 
-class _RequestBodyTooLarge(Exception):
+class _RequestBodyTooLarge(OSError):
+    """OSError subclass so Starlette closes multipart spool files on abort."""
+
     pass
 
 
 class _RequestBodyLimitMiddleware:
     """Bound multipart request bytes before Starlette spools an upload."""
 
-    def __init__(self, app: Any, *, max_body_bytes: int) -> None:
+    def __init__(
+        self,
+        app: Any,
+        *,
+        max_body_bytes: int,
+        max_concurrent_uploads: int,
+        temp_root: Path,
+        spool_root: Path,
+        min_free_bytes: int,
+        max_webhook_body_bytes: int = 64 * 1024,
+    ) -> None:
         self.app = app
         self.max_body_bytes = max_body_bytes
+        self.max_concurrent_uploads = max_concurrent_uploads
+        self.temp_root = temp_root
+        self.spool_root = spool_root
+        self.min_free_bytes = min_free_bytes
+        self.max_webhook_body_bytes = max_webhook_body_bytes
+        self._reservation_bytes = max_body_bytes * 2
+        self._active = 0
+        self._reserved = 0
+        self._lock = threading.Lock()
 
     async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
-        if scope.get("type") != "http" or not (
-            scope.get("method") == "POST" and scope.get("path") == "/v1/jobs"
-        ):
+        method = scope.get("method")
+        path = scope.get("path", "")
+        is_job_upload = method == "POST" and path == "/v1/jobs"
+        is_webhook_write = (
+            (method == "POST" and path == "/v1/webhooks/subscriptions")
+            or (
+                method == "PATCH"
+                and path.startswith("/v1/webhooks/subscriptions/")
+            )
+        )
+        if scope.get("type") != "http" or not (is_job_upload or is_webhook_write):
             await self.app(scope, receive, send)
             return
+
+        body_limit = (
+            self.max_body_bytes if is_job_upload else self.max_webhook_body_bytes
+        )
 
         for raw_name, raw_value in scope.get("headers", []):
             if raw_name.lower() == b"content-length":
                 try:
-                    if int(raw_value) > self.max_body_bytes:
-                        await self._reject(scope, send)
+                    if int(raw_value) > body_limit:
+                        await self._reject(scope, send, status=413, code="request_too_large")
                         return
                 except ValueError:
                     pass
 
+        admitted = False
+        if is_job_upload:
+            with self._lock:
+                free = shutil.disk_usage(self.temp_root).free
+                spool_free = shutil.disk_usage(self.spool_root).free
+                if self._active >= self.max_concurrent_uploads:
+                    rejection = (429, "upload_concurrency_exhausted")
+                elif free - self._reserved - self._reservation_bytes < self.min_free_bytes:
+                    rejection = (507, "upload_storage_exhausted")
+                elif (
+                    self.spool_root.resolve() != self.temp_root.resolve()
+                    and spool_free - self._reserved - self._reservation_bytes
+                    < self.min_free_bytes
+                ):
+                    rejection = (507, "upload_storage_exhausted")
+                else:
+                    rejection = None
+                    admitted = True
+                    self._active += 1
+                    self._reserved += self._reservation_bytes
+            if rejection is not None:
+                await self._reject(scope, send, status=rejection[0], code=rejection[1])
+                return
+
         received = 0
+        oversized = False
+        response_started = False
 
         async def bounded_receive() -> Any:
-            nonlocal received
+            nonlocal oversized, received
             message = await receive()
             if message.get("type") == "http.request":
                 received += len(message.get("body", b""))
-                if received > self.max_body_bytes:
+                if received > body_limit:
+                    oversized = True
                     raise _RequestBodyTooLarge
             return message
 
+        async def bounded_send(message: Any) -> None:
+            nonlocal response_started
+            # FastAPI may translate a receive exception into a 400. Suppress
+            # that response so this outer middleware can preserve the 413
+            # contract for chunked/no-Content-Length requests.
+            if oversized:
+                return
+            if message.get("type") == "http.response.start":
+                response_started = True
+            await send(message)
+
         try:
-            await self.app(scope, bounded_receive, send)
-        except _RequestBodyTooLarge:
-            await self._reject(scope, send)
+            try:
+                await self.app(scope, bounded_receive, bounded_send)
+            except _RequestBodyTooLarge:
+                pass
+            if oversized and not response_started:
+                await self._reject(scope, send, status=413, code="request_too_large")
+        finally:
+            if admitted:
+                with self._lock:
+                    self._active -= 1
+                    self._reserved -= self._reservation_bytes
 
     @staticmethod
-    async def _reject(scope: Any, send: Any) -> None:
+    async def _reject(scope: Any, send: Any, *, status: int, code: str) -> None:
+        descriptions = {
+            "request_too_large": (
+                "Request body is too large",
+                "request body exceeds the configured endpoint limit",
+            ),
+            "upload_concurrency_exhausted": (
+                "Too many uploads",
+                "the concurrent upload admission limit is exhausted",
+            ),
+            "upload_storage_exhausted": (
+                "Upload storage is exhausted",
+                "the temporary filesystem cannot preserve the configured free-space reserve",
+            ),
+        }
+        title, detail = descriptions[code]
         payload = json.dumps(
             {
-                "type": "urn:docling:error:request_too_large",
-                "title": "Request body is too large",
-                "status": 413,
-                "detail": "multipart request exceeds the configured upload limit",
+                "type": f"urn:docling:error:{code}",
+                "title": title,
+                "status": status,
+                "detail": detail,
                 "instance": scope.get("path", "/v1/jobs"),
-                "code": "request_too_large",
+                "code": code,
             },
             separators=(",", ":"),
         ).encode("utf-8")
         await send(
             {
                 "type": "http.response.start",
-                "status": 413,
+                "status": status,
                 "headers": [
                     (b"content-type", b"application/problem+json"),
                     (b"content-length", str(len(payload)).encode("ascii")),
@@ -137,6 +233,7 @@ def create_app(config: ReleaseConfig | None = None, manager: JobManager | None =
         from fastapi.responses import JSONResponse, StreamingResponse
         from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
         from starlette.exceptions import HTTPException as StarletteHTTPException
+        from starlette.requests import ClientDisconnect
     except ImportError as exc:  # pragma: no cover - exercised by packaging smoke tests
         raise RuntimeError(
             "HTTP dependencies are missing; install docling-service[api]"
@@ -144,6 +241,26 @@ def create_app(config: ReleaseConfig | None = None, manager: JobManager | None =
 
     actual_config = config or ReleaseConfig.from_env()
     actual_manager = manager or JobManager(actual_config)
+
+    class CloseableStreamingResponse(StreamingResponse):
+        """Close a synchronous producer even when the ASGI client disconnects."""
+
+        def __init__(self, *args: Any, close: Any = None, **kwargs: Any) -> None:
+            super().__init__(*args, **kwargs)
+            self._close_stream = close
+
+        async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+            try:
+                await super().__call__(scope, receive, send)
+            except ClientDisconnect:
+                # A client abandoning a download is expected transport behavior.
+                return
+            finally:
+                if self._close_stream is not None:
+                    try:
+                        self._close_stream()
+                    except Exception:
+                        LOGGER.exception("failed to close streaming response producer")
 
     @asynccontextmanager
     async def lifespan(_app: Any):
@@ -176,6 +293,10 @@ def create_app(config: ReleaseConfig | None = None, manager: JobManager | None =
     app.add_middleware(
         _RequestBodyLimitMiddleware,
         max_body_bytes=actual_config.max_upload_bytes + 1024 * 1024,
+        max_concurrent_uploads=actual_config.max_concurrent_uploads,
+        temp_root=actual_config.temp_root,
+        spool_root=Path(tempfile.gettempdir()),
+        min_free_bytes=actual_config.min_free_bytes,
     )
 
     bearer = HTTPBearer(auto_error=False)
@@ -374,7 +495,10 @@ def create_app(config: ReleaseConfig | None = None, manager: JobManager | None =
         temporary = Path(temporary_name)
         total = 0
         first = b""
+        protected = False
         try:
+            actual_manager.protect_temp_file(temporary)
+            protected = True
             with temporary.open("wb") as output:
                 while chunk := await file.read(1024 * 1024):
                     if not first:
@@ -402,8 +526,14 @@ def create_app(config: ReleaseConfig | None = None, manager: JobManager | None =
             except StorageQuotaError:
                 raise HTTPException(status_code=507, detail="storage quota is exhausted") from None
         finally:
-            temporary.unlink(missing_ok=True)
-            await file.close()
+            try:
+                temporary.unlink(missing_ok=True)
+            finally:
+                try:
+                    if protected:
+                        actual_manager.release_temp_file(temporary)
+                finally:
+                    await file.close()
         return JobCreateResponse(
             job_id=record.job_id,
             state=record.state,
@@ -546,8 +676,10 @@ def create_app(config: ReleaseConfig | None = None, manager: JobManager | None =
             lease.release()
             raise HTTPException(status_code=409, detail=str(exc)) from None
         media_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
-        return StreamingResponse(
-            file_chunks(path, lease),
+        chunks = file_chunks(path, lease)
+        return CloseableStreamingResponse(
+            chunks,
+            close=chunks.close,
             media_type=media_type,
             headers={
                 "Content-Length": str(path.stat().st_size),
@@ -610,8 +742,10 @@ def create_app(config: ReleaseConfig | None = None, manager: JobManager | None =
             if lease is not None:
                 lease.release()
             raise HTTPException(status_code=409, detail=str(exc)) from None
-        return StreamingResponse(
+
+        return CloseableStreamingResponse(
             stream,
+            close=stream.close,
             media_type="application/zip",
             headers={
                 "Content-Disposition": (
@@ -664,6 +798,8 @@ def create_app(config: ReleaseConfig | None = None, manager: JobManager | None =
             name=request.name,
             enabled=request.enabled,
         )
+        if record.get("error") == "subscription_limit":
+            raise HTTPException(status_code=429, detail="webhook subscription limit reached")
         return subscription_payload(record)
 
     @app.get(
@@ -826,7 +962,13 @@ def main() -> None:
         raise SystemExit("uvicorn is required; install docling-service[api]") from exc
     host = os.getenv("DOCLING_API_HOST", "127.0.0.1")
     port = int(os.getenv("DOCLING_API_PORT", "8000"))
-    uvicorn.run(create_app(), host=host, port=port, workers=1)
+    config = ReleaseConfig.from_env()
+    config.ensure_directories()
+    # The formal executable owns one API app/process, so it can safely align
+    # Starlette's process-wide spool target with the managed temp lifecycle.
+    os.environ["TMPDIR"] = str(config.temp_root)
+    tempfile.tempdir = str(config.temp_root)
+    uvicorn.run(create_app(config=config), host=host, port=port, workers=1)
 
 
 if __name__ == "__main__":

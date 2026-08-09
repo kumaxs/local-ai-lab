@@ -114,6 +114,9 @@ For bearer authentication, set `DOCLING_SERVICE_API_TOKEN` in the shell before
 
 ## Resource and portability controls
 
+- `DOCLING_DOCKER_LOG_MAX_SIZE=10m`: per-container Docker log file size limit.
+- `DOCLING_DOCKER_LOG_MAX_FILE=3`: number of rotated log files to keep.
+
 - `DOCLING_CPU_THREADS=4`: OpenMP/MKL thread count inside the backend.
 - `DOCLING_MAX_CONCURRENT_JOBS=1`: API queue worker count. Increase only after
   measuring peak model memory.
@@ -123,11 +126,17 @@ For bearer authentication, set `DOCLING_SERVICE_API_TOKEN` in the shell before
   conservative CPU default covers formula-dense papers; lower it only after
   measuring the target hardware and corpus.
 - `DOCLING_MAX_UPLOAD_BYTES=268435456`: maximum upload size.
+- `DOCLING_MAX_CONCURRENT_UPLOADS=2`: concurrent multipart uploads accepted by
+  the API process. Upload spooling and the validated copy use `/data/state/temp`.
+  Transfer into the separate input volume uses a flushed same-volume partial
+  file followed by atomic publication, so Docker's cross-filesystem boundary is
+  supported.
 - `DOCLING_MAX_PENDING_JOBS=20`: maximum queued plus running jobs.
 - `DOCLING_MAX_OUTPUT_BYTES=5368709120`: maximum published output per job.
 - `DOCLING_MAX_DATA_BYTES=53687091200`: total managed input, output, and
   reserved-output budget.
 - `DOCLING_MIN_FREE_BYTES=2147483648`: filesystem free-space floor.
+- `DOCLING_MAX_WEBHOOK_SUBSCRIPTIONS=100`: persistent subscription limit.
 - `DOCLING_API_BIND=127.0.0.1`: host bind address. Do not use `0.0.0.0` without
   TLS and authentication.
 
@@ -137,6 +146,11 @@ after 7 days, failed/interrupted output after 2 days, and task metadata after 30
 days by default. These intervals are configurable through the `DOCLING_*_TTL_SECONDS`
 variables documented in [API.md](API.md). Active downloads are protected by
 short leases.
+Adapter staging is measured while conversion is running; crossing the per-job
+limit or free-space floor terminates the converter and removes partial output.
+Docker `json-file` logs rotate at 10 MB with three files per container by
+default. Model volumes and Docker's image cache remain intentionally persistent
+and are outside task TTL cleanup.
 
 The backend transfers figure bytes to the API with `image_export_mode=embedded`.
 The semantic writer externalizes those bytes into per-job `pictures/` assets

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
+import json
+
 from pydantic import BaseModel, ConfigDict, Field, HttpUrl, field_validator
 
 
@@ -11,6 +13,8 @@ JobState = Literal["queued", "running", "succeeded", "failed", "interrupted"]
 
 
 def _checked_webhook_headers(headers: dict[str, str]) -> dict[str, str]:
+    if len(headers) > 16:
+        raise ValueError("webhook headers are limited to 16 entries")
     reserved = {"host", "content-length", "transfer-encoding", "connection", "content-type"}
     for name, value in headers.items():
         lowered = name.casefold()
@@ -22,9 +26,33 @@ def _checked_webhook_headers(headers: dict[str, str]) -> dict[str, str]:
             or "\n" in name
             or "\r" in value
             or "\n" in value
+            or len(name) > 128
+            or len(value) > 4096
         ):
             raise ValueError(f"unsafe webhook header: {name!r}")
+    if len(json.dumps(headers, ensure_ascii=False).encode("utf-8")) > 16 * 1024:
+        raise ValueError("webhook headers exceed 16 KiB")
     return headers
+
+
+def _checked_webhook_filters(filters: dict[str, Any]) -> dict[str, Any]:
+    if len(filters) > 16:
+        raise ValueError("webhook filters are limited to 16 entries")
+
+    def depth(value: Any, level: int = 0) -> int:
+        if level > 4:
+            return level
+        if isinstance(value, dict):
+            return max((depth(item, level + 1) for item in value.values()), default=level)
+        if isinstance(value, list):
+            return max((depth(item, level + 1) for item in value), default=level)
+        return level
+
+    if depth(filters) > 4:
+        raise ValueError("webhook filters exceed nesting depth 4")
+    if len(json.dumps(filters, ensure_ascii=False).encode("utf-8")) > 16 * 1024:
+        raise ValueError("webhook filters exceed 16 KiB")
+    return filters
 
 
 class ProblemDetails(BaseModel):
@@ -152,7 +180,11 @@ class StorageResponse(BaseModel):
 
 class WebhookSubscriptionCreate(BaseModel):
     callback_url: HttpUrl
-    event_types: list[str] = Field(default_factory=lambda: ["docling.job.succeeded", "docling.job.failed"])
+    event_types: list[str] = Field(
+        default_factory=lambda: ["docling.job.succeeded", "docling.job.failed"],
+        min_length=1,
+        max_length=3,
+    )
     filters: dict[str, Any] = Field(default_factory=dict)
     secret: str = Field(min_length=16, max_length=4096)
     headers: dict[str, str] = Field(default_factory=dict)
@@ -164,10 +196,15 @@ class WebhookSubscriptionCreate(BaseModel):
     def validate_headers(cls, value: dict[str, str]) -> dict[str, str]:
         return _checked_webhook_headers(value)
 
+    @field_validator("filters")
+    @classmethod
+    def validate_filters(cls, value: dict[str, Any]) -> dict[str, Any]:
+        return _checked_webhook_filters(value)
+
 
 class WebhookSubscriptionUpdate(BaseModel):
     callback_url: HttpUrl | None = None
-    event_types: list[str] | None = None
+    event_types: list[str] | None = Field(default=None, min_length=1, max_length=3)
     filters: dict[str, Any] | None = None
     secret: str | None = Field(default=None, min_length=16, max_length=4096)
     headers: dict[str, str] | None = None
@@ -178,6 +215,11 @@ class WebhookSubscriptionUpdate(BaseModel):
     @classmethod
     def validate_headers(cls, value: dict[str, str] | None) -> dict[str, str] | None:
         return _checked_webhook_headers(value) if value is not None else None
+
+    @field_validator("filters")
+    @classmethod
+    def validate_filters(cls, value: dict[str, Any] | None) -> dict[str, Any] | None:
+        return _checked_webhook_filters(value) if value is not None else None
 
 
 class WebhookSubscriptionResponse(BaseModel):

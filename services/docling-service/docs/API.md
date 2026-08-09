@@ -110,6 +110,7 @@ Cleanup runs every five minutes by default. The defaults are:
 | Job metadata/tombstone | 30 days |
 | Webhook delivery history | 7 days |
 | Staging and temporary data | 1 hour |
+| Concurrent uploads | 2 per API process |
 | Pending tasks | 20 |
 | Output per task | 5 GiB |
 | Total managed data | 50 GiB |
@@ -118,6 +119,17 @@ Cleanup runs every five minutes by default. The defaults are:
 Expired input and output bytes are removed independently. Metadata remains long
 enough for callers to distinguish an expired artifact (`410` for the archive)
 from an unknown job (`404`). Cleanup failures are retried.
+
+Multipart request spooling and the API's validated copy can coexist briefly.
+Both live under `state/temp`; admission reserves twice the maximum request size,
+preserves the free-space floor, and returns `429` when both upload slots are in
+use or `507` when temporary storage is too full. The production adapter is also
+monitored while it runs and is terminated if staging crosses the per-job output
+limit or the output filesystem crosses the free-space floor.
+When state and input roots are separate Docker volumes, the validated upload is
+copied to a hidden partial file on the input volume, flushed, and atomically
+published there; the input volume's free-space floor is checked before and
+after the copy.
 
 ## Webhooks
 
@@ -141,6 +153,9 @@ Supported event types are `docling.job.succeeded`, `docling.job.failed`, and
 `Content-Type: application/cloudevents+json`. Event IDs remain stable across
 retries. Delivery is at least once, redirects are rejected, DNS is revalidated,
 and retryable failures are attempted at most six times by default.
+Subscriptions persist until explicitly deleted and are limited to 100 by
+default. Header and filter maps are bounded by entry count and serialized size;
+filter nesting depth is also limited.
 
 Every signed request contains:
 
@@ -162,6 +177,7 @@ only after it durably accepts the event, and deduplicate on the event ID.
 | `DOCLING_SERVE_URL` | `http://127.0.0.1:5001` |
 | `DOCLING_API_HOST` / `DOCLING_API_PORT` | `127.0.0.1` / `8000` |
 | `DOCLING_MAX_UPLOAD_BYTES` | `268435456` |
+| `DOCLING_MAX_CONCURRENT_UPLOADS` | `2` |
 | `DOCLING_MAX_CONCURRENT_JOBS` | `1` |
 | `DOCLING_INPUT_TTL_SECONDS` | `86400` |
 | `DOCLING_SUCCESS_OUTPUT_TTL_SECONDS` | `604800` |
@@ -177,6 +193,7 @@ only after it durably accepts the event, and deduplicate on the event ID.
 | `DOCLING_IDEMPOTENCY_TTL_SECONDS` | `86400` |
 | `DOCLING_DOWNLOAD_LEASE_SECONDS` | `300` |
 | `DOCLING_WEBHOOK_MAX_ATTEMPTS` | `6` |
+| `DOCLING_MAX_WEBHOOK_SUBSCRIPTIONS` | `100` |
 | `DOCLING_WEBHOOK_ALLOWED_HOSTS` | empty (webhooks disabled) |
 | `DOCLING_WEBHOOK_ALLOW_PRIVATE_HOSTS` | `false` |
 | `DOCLING_SERVICE_API_TOKEN` | unset |

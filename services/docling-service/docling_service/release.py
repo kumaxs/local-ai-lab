@@ -2,15 +2,18 @@
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import mimetypes
 import os
 import platform
+import signal
 import shutil
 import subprocess
 import sys
 import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -28,6 +31,7 @@ from .lifecycle import (
     QuotaPolicy,
     RetentionPolicy,
     safe_delete_tree,
+    safe_resolve,
 )
 from .persistence import SQLiteStore
 from .webhook import WebhookDispatcher, validate_callback_url
@@ -62,6 +66,41 @@ def _repo_root() -> Path:
     return Path(__file__).resolve().parents[3]
 
 
+def _fsync_directory(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _move_input_file(source: Path, destination: Path) -> None:
+    """Move an upload, preserving atomic publication across Docker volumes."""
+    try:
+        source.replace(destination)
+    except OSError as exc:
+        if exc.errno != errno.EXDEV:
+            raise
+        partial = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.part")
+        try:
+            with source.open("rb") as source_handle, partial.open("xb") as target_handle:
+                shutil.copyfileobj(source_handle, target_handle, length=1024 * 1024)
+                target_handle.flush()
+                os.fsync(target_handle.fileno())
+            os.replace(partial, destination)
+            source.unlink()
+        except BaseException:
+            partial.unlink(missing_ok=True)
+            raise
+
+    # Persist both the file entry and the newly created per-job directory
+    # before the SQLite task becomes authoritative.
+    _fsync_directory(destination.parent)
+    _fsync_directory(destination.parent.parent)
+    if source.parent != destination.parent and source.parent.exists():
+        _fsync_directory(source.parent)
+
+
 @dataclass(frozen=True)
 class ReleaseConfig:
     """Environment-backed runtime policy shared by the API and CLI."""
@@ -80,6 +119,7 @@ class ReleaseConfig:
     cn_ocr_parity: bool
     api_token: str | None
     formula_ocr_url: str | None = None
+    max_concurrent_uploads: int = 2
     input_ttl_seconds: int = 24 * 60 * 60
     success_output_ttl_seconds: int = 7 * 24 * 60 * 60
     failed_output_ttl_seconds: int = 2 * 24 * 60 * 60
@@ -97,6 +137,7 @@ class ReleaseConfig:
     webhook_max_attempts: int = 6
     webhook_allowed_hosts: tuple[str, ...] = ()
     webhook_allow_private_hosts: bool = False
+    max_webhook_subscriptions: int = 100
 
     @classmethod
     def from_env(cls) -> "ReleaseConfig":
@@ -143,6 +184,9 @@ class ReleaseConfig:
             cn_ocr_parity=_env_bool("DOCLING_CN_OCR_PARITY", profile == "macos"),
             api_token=os.getenv("DOCLING_SERVICE_API_TOKEN") or None,
             formula_ocr_url=formula_ocr_url.rstrip("/") if formula_ocr_url else None,
+            max_concurrent_uploads=max(
+                1, int(os.getenv("DOCLING_MAX_CONCURRENT_UPLOADS", "2"))
+            ),
             input_ttl_seconds=max(60, int(os.getenv("DOCLING_INPUT_TTL_SECONDS", "86400"))),
             success_output_ttl_seconds=max(60, int(os.getenv("DOCLING_SUCCESS_OUTPUT_TTL_SECONDS", "604800"))),
             failed_output_ttl_seconds=max(60, int(os.getenv("DOCLING_FAILED_OUTPUT_TTL_SECONDS", "172800"))),
@@ -160,6 +204,9 @@ class ReleaseConfig:
             webhook_max_attempts=max(1, int(os.getenv("DOCLING_WEBHOOK_MAX_ATTEMPTS", "6"))),
             webhook_allowed_hosts=_env_hosts("DOCLING_WEBHOOK_ALLOWED_HOSTS"),
             webhook_allow_private_hosts=_env_bool("DOCLING_WEBHOOK_ALLOW_PRIVATE_HOSTS", False),
+            max_webhook_subscriptions=max(
+                1, int(os.getenv("DOCLING_MAX_WEBHOOK_SUBSCRIPTIONS", "100"))
+            ),
         )
 
     def validate(self) -> None:
@@ -198,6 +245,10 @@ class ReleaseConfig:
             raise ValueError("DOCLING_MAX_DATA_BYTES must cover DOCLING_MAX_UPLOAD_BYTES")
         if self.max_output_bytes > self.max_data_bytes:
             raise ValueError("DOCLING_MAX_OUTPUT_BYTES cannot exceed DOCLING_MAX_DATA_BYTES")
+        if self.max_concurrent_uploads < 1:
+            raise ValueError("DOCLING_MAX_CONCURRENT_UPLOADS must be at least 1")
+        if self.max_webhook_subscriptions < 1:
+            raise ValueError("DOCLING_MAX_WEBHOOK_SUBSCRIPTIONS must be at least 1")
 
     def ensure_directories(self) -> None:
         for path in (
@@ -242,6 +293,7 @@ class ReleaseConfig:
             "code_and_algorithm_emphasis": True,
             "image_export_mode": self.image_export_mode,
             "max_upload_bytes": self.max_upload_bytes,
+            "max_concurrent_uploads": self.max_concurrent_uploads,
             "max_concurrent_jobs": self.max_concurrent_jobs,
             "max_pending_jobs": self.max_pending_jobs,
             "max_output_bytes": self.max_output_bytes,
@@ -253,6 +305,7 @@ class ReleaseConfig:
                 "job_ttl_seconds": self.job_ttl_seconds,
             },
             "webhooks_enabled": bool(self.webhook_allowed_hosts),
+            "max_webhook_subscriptions": self.max_webhook_subscriptions,
         }
 
 
@@ -395,7 +448,10 @@ class JobManager:
             max_pending=config.max_pending_jobs,
             max_data_bytes=config.max_data_bytes,
             webhook_max_attempts=config.webhook_max_attempts,
+            max_webhook_subscriptions=config.max_webhook_subscriptions,
         )
+        self._pending_input_ids: set[str] = set()
+        self._active_temp_names: set[str] = set()
         self.store.import_legacy_state_jobs(config.state_root)
         self._quota = QuotaManager(
             QuotaPolicy(
@@ -427,6 +483,8 @@ class JobManager:
             temp_root=config.temp_root,
             download_lease=self.store.has_active_download,
             scan_interval_seconds=config.cleanup_interval_seconds,
+            pending_inputs=self._pending_inputs_snapshot,
+            protected_temp_entries=self._active_temp_snapshot,
             maintenance=(
                 self.store.purge_expired_download_leases,
                 self.store.purge_expired_idempotency_keys,
@@ -454,6 +512,32 @@ class JobManager:
 
     def _state_path(self, job_id: str) -> Path:
         return self.config.state_root / "jobs" / f"{job_id}.json"
+
+    def _pending_inputs_snapshot(self) -> set[str]:
+        with self._lock:
+            return set(self._pending_input_ids)
+
+    def _mark_pending_input(self, job_id: str) -> None:
+        with self._lock:
+            self._pending_input_ids.add(job_id)
+
+    def _clear_pending_input(self, job_id: str) -> None:
+        with self._lock:
+            self._pending_input_ids.discard(job_id)
+
+    def _active_temp_snapshot(self) -> set[str]:
+        with self._lock:
+            return set(self._active_temp_names)
+
+    def protect_temp_file(self, path: Path) -> None:
+        if path.parent.resolve() != self.config.temp_root.resolve():
+            raise PermissionError("temporary upload is outside DOCLING_STATE_ROOT/temp")
+        with self._lock:
+            self._active_temp_names.add(path.name)
+
+    def release_temp_file(self, path: Path) -> None:
+        with self._lock:
+            self._active_temp_names.discard(path.name)
 
     def _write_record(self, record: JobRecord) -> None:
         _atomic_json(self._state_path(record.job_id), asdict(record))
@@ -557,11 +641,21 @@ class JobManager:
             data_root=self.config.output_root,
             expected_output_bytes=self.config.max_output_bytes,
         )
+        if (
+            shutil.disk_usage(self.config.input_root).free
+            < self.config.min_free_bytes + input_size
+        ):
+            raise StorageQuotaError("input filesystem would fall below min_free_bytes")
         job_id = str(uuid.uuid4())
         final_input = self.config.input_root / job_id / "source.pdf"
-        final_input.parent.mkdir(parents=True, exist_ok=False)
+        self._mark_pending_input(job_id)
         try:
-            input_path.replace(final_input)
+            final_input.parent.mkdir(parents=True, exist_ok=False)
+            _move_input_file(input_path, final_input)
+            if shutil.disk_usage(self.config.input_root).free < self.config.min_free_bytes:
+                raise StorageQuotaError(
+                    "input filesystem crossed min_free_bytes while accepting upload"
+                )
             created_at = utc_now()
             result = self.store.create_job_with_idempotency(
                 idempotency_key=idempotency_key or f"internal:{job_id}",
@@ -584,6 +678,8 @@ class JobManager:
             if final_input.parent.exists():
                 safe_delete_tree(self.config.input_root, final_input.parent)
             raise
+        finally:
+            self._clear_pending_input(job_id)
         if result.get("error"):
             if final_input.parent.exists():
                 safe_delete_tree(self.config.input_root, final_input.parent)
@@ -643,6 +739,8 @@ class JobManager:
         }
 
     def _collect_manifest(self, root: Path) -> list[dict[str, Any]]:
+        if root.is_symlink():
+            raise ValueError("output job directory cannot be a symlink")
         if not root.is_dir():
             return []
         resolved_root = root.resolve()
@@ -672,6 +770,8 @@ class JobManager:
         return files
 
     def _validate_success_outputs(self, root: Path) -> list[dict[str, Any]]:
+        if root.is_symlink():
+            raise ValueError("staging job directory cannot be a symlink")
         if not root.is_dir():
             raise ValueError("conversion did not produce an output directory")
         for name in REQUIRED_SUCCESS_OUTPUTS:
@@ -689,6 +789,8 @@ class JobManager:
     def _publish_staging(self, job_id: str) -> Path:
         staging = self.config.staging_root / job_id
         target = self.config.output_root / job_id
+        if staging.is_symlink() or target.is_symlink():
+            raise ValueError("staging and output job directories cannot be symlinks")
         if target.exists():
             if staging.exists():
                 safe_delete_tree(self.config.staging_root, staging)
@@ -702,6 +804,14 @@ class JobManager:
         staging = self.config.staging_root / job_id
         target = self.config.output_root / job_id
         try:
+            if staging.is_symlink():
+                staging.unlink(missing_ok=True)
+                return []
+            if target.is_symlink():
+                target.unlink(missing_ok=True)
+                if staging.exists():
+                    safe_delete_tree(self.config.staging_root, staging)
+                return []
             if staging.is_dir() and not target.exists():
                 os.replace(staging, target)
             return self._collect_manifest(target)
@@ -711,6 +821,125 @@ class JobManager:
             if target.exists():
                 safe_delete_tree(self.config.output_root, target)
             return []
+
+    @staticmethod
+    def _tree_size_until(root: Path, limit: int) -> int:
+        """Return a cheap staging size estimate, stopping once limit is crossed."""
+        if not root.is_dir():
+            return 0
+        total = 0
+
+        def raise_walk_error(error: OSError) -> None:
+            raise error
+
+        for directory, _subdirectories, filenames in os.walk(
+            root, followlinks=False, onerror=raise_walk_error
+        ):
+            for filename in filenames:
+                path = Path(directory) / filename
+                try:
+                    if path.is_symlink():
+                        continue
+                    total += path.stat().st_size
+                except FileNotFoundError:
+                    continue
+                if total > limit:
+                    return total
+        return total
+
+    @staticmethod
+    def _stop_process_group(process: subprocess.Popen[bytes]) -> None:
+        if process.poll() is not None:
+            return
+        try:
+            if os.name == "posix":
+                os.killpg(process.pid, signal.SIGTERM)
+            else:  # pragma: no cover - release profiles are macOS/Linux
+                process.terminate()
+            process.wait(timeout=5)
+        except (OSError, subprocess.TimeoutExpired):
+            try:
+                if os.name == "posix":
+                    os.killpg(process.pid, signal.SIGKILL)
+                else:  # pragma: no cover
+                    process.kill()
+            except ProcessLookupError:
+                pass
+            process.wait()
+
+    def _run_production_adapter(
+        self, command: list[str], *, job_id: str
+    ) -> subprocess.CompletedProcess[str]:
+        """Run the real adapter while bounding logs, time, and staging growth."""
+        process = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+        max_log_bytes = 4 * 1024 * 1024
+        stdout_tail = bytearray()
+        stderr_tail = bytearray()
+
+        def drain(stream: Any, target: bytearray) -> None:
+            try:
+                while chunk := stream.read(64 * 1024):
+                    target.extend(chunk)
+                    overflow = len(target) - max_log_bytes
+                    if overflow > 0:
+                        del target[:overflow]
+            finally:
+                stream.close()
+
+        threads = [
+            threading.Thread(target=drain, args=(process.stdout, stdout_tail), daemon=True),
+            threading.Thread(target=drain, args=(process.stderr, stderr_tail), daemon=True),
+        ]
+        for thread in threads:
+            thread.start()
+
+        deadline = time.monotonic() + self.config.conversion_timeout_seconds + 120
+        staging = self.config.staging_root / job_id
+        failure: Exception | None = None
+        try:
+            while process.poll() is None:
+                if time.monotonic() >= deadline:
+                    failure = subprocess.TimeoutExpired(
+                        command, self.config.conversion_timeout_seconds + 120
+                    )
+                    break
+                if (
+                    self._tree_size_until(staging, self.config.max_output_bytes)
+                    > self.config.max_output_bytes
+                ):
+                    failure = ValueError(
+                        "job output exceeded DOCLING_MAX_OUTPUT_BYTES while converting"
+                    )
+                    break
+                if shutil.disk_usage(self.config.output_root).free < self.config.min_free_bytes:
+                    failure = ValueError(
+                        "output filesystem crossed DOCLING_MIN_FREE_BYTES while converting"
+                    )
+                    break
+                time.sleep(0.2)
+        except OSError as exc:
+            failure = ValueError(f"could not monitor staging output: {exc}")
+        except BaseException:
+            self._stop_process_group(process)
+            raise
+        finally:
+            if failure is not None:
+                self._stop_process_group(process)
+            for thread in threads:
+                thread.join(timeout=10)
+        if failure is not None:
+            raise failure
+        return subprocess.CompletedProcess(
+            command,
+            int(process.returncode),
+            stdout_tail.decode("utf-8", errors="replace"),
+            stderr_tail.decode("utf-8", errors="replace"),
+        )
 
     def _run(self, job_id: str) -> None:
         with self._lock:
@@ -737,13 +966,16 @@ class JobManager:
         error: str | None = None
         manifest: list[dict[str, Any]] = []
         try:
-            completed = self._runner(
-                command,
-                capture_output=True,
-                text=True,
-                timeout=self.config.conversion_timeout_seconds + 120,
-                check=False,
-            )
+            if self._runner is subprocess.run:
+                completed = self._run_production_adapter(command, job_id=job_id)
+            else:
+                completed = self._runner(
+                    command,
+                    capture_output=True,
+                    text=True,
+                    timeout=self.config.conversion_timeout_seconds + 120,
+                    check=False,
+                )
             exit_code = completed.returncode
             if completed.returncode == 0:
                 manifest = self._validate_success_outputs(
@@ -826,10 +1058,16 @@ class JobManager:
             raise FileNotFoundError(job_id)
         if record.get("output_deleted_at"):
             raise FileNotFoundError(relative_path)
-        root = Path(str(record["output_dir"])).resolve()
-        candidate = (root / relative_path).resolve()
-        if candidate == root or root not in candidate.parents:
-            raise PermissionError("output path escapes the job directory")
+        raw_root = Path(str(record["output_dir"]))
+        expected_root = self.config.output_root / job_id
+        if raw_root != expected_root or raw_root.is_symlink():
+            raise PermissionError("output job directory is outside its configured boundary")
+        root = safe_resolve(self.config.output_root, raw_root)
+        if root != expected_root.resolve():
+            raise PermissionError("output job directory is outside its configured boundary")
+        candidate = safe_resolve(root, root / relative_path)
+        if candidate == root:
+            raise PermissionError("output path must name a file")
         published = {
             str(item.get("path")): item
             for item in self.store.list_manifest(job_id).get("items", [])
@@ -982,7 +1220,7 @@ class JobManager:
         )
 
     def shutdown(self) -> None:
-        self._janitor.stop()
+        self._janitor.stop(wait=None)
         if self._dispatcher is not None:
             self._dispatcher.close()
         self._executor.shutdown(wait=True, cancel_futures=False)

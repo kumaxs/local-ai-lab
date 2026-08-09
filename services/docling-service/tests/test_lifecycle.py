@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import tempfile
 import threading
+import uuid
 import unittest
 from pathlib import Path
 from time import sleep
@@ -10,6 +11,7 @@ from time import sleep
 from docling_service.lifecycle import (
     CLEANUP_KIND_INPUT,
     CLEANUP_KIND_OUTPUT,
+    CLEANUP_KIND_ORPHAN_INPUT,
     CLEANUP_KIND_STAGING,
     CLEANUP_KIND_TEMP,
     JobRecord,
@@ -98,7 +100,10 @@ def _touch(path: Path, content: str = "x") -> None:
 
 def _old(path: Path, age_seconds: float, now: float) -> None:
     mtime = now - age_seconds
-    os.utime(path, (mtime, mtime))
+    try:
+        os.utime(path, (mtime, mtime), follow_symlinks=False)
+    except TypeError:
+        os.utime(path, (mtime, mtime))
 
 
 class QuotaManagerTests(unittest.TestCase):
@@ -354,8 +359,12 @@ class JanitorTests(unittest.TestCase):
             temp_root = root / "temp"
             temp_root.mkdir()
             orphan = temp_root / "docling-upload-orphan.pdf"
+            protected = temp_root / "docling-upload-active.pdf"
             _touch(orphan)
+            _touch(protected)
             _old(orphan, 4000, now())
+            _old(protected, 4000, now())
+            active_names = {protected.name}
             janitor = Janitor(
                 FakeStore([]),
                 retention=RetentionPolicy(temp_ttl=3600),
@@ -364,9 +373,144 @@ class JanitorTests(unittest.TestCase):
                 tombstone_root=root / "tombstones",
                 temp_root=temp_root,
                 now=now,
+                protected_temp_entries=lambda: set(active_names),
             )
             janitor.run_once()
             self.assertFalse(orphan.exists())
+            self.assertTrue(protected.exists())
+            active_names.clear()
+            janitor.run_once()
+            self.assertFalse(protected.exists())
+
+    def test_orphan_input_directories_are_reaped_with_temp_ttl(self) -> None:
+        with tempfile.TemporaryDirectory() as root_dir:
+            root = Path(root_dir)
+            now = FakeClock(1_000_000.0)
+            input_root = root / "inputs"
+            input_root.mkdir()
+
+            stale_job = str(uuid.uuid4())
+            stale_dir = input_root / stale_job
+            stale_dir.mkdir()
+            _touch(stale_dir / "source.pdf")
+            _old(stale_dir, 4_000, now())
+
+            fresh_job = str(uuid.uuid4())
+            fresh_dir = input_root / fresh_job
+            fresh_dir.mkdir()
+            _touch(fresh_dir / "source.pdf")
+            _old(fresh_dir, 30, now())
+
+            pending_job = str(uuid.uuid4())
+            pending_dir = input_root / pending_job
+            pending_dir.mkdir()
+            _touch(pending_dir / "source.pdf")
+            _old(pending_dir, 4_000, now())
+
+            known_job = str(uuid.uuid4())
+            known_dir = input_root / known_job
+            known_dir.mkdir()
+            _touch(known_dir / "source.pdf")
+            _old(known_dir, 4_000, now())
+
+            janitor = Janitor(
+                FakeStore(
+                    [
+                        JobRecord(
+                            job_id=known_job,
+                            state="succeeded",
+                            created_at=now(),
+                            finished_at=now() - 10,
+                            input_path=known_dir,
+                            output_path=Path("outputs") / known_job,
+                        )
+                    ]
+                ),
+                retention=RetentionPolicy(temp_ttl=60),
+                input_root=input_root,
+                output_root=root / "outputs",
+                tombstone_root=root / "tombs",
+                now=now,
+                pending_inputs=lambda: {pending_job},
+            )
+
+            janitor.run_once()
+
+            self.assertFalse(stale_dir.exists())
+            self.assertTrue(fresh_dir.exists())
+            self.assertTrue(pending_dir.exists())
+            self.assertTrue(known_dir.exists())
+
+    def test_orphan_input_symlink_is_not_followed(self) -> None:
+        with tempfile.TemporaryDirectory() as root_dir:
+            root = Path(root_dir)
+            now = FakeClock(1_000_000.0)
+            input_root = root / "inputs"
+            input_root.mkdir()
+
+            orphan = input_root / str(uuid.uuid4())
+            if os.name != "nt":
+                orphan.symlink_to(root / "outside-target")
+            else:
+                # Best-effort on platforms where symlink may need privileges;
+                # this still verifies the skip path in a deterministic way.
+                (orphan).write_text("", encoding="utf-8")
+
+            _old(orphan, 4_000, now())
+
+            janitor = Janitor(
+                FakeStore([]),
+                retention=RetentionPolicy(temp_ttl=60),
+                input_root=input_root,
+                output_root=root / "outputs",
+                tombstone_root=root / "tombs",
+                now=now,
+            )
+            janitor.run_once()
+            if os.name != "nt":
+                self.assertTrue(orphan.is_symlink())
+            else:
+                self.assertTrue(orphan.exists())
+
+    def test_orphan_input_cleanup_retries_on_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as root_dir:
+            root = Path(root_dir)
+            now = FakeClock(1_000_000.0)
+            input_root = root / "inputs"
+            input_root.mkdir()
+
+            orphan = input_root / str(uuid.uuid4())
+            orphan.mkdir()
+            _touch(orphan / "source.pdf")
+            _old(orphan, 4_000, now())
+
+            attempts: dict[str, int] = {}
+
+            def flaky_cleanup(_root: Path, target: Path | str) -> int:
+                attempts[str(target)] = attempts.get(str(target), 0) + 1
+                if attempts[str(target)] == 1:
+                    raise PermissionError("temp failure")
+                return safe_delete_tree(_root, target)
+
+            fake_store = FakeStore([])
+            janitor = Janitor(
+                fake_store,
+                retention=RetentionPolicy(temp_ttl=60),
+                input_root=input_root,
+                output_root=root / "outputs",
+                tombstone_root=root / "tombs",
+                now=now,
+                cleanup_delete_fn=flaky_cleanup,
+            )
+
+            janitor.run_once()
+            self.assertTrue(orphan.exists())
+            self.assertEqual(fake_store.complete_calls[0][1], CLEANUP_KIND_ORPHAN_INPUT)
+            self.assertIsNotNone(fake_store.complete_calls[0][3])
+
+            janitor.run_once()
+            self.assertFalse(orphan.exists())
+            self.assertIsNone(fake_store.complete_calls[1][3])
 
     def test_cleanup_failure_is_retried(self) -> None:
         with tempfile.TemporaryDirectory() as root_dir:

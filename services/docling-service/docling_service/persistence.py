@@ -139,6 +139,7 @@ class SQLiteStore:
         max_pending: int | None = None,
         max_data_bytes: int | None = None,
         webhook_max_attempts: int = DEFAULT_WEBHOOK_MAX_ATTEMPTS,
+        max_webhook_subscriptions: int | None = None,
     ) -> None:
         self._path = Path(db_path).resolve()
         self._path.parent.mkdir(parents=True, exist_ok=True)
@@ -148,6 +149,11 @@ class SQLiteStore:
         self._max_pending = max_pending if (max_pending and max_pending > 0) else None
         self._max_data_bytes = (
             max_data_bytes if (max_data_bytes and max_data_bytes > 0) else None
+        )
+        self._max_webhook_subscriptions = (
+            max_webhook_subscriptions
+            if max_webhook_subscriptions and max_webhook_subscriptions > 0
+            else None
         )
 
         self._conn = sqlite3.connect(
@@ -1666,6 +1672,12 @@ class SQLiteStore:
             return {"error": "invalid_callback_url"}
         now = _utc_now()
         with self._write_txn():
+            if self._max_webhook_subscriptions is not None:
+                current = self._fetch_one(
+                    "SELECT COUNT(*) AS count FROM webhook_subscriptions"
+                )
+                if int(current["count"]) >= self._max_webhook_subscriptions:
+                    return {"error": "subscription_limit"}
             cur = self._conn.execute(
                 """
                 INSERT INTO webhook_subscriptions (
@@ -2333,15 +2345,25 @@ class SQLiteStore:
                     "UPDATE job_files SET status = 'deleted', deleted_at = ? WHERE job_id = ?",
                     (now, job_id),
                 )
-
-            if error is None and kind == "tombstone":
-                self._conn.execute("DELETE FROM jobs WHERE job_id = ?", (job_id,))
+            elif error is None and kind in {
+                "staging_dir",
+                "temp_dir",
+                "tombstone_dir",
+                "orphan_input",
+            }:
                 self._conn.execute(
                     """
                     DELETE FROM cleanup_claims
                     WHERE job_id = ? AND kind = ? AND lease_id = ?
                     """,
                     (job_id, kind, lease_id),
+                )
+
+            if error is None and kind == "tombstone":
+                self._conn.execute("DELETE FROM jobs WHERE job_id = ?", (job_id,))
+                self._conn.execute(
+                    "DELETE FROM cleanup_claims WHERE job_id = ?",
+                    (job_id,),
                 )
 
         return {

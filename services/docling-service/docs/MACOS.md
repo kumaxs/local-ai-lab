@@ -60,6 +60,26 @@ installed release's `.runtime/docling-release/macos/` directory. For a release
 bundle installation this is below the stable versioned installation path; for a
 repository checkout it is below the repository root.
 
+Log output from `run-backend.sh` and `run-api.sh` is now managed by
+`deploy/macos/logging_wrapper.py`, which merges stdout and stderr and performs
+size-based rotation. Defaults are `10MiB` per file and `3` backups.
+Both defaults can be overridden by environment variables (read by the wrapper):
+
+- `DOCLING_MACOS_LOG_MAX_BYTES` (default `10485760`)
+- `DOCLING_MACOS_LOG_BACKUP_COUNT` (default `3`)
+
+Example:
+
+```bash
+export DOCLING_MACOS_LOG_MAX_BYTES=5242880
+export DOCLING_MACOS_LOG_BACKUP_COUNT=5
+zsh services/docling-service/deploy/macos/start.sh
+```
+
+The PIDs written by `start.sh` now point to the wrapper process. `stop.sh`
+retains its existing safety check and still sends termination signals to the
+wrapper.
+
 To require a bearer token, export it before starting both processes:
 
 ```bash
@@ -91,9 +111,17 @@ defaults are:
 - `DOCLING_DEVICE=cpu` for the standard PDF pipeline; this avoids known MPS
   numeric incompatibilities while the formula submodel still uses MLX.
 - `DOCLING_MAX_CONCURRENT_JOBS=1` to avoid competing large model loads.
+- `DOCLING_MAX_CONCURRENT_UPLOADS=2`; multipart spooling and the validated copy
+  use the installed release's managed `data/state/temp` directory.
 - `DOCLING_IMAGE_EXPORT_MODE=embedded` so figures survive the backend/API
   process boundary and can be written into each job output directory.
 
 Set `DOCLING_FORMULA_POLICY=granite_transformers` to diagnose an MLX-specific
 problem without changing the output contract. This is a diagnostic mode, not
 the accepted Apple Silicon release default.
+
+Task input, output, staging, and upload temporary data use the same TTL and
+quota rules described in [API.md](API.md). Model files in
+`~/.cache/docling/models` and older versioned installations under
+`~/Library/Application Support/Local AI Lab/` are persistent and must be
+removed deliberately when no longer needed.
