@@ -33,6 +33,7 @@ SOURCE_PATHS = (
     Path("docs/integrations/docling-serve-quality-parity/quality_parity_adapter.py"),
     Path("docs/integrations/docling-serve-quality-parity/semantic_reflow.py"),
     Path("docs/integrations/docling-serve-quality-parity/formula_only_second_pass.py"),
+    Path("docs/integrations/docling-serve-quality-parity/pdf_structure_inventory.py"),
 )
 ROOT_TEMPLATE_MAP = {
     Path("services/docling-service/release/BUNDLE_README.md"): Path("README.md"),
@@ -52,6 +53,7 @@ REQUIRED_BUNDLE_FILES = {
     Path("services/docling-service/deploy/macos/install.sh"),
     Path("services/docling-service/docling_service/release.py"),
     Path("docs/integrations/docling-serve-quality-parity/quality_parity_adapter.py"),
+    Path("docs/integrations/docling-serve-quality-parity/pdf_structure_inventory.py"),
 }
 
 

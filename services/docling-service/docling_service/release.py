@@ -10,6 +10,7 @@ import os
 import platform
 import signal
 import shutil
+import stat
 import subprocess
 import sys
 import threading
@@ -60,6 +61,137 @@ def _env_hosts(name: str) -> tuple[str, ...]:
             if host.strip()
         )
     )
+
+
+def _normalize_formula_second_pass_policy(raw: str | None) -> str:
+    normalized = (raw or "off").strip().casefold()
+    if normalized == "review":
+        return "auto"
+    if normalized == "apply":
+        return "apply-all"
+    return normalized
+
+
+def _resolve_formula_second_pass_route_b(
+    config: "ReleaseConfig",
+    *,
+    job_id: str | None = None,
+) -> Path | None:
+    """Resolve the Route-B directory for a direct or shared-root layout.
+
+    A configured path may itself be a direct document directory, or a shared
+    root containing a directory per job.  A candidate is trusted only when
+    its ``document.json`` and ``status.json`` are contained regular files and
+    ``status.json`` declares ``ok: true``.  Job-specific resolution also
+    requires a contained regular ``metadata.json`` whose ``job_id`` matches.
+    Per-job paths are resolved before acceptance and must remain inside the
+    configured root.
+    """
+    configured = config.formula_second_pass_route_b_dir
+    if configured is None:
+        return None
+
+    configured = configured.expanduser()
+    if configured.is_symlink():
+        raise ValueError(
+            "Configured Route-B root must not be a symlink: "
+            f"{configured}"
+        )
+    configured_root = configured.resolve(strict=False)
+    if not configured_root.is_dir():
+        return None
+
+    def contained_path(path: Path, *, label: str) -> Path:
+        resolved = path.resolve(strict=False)
+        try:
+            resolved.relative_to(configured_root)
+        except ValueError as exc:
+            raise ValueError(
+                f"Route-B {label} escapes the configured root: {path}"
+            ) from exc
+        return resolved
+
+    def is_regular_non_symlink(path: Path, *, label: str) -> bool:
+        contained_path(path, label=label)
+        try:
+            mode = path.lstat().st_mode
+        except OSError:
+            return False
+        return stat.S_ISREG(mode)
+
+    def load_regular_json(path: Path, *, label: str) -> Mapping[str, Any] | None:
+        if not is_regular_non_symlink(path, label=label):
+            return None
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            return None
+        return payload if isinstance(payload, Mapping) else None
+
+    def has_trusted_artifact(directory: Path, *, direct_fallback: bool) -> bool:
+        document = directory / "document.json"
+        if not is_regular_non_symlink(document, label="document"):
+            return False
+        status_payload = load_regular_json(
+            directory / "status.json",
+            label="status",
+        )
+        if status_payload is None or status_payload.get("ok") is not True:
+            return False
+
+        if direct_fallback or job_id is not None:
+            metadata_path = directory / "metadata.json"
+            try:
+                metadata_path.lstat()
+            except FileNotFoundError:
+                metadata_exists = False
+            except OSError:
+                return False
+            else:
+                metadata_exists = True
+            # A document/status pair without provenance metadata is never a
+            # trusted Route-B artifact.  Requiring metadata even for the
+            # no-job compatibility query keeps availability reporting aligned
+            # with the job-aware resolver used by the actual adapter command.
+            if not metadata_exists:
+                return False
+            metadata_payload = load_regular_json(
+                metadata_path,
+                label="metadata",
+            )
+            if metadata_payload is None:
+                return False
+            metadata_job_id = metadata_payload.get("job_id")
+            if job_id is not None:
+                if metadata_job_id != job_id:
+                    return False
+            elif metadata_job_id is not None:
+                return False
+        return True
+
+    if job_id is not None:
+        candidate = configured / job_id
+        candidate_resolved = candidate.resolve(strict=False)
+        try:
+            candidate_resolved.relative_to(configured_root)
+        except ValueError as exc:
+            raise ValueError(
+                "Route-B per-job directory escapes the configured root: "
+                f"{candidate}"
+            ) from exc
+        if candidate.is_symlink():
+            raise ValueError(
+                "Route-B per-job directory must not be a symlink: "
+                f"{candidate}"
+            )
+        if has_trusted_artifact(candidate_resolved, direct_fallback=False):
+            # Preserve the configured spelling for command-line compatibility;
+            # containment above was checked against the fully resolved path.
+            return candidate
+
+    if has_trusted_artifact(configured_root, direct_fallback=True):
+        return configured
+    return None
 
 
 def _repo_root() -> Path:
@@ -138,6 +270,15 @@ class ReleaseConfig:
     webhook_allowed_hosts: tuple[str, ...] = ()
     webhook_allow_private_hosts: bool = False
     max_webhook_subscriptions: int = 100
+    formula_second_pass_policy: str = "off"
+    formula_second_pass_route_b_dir: Path | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "formula_second_pass_policy",
+            _normalize_formula_second_pass_policy(self.formula_second_pass_policy),
+        )
 
     @classmethod
     def from_env(cls) -> "ReleaseConfig":
@@ -163,6 +304,12 @@ class ReleaseConfig:
             formula_default = "granite_transformers"
         formula_policy = os.getenv("DOCLING_FORMULA_POLICY", formula_default)
         formula_ocr_url = os.getenv("DOCLING_FORMULA_OCR_URL")
+        formula_second_pass_policy = _normalize_formula_second_pass_policy(
+            os.getenv("DOCLING_FORMULA_SECOND_PASS_POLICY", "off")
+        )
+        formula_second_pass_route_b_dir = os.getenv(
+            "DOCLING_FORMULA_SECOND_PASS_ROUTE_B_DIR"
+        )
         if formula_ocr_url is None and profile == "docker" and formula_policy == "formula_service":
             formula_ocr_url = "http://formula:8001"
         timeout_default = "7200" if profile == "docker" else "3600"
@@ -181,6 +328,12 @@ class ReleaseConfig:
             ),
             image_export_mode=os.getenv("DOCLING_IMAGE_EXPORT_MODE", "embedded"),
             formula_policy=formula_policy,
+            formula_second_pass_policy=formula_second_pass_policy,
+            formula_second_pass_route_b_dir=Path(
+                formula_second_pass_route_b_dir
+            ).expanduser().absolute()
+            if formula_second_pass_route_b_dir
+            else None,
             cn_ocr_parity=_env_bool("DOCLING_CN_OCR_PARITY", profile == "macos"),
             api_token=os.getenv("DOCLING_SERVICE_API_TOKEN") or None,
             formula_ocr_url=formula_ocr_url.rstrip("/") if formula_ocr_url else None,
@@ -239,6 +392,26 @@ class ReleaseConfig:
                 raise ValueError(
                     "DOCLING_FORMULA_OCR_URL must be a local Docker/loopback HTTP endpoint"
                 )
+        if self.formula_second_pass_policy not in {
+            "off",
+            "auto",
+            "apply-all",
+        }:
+            raise ValueError("DOCLING_FORMULA_SECOND_PASS_POLICY is invalid")
+        if self.formula_second_pass_policy == "apply-all":
+            if not self.formula_second_pass_route_b_dir:
+                raise ValueError(
+                    "DOCLING_FORMULA_SECOND_PASS_POLICY=apply-all requires "
+                    "DOCLING_FORMULA_SECOND_PASS_ROUTE_B_DIR"
+                )
+            if self.formula_second_pass_route_b_dir.is_symlink():
+                raise ValueError(
+                    "DOCLING_FORMULA_SECOND_PASS_ROUTE_B_DIR must not be a symlink"
+                )
+            if not self.formula_second_pass_route_b_dir.is_dir():
+                raise ValueError(
+                    "DOCLING_FORMULA_SECOND_PASS_ROUTE_B_DIR must be an existing directory"
+                )
         if not self.adapter_path.is_file():
             raise ValueError(f"quality adapter not found: {self.adapter_path}")
         if self.max_data_bytes < self.max_upload_bytes:
@@ -272,6 +445,22 @@ class ReleaseConfig:
     @property
     def temp_root(self) -> Path:
         return self.state_root / "temp"
+
+    def effective_formula_second_pass_policy(self, job_id: str | None = None) -> str:
+        """Return the policy that can be applied for one job.
+
+        ``formula_second_pass_route_b_dir`` is allowed to be either a direct
+        Route-B document directory or a shared root containing one directory
+        per job.  Keep this decision in the same resolver used when building
+        the adapter command so status/capability callers cannot disagree with
+        the worker runtime.  The optional ``job_id`` preserves the historical
+        no-argument helper API while allowing per-job resolution.
+        """
+        if self.formula_second_pass_policy == "off":
+            return "off"
+        if _resolve_formula_second_pass_route_b(self, job_id=job_id) is not None:
+            return "apply-all"
+        return "off"
 
     def public_capabilities(self) -> dict[str, Any]:
         return {
@@ -317,6 +506,7 @@ class JobRecord:
     input_path: str
     output_dir: str
     created_at: str
+    input_sha256: str | None = None
     started_at: str | None = None
     finished_at: str | None = None
     exit_code: int | None = None
@@ -329,6 +519,24 @@ def build_adapter_command(
     *,
     output_root: Path | None = None,
 ) -> list[str]:
+    resolved_route_b: Path | None = None
+    if config.formula_second_pass_policy != "off":
+        resolved_route_b = _resolve_formula_second_pass_route_b(
+            config,
+            job_id=record.job_id,
+        )
+    if config.formula_second_pass_policy == "apply-all":
+        if resolved_route_b is None:
+            raise ValueError(
+                "Cannot run apply-all formula second pass without a matching "
+                "Route-B document directory with trusted status.json and "
+                "matching metadata.json"
+            )
+        formula_second_pass_policy = "apply-all"
+    elif config.formula_second_pass_policy == "auto" and resolved_route_b is not None:
+        formula_second_pass_policy = "apply-all"
+    else:
+        formula_second_pass_policy = "off"
     command = [
         sys.executable,
         str(config.adapter_path),
@@ -349,8 +557,19 @@ def build_adapter_command(
         "--formula-policy",
         config.formula_policy,
         "--formula-second-pass-policy",
-        "apply-all",
+        formula_second_pass_policy,
     ]
+    normalized_input_sha256 = _normalize_hex_sha256(record.input_sha256)
+    if normalized_input_sha256 is not None:
+        command.extend(["--expected-input-sha256", normalized_input_sha256])
+    if formula_second_pass_policy == "apply-all":
+        assert resolved_route_b is not None
+        command.extend(
+            [
+                "--formula-second-pass-route-b-dir",
+                str(resolved_route_b),
+            ]
+        )
     if config.cn_ocr_parity:
         command.append("--cn-ocr-parity")
     if config.formula_ocr_url:
@@ -401,6 +620,76 @@ def _sha256_path(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _sha256_nofollow_path(path: Path) -> str:
+    try:
+        pre_stat = path.lstat()
+    except OSError:
+        raise
+    if not stat.S_ISREG(pre_stat.st_mode):
+        raise ValueError("source.pdf is not a regular file")
+    open_flags = os.O_RDONLY | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        open_flags |= os.O_NOFOLLOW
+
+    descriptor = os.open(str(path), open_flags)
+    descriptor_owner = descriptor
+    try:
+        opened_stat = os.fstat(descriptor)
+        if not stat.S_ISREG(opened_stat.st_mode):
+            raise ValueError("source.pdf is not a regular file")
+        expected_file_signature = (
+            pre_stat.st_dev,
+            pre_stat.st_ino,
+            pre_stat.st_size,
+            pre_stat.st_mode,
+        )
+        opened_signature = (
+            opened_stat.st_dev,
+            opened_stat.st_ino,
+            opened_stat.st_size,
+            opened_stat.st_mode,
+        )
+        if opened_signature != expected_file_signature:
+            raise ValueError("source.pdf changed during verification")
+        digest = hashlib.sha256()
+        with os.fdopen(descriptor, "rb") as handle:
+            descriptor_owner = None
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+            read_stat = os.fstat(handle.fileno())
+            if read_stat.st_dev != opened_stat.st_dev:
+                raise ValueError("source.pdf changed during verification")
+            if read_stat.st_ino != opened_stat.st_ino:
+                raise ValueError("source.pdf changed during verification")
+            if read_stat.st_size != opened_stat.st_size:
+                raise ValueError("source.pdf changed during verification")
+            if read_stat.st_mode != opened_stat.st_mode:
+                raise ValueError("source.pdf changed during verification")
+            final_path_stat = path.lstat()
+            if (
+                final_path_stat.st_dev != pre_stat.st_dev
+                or final_path_stat.st_ino != pre_stat.st_ino
+                or final_path_stat.st_size != pre_stat.st_size
+                or final_path_stat.st_mode != pre_stat.st_mode
+            ):
+                raise ValueError("source.pdf changed during verification")
+        return digest.hexdigest()
+    finally:
+        if descriptor_owner is not None:
+            os.close(descriptor_owner)
+
+
+def _normalize_hex_sha256(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    lower = value.lower()
+    if len(lower) != 64:
+        return None
+    if any(character not in "0123456789abcdef" for character in lower):
+        return None
+    return lower
 
 
 class DownloadLease:
@@ -544,9 +833,9 @@ class JobManager:
 
     @staticmethod
     def _record_from_mapping(record: Mapping[str, Any]) -> JobRecord:
-        return JobRecord(
-            **{field: record.get(field) for field in SQLiteStore.LEGACY_FIELDS}
-        )
+        fields = {field: record.get(field) for field in SQLiteStore.LEGACY_FIELDS}
+        fields["input_sha256"] = record.get("input_sha256")
+        return JobRecord(**fields)
 
     def _mirror_job(self, job_id: str) -> None:
         payload = self.store.legacy_record(job_id)
@@ -567,7 +856,18 @@ class JobManager:
                 staging = self.config.staging_root / job_id
                 try:
                     source = candidate if candidate.is_dir() else staging
-                    manifest = self._validate_success_outputs(source)
+                    recovered_record = self._record_from_mapping(record)
+                    expected_input_sha256 = _normalize_hex_sha256(
+                        recovered_record.input_sha256
+                    )
+                    if expected_input_sha256 is None:
+                        raise ValueError(
+                            "missing or invalid input_sha256 on production recovery job record"
+                        )
+                    manifest = self._validate_success_outputs(
+                        source,
+                        expected_input_sha256=expected_input_sha256,
+                    )
                     if source == staging:
                         self._publish_staging(job_id)
                     self.store.update_job(
@@ -769,7 +1069,9 @@ class JobManager:
             )
         return files
 
-    def _validate_success_outputs(self, root: Path) -> list[dict[str, Any]]:
+    def _validate_success_outputs(
+        self, root: Path, *, expected_input_sha256: str | None = None
+    ) -> list[dict[str, Any]]:
         if root.is_symlink():
             raise ValueError("staging job directory cannot be a symlink")
         if not root.is_dir():
@@ -784,6 +1086,48 @@ class JobManager:
             raise ValueError("status.json is invalid") from exc
         if not isinstance(status, dict) or status.get("ok") is not True:
             raise ValueError("status.json did not report ok=true")
+        if expected_input_sha256 is not None:
+            normalized_expected_input_sha256 = _normalize_hex_sha256(
+                expected_input_sha256
+            )
+            if normalized_expected_input_sha256 is None:
+                raise ValueError("expected_input_sha256 must be a 64-character hex digest")
+            metadata_path = root / "metadata.json"
+            if metadata_path.is_symlink() or not metadata_path.is_file():
+                raise ValueError("metadata.json is not a regular file")
+            try:
+                metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+                raise ValueError("metadata.json is invalid") from exc
+            if not isinstance(metadata, Mapping):
+                raise ValueError("metadata.json is invalid")
+            if (
+                str(metadata.get("original_input_sha256") or "").lower()
+                != normalized_expected_input_sha256
+            ):
+                raise ValueError(
+                    "metadata.original_input_sha256 does not match expected input"
+                )
+            if (
+                str(metadata.get("visual_evidence_input_sha256") or "").lower()
+                != normalized_expected_input_sha256
+            ):
+                raise ValueError(
+                    "metadata.visual_evidence_input_sha256 does not match expected input"
+                )
+            try:
+                source_pdf_path = root / "source.pdf"
+                source_pdf_sha256 = _sha256_nofollow_path(source_pdf_path)
+                if source_pdf_sha256 != normalized_expected_input_sha256:
+                    raise ValueError("source.pdf does not match expected input")
+            except FileNotFoundError as exc:
+                raise ValueError("source.pdf is missing") from exc
+            except ValueError as exc:
+                raise
+            except OSError as exc:
+                if getattr(os, "O_NOFOLLOW", None) is not None and exc.errno == errno.ELOOP:
+                    raise ValueError("source.pdf is not a regular file") from exc
+                raise ValueError("source.pdf is not readable") from exc
         return self._collect_manifest(root)
 
     def _publish_staging(self, job_id: str) -> Path:
@@ -956,16 +1300,19 @@ class JobManager:
                 return
             self._mirror_job(job_id)
         record = self._record_from_mapping(updated)
-        command = build_adapter_command(
-            self.config,
-            record,
-            output_root=self.config.staging_root,
-        )
         state = "failed"
         exit_code: int | None = None
         error: str | None = None
         manifest: list[dict[str, Any]] = []
         try:
+            command = build_adapter_command(
+                self.config,
+                record,
+                output_root=self.config.staging_root,
+            )
+            expected_input_sha256 = _normalize_hex_sha256(record.input_sha256)
+            if expected_input_sha256 is None:
+                raise ValueError("missing or invalid input_sha256 on production job record")
             if self._runner is subprocess.run:
                 completed = self._run_production_adapter(command, job_id=job_id)
             else:
@@ -979,7 +1326,8 @@ class JobManager:
             exit_code = completed.returncode
             if completed.returncode == 0:
                 manifest = self._validate_success_outputs(
-                    self.config.staging_root / job_id
+                    self.config.staging_root / job_id,
+                    expected_input_sha256=expected_input_sha256,
                 )
                 self._publish_staging(job_id)
                 state = "succeeded"

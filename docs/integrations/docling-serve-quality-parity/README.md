@@ -121,6 +121,7 @@ The adapter writes one job directory under `--output-root`:
 
 ```text
 <output-root>/<job-id>/
+  source.pdf                 # immutable submitted-snapshot evidence
   document.md
   document.html
   document.json
@@ -132,9 +133,18 @@ The adapter writes one job directory under `--output-root`:
   tables/table_N.html
   tables/table_N.csv
   tables/table_N.png
+  algorithms/algorithm_N.png
   formulas/formula_N_context.png
+  formulas/formula_N.png
   pictures/picture_N.png
+  code_blocks/code_block_N.png
 ```
+
+`source.pdf` is a regular, read-only copy of the submitted immutable snapshot.
+It is an internal evidence file, not a replacement for `document.html` or
+`document.md`, and it is intentionally excluded from the service ZIP archive.
+The adapter verifies its SHA-256 and identity before inventory, before final
+visual gates, and before publishing metadata/status.
 
 n8n should read:
 
@@ -145,16 +155,43 @@ n8n should read:
 - `metadata.json.ocr_fallback_used`
 - `metadata.json.text_quality_gxx_count`
 - `metadata.json.text_quality_gxx_density`
-- `metadata.json.formula_placeholder_count`
-- `metadata.json.table_count`
+- `metadata.json` coverage and fallback summaries
 - `metadata.json.generated_outputs`
 - `metadata.json.output_dir`
+- `status.json.quality_signals` and related formula/table/algorithm/code verdict fields
 
 Success classes:
 
 - `success`: Serve succeeded and no adapter quality caveat was recorded.
 - `degraded_success`: Serve succeeded but known parity gaps or warnings remain.
 - `failure`: Serve conversion failed.
+
+### Immutable input and final evidence gates
+
+Before network conversion, the direct adapter creates an
+`_ImmutableInputSnapshot`, checks the optional expected SHA-256, acquires a
+persistent per-job lock, and claims a fresh output directory. A pre-existing
+job directory is rejected; partial output is cleaned only when its directory
+identity is still owned by that run. The submitted snapshot is authoritative:
+automatic sibling text-layer recovery is disabled, so a nearby PDF is never
+silently substituted.
+
+The published `source.pdf` is copied from that snapshot and checked by the PDF
+inventory gate. Inventory verifies the source name/path, SHA-256, page sequence,
+text health, and independent high-confidence counts for formulas, tables,
+algorithms, and code. The final formula and structural gates then reconcile
+those counts with the semantic document and occurrence-bound source visuals.
+Formula, table, algorithm, and code evidence records include the source-PDF
+SHA, page/bbox geometry, page/pixel dimensions, asset digest, stable source ref,
+and normalized body identity. A visual that is only an appendix, context crop,
+label, blank image, or unbound occurrence is diagnostic evidence and cannot
+satisfy exact coverage.
+
+This lifecycle applies to the direct quality-parity CLI. The formal service
+wrapper additionally owns `/data/inputs`, `.staging`, published outputs,
+SQLite claims, and the background Janitor. Direct CLI and review helpers are not
+registered with that Janitor; their temporary output roots remain an operator
+cleanup responsibility.
 
 If Serve is not reachable, the command exits non-zero and prints JSON containing
 the validated local start command.
@@ -176,12 +213,15 @@ The adapter preserves:
   `document.md`, `document.html`, `document.json`, `metadata.json`, `status.json`;
 - best-effort `tables/table_N.json`, `tables/table_N.html`, and
   `tables/table_N.csv` extraction from Serve JSON table nodes;
-- adapter-owned review artifacts: rendered page images, table crops, formula
-  source/context crops, picture crops, and `review_index.html`;
+- adapter-owned review artifacts: rendered page images, non-empty table crops, and
+  formula/table/algorithm/code/picture source crops linked for exact PDF visual
+  review, plus `review_index.html`;
 - warnings for missing/incomplete formulas and suspicious formula text such as
-  likely column contamination.
+  likely column contamination;
 - explicit unresolved-gap warnings for footnotes, PDF links, inline formula HTML
-  rendering, and math symbol rendering.
+  rendering, and math symbol rendering;
+- source visual links must be retained on final `document.html` and `document.md`
+  for reviewability before any replacement is considered.
 
 The review artifact layer is intentionally post-processing owned by this
 adapter. Docling Server remains the execution backend for Route A.
@@ -189,20 +229,64 @@ adapter. Docling Server remains the execution backend for Route A.
 ## Formula Second Pass
 
 `quality_parity_adapter.py` runs `formula_only_second_pass.py` after the Route A
-adapter output and review artifacts are written. The current helper and formal
-release default is `apply-all`; pass `--formula-second-pass-policy off` to
-disable it. Replacement remains evidence- and quality-gated:
+adapter output and review artifacts are written.
+Formal release default is `off` for `--formula-second-pass-policy`.
 
-- Route A remains the document backbone.
-- Route B is used only as a formula candidate source.
-- `route-a-full` or any other fallback source is used only when explicitly
-  passed as a guarded fallback source and only for allowlisted equation numbers.
-- `review` mode writes sidecar evidence without replacing contract files.
-- `apply` mode writes the same sidecar evidence, then patches
-  `document.md`, `document.json`, and the affected formula blocks in
-  `document.html` with rendered display math, traceable raw TeX, and review
-  links. The final HTML display text is taken from the patched markdown body so
-  restored equation numbers are preserved.
+Replacement gating:
+
+- `off`: Route B is ignored; Route A output is authoritative.
+- `auto`: route-b candidates are consumed only when a trusted route-b source is
+  provided.
+- `apply-all`: route-b candidates are consumed only when the guarded route-b path
+  and minimum required candidate artifacts are present.
+- `apply-all` must fail-fast if the required `route-a`/`route-b` directories are
+  missing, not distinct, or if output sidecars are missing/dirty.
+- `apply-all` requires both route `status.json` to be `ok=true`, readable source
+  PDF evidence (`source.pdf` / `input.pdf` / declared source path), and matching
+  persisted source SHA fields (`input_sha256` / `source.sha256` / `source_sha256`)
+  for both routes; any hash mismatch or missing hash path causes fail-closed.
+- `apply-all` is a full-coverage mode: all route-A formula nodes must be
+  attempted, all replacement candidates must be accepted, and all Markdown anchors
+  must be patched. Coverage failures are hard errors (`route_b_formula_coverage_incomplete`,
+  `route_a_markdown_formula_coverage_incomplete`).
+- Legacy CLI values remain accepted as input aliases: `review` resolves to
+  `auto`, and `apply` resolves to `apply-all`.
+- Route B is a candidate source only while route A remains the contract baseline.
+  In `apply-all`, sidecar JSON/Markdown coverage gates run before the primary
+  copy. The copy and every later HTML, synchronization, polish, and final-surface
+  gate run inside one rollback-protected transaction; any later failure restores
+  the pre-apply Route-A files and records a failed status.
+- In service mode, `--formula-second-pass-route-b-dir` may be a direct
+  route-B document directory or a shared route-B root that resolves to
+  `<root>/<job-id>` per job.
+- Every job-aware direct or shared Route-B artifact must also contain a regular,
+  non-symlink `metadata.json` whose `job_id` exactly matches the requested job.
+  Missing, malformed, one-sided, or stale job identity makes `auto` resolve to
+  `off` and makes explicit `apply-all` fail closed.
+- `route-a-full` or any other fallback source is used only when explicitly passed
+  as guarded fallback and only for allowlisted equation numbers.
+- Contract patches are applied only when candidate evidence is complete; the
+  result must keep linked source visuals and preserve equation numbering.
+- Legacy VLM artifacts without verifiable source hash + readable source PDF evidence
+  are treated as untrusted and must be regenerated before `apply-all` can consume
+  them.
+
+For final review output, a source visual is authoritative only when it is visibly
+attached to one unique body occurrence, comes from the submitted PDF, contains
+the actual formula/table/algorithm/code body, and passes the matching content and
+geometry checks. An appendix-only, unbound, blank, label-only, or context-only
+image does not satisfy delivery. Machine HTML/TeX remains a searchable auxiliary
+surface. An occurrence-bound exact source visual may keep a job deliverable when
+machine formula transcription is incomplete, but only as `degraded_success` with
+the crop open at that occurrence and an explicit machine warning. Raw formula
+tokens, undecoded placeholders, conflicting body content, or missing source
+evidence fail the job.
+
+Inline math remains recovery-limited by source geometry: if glyph clusters and
+anchors are available, machine recovery can be attempted. A residual may use a
+tight, open source crop only when it is bound to that exact body occurrence.
+Appendix-only or ambiguous bindings fail the delivery gate. The adapter never
+invents document-specific substitutions.
 
 CN reviewed command shape:
 
@@ -213,7 +297,7 @@ python3 docs/integrations/docling-serve-quality-parity/quality_parity_adapter.py
   --output-root /tmp/docling-serve-quality-parity \
   --job-id CN \
   --cn-ocr-parity \
-  --formula-second-pass-policy apply \
+  --formula-second-pass-policy apply-all \
   --formula-second-pass-route-b-dir /path/to/route-b/CN \
   --formula-second-pass-guarded-fallback-dir route-a-full=/path/to/route-a-full/CN \
   --formula-second-pass-guarded-fallback-eq 5 \
@@ -221,13 +305,12 @@ python3 docs/integrations/docling-serve-quality-parity/quality_parity_adapter.py
   --formula-second-pass-guarded-fallback-eq 8
 ```
 
-When enabled, the adapter records `metadata.json:formula_second_pass`,
-`metadata.json:formula_second_pass_applied`,
-`metadata.json:formula_second_pass_html_gate`, and
-`status.json:quality_signals.formula_second_pass`. If `apply` reports
-replacements but the final decoded `document.html` does not contain each patched
-formula text, its MathJax display wrapper, and a traceable formula marker, the
-adapter marks the result as a `degraded_failure`. The default sidecar output is:
+When enabled, the adapter records quality diagnostics and replacement outcomes in
+`status.json` plus related metadata, including `final_source_visuals`,
+`final_formula_surface`, and `final_structural_surface` where these fields are
+emitted by the current implementation. If replacement mode is enabled but the
+patched `document.html`/`document.md` cannot be validated against source-linked
+visuals, the adapter reports `degraded_failure`. The default sidecar output is:
 
 ```text
 <output-root>/<job-id>/formula_second_pass/
@@ -340,6 +423,7 @@ Per-PDF outputs, when conversion succeeds:
 
 ```text
 <output-root>/<job-id>/
+  source.pdf
   document.md
   document.html
   document.json
@@ -351,6 +435,17 @@ Per-PDF outputs, when conversion succeeds:
   tables/table_N.html
   tables/table_N.csv
 ```
+
+Route B uses a per-job publish lock (`.<job-id>.vlm_publish.lock`) and builds
+each attempt in a sibling staging directory before one atomic rename. Any old
+job directory is quarantined as a complete unit before a new attempt; the
+quarantine marker is created with `lstat`/exclusive no-follow semantics and
+never follows a nested symlink. Only the newest two quarantine siblings are
+retained (`keep2`), and older candidates are removed without following
+symlinks. A failed attempt therefore cannot leave a mixture of stale pages,
+tables, and new contract files in the active job directory. These VLM
+quarantines are evaluation artifacts, outside the service Janitor, and must be
+cleaned by the operator when the review is complete.
 
 Summary rows include the input filename, job id, output directory, model,
 processed page count, success class, runtime, warnings/failure reason, output

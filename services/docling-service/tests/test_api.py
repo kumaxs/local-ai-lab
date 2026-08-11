@@ -58,15 +58,34 @@ class ApiTests(unittest.TestCase):
             def runner(command, **_kwargs):
                 job_id = command[command.index("--job-id") + 1]
                 output_root = Path(command[command.index("--output-root") + 1])
+                input_file = Path(command[command.index("--input-file") + 1])
+                expected_input_sha256 = None
+                if "--expected-input-sha256" in command:
+                    marker = command.index("--expected-input-sha256")
+                    if marker + 1 < len(command):
+                        expected_input_sha256 = command[marker + 1]
+                source_pdf_bytes = input_file.read_bytes()
+                if expected_input_sha256 is None:
+                    expected_input_sha256 = hashlib.sha256(source_pdf_bytes).hexdigest()
                 output_dir = output_root / job_id
                 output_dir.mkdir(parents=True)
                 (output_dir / "document.html").write_text("<p>Converted</p>", encoding="utf-8")
                 (output_dir / "document.md").write_text("# Converted\n", encoding="utf-8")
                 (output_dir / "document.json").write_text("{}", encoding="utf-8")
-                (output_dir / "metadata.json").write_text("{}", encoding="utf-8")
+                (output_dir / "metadata.json").write_text(
+                    json.dumps(
+                        {
+                            "original_input_sha256": expected_input_sha256,
+                            "visual_evidence_input_sha256": expected_input_sha256,
+                            "conversion_input_sha256": expected_input_sha256,
+                        }
+                    ),
+                    encoding="utf-8",
+                )
                 (output_dir / "status.json").write_text(
                     json.dumps({"ok": True}), encoding="utf-8"
                 )
+                (output_dir / "source.pdf").write_bytes(source_pdf_bytes)
                 return subprocess.CompletedProcess(command, 0, "{}", "")
 
             manager = JobManager(config, runner=runner)

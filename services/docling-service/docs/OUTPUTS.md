@@ -1,8 +1,8 @@
 # Output contract
 
 Each accepted request owns one directory named by the server-generated UUID.
-The primary reading surfaces are semantic HTML and Markdown; source images are
-supporting evidence and never a substitute for recognized content.
+The primary reading surfaces are semantic HTML and Markdown. Source visuals
+for formula/table/algorithm/code are the authoritative visual review layer.
 
 ## Required files
 
@@ -13,6 +13,11 @@ supporting evidence and never a substitute for recognized content.
 | `document.json` | Docling structural document plus provenance and quality annotations |
 | `metadata.json` | input, engine, conversion-policy, count, provenance, and output inventory metadata |
 | `status.json` | final quality decision, warnings, errors, and diagnostic signals |
+
+The release adapter may also retain a job-local `source.pdf`. It is the
+read-only copy of the immutable submitted snapshot used for final visual
+evidence and PDF inventory; it is not one of the five required reading files
+and is intentionally omitted from the service ZIP archive.
 
 ## Conditional files
 
@@ -27,6 +32,8 @@ tables/table_N.csv
 tables/table_N.png
 formulas/formula_N.png
 formulas/formula_N_context.png
+algorithms/algorithm_N.png
+code_blocks/code_block_N.png
 pictures/picture_N.png
 formula_second_pass/*
 ```
@@ -34,6 +41,71 @@ formula_second_pass/*
 These artifacts support traceability and manual review. They may be absent when
 the source does not contain that structure or a reliable bounding box is not
 available.
+
+## Input identity and provenance
+
+The quality-parity path snapshots the submitted PDF before conversion, records
+its expected SHA-256 when supplied, and rejects a changed, replaced, symlinked,
+or non-regular input. Each job uses a fresh output directory and a persistent
+job lock; an old sibling output or sibling PDF is never used for recovery. The
+published `source.pdf` is checked against the snapshot before inventory, before
+the final visual gates, and before metadata/status publication.
+
+The PDF inventory gate reads that same `source.pdf` and verifies its name,
+location, digest, page continuity, text health, and independent high-confidence
+formula/table/algorithm/code counts. `metadata.json` and
+`status.json.quality_signals` may expose `pdf_structure_inventory`,
+`final_pdf_inventory`, `final_source_visuals`, `final_formula_surface`, and
+`final_structural_surface`. The high-confidence/ambiguous counters drive gate
+comparisons; persisted `records` arrays are bounded diagnostic samples and are
+not a second exact-count contract.
+
+Formula, table, algorithm, and code source visuals are occurrence-bound
+evidence, not generic decorations. Their manifests bind the submitted-PDF SHA,
+page/bbox and page/pixel geometry, asset digest, stable source reference, and
+normalized body identity. A blank, label-only, context-only, appendix-only, or
+unbound crop cannot satisfy exact coverage. Machine HTML/TeX remains searchable
+but cannot override a conflicting source visual.
+
+The second-pass formula repair policy is configured by
+`DOCLING_FORMULA_SECOND_PASS_POLICY` (formal release:
+`off`, `auto`, `apply-all`).
+In release mode, `DOCLING_FORMULA_SECOND_PASS_ROUTE_B_DIR` can be either a
+direct route-B document directory (`.../<job-id>`) or a shared route-B root that
+contains per-job directories; the service resolves `<route-b-root>/<job-id>` first
+when present.
+For any job-aware lookup, the resolved directory must contain regular,
+non-symlink `document.json`, `status.json`, and `metadata.json` files;
+`metadata.json.job_id` must exactly match the requested job. A missing or stale
+job binding disables `auto` and causes explicit `apply-all` to fail before the
+adapter is launched.
+
+- `off`: no second-pass refinement.
+- `auto`: run second pass only when a route-B reference directory exists and is
+  valid.
+- `apply-all`: always run second pass when `formula_second_pass_route_b_dir` is
+  configured and valid.
+
+- `apply-all` requires both route status files to report `ok=true`, distinct
+  input/output directories, successful formula coverage for JSON and Markdown,
+  readable source PDF bytes (`source.pdf` / `input.pdf` / declared source path),
+  symmetric matching route job identities, and matching persisted SHA-256
+  provenance for both routes.
+- Legacy route-B VLM artifacts that do not provide verifiable input hash + source
+  PDF evidence are rejected and must be regenerated before they can be consumed.
+
+Legacy aliases are still accepted for compatibility:
+`review` maps to `auto`, and `apply` maps to `apply-all`.
+`formula_second_pass_route_b_dir` must point to an existing directory for
+`apply-all`.
+
+Route-B VLM review output uses the same source identity discipline. Each attempt
+is built in a sibling staging directory under a per-job publish lock and is
+published with one atomic rename. An existing job directory is quarantined as a
+whole; quarantine markers are created exclusively without following symlinks,
+and retention keeps only the newest two quarantine siblings. Quarantined VLM
+directories are evaluation artifacts, not service output, and are outside the
+service Janitor.
 
 ## HTML semantics
 
@@ -45,10 +117,18 @@ available.
   numbers are separate from content indentation.
 - Algorithms and code preserve reliable bold/italic spans and syntax roles.
 - Tables are real HTML tables; intentional cell line breaks remain visible.
-- Page, formula, and table crops may be linked from `review_index.html` as QA
-  evidence, but are never embedded in or linked from the primary surfaces as a
-  replacement for recognized content. Paper figures remain ordinary semantic
-  figure assets referenced by `document.html`.
+- Page, formula, table, algorithm, and code source crops are included for QA.
+  A crop is authoritative only when it is visibly bound to one unique body
+  occurrence, originates from the submitted PDF, contains the actual body rather
+  than an equation label or surrounding context alone, and passes content and
+  geometry identity checks. Appendix-only or unbound crops do not satisfy the
+  delivery gate.
+- Machine-rendered HTML/TeX remains for searchable output and traceability, but is
+  not a substitute when source visuals are available.
+- Inline math recovery is geometry-driven only. A remaining unresolved cluster
+  may be delivered as degraded machine-surface quality only with a tight, open
+  source crop at the exact body occurrence; ambiguous or appendix-only evidence
+  fails. Paper-specific substitutions are never injected.
 
 ## Markdown semantics
 
@@ -57,6 +137,8 @@ available.
   syntax would lose cell line breaks or spans.
 - Code and algorithms use fenced/preformatted blocks so whitespace is material.
 - Citation and footnote relationships use Markdown links and anchors.
+- Formula links and inline formulas in Markdown remain searchable, with source visual
+  checks recorded in the quality artifacts.
 
 ## Status interpretation
 
@@ -71,25 +153,38 @@ Read `status.json.ok` first, then `status.json.success_class`, `warnings`, and
 - `failure`: conversion did not produce an acceptable output.
 
 Useful signals include formula counts and placeholders, per-formula MathML
-coverage, `portable_formula_ocr` recognition/patch results (selected model
-variant, source-semantic coverage, missing symbols, repairs, and guarded primary
-and fallback evidence), plus `source_semantic_gate` explaining whether a reliable
-PDF text layer was available,
+coverage, formula recognition/patch diagnostics (selected model variant,
+source-semantic coverage, missing symbols, repairs, and guarded primary and
+fallback evidence), plus whether a reliable PDF text layer was available,
 table counts, `/Gxx` bad-text-layer density, broken local references, OCR
 fallback use, semantic reflow application, citation links, footnotes, algorithm
 blocks, and actual formula/OCR engines.
 
-`portable_formula_ocr.surface_sync_ok` describes the provisional writer output
-before semantic reflow and may be false when a late formula anchor is rebuilt in
-the authoritative surfaces. Acceptance is determined by
-`final_formula_surface`: every formula must appear as MathML in HTML and a TeX
-block in Markdown, with no fallback or undecoded placeholder.
+A fully machine-renderable result has `machine_surface_ok=true`: every semantic
+formula appears as MathML in HTML and a TeX block in Markdown, with no TeX
+fallback.
+
+When machine coverage is incomplete but an exact, open source visual is bound to
+every affected body occurrence, the output may remain `ok=true` only as
+`degraded_success` and must carry explicit inline-formula/formula-surface
+warnings. Appendix-only evidence, raw model tokens, undecoded placeholders, or
+missing source visuals are hard failures and drive `degraded_failure`.
+
+`final_formula_surface` separates machine and visual delivery. Implementations may
+also emit `final_source_visuals` and `final_structural_surface` for traceability.
 
 The API output manifest adds a SHA-256 and byte size for every downloadable
 regular file. Consumers should not infer completeness merely from the presence
 of `document.html`; use `status.json` and the manifest together.
 
-For Docker, `portable_formula_ocr.crop_tightening` records the visible-ink crop,
+The service Janitor owns TTL cleanup for registered input PDFs, staging,
+published output, temporary files, and tombstones using persistent cleanup
+claims. Direct `quality_parity_adapter.py` runs, batch review helpers, and VLM
+evaluation runs are not registered with that Janitor; operators must remove
+their temporary output roots after review. The archive endpoint deliberately
+filters out `source.pdf` even when it exists in the internal job tree.
+
+In some deployments, `portable_formula_ocr.crop_tightening` records the visible-ink crop,
 edge-clipping decision, and the primary/fallback image selected per formula.
 `high_resolution_crop_indexes` records formula bboxes for which a column-bounded
 six-times PDF render was available; that image is selected only when the preview

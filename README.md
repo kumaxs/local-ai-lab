@@ -11,6 +11,12 @@ Canonical GitHub: `https://github.com/kumaxs/local-ai-lab`
 `/Users/zeyuan/Local-AI-Lab` 已退役（墓碑目录），当前会话 handoff 快照为唯一
 可信传递文件 `HANDOFF.md`。
 
+质量交付路径会在转换前建立不可变输入快照，并在提供
+`--expected-input-sha256` 时校验提交的摘要。每个直接 CLI 任务都必须使用新的
+任务目录和持久化 job lock；发布的 `source.pdf` 是该快照的只读副本，所有后续
+转换、视觉证据和 PDF inventory 都以它为准。不会自动从兄弟文件恢复文本层，
+也不会把旧任务目录当作当前任务的输入。
+
 [最新 Release](https://github.com/kumaxs/local-ai-lab/releases/latest) ·
 [API 文档](services/docling-service/docs/API.md) ·
 [Docker 部署](services/docling-service/docs/DOCKER.md) ·
@@ -205,6 +211,12 @@ Janitor 默认每 5 分钟运行。清理采用持久化 claim，失败会保留
 **不统计**模型、Docker 镜像、日志、SQLite/WAL 本身以及开发目录 `.runtime`
 中的质量回归材料。`GET /v1/system/storage` 也只报告这一任务管理口径。
 
+服务 API 的 staging、输入、输出、临时目录和 tombstone 由服务 Janitor 按
+持久化 claim 与 TTL 负责治理。直接运行
+`quality_parity_adapter.py`、`batch_full_dir_review.py` 或 VLM 评估 helper
+不加入这套 SQLite/Janitor 生命周期；它们使用自己的 output root，操作者必须
+在验收后清理临时 replay、staging 和 review 目录。
+
 SQLite 删除记录后会复用空闲页，但数据库物理文件可能保持历史高水位；这不
 等于数据继续泄漏，如需缩小文件应在停机维护窗口执行 checkpoint/VACUUM。
 
@@ -215,6 +227,19 @@ SQLite 删除记录后会复用空闲页，但数据库物理文件可能保持�
 
 > `docker compose down` 保留 named volumes；`docker compose down -v` 会
 > 删除模型、任务、输入和输出卷，是不可恢复的破坏性操作。
+
+服务 archive 端点有意不打包 `source.pdf`：ZIP 只包含已发布的交付文件和
+`manifest.json`，源 PDF 仍受输入留存和权限策略约束。源 PDF 的 SHA、大小和
+文件类型仍会参与发布验证；不要把 archive 内容等同于任务目录的内部证据树。
+
+质量门还会从同一 `source.pdf` 运行 PDF inventory，检查页序、文本健康度以及
+表格、算法、代码和公式的独立计数。公式、表格、算法和代码的源视觉必须带有
+PDF SHA、页码/bbox、资产摘要和 occurrence body identity；未绑定、仅 appendix、
+空白或标签-only 的图片不能使任务通过。
+
+VLM 评估 helper 使用每 job publish lock、同卷 staging 原子发布和不跟随符号链接
+的整目录 quarantine，只保留最近两个 quarantine（keep2）；这些评估产物不在
+服务 Janitor 管理范围内。
 
 ## Webhook / n8n
 
@@ -233,6 +258,11 @@ Docker 默认只把 API 绑定到 `127.0.0.1:8766`，macOS 默认绑定到
 应检查 `git status` 和 staged diff。
 
 ## 开发验证
+
+最近一次正式记录的验证为：integration discovery **584 OK（5 skipped）**，
+service discovery **165 OK**。九份真实 PDF 的统一离线交付回放为 **9/9
+通过**；每份的公式、结构、独立 PDF inventory 和本地引用门禁均为绿，且已对
+CN 公式/表格、算法和 BERT 表格来源裁剪做原始分辨率视觉抽查。
 
 ```bash
 cd services/docling-service

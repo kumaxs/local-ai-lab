@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import zipfile
 import subprocess
 import sys
 import tarfile
@@ -21,6 +22,16 @@ RELEASE_ROOT = SERVICE_ROOT / "release"
 
 
 class DistributionTests(unittest.TestCase):
+    INVENTORY_TOOL = (
+        "docs/integrations/docling-serve-quality-parity/"
+        "pdf_structure_inventory.py"
+    )
+
+    def test_dockerignore_whitelists_inventory_script(self) -> None:
+        dockerignore = (REPO_ROOT / ".dockerignore").read_text(encoding="utf-8")
+        self.assertIn(
+            f"!{self.INVENTORY_TOOL}", dockerignore
+        )
 
     def _get_service_block(self, compose_text: str, service: str) -> str:
         lines = compose_text.splitlines()
@@ -193,6 +204,16 @@ class DistributionTests(unittest.TestCase):
             text=True,
         )
 
+    def test_docker_api_image_includes_inventory_script(self) -> None:
+        dockerfile = (SERVICE_ROOT / "deploy/docker/Dockerfile.api").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(
+            "COPY docs/integrations/docling-serve-quality-parity/"
+            "pdf_structure_inventory.py /opt/docling-quality/pdf_structure_inventory.py",
+            dockerfile,
+        )
+
     def test_release_workflow_publishes_assets_and_multiarch_images(self) -> None:
         workflow_path = REPO_ROOT / ".github/workflows/docling-service-release.yml"
         if not workflow_path.is_file():
@@ -264,6 +285,55 @@ class DistributionTests(unittest.TestCase):
                 f"docling-service-{RELEASE_VERSION}/services/docling-service/deploy/macos/logging_wrapper.py",
                 names,
             )
+            inventory_bundle_path = (
+                f"docling-service-{RELEASE_VERSION}/{self.INVENTORY_TOOL}"
+            )
+            self.assertIn(inventory_bundle_path, names)
+            manifest_paths = {entry.get("path") for entry in manifest["files"]}
+            self.assertIn(self.INVENTORY_TOOL, manifest_paths)
+
+    def test_release_verification_rejects_missing_inventory_script(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "output"
+            command = [
+                sys.executable,
+                str(RELEASE_ROOT / "build_release_bundle.py"),
+                "--source-root",
+                str(REPO_ROOT),
+                "--output-dir",
+                str(output),
+                "--version",
+                RELEASE_VERSION,
+                "--commit",
+                "0" * 40,
+                "--epoch",
+                "1785816000",
+            ]
+            subprocess.run(command, check=True, capture_output=True, text=True)
+            source_zip = output / f"docling-service-{RELEASE_VERSION}.zip"
+            bad_zip = output / f"docling-service-{RELEASE_VERSION}-missing-inventory.zip"
+            with zipfile.ZipFile(source_zip, "r") as source:
+                with zipfile.ZipFile(
+                    bad_zip,
+                    "w",
+                    compression=zipfile.ZIP_DEFLATED,
+                    compresslevel=9,
+                ) as target:
+                    for item in source.infolist():
+                        if item.filename.endswith(f"/{self.INVENTORY_TOOL}"):
+                            continue
+                        target.writestr(item, source.read(item.filename))
+            with self.assertRaises(subprocess.CalledProcessError):
+                subprocess.run(
+                    [
+                        sys.executable,
+                        str(RELEASE_ROOT / "verify_release_bundle.py"),
+                        str(bad_zip),
+                    ],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
 
 
 if __name__ == "__main__":

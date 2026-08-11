@@ -10,19 +10,28 @@ from __future__ import annotations
 
 import argparse
 import base64
+import copy
 import csv
 import difflib
+import errno
+import fcntl
+import hashlib
 import html
 import io
 import json
+import os
 import re
+import secrets
 import shutil
+import stat
+import tempfile
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
+from pdf_structure_inventory import KIND_HEALTHY, KIND_ORDER, KIND_UNKNOWN, pdf_structure_inventory
 
 from formula_only_second_pass import (
     canonicalize_formula_output,
@@ -32,7 +41,13 @@ from formula_only_second_pass import (
     run_formula_second_pass,
     validate_candidate_latex,
 )
-from semantic_reflow import _formula_mathml, rebuild_semantic_surfaces
+from semantic_reflow import (
+    _formula_mathml,
+    _formula_source_text,
+    _numbered_code_lines,
+    rebuild_semantic_surfaces,
+    source_algorithm_block,
+)
 
 GXX_RE = re.compile(r"/G[0-9A-Fa-f]{2}")
 DATA_IMAGE_RE = re.compile(r"data:image/[^\"')\s]+")
@@ -46,6 +61,26 @@ V1_GXX_FAILURE_MIN_DENSITY = 0.002
 FORMULA_SOURCE_PADDING_PX = 2
 FORMULA_CONTEXT_PADDING_PX = 96
 DEFAULT_REVIEW_PADDING_PX = 18
+FORMULA_SOURCE_MIN_WIDTH_PX = 18
+FORMULA_SOURCE_MIN_HEIGHT_PX = 18
+FORMULA_SOURCE_CONTEXT_MIN_WIDTH_PX = 24
+FORMULA_SOURCE_CONTEXT_MIN_HEIGHT_PX = 22
+FORMULA_SOURCE_MAX_ASPECT_RATIO = 28.0
+FORMULA_SOURCE_MIN_ASPECT_RATIO = 0.03
+FORMULA_SECOND_PASS_REPLACEMENT_LOG_LIMIT = 20
+STRUCTURAL_VISUAL_PROVENANCE_VERSION = 1
+INPUT_SNAPSHOT_MAX_BYTES = 256 * 1024 * 1024
+INPUT_SNAPSHOT_READ_SIZE = 1024 * 1024
+JOB_LOCK_DIRECTORY_NAME = ".quality-parity-locks"
+ALLOWED_FORMULA_DROPOUT_REASONS: set[str] = {
+    "compact_formula_fragment",
+    "standalone_equation_number",
+    "formula_number_only",
+    "bbox_too_thin_for_complex_formula",
+    "bbox_likely_line_or_separator",
+    "source_crop_likely_too_thin",
+    "source_crop_likely_useless_for_review",
+}
 # These gaps were closed by the accepted semantic output layer. Keep the field in
 # the output contract for compatibility, but do not emit stale warnings.
 UNRESOLVED_V1_PARITY_WARNINGS: list[str] = []
@@ -61,12 +96,6 @@ CN_ACCEPTED_BASELINE = {
     "minimum_cn_character_count": 9900,
     "minimum_final_output_cn_character_count": 9000,
 }
-CN_FINAL_TEXT_CORRECTIONS = (
-    (
-        re.compile(r"获\s*取历史时刻知识状态的权重力"),
-        "获取历史时刻知识状态的权重为",
-    ),
-)
 PAGE_EDGE_LABELS = {"page_header", "page_footer"}
 HEADER_FOOTER_NOISE_RE = re.compile(
     r"(?i)\b(arxiv|proceedings|conference|workshop|copyright|all rights reserved|"
@@ -76,6 +105,23 @@ MATH_TEXT_RE = re.compile(
     r"(?:\\(?:frac|sum|int|alpha|beta|gamma|theta|mathcal|mathbf|mathrm|sqrt|infty|cdot|left|right)|"
     r"[Θ∆Φℝ𝑊𝑟𝑑𝒩×≪ˆ=|])"
 )
+
+
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _sha256_argument(value: str) -> str:
+    normalized = str(value or "").strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", normalized):
+        raise argparse.ArgumentTypeError("expected SHA-256 must be exactly 64 hex characters")
+    return normalized
+
+
 ALIGNMENT_ENV_RE = re.compile(
     r"\\begin\s*\{\s*(?:aligned|align|array|matrix|pmatrix|bmatrix|cases|split|gathered)\s*\}"
 )
@@ -128,6 +174,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--serve-url", default="http://127.0.0.1:5001")
     parser.add_argument("--input-file", required=True, type=Path)
     parser.add_argument("--output-root", required=True, type=Path)
+    parser.add_argument(
+        "--expected-input-sha256",
+        type=_sha256_argument,
+        default=None,
+        help=(
+            "Release-bound SHA-256 of the submitted PDF. The adapter snapshots "
+            "the input before network access and rejects any mismatch."
+        ),
+    )
     parser.add_argument(
         "--job-id",
         default=None,
@@ -250,14 +305,14 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--formula-second-pass-policy",
-        choices=["off", "review", "apply", "apply-all"],
-        default="apply-all",
+        choices=["off", "auto", "apply-all", "review", "apply"],
+        default="off",
         help=(
             "Optionally run formula_only_second_pass.py after adapter outputs are "
-            "written. review writes sidecar evidence only; apply replaces "
-            "suspicious formulas in document.md/document.json; apply-all attempts "
-            "every discovered formula and replaces main outputs only when the "
-            "second-pass candidate passes quality gates."
+            "written. off keeps Route A authoritative; auto enables apply-all only "
+            "when a trusted Route-B directory exists; apply-all requires Route B "
+            "and fails closed when it is absent. Legacy review/apply values map to "
+            "auto/apply-all."
         ),
     )
     parser.add_argument(
@@ -533,6 +588,221 @@ def html_ref_metrics(document: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _markdown_strip_container_prefix(line: str) -> str:
+    """Remove Markdown container markers only for fence recognition."""
+
+    value = line.rstrip("\r\n")
+    while True:
+        quote = re.match(r"^[ \t]{0,3}>[ \t]?", value)
+        if quote:
+            value = value[quote.end() :]
+            continue
+        list_item = re.match(
+            r"^[ \t]{0,3}(?:[-+*]|\d{1,9}[.)])[ \t]+",
+            value,
+        )
+        if list_item:
+            value = value[list_item.end() :]
+            continue
+        return value
+
+
+def _markdown_fenced_ranges(markdown: str) -> list[tuple[int, int]]:
+    """Return byte ranges occupied by backtick/tilde fenced code blocks.
+
+    The scanner is line based and understands blockquote/list container
+    prefixes.  An unmatched opening fence protects the remainder of the
+    document, which is the conservative behavior for mutation gates.
+    """
+
+    ranges: list[tuple[int, int]] = []
+    open_start: int | None = None
+    open_char = ""
+    open_length = 0
+    offset = 0
+    for line in markdown.splitlines(keepends=True):
+        candidate = _markdown_strip_container_prefix(line)
+        if open_start is None:
+            opening = re.match(
+                r"^[ \t]{0,3}(?P<fence>`{3,}|~{3,})(?P<info>[^\r\n]*)$",
+                candidate,
+            )
+            if opening:
+                fence = opening.group("fence")
+                # CommonMark forbids backticks in a backtick fence's info
+                # string.  Treating such a line as prose avoids masking an
+                # unrelated inline literal through end-of-document.
+                if fence[0] == "`" and "`" in opening.group("info"):
+                    offset += len(line)
+                    continue
+                open_start = offset
+                open_char = fence[0]
+                open_length = len(fence)
+        else:
+            closing = re.fullmatch(
+                rf"[ \t]{{0,3}}{re.escape(open_char)}{{{open_length},}}[ \t]*",
+                candidate,
+            )
+            if closing:
+                ranges.append((open_start, offset + len(line)))
+                open_start = None
+                open_char = ""
+                open_length = 0
+        offset += len(line)
+    if open_start is not None:
+        ranges.append((open_start, len(markdown)))
+    return ranges
+
+
+def _markdown_inline_code_ranges(
+    markdown: str,
+    start: int,
+    end: int,
+) -> list[tuple[int, int]]:
+    ranges: list[tuple[int, int]] = []
+    position = start
+    while position < end:
+        opening = markdown.find("`", position, end)
+        if opening < 0:
+            break
+        opening_end = opening + 1
+        while opening_end < end and markdown[opening_end] == "`":
+            opening_end += 1
+        length = opening_end - opening
+        delimiter = "`" * length
+        search_at = opening_end
+        closing = -1
+        while search_at < end:
+            probe = markdown.find(delimiter, search_at, end)
+            if probe < 0:
+                break
+            before_same = probe > start and markdown[probe - 1] == "`"
+            after = probe + length
+            after_same = after < end and markdown[after] == "`"
+            if not before_same and not after_same:
+                closing = probe
+                break
+            search_at = probe + length
+        if closing < 0:
+            position = opening_end
+            continue
+        ranges.append((opening, closing + length))
+        position = closing + length
+    return ranges
+
+
+def _markdown_code_ranges(markdown: str) -> list[tuple[int, int]]:
+    fenced = _markdown_fenced_ranges(markdown)
+    ranges = list(fenced)
+    cursor = 0
+    for start, end in [*fenced, (len(markdown), len(markdown))]:
+        if cursor < start:
+            ranges.extend(_markdown_inline_code_ranges(markdown, cursor, start))
+        cursor = max(cursor, end)
+    return sorted(ranges)
+
+
+def _markdown_non_code_ranges(markdown: str) -> list[tuple[int, int]]:
+    ranges: list[tuple[int, int]] = []
+    cursor = 0
+    for start, end in _markdown_code_ranges(markdown):
+        if cursor < start:
+            ranges.append((cursor, start))
+        cursor = max(cursor, end)
+    if cursor < len(markdown):
+        ranges.append((cursor, len(markdown)))
+    return ranges
+
+
+def _markdown_mask_code(markdown: str) -> str:
+    """Mask code bytes while retaining offsets and line boundaries."""
+
+    pieces: list[str] = []
+    cursor = 0
+    for start, end in _markdown_code_ranges(markdown):
+        pieces.append(markdown[cursor:start])
+        pieces.append(
+            "".join("\n" if char == "\n" else "\r" if char == "\r" else " " for char in markdown[start:end])
+        )
+        cursor = end
+    pieces.append(markdown[cursor:])
+    return "".join(pieces)
+
+
+def _markdown_display_math_spans(markdown: str) -> list[tuple[int, int]]:
+    spans: list[tuple[int, int]] = []
+    for start, end in _markdown_non_code_ranges(markdown):
+        for match in re.finditer(r"\$\$.*?\$\$", markdown[start:end], flags=re.S):
+            spans.append((start + match.start(), start + match.end()))
+    return spans
+
+
+def _markdown_formula_slots(markdown: str) -> list[tuple[int, int]]:
+    slots = list(_markdown_display_math_spans(markdown))
+    for start, end in _markdown_non_code_ranges(markdown):
+        for match in re.finditer(
+            r"<!--\s*formula-not-decoded\s*-->",
+            markdown[start:end],
+        ):
+            slots.append((start + match.start(), start + match.end()))
+    return sorted(slots)
+
+
+def _markdown_sub_outside_code(
+    markdown: str,
+    pattern: str | re.Pattern[str],
+    replacement: str | Any,
+    *,
+    flags: int = 0,
+) -> tuple[str, int]:
+    compiled = re.compile(pattern, flags) if isinstance(pattern, str) else pattern
+    edits: list[tuple[int, int, str]] = []
+    for start, end in _markdown_non_code_ranges(markdown):
+        for match in compiled.finditer(markdown[start:end]):
+            value = (
+                replacement(match)
+                if callable(replacement)
+                else match.expand(str(replacement))
+            )
+            edits.append((start + match.start(), start + match.end(), value))
+    for start, end, value in reversed(edits):
+        markdown = markdown[:start] + value + markdown[end:]
+    return markdown, len(edits)
+
+
+def _markdown_source_formula_anchor_spans(
+    markdown: str,
+) -> list[tuple[int, int, int]]:
+    spans: list[tuple[int, int, int]] = []
+    pattern = re.compile(r"<!--\s*source-formula-anchor:(?P<index>\d+)\s*-->")
+    for start, end in _markdown_non_code_ranges(markdown):
+        for match in pattern.finditer(markdown[start:end]):
+            spans.append(
+                (
+                    start + match.start(),
+                    start + match.end(),
+                    int(match.group("index")),
+                )
+            )
+    return spans
+
+
+def _markdown_adjacent_text_fence_end(markdown: str, end: int) -> int:
+    """Include an immediately following generated ``text`` evidence fence."""
+
+    for start, fence_end in _markdown_fenced_ranges(markdown):
+        if start < end:
+            continue
+        if markdown[end:start].strip():
+            return end
+        first_line = markdown[start:fence_end].splitlines()[0]
+        opening = _markdown_strip_container_prefix(first_line)
+        if re.match(r"^[ \t]{0,3}(?:`{3,}|~{3,})[ \t]*text\b", opening, re.I):
+            return fence_end
+        return end
+    return end
+
+
 def broken_local_refs(output_dir: Path, document: dict[str, Any]) -> list[str]:
     html_content = document.get("html_content") or ""
     markdown = document.get("md_content") or ""
@@ -541,14 +811,39 @@ def broken_local_refs(output_dir: Path, document: dict[str, Any]) -> list[str]:
         html_content,
         flags=re.I,
     )
-    refs.extend(re.findall(r"!?\[[^\]]*\]\(([^)]+)\)", markdown))
+    markdown_without_code = _markdown_mask_code(markdown)
+    refs.extend(
+        re.findall(r"!?\[[^\]]*\]\(([^)]+)\)", markdown_without_code)
+    )
+    refs.extend(
+        re.findall(
+            r"<img\b[^>]*\bsrc\s*=\s*[\"']([^\"']+)[\"'][^>]*>",
+            markdown_without_code,
+            flags=re.I,
+        )
+    )
     broken: list[str] = []
+    output_root = output_dir.resolve()
     for ref in refs:
         ref = html.unescape(ref).strip().strip("<>")
         if not ref or ref.startswith(("data:", "http://", "https://", "#", "mailto:")):
             continue
-        path_ref = ref.split("#", 1)[0].split("?", 1)[0]
-        if path_ref and not (output_dir / path_ref).exists():
+        path_ref = urllib.parse.unquote(
+            ref.split("#", 1)[0].split("?", 1)[0]
+        )
+        if not path_ref:
+            continue
+        raw_path = Path(path_ref)
+        if raw_path.is_absolute():
+            broken.append(path_ref)
+            continue
+        candidate = (output_dir / raw_path).resolve()
+        try:
+            candidate.relative_to(output_root)
+        except ValueError:
+            broken.append(path_ref)
+            continue
+        if not candidate.exists():
             broken.append(path_ref)
     return sorted(set(broken))
 
@@ -696,12 +991,20 @@ def custom_config_mapping(value: Any) -> dict[str, Any]:
 
 
 def request_payload(args: argparse.Namespace, options: dict[str, Any]) -> dict[str, Any]:
-    pdf_bytes = args.input_file.read_bytes()
+    snapshot = getattr(args, "_input_snapshot", None)
+    pdf_bytes = (
+        snapshot.read_bytes()
+        if isinstance(snapshot, _ImmutableInputSnapshot)
+        else args.input_file.read_bytes()
+    )
+    filename = str(
+        getattr(args, "_submitted_input_name", None) or args.input_file.name
+    )
     return {
         "sources": [
             {
                 "kind": "file",
-                "filename": args.input_file.name,
+                "filename": filename,
                 "base64_string": base64.b64encode(pdf_bytes).decode("ascii"),
             }
         ],
@@ -788,7 +1091,7 @@ def _pdf_visual_distance(
     first_path: Path,
     second_path: Path,
     *,
-    max_pages: int = 2,
+    max_pages: int | None = None,
 ) -> float | None:
     try:
         import fitz  # type: ignore
@@ -800,11 +1103,14 @@ def _pdf_visual_distance(
     except Exception:
         return None
     try:
-        page_count = min(first_doc.page_count, second_doc.page_count, max_pages)
+        if first_doc.page_count != second_doc.page_count:
+            return None
+        page_count = first_doc.page_count
+        if max_pages is not None:
+            page_count = min(page_count, max_pages)
         if page_count <= 0:
             return None
-        total = 0.0
-        compared = 0
+        worst_local_distance = 0.0
         matrix = fitz.Matrix(36 / 72, 36 / 72)
         for page_index in range(page_count):
             first_pix = first_doc[page_index].get_pixmap(
@@ -821,21 +1127,34 @@ def _pdf_visual_distance(
                 return None
             first_samples = first_pix.samples
             second_samples = second_pix.samples
-            sample_count = min(len(first_samples), len(second_samples))
-            if not sample_count:
-                continue
-            stride = max(1, sample_count // 8000)
-            diffs = [
-                abs(first_samples[offset] - second_samples[offset])
-                for offset in range(0, sample_count, stride)
-            ]
-            if not diffs:
-                continue
-            total += sum(diffs) / len(diffs)
-            compared += 1
-        if compared == 0:
-            return None
-        return total / compared
+            if len(first_samples) != len(second_samples) or not first_samples:
+                return None
+            width = first_pix.width
+            height = first_pix.height
+            tile_size = 32
+            for top in range(0, height, tile_size):
+                for left in range(0, width, tile_size):
+                    total_difference = 0
+                    sample_count = 0
+                    right = min(width, left + tile_size)
+                    bottom = min(height, top + tile_size)
+                    for row in range(top, bottom):
+                        start = row * width + left
+                        end = row * width + right
+                        total_difference += sum(
+                            abs(first_value - second_value)
+                            for first_value, second_value in zip(
+                                first_samples[start:end],
+                                second_samples[start:end],
+                            )
+                        )
+                        sample_count += end - start
+                    if sample_count:
+                        worst_local_distance = max(
+                            worst_local_distance,
+                            total_difference / sample_count,
+                        )
+        return worst_local_distance
     finally:
         first_doc.close()
         second_doc.close()
@@ -884,7 +1203,11 @@ def find_text_layer_recovery_source(input_file: Path) -> dict[str, Any]:
         if page_size_distance > 2.0:
             continue
         visual_distance = _pdf_visual_distance(input_file, candidate)
-        if visual_distance is None or visual_distance > 18.0:
+        # Full-document 32px-tile comparison prevents a sibling that differs
+        # only on a later formula/table page from supplying semantic text or
+        # source evidence for the submitted PDF.  Rasterized derivatives in
+        # the accepted recovery fixture remain below 13 at 36 dpi.
+        if visual_distance is None or visual_distance > 13.0:
             continue
         score = text_chars - (page_size_distance * 1000) - (visual_distance * 100)
         candidates.append(
@@ -926,37 +1249,143 @@ def args_with_conversion_input(
     return converted_args
 
 
+def _atomic_write_output_file(
+    path: Path,
+    value: bytes,
+    *,
+    mode: int = 0o644,
+    expected_parent_identity: tuple[int, int] | None = None,
+) -> None:
+    """Replace one regular output without following a destination symlink."""
+
+    parent = path.parent
+    parent.mkdir(parents=True, exist_ok=True)
+    directory_fd = os.open(
+        parent,
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0),
+    )
+    temporary_name = f".{path.name}.{secrets.token_hex(16)}.tmp"
+    temporary_fd: int | None = None
+    try:
+        parent_stat = os.fstat(directory_fd)
+        if (
+            not stat.S_ISDIR(parent_stat.st_mode)
+            or (
+                expected_parent_identity is not None
+                and (parent_stat.st_dev, parent_stat.st_ino)
+                != expected_parent_identity
+            )
+        ):
+            raise _InputLifecycleError("job_output_directory_replaced")
+        try:
+            existing = os.stat(
+                path.name,
+                dir_fd=directory_fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            existing = None
+        if existing is not None and not stat.S_ISREG(existing.st_mode):
+            raise _InputLifecycleError("unsafe_contract_output_target", path.name)
+        temporary_fd = os.open(
+            temporary_name,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+            dir_fd=directory_fd,
+        )
+        _write_all(temporary_fd, value)
+        os.fsync(temporary_fd)
+        os.fchmod(temporary_fd, mode)
+        os.close(temporary_fd)
+        temporary_fd = None
+        os.replace(
+            temporary_name,
+            path.name,
+            src_dir_fd=directory_fd,
+            dst_dir_fd=directory_fd,
+        )
+        os.fsync(directory_fd)
+    finally:
+        if temporary_fd is not None:
+            os.close(temporary_fd)
+        try:
+            os.unlink(temporary_name, dir_fd=directory_fd)
+        except FileNotFoundError:
+            pass
+        os.close(directory_fd)
+
+
+def _atomic_write_output_text(
+    path: Path,
+    value: str,
+    *,
+    expected_parent_identity: tuple[int, int] | None = None,
+) -> None:
+    _atomic_write_output_file(
+        path,
+        value.encode("utf-8"),
+        expected_parent_identity=expected_parent_identity,
+    )
+
+
 def write_contract_outputs(
     output_dir: Path,
     response: dict[str, Any],
     metadata: dict[str, Any],
     status: dict[str, Any],
+    *,
+    output_guard: _FreshOutputGuard | None = None,
 ) -> None:
     document = response.get("document") or {}
     output_dir.mkdir(parents=True, exist_ok=True)
-    (output_dir / "document.md").write_text(
-        document.get("md_content") or "", encoding="utf-8"
+    expected_identity = None
+    if output_guard is not None:
+        output_guard.verify_output_directory()
+        expected_identity = output_guard.initial_identity
+    _atomic_write_output_text(
+        output_dir / "document.md",
+        document.get("md_content") or "",
+        expected_parent_identity=expected_identity,
     )
     document_html = document.get("html_content") or ""
-    (output_dir / "document.html").write_text(document_html, encoding="utf-8")
-    (output_dir / "document.json").write_text(
+    _atomic_write_output_text(
+        output_dir / "document.html",
+        document_html,
+        expected_parent_identity=expected_identity,
+    )
+    _atomic_write_output_text(
+        output_dir / "document.json",
         json.dumps(document.get("json_content"), indent=2, ensure_ascii=False),
-        encoding="utf-8",
+        expected_parent_identity=expected_identity,
     )
-    (output_dir / "metadata.json").write_text(
-        json.dumps(metadata, indent=2, ensure_ascii=False), encoding="utf-8"
+    _atomic_write_output_text(
+        output_dir / "metadata.json",
+        json.dumps(metadata, indent=2, ensure_ascii=False),
+        expected_parent_identity=expected_identity,
     )
-    (output_dir / "status.json").write_text(
-        json.dumps(status, indent=2, ensure_ascii=False), encoding="utf-8"
+    _atomic_write_output_text(
+        output_dir / "status.json",
+        json.dumps(status, indent=2, ensure_ascii=False),
+        expected_parent_identity=expected_identity,
     )
 
     tables = extract_table_nodes(document.get("json_content"))
     tables_dir = output_dir / "tables"
     for index, table in enumerate(tables, start=1):
         tables_dir.mkdir(exist_ok=True)
-        (tables_dir / f"table_{index}.json").write_text(
-            json.dumps(table, indent=2, ensure_ascii=False), encoding="utf-8"
+        _atomic_write_output_text(
+            tables_dir / f"table_{index}.json",
+            json.dumps(table, indent=2, ensure_ascii=False),
         )
+    if output_guard is not None:
+        output_guard.verify_output_directory()
 
 
 def first_prov(node: dict[str, Any]) -> dict[str, Any] | None:
@@ -966,7 +1395,30 @@ def first_prov(node: dict[str, Any]) -> dict[str, Any] | None:
     return None
 
 
-def bbox_geometry(prov: dict[str, Any] | None) -> dict[str, float] | None:
+def _bbox_coord_origin(bbox: dict[str, Any]) -> str | None:
+    explicit = str(bbox.get("coord_origin") or "").upper()
+    if explicit in {"TOPLEFT", "BOTTOMLEFT"}:
+        return explicit
+    try:
+        top = float(bbox["t"])
+        bottom = float(bbox["b"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if top > bottom:
+        return "BOTTOMLEFT"
+    if top < bottom:
+        return "TOPLEFT"
+    return None
+
+
+def _bbox_explicit_coord_origin(bbox: dict[str, Any]) -> str | None:
+    """Return only a declared origin for source-crop operations."""
+
+    explicit = str(bbox.get("coord_origin") or "").upper()
+    return explicit if explicit in {"TOPLEFT", "BOTTOMLEFT"} else None
+
+
+def bbox_geometry(prov: dict[str, Any] | None) -> dict[str, Any] | None:
     if not prov or not isinstance(prov.get("bbox"), dict):
         return None
     bbox = prov["bbox"]
@@ -974,6 +1426,9 @@ def bbox_geometry(prov: dict[str, Any] | None) -> dict[str, float] | None:
     right = float(bbox.get("r") or 0.0)
     top = float(bbox.get("t") or 0.0)
     bottom = float(bbox.get("b") or 0.0)
+    origin = _bbox_coord_origin(bbox)
+    if origin is None:
+        return None
     width = abs(right - left)
     height = abs(top - bottom)
     return {
@@ -984,23 +1439,85 @@ def bbox_geometry(prov: dict[str, Any] | None) -> dict[str, float] | None:
         "width": width,
         "height": height,
         "aspect_width_over_height": width / height if height else 0.0,
+        "coord_origin": origin,
     }
 
 
-def _bbox_union(boxes: list[dict[str, float]]) -> dict[str, float] | None:
+def _bbox_pixel_crop_box(
+    bbox: dict[str, Any],
+    *,
+    page_width: float,
+    page_height: float,
+    image_width: int,
+    image_height: int,
+    padding: int,
+    render_scale: float | None = None,
+) -> tuple[int, int, int, int] | None:
+    """Convert a Docling bbox to a clipped image crop in either coordinate system."""
+
+    if page_width <= 0 or page_height <= 0 or image_width <= 0 or image_height <= 0:
+        return None
+    if render_scale is not None:
+        try:
+            scale_x = scale_y = float(render_scale)
+        except (TypeError, ValueError):
+            return None
+        if scale_x <= 0.0:
+            return None
+    else:
+        scale_x = image_width / page_width
+        scale_y = image_height / page_height
+    left = float(bbox.get("l") or 0.0) * scale_x
+    right = float(bbox.get("r") or 0.0) * scale_x
+    top_value = float(bbox.get("t") or 0.0)
+    bottom_value = float(bbox.get("b") or 0.0)
+    origin = _bbox_explicit_coord_origin(bbox)
+    if origin is None:
+        return None
+    if origin == "BOTTOMLEFT":
+        top = (page_height - top_value) * scale_y
+        bottom = (page_height - bottom_value) * scale_y
+    else:
+        top = top_value * scale_y
+        bottom = bottom_value * scale_y
+    crop_box = (
+        max(0, int(min(left, right) - padding)),
+        max(0, int(min(top, bottom) - padding)),
+        min(image_width, int(max(left, right) + padding)),
+        min(image_height, int(max(top, bottom) + padding)),
+    )
+    if crop_box[2] <= crop_box[0] or crop_box[3] <= crop_box[1]:
+        return None
+    return crop_box
+
+
+def _bbox_union(boxes: list[dict[str, Any]]) -> dict[str, Any] | None:
     if not boxes:
         return None
+    origins = {_bbox_coord_origin(box) for box in boxes}
+    if None in origins:
+        return None
+    if len(origins) != 1:
+        return None
+    origin = next(iter(origins))
     left = min(box["l"] for box in boxes)
     right = max(box["r"] for box in boxes)
-    top = max(box["t"] for box in boxes)
-    bottom = min(box["b"] for box in boxes)
+    if origin == "BOTTOMLEFT":
+        top = max(box["t"] for box in boxes)
+        bottom = min(box["b"] for box in boxes)
+        height = top - bottom
+    else:
+        top = min(box["t"] for box in boxes)
+        bottom = max(box["b"] for box in boxes)
+        height = bottom - top
     return {
         "l": left,
         "r": right,
         "t": top,
         "b": bottom,
         "width": right - left,
-        "height": top - bottom,
+        "height": height,
+        "coord_origin": origin,
     }
 
 
@@ -1054,6 +1571,7 @@ def pdf_source_text_evidence(input_file: Path) -> dict[str, Any]:
                     "b": float(box[1]),
                     "r": float(box[2]),
                     "t": float(box[3]),
+                    "coord_origin": "BOTTOMLEFT",
                 }
                 characters.append(
                     {
@@ -1125,6 +1643,7 @@ def _pdf_source_text_evidence_pymupdf(input_file: Path) -> dict[str, Any]:
                                 "b": page_height - y1,
                                 "r": right,
                                 "t": page_height - y0,
+                                "coord_origin": "BOTTOMLEFT",
                             }
                             characters.append(
                                 {
@@ -1150,17 +1669,73 @@ def _pdf_source_text_evidence_pymupdf(input_file: Path) -> dict[str, Any]:
 
 
 def table_grid(table: dict[str, Any]) -> list[list[str]]:
-    cells = ((table.get("data") or {}).get("table_cells") or [])
-    max_row = 0
-    max_col = 0
+    data = table.get("data") or {}
+    cells = [cell for cell in (data.get("table_cells") or []) if isinstance(cell, dict)]
+
+    def nonnegative_int(value: Any) -> int:
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            return 0
+        return max(0, parsed)
+
+    declared_rows = nonnegative_int(data.get("num_rows"))
+    declared_cols = nonnegative_int(data.get("num_cols"))
+    has_coordinates = any(
+        any(
+            key in cell
+            for key in (
+                "start_row_offset_idx",
+                "end_row_offset_idx",
+                "start_col_offset_idx",
+                "end_col_offset_idx",
+            )
+        )
+        for cell in cells
+    )
+    if cells and not has_coordinates:
+        # Minimal Docling fixtures (and some legacy payloads) retain declared
+        # dimensions but omit offsets.  Preserve every cell deterministically
+        # instead of collapsing a meaningful table into a false 0x0 fallback.
+        max_row = declared_rows
+        max_col = declared_cols
+        if max_row <= 0 and max_col <= 0:
+            max_row, max_col = 1, len(cells)
+        elif max_row <= 0:
+            max_row = (len(cells) + max_col - 1) // max_col
+        elif max_col <= 0:
+            max_col = (len(cells) + max_row - 1) // max_row
+        if max_row * max_col < len(cells):
+            max_row = (len(cells) + max_col - 1) // max_col
+        grid = [["" for _ in range(max_col)] for _ in range(max_row)]
+        for index, cell in enumerate(cells):
+            row, col = divmod(index, max_col)
+            grid[row][col] = str(cell.get("text") or "")
+        return grid
+
+    max_row = declared_rows
+    max_col = declared_cols
     for cell in cells:
-        max_row = max(max_row, int(cell.get("end_row_offset_idx") or 0))
-        max_col = max(max_col, int(cell.get("end_col_offset_idx") or 0))
+        max_row = max(max_row, nonnegative_int(cell.get("end_row_offset_idx")))
+        max_col = max(max_col, nonnegative_int(cell.get("end_col_offset_idx")))
     grid = [["" for _ in range(max_col)] for _ in range(max_row)]
+    unplaced: list[dict[str, Any]] = []
     for cell in cells:
-        row = int(cell.get("start_row_offset_idx") or 0)
-        col = int(cell.get("start_col_offset_idx") or 0)
+        if "start_row_offset_idx" not in cell or "start_col_offset_idx" not in cell:
+            unplaced.append(cell)
+            continue
+        row = nonnegative_int(cell.get("start_row_offset_idx"))
+        col = nonnegative_int(cell.get("start_col_offset_idx"))
         if 0 <= row < max_row and 0 <= col < max_col:
+            grid[row][col] = str(cell.get("text") or "")
+    if unplaced:
+        empty_slots = [
+            (row, col)
+            for row in range(max_row)
+            for col in range(max_col)
+            if not grid[row][col]
+        ]
+        for cell, (row, col) in zip(unplaced, empty_slots):
             grid[row][col] = str(cell.get("text") or "")
     return grid
 
@@ -1204,9 +1779,26 @@ def render_page_images_and_crops(
     tables: list[dict[str, Any]],
     formulas: list[dict[str, Any]],
     pictures: list[dict[str, Any]],
-) -> tuple[dict[str, int], list[str], list[dict[str, Any]]]:
+    *,
+    document_json: Any = None,
+    semantic_pdf_sha256: str | None = None,
+    conversion_pdf_sha256: str | None = None,
+) -> tuple[
+    dict[str, int],
+    list[str],
+    list[dict[str, Any]],
+    dict[str, Any],
+]:
     warnings: list[str] = []
     crop_metrics: list[dict[str, Any]] = []
+    structural_manifest: dict[str, Any] = {
+        "version": STRUCTURAL_VISUAL_PROVENANCE_VERSION,
+        "visual_pdf_sha256": None,
+        "pages": {},
+        "tables": [],
+        "code": [],
+        "algorithms": [],
+    }
     counts = {
         "page_image_count": 0,
         "table_image_count": 0,
@@ -1219,7 +1811,7 @@ def render_page_images_and_crops(
         import pypdfium2 as pdfium
     except ImportError as exc:
         warnings.append(f"review_artifact_pdf_renderer_missing:{exc}")
-        return counts, warnings, crop_metrics
+        return counts, warnings, crop_metrics, structural_manifest
 
     pages_dir = output_dir / "pages"
     tables_dir = output_dir / "tables"
@@ -1232,8 +1824,18 @@ def render_page_images_and_crops(
         pdf = pdfium.PdfDocument(str(input_file))
     except Exception as exc:
         warnings.append(f"review_artifact_pdf_open_failed:{exc}")
-        return counts, warnings, crop_metrics
+        return counts, warnings, crop_metrics, structural_manifest
 
+    try:
+        source_pdf_sha256 = file_sha256(input_file)
+    except OSError:
+        source_pdf_sha256 = None
+    structural_manifest["visual_pdf_sha256"] = source_pdf_sha256
+    semantic_page_inventory = (
+        _document_page_size_inventory(document_json)
+        if isinstance(document_json, dict)
+        else None
+    )
     page_sizes: dict[int, tuple[float, float]] = {}
     page_images: dict[int, Any] = {}
     try:
@@ -1248,6 +1850,22 @@ def render_page_images_and_crops(
             page_path = pages_dir / f"page_{page_no}.png"
             image.save(page_path)
             page_images[page_no] = image
+            semantic_page_record = (
+                (semantic_page_inventory or {}).get("page_records", {}).get(page_no)
+                or {}
+            )
+            semantic_page_size = semantic_page_record.get("size") or {}
+            structural_manifest["pages"][str(page_no)] = {
+                "page_no": page_no,
+                "path": str(page_path.relative_to(output_dir)),
+                "page_size": {"width": float(width), "height": float(height)},
+                "semantic_page_size": _structural_page_size_snapshot(
+                    semantic_page_size
+                ),
+                "page_image_size": {"width": image.width, "height": image.height},
+                "page_image_sha256": file_sha256(page_path),
+                "visual_pdf_sha256": source_pdf_sha256,
+            }
             counts["page_image_count"] += 1
 
         def crop_node(
@@ -1262,35 +1880,46 @@ def render_page_images_and_crops(
             if image is None or page_size is None:
                 return False, None
             bbox = prov["bbox"]
-            _, page_height = page_size
             left = float(bbox.get("l") or 0.0)
             right = float(bbox.get("r") or 0.0)
             top = float(bbox.get("t") or 0.0)
             bottom = float(bbox.get("b") or 0.0)
-            if str(bbox.get("coord_origin", "")).upper() == "BOTTOMLEFT":
-                x0 = left * scale
-                x1 = right * scale
-                y0 = (page_height - top) * scale
-                y1 = (page_height - bottom) * scale
-            else:
-                x0 = left * scale
-                x1 = right * scale
-                y0 = top * scale
-                y1 = bottom * scale
-            box = (
-                max(0, int(min(x0, x1) - crop_padding)),
-                max(0, int(min(y0, y1) - crop_padding)),
-                min(image.width, int(max(x0, x1) + crop_padding)),
-                min(image.height, int(max(y0, y1) + crop_padding)),
+            origin = _bbox_explicit_coord_origin(bbox)
+            if origin is None:
+                return False, None
+            box = _bbox_pixel_crop_box(
+                bbox,
+                page_width=page_size[0],
+                page_height=page_size[1],
+                image_width=image.width,
+                image_height=image.height,
+                padding=crop_padding,
+                render_scale=scale,
             )
-            if box[2] <= box[0] or box[3] <= box[1]:
+            if box is None:
                 return False, None
             dest.parent.mkdir(exist_ok=True)
             image.crop(box).save(dest)
             metric = {
                 "path": str(dest.relative_to(output_dir)),
                 "page_no": page_no,
+                "bbox": {
+                    "l": left,
+                    "r": right,
+                    "t": top,
+                    "b": bottom,
+                    "coord_origin": origin,
+                },
+                "asset_sha256": file_sha256(dest),
+                "source_pdf_sha256": source_pdf_sha256,
+                "page_image_path": f"pages/page_{page_no}.png",
+                "page_image_sha256": (
+                    structural_manifest["pages"].get(str(page_no), {}).get(
+                        "page_image_sha256"
+                    )
+                ),
                 "padding_px": crop_padding,
+                "render_scale": scale,
                 "pixel_box": box,
                 "pixel_width": box[2] - box[0],
                 "pixel_height": box[3] - box[1],
@@ -1316,13 +1945,56 @@ def render_page_images_and_crops(
                 expanded_bbox["b"] = float(expanded_bbox.get("b", 0.0)) - 16.0
                 table_prov[0]["bbox"] = expanded_bbox
                 table_crop_node["prov"] = table_prov
-            wrote_table, _ = crop_node(
+            wrote_table, table_metric = crop_node(
                 table_crop_node,
                 tables_dir / f"table_{index}.png",
                 max(padding, 48),
             )
             if wrote_table:
                 counts["table_image_count"] += 1
+                table_part_index = _structural_node_part_index(table)
+                source_ref = _structural_node_source_ref(
+                    table,
+                    kind="table",
+                    fallback_index=index - 1,
+                    part_index=table_part_index,
+                )
+                source_prov = first_prov(table) or {}
+                source_grid = table_grid(table)
+                table_page_no = _positive_page_number(source_prov.get("page_no"))
+                table_semantic_page = (
+                    (
+                        (semantic_page_inventory or {}).get("page_records", {}).get(
+                            table_page_no
+                        )
+                        or {}
+                    ).get("size")
+                    or None
+                )
+                structural_manifest["tables"].append(
+                    _structural_visual_provenance_entry(
+                        kind="table",
+                        index=index,
+                        source_ref=source_ref,
+                        node=table,
+                        body_identity=_table_grid_body_identity(source_grid),
+                        metric=table_metric,
+                        node_bbox=(source_prov.get("bbox") or None),
+                        part_index=table_part_index,
+                        semantic_pdf_sha256=(
+                            semantic_pdf_sha256 or source_pdf_sha256
+                        ),
+                        conversion_pdf_sha256=(
+                            conversion_pdf_sha256
+                            or semantic_pdf_sha256
+                            or source_pdf_sha256
+                        ),
+                        semantic_page_size=table_semantic_page,
+                        crop_coordinate_page_size=(table_metric or {}).get(
+                            "page_size"
+                        ),
+                    )
+                )
         for index, formula in enumerate(formulas, start=1):
             wrote_source, source_metric = crop_node(
                 formula,
@@ -1338,9 +2010,26 @@ def render_page_images_and_crops(
                 "index": index,
                 "page_no": (first_prov(formula) or {}).get("page_no"),
                 "bbox": bbox_geometry(first_prov(formula)),
+                "source_pdf_sha256": source_pdf_sha256,
+                "formula_content_identity_sha256": (
+                    _formula_content_identity_sha256(
+                        str(formula.get("text") or "")
+                    )
+                ),
+                "formula_raw_content_sha256": _formula_raw_content_sha256(
+                    str(formula.get("text") or "")
+                ),
                 "source": source_metric,
                 "context": context_metric,
             }
+            for metric in (source_metric, context_metric):
+                if isinstance(metric, dict):
+                    metric["formula_content_identity_sha256"] = formula_metric[
+                        "formula_content_identity_sha256"
+                    ]
+                    metric["formula_raw_content_sha256"] = formula_metric[
+                        "formula_raw_content_sha256"
+                    ]
             crop_metrics.append(formula_metric)
             if wrote_source:
                 counts["formula_asset_count"] += 1
@@ -1355,21 +2044,26 @@ def render_page_images_and_crops(
     counts["formula_evidence_count"] = max(
         counts["formula_asset_count"], counts["formula_context_asset_count"]
     )
-    return counts, warnings, crop_metrics
+    return counts, warnings, crop_metrics, structural_manifest
 
 
 def inject_empty_table_visual_fallbacks(
     output_dir: Path,
     document_json: Any,
     tables: list[dict[str, Any]],
+    *,
+    provenance_manifest: dict[str, Any] | None = None,
+    expected_visual_pdf_sha256: str | None = None,
+    expected_semantic_pdf_sha256: str | None = None,
 ) -> dict[str, Any]:
-    nodes_by_ref = {
-        str(node.get("self_ref")): node
-        for node in iter_nodes(document_json)
-        if isinstance(node, dict) and node.get("self_ref")
-    }
+    nodes_by_ref = _structural_nodes_by_part_ref(document_json)
+    page_inventory = _document_page_size_inventory(document_json)
     candidates: list[dict[str, Any]] = []
+    provenance_verified_refs: list[str] = []
+    provenance_mismatch_refs: list[str] = []
+    provenance_diagnostics: dict[str, list[str]] = {}
     for index, table in enumerate(tables, start=1):
+        table_part_index = _structural_node_part_index(table)
         data = table.get("data") or {}
         if data.get("table_cells") or data.get("num_rows") or data.get("num_cols"):
             continue
@@ -1379,18 +2073,60 @@ def inject_empty_table_visual_fallbacks(
         caption_texts = []
         for caption in table.get("captions") or []:
             reference = str(caption.get("$ref") or "")
-            node = nodes_by_ref.get(reference)
+            node = nodes_by_ref.get((table_part_index, reference))
             text = str((node or {}).get("text") or "").strip()
             if text:
                 caption_texts.append(text)
-        if not caption_texts:
-            continue
+        source_ref = _structural_node_source_ref(
+            table,
+            kind="table",
+            fallback_index=index - 1,
+            part_index=table_part_index,
+        )
+        page_no = _positive_page_number((first_prov(table) or {}).get("page_no"))
+        page_size = (
+            (
+                (page_inventory.get("page_records") or {}).get(page_no)
+                or {}
+            ).get("size")
+            or None
+        )
+        manifest_entry, lookup_reasons = _structural_manifest_entry_for_ref(
+            provenance_manifest,
+            kind="tables",
+            source_ref=source_ref,
+            index=index,
+        )
+        verified, verify_reasons = _structural_provenance_verify(
+            output_dir,
+            manifest_entry,
+            current_source_ref=source_ref,
+            current_page_no=page_no,
+            current_bbox=(first_prov(table) or {}).get("bbox"),
+            current_body_identity=_table_grid_body_identity([]),
+            current_self_ref=str(table.get("self_ref") or ""),
+            current_part_index=table_part_index,
+            current_semantic_page_size=page_size,
+            expected_visual_pdf_sha256=expected_visual_pdf_sha256,
+            expected_semantic_pdf_sha256=expected_semantic_pdf_sha256,
+            expected_asset_path=f"tables/table_{index}.png",
+            expected_kind="table",
+        )
+        reasons = sorted(set(lookup_reasons + verify_reasons))
+        if verified and not lookup_reasons:
+            provenance_verified_refs.append(source_ref)
+        else:
+            provenance_mismatch_refs.append(source_ref)
+            provenance_diagnostics[source_ref] = reasons
         candidates.append(
             {
                 "table_index": index,
                 "image": f"tables/table_{index}.png",
-                "caption": " ".join(caption_texts),
-                "page_no": (first_prov(table) or {}).get("page_no"),
+                "caption": " ".join(caption_texts) or f"Table {index}",
+                "page_no": page_no,
+                "source_ref": source_ref,
+                "provenance_verified": verified and not lookup_reasons,
+                "provenance_reasons": reasons,
                 "reason": "empty_structural_grid_with_source_bbox_and_caption",
             }
         )
@@ -1400,8 +2136,51 @@ def inject_empty_table_visual_fallbacks(
     html_path = output_dir / "document.html"
     if candidates and html_path.exists():
         document_html = html_path.read_text(encoding="utf-8")
-        for candidate in candidates:
+
+        def fallback_figure(candidate: dict[str, Any], *, exact: bool = True) -> str:
+            suffix = " — exact source rendering from the original PDF" if exact else ""
+            return (
+                '<figure class="docling-table-visual-fallback" '
+                f'data-source-ref="{html.escape(str(candidate["source_ref"]), quote=True)}">'
+                f'<img src="{candidate["image"]}" '
+                f'alt="{html.escape(candidate["caption"], quote=True)}">'
+                f'<figcaption>{html.escape(candidate["caption"])}{suffix}</figcaption>'
+                "</figure>"
+            )
+
+        for candidate in reversed(candidates):
             target = _normalized_noise_text(candidate["caption"])
+            applied = False
+            matching_figures = []
+            for figure in re.finditer(
+                r'<figure\b[^>]*class="[^"]*\bsemantic-table\b[^"]*"[^>]*>'
+                r"(?P<body>.*?)</figure>",
+                document_html,
+                flags=re.I | re.S,
+            ):
+                table_match = re.search(
+                    r"<table\b(?P<attrs>[^>]*)>(?P<body>.*?)</table>",
+                    figure.group("body"),
+                    flags=re.I | re.S,
+                )
+                if (
+                    table_match
+                    and _html_source_ref(table_match.group("attrs"))
+                    == str(candidate["source_ref"])
+                    and not re.search(r"<(?:td|th)\b", table_match.group("body"), re.I)
+                ):
+                    matching_figures.append(figure)
+            if len(matching_figures) == 1:
+                figure = matching_figures[0]
+                document_html = (
+                    document_html[: figure.start()]
+                    + fallback_figure(candidate)
+                    + document_html[figure.end() :]
+                )
+                html_count += 1
+                applied = True
+            if applied:
+                continue
             for match in re.finditer(
                 r"<table\b[^>]*>(?P<body>.*?)</table>",
                 document_html,
@@ -1413,34 +2192,95 @@ def inject_empty_table_visual_fallbacks(
                 )
                 if visible != target:
                     continue
-                replacement = (
-                    '<figure class="docling-table-visual-fallback">'
-                    f'<img src="{candidate["image"]}" '
-                    f'alt="{html.escape(candidate["caption"], quote=True)}">'
-                    f'<figcaption>{html.escape(candidate["caption"])}</figcaption>'
-                    "</figure>"
-                )
+                replacement = fallback_figure(candidate, exact=False)
                 document_html = (
                     document_html[: match.start()]
                     + replacement
                     + document_html[match.end() :]
                 )
                 html_count += 1
+                applied = True
                 break
+            if applied:
+                continue
+            semantic_figures = list(
+                re.finditer(
+                    r'<figure\b[^>]*class="[^"]*\bsemantic-table\b[^"]*"[^>]*>'
+                    r"(?P<body>.*?)</figure>",
+                    document_html,
+                    flags=re.I | re.S,
+                )
+            )
+            table_index = int(candidate["table_index"]) - 1
+            if not (0 <= table_index < len(semantic_figures)):
+                continue
+            figure = semantic_figures[table_index]
+            figure_body = figure.group("body")
+            table_match = re.search(
+                r"<table\b[^>]*>(?P<body>.*?)</table>",
+                figure_body,
+                flags=re.I | re.S,
+            )
+            if table_match and re.search(r"<(?:td|th)\b", table_match.group("body"), re.I):
+                continue
+            replacement = fallback_figure(candidate)
+            document_html = (
+                document_html[: figure.start()]
+                + replacement
+                + document_html[figure.end() :]
+            )
+            html_count += 1
         html_path.write_text(document_html, encoding="utf-8")
+    final_html = html_path.read_text(encoding="utf-8") if html_path.exists() else ""
+    html_bound_refs: list[str] = []
+    for candidate in candidates:
+        source_ref = str(candidate["source_ref"])
+        blocks = [
+            match.group("body")
+            for match in re.finditer(
+                r'<figure\b(?P<attrs>[^>]*)class="[^"]*\bdocling-table-visual-fallback\b[^"]*"'
+                r'(?P<tail>[^>]*)>(?P<body>.*?)</figure>',
+                final_html,
+                flags=re.I | re.S,
+            )
+            if _html_source_ref(match.group("attrs") + match.group("tail"))
+            == source_ref
+        ]
+        if len(blocks) == 1 and str(candidate["image"]) in blocks[0]:
+            html_bound_refs.append(source_ref)
 
     markdown_count = 0
     md_path = output_dir / "document.md"
     if candidates and md_path.exists():
         document_markdown = md_path.read_text(encoding="utf-8")
         for candidate in candidates:
+            source_ref = str(candidate["source_ref"])
+            source_marker = f"<!-- source-table-ref:{source_ref} -->"
+            fallback_marker = f"<!-- source-empty-table-ref:{source_ref} -->"
+            source_evidence = (
+                source_marker
+                + "\n"
+                + fallback_marker
+                + "\n\n"
+                + f'![{candidate["caption"]}]({candidate["image"]})'
+            )
+            if document_markdown.count(source_marker) == 1:
+                document_markdown = document_markdown.replace(
+                    source_marker,
+                    source_evidence,
+                    1,
+                )
+                markdown_count += 1
+                continue
             caption_pattern = re.compile(
                 r"(?m)^(?P<caption>"
                 + re.escape(candidate["caption"])
                 + r")\s*$"
             )
             replacement = (
-                f'![{candidate["caption"]}]({candidate["image"]})\n\n'
+                fallback_marker
+                + "\n\n"
+                + f'![{candidate["caption"]}]({candidate["image"]})\n\n'
                 r"\g<caption>"
             )
             document_markdown, changed = caption_pattern.subn(
@@ -1450,32 +2290,1072 @@ def inject_empty_table_visual_fallbacks(
             )
             markdown_count += changed
         md_path.write_text(document_markdown, encoding="utf-8")
+    final_markdown = md_path.read_text(encoding="utf-8") if md_path.exists() else ""
+    markdown_bound_refs: list[str] = []
+    for candidate in candidates:
+        source_ref = str(candidate["source_ref"])
+        marker = f"<!-- source-empty-table-ref:{source_ref} -->"
+        if final_markdown.count(marker) != 1:
+            continue
+        start = final_markdown.index(marker)
+        next_marker = re.search(
+            r"<!--\s*source-(?:empty-table|table|code|algorithm)-ref:",
+            final_markdown[start + len(marker) :],
+            flags=re.I,
+        )
+        end = (
+            start + len(marker) + next_marker.start()
+            if next_marker
+            else len(final_markdown)
+        )
+        if str(candidate["image"]) in final_markdown[start:end]:
+            markdown_bound_refs.append(source_ref)
 
     return {
         "candidate_count": len(candidates),
         "html_applied_count": html_count,
         "markdown_applied_count": markdown_count,
+        "candidate_source_refs": [str(item["source_ref"]) for item in candidates],
+        "html_bound_source_refs": html_bound_refs,
+        "markdown_bound_source_refs": markdown_bound_refs,
+        "html_unbound_source_refs": sorted(
+            set(str(item["source_ref"]) for item in candidates)
+            - set(html_bound_refs)
+        ),
+        "markdown_unbound_source_refs": sorted(
+            set(str(item["source_ref"]) for item in candidates)
+            - set(markdown_bound_refs)
+        ),
+        "provenance_verified_refs": sorted(set(provenance_verified_refs)),
+        "provenance_mismatch_refs": sorted(set(provenance_mismatch_refs)),
+        "provenance_diagnostics": provenance_diagnostics,
         "candidates": candidates,
     }
+
+
+def _structural_node_source_ref(
+    node: dict[str, Any],
+    *,
+    kind: str,
+    fallback_index: int,
+    part_index: int | None = None,
+) -> str:
+    """Return the same stable source identity used by semantic reflow."""
+
+    source_ref = str(node.get("self_ref") or "").strip()
+    if source_ref:
+        source_ref = (
+            source_ref.replace("\r", " ")
+            .replace("\n", " ")
+            .replace("--", "- -")
+        )
+    else:
+        source_ref = f"{kind}:{fallback_index}"
+    if part_index is None:
+        candidate_part = node.get("_local_ai_lab_chunk_part_index")
+        if isinstance(candidate_part, int) and not isinstance(candidate_part, bool):
+            part_index = candidate_part
+    return f"chunk:{part_index}:{source_ref}" if part_index is not None else source_ref
+
+
+def _structural_node_part_index(node: dict[str, Any]) -> int | None:
+    value = node.get("_local_ai_lab_chunk_part_index")
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _structural_nodes_by_part_ref(
+    document_json: Any,
+) -> dict[tuple[int | None, str], dict[str, Any]]:
+    return {
+        (_structural_node_part_index(node), str(node.get("self_ref"))): node
+        for node in iter_nodes(document_json)
+        if isinstance(node, dict) and node.get("self_ref")
+    }
+
+
+_STRUCTURAL_BODY_TOKEN_RE = re.compile(
+    r"\\[A-Za-z]+|[A-Za-z_][A-Za-z0-9_]*|\d+(?:\.\d+)*|"
+    r"===|!==|==|!=|<=|>=|:=|->|<-|=>|\+\+|--|\*\*|//|&&|\|\||<<|>>|[^\s]"
+)
+
+
+def _structural_visible_body_text(value: str, *, html_markup: bool = False) -> str:
+    """Return visible structural body text without discarding operators."""
+
+    visible = value
+    if html_markup:
+        visible = re.sub(
+            r"<(?:script|style|template)\b.*?</(?:script|style|template)>",
+            " ",
+            visible,
+            flags=re.I | re.S,
+        )
+        # A source table footnote marker is part of the visible cell text.
+        # Remove only the hyperlink/superscript presentation wrapper; keeping
+        # the marker itself makes ``PDF*`` identical to ``PDF<sup>*</sup>``
+        # without weakening ordinary mathematical superscript checks.
+        visible = re.sub(
+            r"<sup\b(?=[^>]*(?:"
+            r"\bclass\s*=\s*[\"'][^\"']*\bfootnote[^\"']*[\"']|"
+            r"\bid\s*=\s*[\"'][^\"']*\bfnref-[^\"']*[\"']))[^>]*>",
+            "",
+            visible,
+            flags=re.I | re.S,
+        )
+        visible = re.sub(r"<sub\b[^>]*>", "_", visible, flags=re.I)
+        visible = re.sub(r"</sub\s*>", "", visible, flags=re.I)
+        visible = re.sub(r"<sup\b[^>]*>", "^", visible, flags=re.I)
+        visible = re.sub(r"</sup\s*>", "", visible, flags=re.I)
+        visible = re.sub(r"<br\s*/?>", "\n", visible, flags=re.I)
+        visible = re.sub(
+            r"</(?:p|pre|li|tr|section|article|h[1-6])\s*>",
+            "\n",
+            visible,
+            flags=re.I,
+        )
+        visible = re.sub(r"<[^>]+>", "", visible)
+    visible = html.unescape(visible)
+    visible = visible.translate(
+        str.maketrans(
+            {
+                "\u00a0": " ",
+                "−": "-",
+                "–": "-",
+                "—": "-",
+                "（": "(",
+                "）": ")",
+            }
+        )
+    )
+    return visible.replace("\r\n", "\n").replace("\r", "\n")
+
+
+def _structural_body_identity(value: str, *, html_markup: bool = False) -> str:
+    """Normalize presentation while retaining token order, variables, and operators."""
+
+    visible = _structural_visible_body_text(value, html_markup=html_markup)
+    visible = visible.replace(r"\(", "").replace(r"\)", "")
+    identities: list[str] = []
+    for line in visible.splitlines() or [visible]:
+        tokens = _STRUCTURAL_BODY_TOKEN_RE.findall(line)
+        if tokens:
+            identities.append(" ".join(tokens))
+    return "\n".join(identities)
+
+
+def _code_body_identity(value: str, *, html_markup: bool = False) -> str:
+    """Ignore physical code wrapping while retaining every semantic token."""
+
+    return " ".join(
+        _structural_body_identity(value, html_markup=html_markup).splitlines()
+    )
+
+
+def _algorithm_body_identity(value: str, *, html_markup: bool = False) -> str:
+    """Normalize algorithm line-number presentation and soft wrapping only."""
+
+    visible = _structural_visible_body_text(value, html_markup=html_markup)
+    lines = []
+    for line in visible.splitlines() or [visible]:
+        # HTML line-number spans omit the source colon.  The number and body
+        # token sequence remain authoritative, so normalize only that optional
+        # delimiter and then ignore physical wrapping within a step.
+        lines.append(re.sub(r"^\s*(\d{1,3})\s*:\s*", r"\1 ", line))
+    return " ".join(_structural_body_identity("\n".join(lines)).splitlines())
+
+
+def _table_grid_body_identity(grid: list[list[Any]]) -> str:
+    if not grid:
+        return ""
+
+    def cell_identity(value: Any) -> str:
+        # Soft wrapping and explicit <br> presentation inside a single cell do
+        # not alter table identity.  Cell/row boundaries stay encoded by the
+        # surrounding JSON grid, while token/operator order remains strict.
+        visible = re.sub(r"\s+", " ", str(value or "")).strip()
+        # Docling/PDF extraction can insert or remove spacing between a math
+        # symbol and its numeric index (``C 2``/``C2``, ``mn 2``/``mn2``).
+        # Normalize only letter-digit boundaries; letter-letter and all
+        # operators remain strict.
+        visible = re.sub(r"(?<=[A-Za-z])\s+(?=\d)", "", visible)
+        visible = re.sub(r"(?<=\d)\s+(?=[A-Za-z])", "", visible)
+        return _structural_body_identity(
+            visible,
+            html_markup=bool(re.search(r"</?[A-Za-z][^>]*>", visible)),
+        )
+
+    return json.dumps(
+        [[cell_identity(cell) for cell in row] for row in grid],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+
+
+def _structural_body_identity_sha256(kind: str, identity: str) -> str:
+    """Hash an already-normalized body without making an empty grid vacuous."""
+
+    return hashlib.sha256(
+        (str(kind).casefold() + "\0" + str(identity)).encode("utf-8")
+    ).hexdigest()
+
+
+def _structural_bbox_snapshot(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    origin = _bbox_explicit_coord_origin(value)
+    if origin is None:
+        return None
+    try:
+        result = {
+            key: float(value[key])
+            for key in ("l", "r", "t", "b")
+        }
+    except (KeyError, TypeError, ValueError):
+        return None
+    result["coord_origin"] = origin
+    return result
+
+
+def _structural_page_size_snapshot(value: Any) -> dict[str, float] | None:
+    if not isinstance(value, dict):
+        return None
+    try:
+        width = float(value.get("width") or 0.0)
+        height = float(value.get("height") or 0.0)
+    except (TypeError, ValueError):
+        return None
+    if width <= 0.0 or height <= 0.0:
+        return None
+    return {"width": width, "height": height}
+
+
+def _structural_geometry_compatibility(
+    semantic_page_size: Any,
+    visual_page_size: Any,
+) -> dict[str, Any]:
+    semantic = _structural_page_size_snapshot(semantic_page_size)
+    visual = _structural_page_size_snapshot(visual_page_size)
+    if semantic is None or visual is None:
+        return {
+            "compatible": False,
+            "reason": "missing_page_size",
+            "scale_x": None,
+            "scale_y": None,
+        }
+    scale_x = visual["width"] / semantic["width"]
+    scale_y = visual["height"] / semantic["height"]
+    relative_delta = abs(scale_x - scale_y) / max(scale_x, scale_y, 1e-12)
+    absolute_scale_delta = max(abs(scale_x - 1.0), abs(scale_y - 1.0))
+    compatible = relative_delta <= 0.01 and absolute_scale_delta <= 0.005
+    return {
+        "compatible": compatible,
+        "reason": (
+            None
+            if compatible
+            else (
+                "page_aspect_ratio_mismatch"
+                if relative_delta > 0.01
+                else "semantic_visual_page_size_mismatch"
+            )
+        ),
+        "scale_x": scale_x,
+        "scale_y": scale_y,
+    }
+
+
+def _structural_visual_provenance_entry(
+    *,
+    kind: str,
+    index: int,
+    source_ref: str,
+    node: dict[str, Any] | None,
+    body_identity: str,
+    metric: dict[str, Any] | None,
+    node_bbox: Any,
+    part_index: int | None,
+    semantic_pdf_sha256: str | None,
+    conversion_pdf_sha256: str | None,
+    semantic_page_size: Any = None,
+    crop_coordinate_page_size: Any = None,
+    source_node_bindings: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    metric = metric if isinstance(metric, dict) else {}
+    visual_page_size = _structural_page_size_snapshot(metric.get("page_size"))
+    semantic_page_size = _structural_page_size_snapshot(semantic_page_size)
+    page_no = _positive_page_number(metric.get("page_no"))
+    if page_no is None and isinstance(node, dict):
+        page_no = _positive_page_number((first_prov(node) or {}).get("page_no"))
+    source_node_bindings = list(source_node_bindings or [])
+    if not source_node_bindings and isinstance(node, dict):
+        source_node_bindings = [
+            {
+                "source_ref": source_ref,
+                "self_ref": str(node.get("self_ref") or ""),
+                "part_index": part_index,
+                "page_no": page_no,
+                "bbox": _structural_bbox_snapshot(node_bbox),
+                "body_identity_sha256": _structural_body_identity_sha256(
+                    str(kind), body_identity
+                ),
+            }
+        ]
+    return {
+        "version": STRUCTURAL_VISUAL_PROVENANCE_VERSION,
+        "kind": str(kind),
+        "index": int(index),
+        "source_ref": str(source_ref),
+        "self_ref": str((node or {}).get("self_ref") or ""),
+        "part_index": part_index,
+        "page_no": page_no,
+        "node_bbox": _structural_bbox_snapshot(node_bbox),
+        "crop_bbox": _structural_bbox_snapshot(metric.get("bbox")),
+        "padding_px": metric.get("padding_px"),
+        "render_scale": metric.get("render_scale"),
+        "pixel_box": list(metric.get("pixel_box") or []),
+        "page_size": visual_page_size,
+        "semantic_page_size": semantic_page_size,
+        "crop_coordinate_page_size": (
+            _structural_page_size_snapshot(crop_coordinate_page_size)
+            or visual_page_size
+        ),
+        "page_image_size": metric.get("page_image_size"),
+        "page_image_path": str(metric.get("page_image_path") or ""),
+        "page_image_sha256": str(metric.get("page_image_sha256") or "").lower(),
+        "asset_path": str(metric.get("path") or ""),
+        "asset_sha256": str(metric.get("asset_sha256") or "").lower(),
+        "visual_pdf_sha256": str(metric.get("source_pdf_sha256") or "").lower(),
+        "semantic_pdf_sha256": str(semantic_pdf_sha256 or "").lower(),
+        "conversion_pdf_sha256": str(conversion_pdf_sha256 or "").lower(),
+        "geometry_compatibility": _structural_geometry_compatibility(
+            semantic_page_size,
+            visual_page_size,
+        ),
+        "structural_body_identity_sha256": _structural_body_identity_sha256(
+            str(kind), body_identity
+        ),
+        "source_node_bindings": source_node_bindings,
+    }
+
+
+def _strict_output_asset_path(output_dir: Path, relative_value: Any) -> Path | None:
+    relative = Path(str(relative_value or ""))
+    if not str(relative) or relative.is_absolute() or ".." in relative.parts:
+        return None
+    if output_dir.is_symlink():
+        return None
+    candidate = output_dir / relative
+    current = output_dir
+    for part in relative.parts:
+        current = current / part
+        if current.is_symlink():
+            return None
+    try:
+        candidate.resolve(strict=False).relative_to(output_dir.resolve())
+    except (OSError, ValueError):
+        return None
+    return candidate if candidate.is_file() and not candidate.is_symlink() else None
+
+
+def _structural_provenance_verify(
+    output_dir: Path,
+    entry: Any,
+    *,
+    current_source_ref: str,
+    current_page_no: Any,
+    current_bbox: Any,
+    current_body_identity: str,
+    current_self_ref: str = "",
+    current_part_index: int | None = None,
+    current_semantic_page_size: Any = None,
+    expected_visual_pdf_sha256: str | None,
+    expected_semantic_pdf_sha256: str | None = None,
+    expected_asset_path: str | None = None,
+    expected_kind: str | None = None,
+) -> tuple[bool, list[str]]:
+    """Recompute every file/geometry/body binding used by a structural crop."""
+
+    reasons: list[str] = []
+    if not isinstance(entry, dict):
+        return False, ["missing_manifest_entry"]
+    if entry.get("version") != STRUCTURAL_VISUAL_PROVENANCE_VERSION:
+        reasons.append("manifest_version_mismatch")
+    if expected_kind and str(entry.get("kind") or "") != expected_kind:
+        reasons.append("structural_kind_mismatch")
+    if str(entry.get("source_ref") or "") != str(current_source_ref):
+        reasons.append("source_ref_mismatch")
+    if str(entry.get("self_ref") or "") != str(current_self_ref or ""):
+        reasons.append("self_ref_mismatch")
+    if entry.get("part_index") != current_part_index:
+        reasons.append("part_index_mismatch")
+    page_no = _positive_page_number(entry.get("page_no"))
+    if page_no is None or page_no != _positive_page_number(current_page_no):
+        reasons.append("page_no_mismatch")
+    entry_bbox = _structural_bbox_snapshot(entry.get("node_bbox"))
+    current_bbox_snapshot = _structural_bbox_snapshot(current_bbox)
+    if entry_bbox is None or current_bbox_snapshot is None:
+        reasons.append("missing_node_bbox_or_origin")
+    elif any(
+        entry_bbox[key] != current_bbox_snapshot[key]
+        for key in ("l", "r", "t", "b", "coord_origin")
+    ):
+        reasons.append("node_bbox_mismatch")
+    expected_body_sha = _structural_body_identity_sha256(
+        str(entry.get("kind") or ""), current_body_identity
+    )
+    if (
+        not re.fullmatch(
+            r"[0-9a-f]{64}",
+            str(entry.get("structural_body_identity_sha256") or "").lower(),
+        )
+        or str(entry.get("structural_body_identity_sha256") or "").lower()
+        != expected_body_sha
+    ):
+        reasons.append("structural_body_identity_mismatch")
+
+    expected_visual_sha = str(expected_visual_pdf_sha256 or "").strip().lower()
+    declared_visual_sha = str(entry.get("visual_pdf_sha256") or "").lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", expected_visual_sha):
+        reasons.append("missing_expected_visual_pdf_sha256")
+    if (
+        not re.fullmatch(r"[0-9a-f]{64}", declared_visual_sha)
+        or declared_visual_sha != expected_visual_sha
+    ):
+        reasons.append("visual_pdf_sha256_mismatch")
+    declared_semantic_sha = str(entry.get("semantic_pdf_sha256") or "").lower()
+    declared_conversion_sha = str(entry.get("conversion_pdf_sha256") or "").lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", declared_semantic_sha):
+        reasons.append("missing_semantic_pdf_sha256")
+    if not re.fullmatch(r"[0-9a-f]{64}", declared_conversion_sha):
+        reasons.append("missing_conversion_pdf_sha256")
+    if expected_semantic_pdf_sha256:
+        expected_semantic_sha = str(expected_semantic_pdf_sha256).strip().lower()
+        if declared_semantic_sha != expected_semantic_sha:
+            reasons.append("semantic_pdf_sha256_mismatch")
+        if declared_conversion_sha != expected_semantic_sha:
+            reasons.append("conversion_pdf_sha256_mismatch")
+
+    visual_page_size = _structural_page_size_snapshot(entry.get("page_size"))
+    semantic_page_size = _structural_page_size_snapshot(
+        entry.get("semantic_page_size")
+    )
+    current_semantic_size = _structural_page_size_snapshot(
+        current_semantic_page_size
+    )
+    if visual_page_size is None or semantic_page_size is None:
+        reasons.append("missing_page_size")
+    if (
+        current_semantic_size is not None
+        and semantic_page_size is not None
+        and current_semantic_size != semantic_page_size
+    ):
+        reasons.append("semantic_page_size_mismatch")
+    compatibility = entry.get("geometry_compatibility")
+    if not isinstance(compatibility, dict) or compatibility.get("compatible") is not True:
+        reasons.append("visual_semantic_geometry_incompatible")
+    if entry_bbox is not None and semantic_page_size is not None:
+        if (
+            entry_bbox["l"] < 0.0
+            or entry_bbox["r"] <= entry_bbox["l"]
+            or entry_bbox["r"] > semantic_page_size["width"]
+            or min(entry_bbox["t"], entry_bbox["b"]) < 0.0
+            or max(entry_bbox["t"], entry_bbox["b"])
+            > semantic_page_size["height"]
+            or entry_bbox["t"] == entry_bbox["b"]
+        ):
+            reasons.append("node_bbox_out_of_page_bounds")
+
+    page_image_path = _strict_output_asset_path(
+        output_dir, entry.get("page_image_path")
+    )
+    expected_page_path = f"pages/page_{page_no}.png" if page_no else ""
+    if str(entry.get("page_image_path") or "") != expected_page_path:
+        reasons.append("page_image_path_mismatch")
+    declared_page_sha = str(entry.get("page_image_sha256") or "").lower()
+    if page_image_path is None:
+        reasons.append("page_image_missing_or_unsafe")
+    elif not re.fullmatch(r"[0-9a-f]{64}", declared_page_sha):
+        reasons.append("missing_page_image_sha256")
+    else:
+        try:
+            if file_sha256(page_image_path) != declared_page_sha:
+                reasons.append("page_image_sha256_mismatch")
+        except OSError:
+            reasons.append("page_image_hash_failed")
+
+    asset_path_value = str(entry.get("asset_path") or "")
+    if expected_asset_path and asset_path_value != expected_asset_path:
+        reasons.append("asset_path_mismatch")
+    asset_path = _strict_output_asset_path(output_dir, asset_path_value)
+    declared_asset_sha = str(entry.get("asset_sha256") or "").lower()
+    if asset_path is None:
+        reasons.append("asset_missing_or_unsafe")
+    elif not re.fullmatch(r"[0-9a-f]{64}", declared_asset_sha):
+        reasons.append("missing_asset_sha256")
+    else:
+        try:
+            if file_sha256(asset_path) != declared_asset_sha:
+                reasons.append("asset_sha256_mismatch")
+        except OSError:
+            reasons.append("asset_hash_failed")
+
+    crop_bbox = _structural_bbox_snapshot(entry.get("crop_bbox"))
+    coordinate_page_size = _structural_page_size_snapshot(
+        entry.get("crop_coordinate_page_size")
+    )
+    page_image_size = entry.get("page_image_size")
+    try:
+        image_width = int((page_image_size or {}).get("width") or 0)
+        image_height = int((page_image_size or {}).get("height") or 0)
+        padding = int(entry.get("padding_px"))
+    except (TypeError, ValueError):
+        image_width = image_height = 0
+        padding = -1
+    declared_pixel_box = entry.get("pixel_box")
+    render_scale: float | None = None
+    if entry.get("render_scale") is not None:
+        try:
+            render_scale = float(entry.get("render_scale"))
+        except (TypeError, ValueError):
+            render_scale = None
+            reasons.append("invalid_render_scale")
+        else:
+            if render_scale <= 0.0:
+                render_scale = None
+                reasons.append("invalid_render_scale")
+    if (
+        crop_bbox is None
+        or coordinate_page_size is None
+        or image_width <= 0
+        or image_height <= 0
+        or padding < 0
+        or not isinstance(declared_pixel_box, list)
+        or len(declared_pixel_box) != 4
+    ):
+        reasons.append("missing_crop_geometry")
+    else:
+        recomputed = _bbox_pixel_crop_box(
+            crop_bbox,
+            page_width=coordinate_page_size["width"],
+            page_height=coordinate_page_size["height"],
+            image_width=image_width,
+            image_height=image_height,
+            padding=padding,
+            render_scale=render_scale,
+        )
+        if recomputed is None or list(recomputed) != declared_pixel_box:
+            reasons.append("pixel_box_mismatch")
+    return not reasons, sorted(set(reasons))
+
+
+def _structural_manifest_entry_for_ref(
+    manifest: Any,
+    *,
+    kind: str,
+    source_ref: str,
+    index: int | None = None,
+) -> tuple[dict[str, Any] | None, list[str]]:
+    if not isinstance(manifest, dict):
+        return None, ["missing_structural_visual_provenance_manifest"]
+    entries = manifest.get(str(kind))
+    if not isinstance(entries, list):
+        return None, [f"missing_{kind}_provenance_inventory"]
+    matches = [
+        item
+        for item in entries
+        if isinstance(item, dict)
+        and str(item.get("source_ref") or "") == str(source_ref)
+        and (index is None or item.get("index") == index)
+    ]
+    if len(matches) != 1:
+        return None, [
+            f"{kind}_provenance_entry_"
+            + ("missing" if not matches else "ambiguous")
+        ]
+    return matches[0], []
+
+
+def _structural_expected_visual_pdf_sha256(metadata: Any) -> str | None:
+    if not isinstance(metadata, dict):
+        return None
+    value = str(metadata.get("visual_evidence_input_sha256") or "").strip().lower()
+    return value if re.fullmatch(r"[0-9a-f]{64}", value) else None
+
+
+def _structural_expected_semantic_pdf_sha256(metadata: Any) -> str | None:
+    if not isinstance(metadata, dict):
+        return None
+    value = str(
+        metadata.get("conversion_input_sha256")
+        or metadata.get("input_sha256")
+        or ""
+    ).strip().lower()
+    return value if re.fullmatch(r"[0-9a-f]{64}", value) else None
+
+
+def _replace_structural_manifest_entry(
+    manifest: dict[str, Any] | None,
+    *,
+    inventory: str,
+    entry: dict[str, Any],
+) -> None:
+    if not isinstance(manifest, dict):
+        return
+    values = manifest.setdefault(inventory, [])
+    if not isinstance(values, list):
+        values = []
+        manifest[inventory] = values
+    values[:] = [
+        value
+        for value in values
+        if not (
+            isinstance(value, dict)
+            and value.get("index") == entry.get("index")
+            and str(value.get("source_ref") or "")
+            == str(entry.get("source_ref") or "")
+        )
+    ]
+    values.append(entry)
+
+
+def _structural_page_manifest_verify(
+    output_dir: Path,
+    manifest: Any,
+    *,
+    page_no: int,
+    expected_visual_pdf_sha256: str | None,
+    current_semantic_page_size: Any,
+) -> tuple[bool, list[str], dict[str, Any] | None]:
+    reasons: list[str] = []
+    if not isinstance(manifest, dict):
+        return False, ["missing_structural_visual_provenance_manifest"], None
+    pages = manifest.get("pages")
+    entry = pages.get(str(page_no)) if isinstance(pages, dict) else None
+    if not isinstance(entry, dict):
+        return False, ["missing_page_provenance_entry"], None
+    if _positive_page_number(entry.get("page_no")) != page_no:
+        reasons.append("page_manifest_page_no_mismatch")
+    expected_path = f"pages/page_{page_no}.png"
+    if str(entry.get("path") or "") != expected_path:
+        reasons.append("page_manifest_path_mismatch")
+    expected_visual = str(expected_visual_pdf_sha256 or "").lower()
+    declared_visual = str(entry.get("visual_pdf_sha256") or "").lower()
+    manifest_visual = str(manifest.get("visual_pdf_sha256") or "").lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", expected_visual):
+        reasons.append("missing_expected_visual_pdf_sha256")
+    if declared_visual != expected_visual or manifest_visual != expected_visual:
+        reasons.append("page_manifest_visual_pdf_sha256_mismatch")
+    semantic_size = _structural_page_size_snapshot(current_semantic_page_size)
+    recorded_semantic_size = _structural_page_size_snapshot(
+        entry.get("semantic_page_size")
+    )
+    visual_size = _structural_page_size_snapshot(entry.get("page_size"))
+    if semantic_size is None or recorded_semantic_size is None or visual_size is None:
+        reasons.append("page_manifest_missing_page_size")
+    else:
+        if semantic_size != recorded_semantic_size:
+            reasons.append("page_manifest_semantic_page_size_mismatch")
+        if not _structural_geometry_compatibility(
+            recorded_semantic_size,
+            visual_size,
+        ).get("compatible"):
+            reasons.append("page_manifest_geometry_incompatible")
+    page_path = _strict_output_asset_path(output_dir, expected_path)
+    declared_hash = str(entry.get("page_image_sha256") or "").lower()
+    if page_path is None:
+        reasons.append("page_manifest_image_missing_or_unsafe")
+    elif not re.fullmatch(r"[0-9a-f]{64}", declared_hash):
+        reasons.append("page_manifest_missing_image_sha256")
+    else:
+        try:
+            if file_sha256(page_path) != declared_hash:
+                reasons.append("page_manifest_image_sha256_mismatch")
+        except OSError:
+            reasons.append("page_manifest_image_hash_failed")
+    return not reasons, sorted(set(reasons)), entry
+
+
+def _structural_entry_page_manifest_reasons(
+    entry: Any,
+    page_entry: Any,
+) -> list[str]:
+    if not isinstance(entry, dict) or not isinstance(page_entry, dict):
+        return ["missing_entry_or_page_manifest_binding"]
+    reasons: list[str] = []
+    for entry_key, page_key in (
+        ("page_no", "page_no"),
+        ("page_image_path", "path"),
+        ("page_image_sha256", "page_image_sha256"),
+        ("visual_pdf_sha256", "visual_pdf_sha256"),
+        ("page_size", "page_size"),
+        ("semantic_page_size", "semantic_page_size"),
+        ("page_image_size", "page_image_size"),
+    ):
+        if entry.get(entry_key) != page_entry.get(page_key):
+            reasons.append(f"entry_page_manifest_{entry_key}_mismatch")
+    return reasons
+
+
+def _html_source_ref(attrs: str) -> str | None:
+    match = re.search(
+        r"\bdata-source-ref\s*=\s*([\"'])(?P<value>.*?)\1",
+        attrs,
+        flags=re.I | re.S,
+    )
+    return html.unescape(match.group("value")) if match else None
+
+
+def _html_table_grid_for_source_ref(
+    document_html: str,
+    source_ref: str,
+) -> list[list[str]] | None:
+    matches = [
+        match
+        for match in re.finditer(
+            r"<table\b(?P<attrs>[^>]*)>(?P<body>.*?)</table>",
+            document_html,
+            flags=re.I | re.S,
+        )
+        if _html_source_ref(match.group("attrs")) == source_ref
+    ]
+    if len(matches) != 1:
+        return None
+    row_matches = list(
+        re.finditer(
+            r"<tr\b[^>]*>(?P<body>.*?)</tr>",
+            matches[0].group("body"),
+            flags=re.I | re.S,
+        )
+    )
+    if not row_matches:
+        return None
+    values: dict[tuple[int, int], str] = {}
+    covered: set[tuple[int, int]] = set()
+    maximum_row = len(row_matches)
+    maximum_column = 0
+    for row_index, row_match in enumerate(row_matches):
+        column = 0
+        cells = list(
+            re.finditer(
+                r"<(?:td|th)\b(?P<attrs>[^>]*)>(?P<body>.*?)</(?:td|th)>",
+                row_match.group("body"),
+                flags=re.I | re.S,
+            )
+        )
+        for cell in cells:
+            while (row_index, column) in covered:
+                column += 1
+            attrs = cell.group("attrs")
+            rowspan_match = re.search(r"\browspan\s*=\s*[\"']?(\d+)", attrs, re.I)
+            colspan_match = re.search(r"\bcolspan\s*=\s*[\"']?(\d+)", attrs, re.I)
+            rowspan = max(1, int(rowspan_match.group(1)) if rowspan_match else 1)
+            colspan = max(1, int(colspan_match.group(1)) if colspan_match else 1)
+            values[(row_index, column)] = _structural_visible_body_text(
+                cell.group("body"),
+                html_markup=True,
+            )
+            for covered_row in range(row_index, row_index + rowspan):
+                for covered_column in range(column, column + colspan):
+                    if covered_row != row_index or covered_column != column:
+                        covered.add((covered_row, covered_column))
+                        values.setdefault((covered_row, covered_column), "")
+            maximum_row = max(maximum_row, row_index + rowspan)
+            maximum_column = max(maximum_column, column + colspan)
+            column += colspan
+        maximum_column = max(maximum_column, column)
+    if maximum_column <= 0:
+        return None
+    return [
+        [values.get((row, column), "") for column in range(maximum_column)]
+        for row in range(maximum_row)
+    ]
+
+
+def _markdown_marker_range(
+    document_markdown: str,
+    *,
+    kind: str,
+    source_ref: str,
+) -> tuple[int, int] | None:
+    marker = f"<!-- source-{kind}-ref:{source_ref} -->"
+    masked_markdown = _markdown_mask_code(document_markdown)
+    marker_matches = list(re.finditer(re.escape(marker), masked_markdown))
+    if len(marker_matches) != 1:
+        return None
+    start = marker_matches[0].end()
+    next_marker = re.search(
+        r"<!--\s*source-(?:table|code|algorithm)-ref:",
+        masked_markdown[start:],
+        flags=re.I,
+    )
+    end = start + next_marker.start() if next_marker else len(document_markdown)
+    appendix = re.search(
+        r"(?m)^## Original (?:table|code|algorithm) renderings\s*$",
+        masked_markdown[start:end],
+        flags=re.I,
+    )
+    if appendix:
+        end = start + appendix.start()
+    return start, end
+
+
+def _markdown_marker_window(
+    document_markdown: str,
+    *,
+    kind: str,
+    source_ref: str,
+) -> str | None:
+    marker_range = _markdown_marker_range(
+        document_markdown,
+        kind=kind,
+        source_ref=source_ref,
+    )
+    if marker_range is None:
+        return None
+    return document_markdown[marker_range[0] : marker_range[1]]
+
+
+def _split_markdown_table_row(line: str) -> list[str]:
+    row = line.strip()
+    if row.startswith("|"):
+        row = row[1:]
+    if row.endswith("|") and not row.endswith(r"\|"):
+        row = row[:-1]
+    cells = re.split(r"(?<!\\)\|", row)
+    visible_cells: list[str] = []
+    for cell in cells:
+        visible = cell.replace(r"\|", "|")
+        visible = re.sub(r"<br\s*/?>", " ", visible, flags=re.I)
+        visible = _markdown_link_labels(visible)
+        visible = re.sub(r"`([^`]*)`", r"\1", visible)
+        visible = re.sub(r"\*\*(?=\S)(.*?\S)\*\*", r"\1", visible)
+        visible = re.sub(r"__(?=\S)(.*?\S)__", r"\1", visible)
+        visible = re.sub(r"\[\^([^\]]+)\]", "", visible)
+        visible = re.sub(r"\\([\\`*_{}\[\]()#+.!|>\-])", r"\1", visible)
+        visible_cells.append(visible.strip())
+    return visible_cells
+
+
+def _markdown_link_labels(value: str) -> str:
+    """Remove Markdown link destinations while preserving nested labels.
+
+    Author-year table citations commonly render as
+    ``[Author [2026]](#ref-7)``.  A flat regular expression stops at the inner
+    bracket and leaves the destination in the structural identity.  This
+    bounded scanner understands balanced brackets/parentheses and changes no
+    bracketed text that is not actually followed by a link target.
+    """
+
+    output: list[str] = []
+    index = 0
+    while index < len(value):
+        image = value[index] == "!" and index + 1 < len(value) and value[index + 1] == "["
+        bracket = index + 1 if image else index
+        if value[bracket : bracket + 1] != "[":
+            output.append(value[index])
+            index += 1
+            continue
+        depth = 1
+        cursor = bracket + 1
+        while cursor < len(value) and depth:
+            if value[cursor] == "\\":
+                cursor += 2
+                continue
+            if value[cursor] == "[":
+                depth += 1
+            elif value[cursor] == "]":
+                depth -= 1
+            cursor += 1
+        if depth or cursor >= len(value) or value[cursor] != "(":
+            output.append(value[index])
+            index += 1
+            continue
+        target_depth = 1
+        target_end = cursor + 1
+        while target_end < len(value) and target_depth:
+            if value[target_end] == "\\":
+                target_end += 2
+                continue
+            if value[target_end] == "(":
+                target_depth += 1
+            elif value[target_end] == ")":
+                target_depth -= 1
+            target_end += 1
+        if target_depth:
+            output.append(value[index])
+            index += 1
+            continue
+        label = value[bracket + 1 : cursor - 1]
+        output.append(_markdown_link_labels(label))
+        index = target_end
+    return "".join(output)
+
+
+def _markdown_table_grid_for_source_ref(
+    document_markdown: str,
+    source_ref: str,
+) -> list[list[str]] | None:
+    window = _markdown_marker_window(
+        document_markdown,
+        kind="table",
+        source_ref=source_ref,
+    )
+    if window is None:
+        return None
+    lines = window.splitlines()
+    for separator_index, line in enumerate(lines):
+        if "|" not in line or separator_index == 0:
+            continue
+        separator_cells = _split_markdown_table_row(line)
+        if not separator_cells or not all(
+            re.fullmatch(r":?-{1,}:?", cell.strip())
+            for cell in separator_cells
+        ):
+            continue
+        header = _split_markdown_table_row(lines[separator_index - 1])
+        if "|" not in lines[separator_index - 1]:
+            continue
+        rows = [header]
+        for body_line in lines[separator_index + 1 :]:
+            if "|" not in body_line:
+                break
+            rows.append(_split_markdown_table_row(body_line))
+        width = max((len(row) for row in rows), default=0)
+        if width <= 0:
+            return None
+        return [row + [""] * (width - len(row)) for row in rows]
+    return None
+
+
+def _html_section_pre_body_for_source_ref(
+    document_html: str,
+    *,
+    css_class: str,
+    source_ref: str,
+) -> str | None:
+    bodies: list[str] = []
+    for section in re.finditer(
+        r"<section\b(?P<attrs>[^>]*)>(?P<body>.*?)</section>",
+        document_html,
+        flags=re.I | re.S,
+    ):
+        class_match = re.search(
+            r"\bclass\s*=\s*([\"'])(?P<value>.*?)\1",
+            section.group("attrs"),
+            flags=re.I | re.S,
+        )
+        classes = set((class_match.group("value") if class_match else "").split())
+        if css_class not in classes:
+            continue
+        for pre in re.finditer(
+            r"<pre\b(?P<attrs>[^>]*)>\s*(?:<code\b[^>]*>)?"
+            r"(?P<body>.*?)(?:</code>\s*)?</pre>",
+            section.group("body"),
+            flags=re.I | re.S,
+        ):
+            if _html_source_ref(pre.group("attrs")) == source_ref:
+                bodies.append(pre.group("body"))
+    return bodies[0] if len(bodies) == 1 else None
+
+
+def _html_section_range_for_source_ref(
+    document_html: str,
+    *,
+    css_class: str,
+    source_ref: str,
+) -> tuple[int, int] | None:
+    ranges: list[tuple[int, int]] = []
+    for section in re.finditer(
+        r"<section\b(?P<attrs>[^>]*)>(?P<body>.*?)</section>",
+        document_html,
+        flags=re.I | re.S,
+    ):
+        class_match = re.search(
+            r"\bclass\s*=\s*([\"'])(?P<value>.*?)\1",
+            section.group("attrs"),
+            flags=re.I | re.S,
+        )
+        classes = set((class_match.group("value") if class_match else "").split())
+        if css_class not in classes:
+            continue
+        if any(
+            _html_source_ref(pre.group("attrs")) == source_ref
+            for pre in re.finditer(
+                r"<pre\b(?P<attrs>[^>]*)>",
+                section.group("body"),
+                flags=re.I | re.S,
+            )
+        ):
+            ranges.append((section.start(), section.end()))
+    return ranges[0] if len(ranges) == 1 else None
+
+
+def _markdown_fenced_body_for_source_ref(
+    document_markdown: str,
+    *,
+    kind: str,
+    source_ref: str,
+) -> str | None:
+    window = _markdown_marker_window(
+        document_markdown,
+        kind=kind,
+        source_ref=source_ref,
+    )
+    if window is None:
+        return None
+    fences = _markdown_fenced_ranges(window)
+    if len(fences) != 1:
+        return None
+    start, end = fences[0]
+    block = window[start:end]
+    lines = block.splitlines(keepends=True)
+    if len(lines) < 2:
+        return None
+    opening = lines[0]
+    fence_marker = re.search(r"`{3,}|~{3,}", opening)
+    if fence_marker is None:
+        return None
+    closing = _markdown_strip_container_prefix(lines[-1])
+    if not re.fullmatch(
+        rf"[ \t]{{0,3}}{re.escape(fence_marker.group(0)[0])}"
+        rf"{{{len(fence_marker.group(0))},}}[ \t]*",
+        closing,
+    ):
+        return None
+    container_prefix = opening[: fence_marker.start()] if fence_marker else ""
+    body_lines = lines[1:-1]
+    if container_prefix:
+        body_lines = [
+            line[len(container_prefix) :]
+            if line.startswith(container_prefix)
+            else line
+            for line in body_lines
+        ]
+    return "".join(body_lines)
 
 
 def append_structured_table_source_renderings(
     output_dir: Path,
     document_json: Any,
     tables: list[dict[str, Any]],
+    *,
+    provenance_manifest: dict[str, Any] | None = None,
+    expected_visual_pdf_sha256: str | None = None,
+    expected_semantic_pdf_sha256: str | None = None,
 ) -> dict[str, Any]:
     """Append exact PDF crops for non-empty tables without replacing structure."""
-    nodes_by_ref = {
-        str(node.get("self_ref")): node
-        for node in iter_nodes(document_json)
-        if isinstance(node, dict) and node.get("self_ref")
-    }
+    nodes_by_ref = _structural_nodes_by_part_ref(document_json)
+    page_inventory = _document_page_size_inventory(document_json)
     candidates: list[dict[str, Any]] = []
+    expected_body_identity_by_ref: dict[str, str] = {}
+    provenance_verified_refs: list[str] = []
+    provenance_mismatch_refs: list[str] = []
+    provenance_diagnostics: dict[str, list[str]] = {}
     for index, table in enumerate(tables, start=1):
-        data = table.get("data") or {}
-        if not (
-            data.get("table_cells") or data.get("num_rows") or data.get("num_cols")
-        ):
+        table_part_index = _structural_node_part_index(table)
+        source_grid = table_grid(table)
+        # Raw 0x0 tables are certified by the explicit visual-fallback gate,
+        # not by pretending that an absent semantic table body has identity.
+        if not source_grid:
             continue
         image_path = output_dir / "tables" / f"table_{index}.png"
         if not image_path.exists():
@@ -1483,18 +3363,67 @@ def append_structured_table_source_renderings(
         caption_texts: list[str] = []
         for caption in table.get("captions") or []:
             reference = str(caption.get("$ref") or "")
-            text = str((nodes_by_ref.get(reference) or {}).get("text") or "").strip()
+            text = str(
+                (nodes_by_ref.get((table_part_index, reference)) or {}).get("text")
+                or ""
+            ).strip()
             if text:
                 caption_texts.append(text)
         caption = " ".join(caption_texts) or f"Table {index}"
         if re.match(r"(?i)^Figure\b", caption):
             caption = f"Table {index}"
+        source_ref = _structural_node_source_ref(
+            table,
+            kind="table",
+            fallback_index=index - 1,
+            part_index=table_part_index,
+        )
+        expected_identity = _table_grid_body_identity(source_grid)
+        expected_body_identity_by_ref[source_ref] = expected_identity
+        page_no = _positive_page_number((first_prov(table) or {}).get("page_no"))
+        page_size = (
+            (
+                (page_inventory.get("page_records") or {}).get(page_no)
+                or {}
+            ).get("size")
+            or None
+        )
+        manifest_entry, lookup_reasons = _structural_manifest_entry_for_ref(
+            provenance_manifest,
+            kind="tables",
+            source_ref=source_ref,
+            index=index,
+        )
+        verified, verify_reasons = _structural_provenance_verify(
+            output_dir,
+            manifest_entry,
+            current_source_ref=source_ref,
+            current_page_no=page_no,
+            current_bbox=(first_prov(table) or {}).get("bbox"),
+            current_body_identity=expected_identity,
+            current_self_ref=str(table.get("self_ref") or ""),
+            current_part_index=table_part_index,
+            current_semantic_page_size=page_size,
+            expected_visual_pdf_sha256=expected_visual_pdf_sha256,
+            expected_semantic_pdf_sha256=expected_semantic_pdf_sha256,
+            expected_asset_path=f"tables/table_{index}.png",
+            expected_kind="table",
+        )
+        reasons = sorted(set(lookup_reasons + verify_reasons))
+        if verified and not lookup_reasons:
+            provenance_verified_refs.append(source_ref)
+        else:
+            provenance_mismatch_refs.append(source_ref)
+            provenance_diagnostics[source_ref] = reasons
         candidates.append(
             {
                 "table_index": index,
                 "image": f"tables/table_{index}.png",
                 "caption": caption,
-                "page_no": (first_prov(table) or {}).get("page_no"),
+                "page_no": page_no,
+                "source_ref": source_ref,
+                "provenance_verified": verified and not lookup_reasons,
+                "provenance_reasons": reasons,
             }
         )
 
@@ -1502,111 +3431,1187 @@ def append_structured_table_source_renderings(
     html_path = output_dir / "document.html"
     if candidates and html_path.exists():
         document_html = html_path.read_text(encoding="utf-8")
-        figures = "\n".join(
-            (
+        def evidence_figure(candidate: dict[str, Any]) -> str:
+            return (
                 '<figure class="docling-table-source-evidence">'
+                f'<span hidden data-source-ref="{html.escape(str(candidate["source_ref"]), quote=True)}"></span>'
                 f'<img src="{candidate["image"]}" '
                 f'alt="{html.escape(candidate["caption"], quote=True)} source rendering">'
                 f'<figcaption>{html.escape(candidate["caption"])} — '
                 "exact source rendering from the original PDF</figcaption>"
                 "</figure>"
             )
-            for candidate in candidates
+        html_bound_refs: list[str] = []
+        unmatched_candidates: list[dict[str, Any]] = []
+        for candidate in candidates:
+            source_ref = str(candidate["source_ref"])
+            escaped_ref = re.escape(html.escape(source_ref, quote=True))
+            block_re = re.compile(
+                r'(?P<block><figure\b[^>]*class="[^"]*\bsemantic-table\b[^"]*"[^>]*>'
+                r".*?<table\b[^>]*data-source-ref=[\"']"
+                + escaped_ref
+                + r"[\"'][^>]*>.*?</figure>)",
+                flags=re.I | re.S,
+            )
+            document_html, applied = block_re.subn(
+                lambda match, candidate=candidate: (
+                    match.group("block") + evidence_figure(candidate)
+                ),
+                document_html,
+                count=1,
+            )
+            if applied:
+                html_bound_refs.append(source_ref)
+            else:
+                unmatched_candidates.append(candidate)
+        figures = "\n".join(
+            evidence_figure(candidate) for candidate in unmatched_candidates
         )
         appendix = (
             '<section class="docling-table-source-evidence-appendix">'
             "<h2>Original table renderings</h2>"
             f"{figures}</section>"
         )
-        if "</body>" in document_html.lower():
+        if unmatched_candidates and "</body>" in document_html.lower():
             match = re.search(r"</body>", document_html, flags=re.I)
             assert match is not None
             document_html = (
                 document_html[: match.start()] + appendix + document_html[match.start() :]
             )
-        else:
-            document_html += appendix
         html_path.write_text(document_html, encoding="utf-8")
-        html_applied = len(candidates)
+        html_applied = len(html_bound_refs) + (
+            len(unmatched_candidates) if "</body>" in document_html.lower() else 0
+        )
+    else:
+        html_bound_refs = []
+        unmatched_candidates = []
 
     markdown_applied = 0
     md_path = output_dir / "document.md"
     if candidates and md_path.exists():
         document_markdown = md_path.read_text(encoding="utf-8").rstrip()
-        parts = [
-            "\n\n## Original table renderings\n",
-            (
-                "The following images preserve each structured table exactly as "
-                "rendered in the original PDF."
-            ),
-        ]
+        markdown_bound_refs: list[str] = []
+        unmatched_markdown_candidates: list[dict[str, Any]] = []
         for candidate in candidates:
-            parts.extend(
-                [
-                    "",
-                    f'![{candidate["caption"]} — source rendering]'
-                    f'({candidate["image"]})',
-                ]
+            source_ref = str(candidate["source_ref"])
+            marker = f"<!-- source-table-ref:{source_ref} -->"
+            evidence = (
+                marker
+                + "\n\n"
+                + f'![{candidate["caption"]} — source rendering]'
+                f'({candidate["image"]})'
             )
-        md_path.write_text(
-            document_markdown + "\n".join(parts) + "\n",
-            encoding="utf-8",
+            if document_markdown.count(marker) == 1:
+                document_markdown = document_markdown.replace(marker, evidence, 1)
+                markdown_bound_refs.append(source_ref)
+            else:
+                unmatched_markdown_candidates.append(candidate)
+        if unmatched_markdown_candidates:
+            parts = [
+                "",
+                "## Original table renderings",
+                "",
+                (
+                    "The following images preserve tables that could not be bound "
+                    "to a unique semantic occurrence."
+                ),
+            ]
+            for candidate in unmatched_markdown_candidates:
+                parts.extend(
+                    [
+                        "",
+                        f'![{candidate["caption"]} — source rendering]'
+                        f'({candidate["image"]})',
+                    ]
+                )
+            document_markdown = document_markdown + "\n".join(parts)
+        md_path.write_text(document_markdown.rstrip() + "\n", encoding="utf-8")
+        markdown_applied = len(markdown_bound_refs) + len(unmatched_markdown_candidates)
+    else:
+        markdown_bound_refs = []
+        unmatched_markdown_candidates = []
+
+    final_html = html_path.read_text(encoding="utf-8") if html_path.exists() else ""
+    final_markdown = md_path.read_text(encoding="utf-8") if md_path.exists() else ""
+    html_body_identity_verified_refs: list[str] = []
+    markdown_body_identity_verified_refs: list[str] = []
+    html_body_identity_mismatch_refs: list[str] = []
+    markdown_body_identity_mismatch_refs: list[str] = []
+    body_identity_diagnostics: dict[str, dict[str, str]] = {}
+    for candidate in candidates:
+        source_ref = str(candidate["source_ref"])
+        expected_identity = expected_body_identity_by_ref.get(source_ref, "")
+        html_grid = _html_table_grid_for_source_ref(final_html, source_ref)
+        markdown_grid = _markdown_table_grid_for_source_ref(
+            final_markdown,
+            source_ref,
         )
-        markdown_applied = len(candidates)
+        html_identity = (
+            _table_grid_body_identity(html_grid) if html_grid is not None else ""
+        )
+        markdown_identity = (
+            _table_grid_body_identity(markdown_grid)
+            if markdown_grid is not None
+            else ""
+        )
+        if expected_identity and html_identity == expected_identity:
+            html_body_identity_verified_refs.append(source_ref)
+        else:
+            html_body_identity_mismatch_refs.append(source_ref)
+        if expected_identity and markdown_identity == expected_identity:
+            markdown_body_identity_verified_refs.append(source_ref)
+        else:
+            markdown_body_identity_mismatch_refs.append(source_ref)
+        body_identity_diagnostics[source_ref] = {
+            "html": "verified" if html_identity == expected_identity and expected_identity else "mismatch",
+            "markdown": (
+                "verified"
+                if markdown_identity == expected_identity and expected_identity
+                else "mismatch"
+            ),
+        }
 
     return {
         "candidate_count": len(candidates),
         "html_applied_count": html_applied,
         "markdown_applied_count": markdown_applied,
+        "candidate_source_refs": [str(item["source_ref"]) for item in candidates],
+        "html_bound_source_refs": html_bound_refs,
+        "markdown_bound_source_refs": markdown_bound_refs,
+        "html_unbound_source_refs": [
+            str(item["source_ref"]) for item in unmatched_candidates
+        ],
+        "markdown_unbound_source_refs": [
+            str(item["source_ref"]) for item in unmatched_markdown_candidates
+        ],
+        "html_body_identity_verified_refs": sorted(
+            set(html_body_identity_verified_refs)
+        ),
+        "markdown_body_identity_verified_refs": sorted(
+            set(markdown_body_identity_verified_refs)
+        ),
+        "html_body_identity_mismatch_refs": sorted(
+            set(html_body_identity_mismatch_refs)
+        ),
+        "markdown_body_identity_mismatch_refs": sorted(
+            set(markdown_body_identity_mismatch_refs)
+        ),
+        "body_identity_diagnostics": body_identity_diagnostics,
+        "provenance_verified_refs": sorted(set(provenance_verified_refs)),
+        "provenance_mismatch_refs": sorted(set(provenance_mismatch_refs)),
+        "provenance_diagnostics": provenance_diagnostics,
         "candidates": candidates,
     }
+
+
+def _parse_formula_source_crop_diagnostics(
+    formula_crop_diagnostics: list[dict[str, Any]] | None,
+    suspicious_formula_diagnostics: list[dict[str, Any]] | None = None,
+) -> dict[int, dict[str, Any]]:
+    parsed = {
+        int(item["index"]): item
+        for item in formula_crop_diagnostics or []
+        if isinstance(item.get("index"), int)
+    }
+    for suspicious in suspicious_formula_diagnostics or []:
+        index = suspicious.get("index")
+        if not isinstance(index, int):
+            continue
+        merged = dict(parsed.get(index) or {})
+        merged["index"] = index
+        merged["reasons"] = sorted(
+            {
+                *[str(reason) for reason in (merged.get("reasons") or [])],
+                *[str(reason) for reason in (suspicious.get("reasons") or [])],
+            }
+        )
+        for key in ("source_crop", "context_crop", "evidence", "full_page_evidence"):
+            if suspicious.get(key) is not None:
+                merged[key] = suspicious[key]
+        parsed[index] = merged
+    return parsed
+
+
+def _formula_image_size(path: Path) -> tuple[int, int] | None:
+    try:
+        from PIL import Image
+
+        with Image.open(path) as image:
+            return int(image.width), int(image.height)
+    except Exception:
+        return None
+
+
+def _image_has_visible_content(path: Path) -> bool:
+    """Reject blank/solid crops that cannot provide visual source evidence."""
+    try:
+        from PIL import Image
+
+        with Image.open(path) as image:
+            rgba = image.convert("RGBA")
+            background = Image.new("RGBA", rgba.size, (255, 255, 255, 255))
+            background.alpha_composite(rgba)
+            grayscale = background.convert("L")
+            low, high = grayscale.getextrema()
+            if high - low < 8:
+                return False
+            histogram = grayscale.histogram()
+            total = max(1, grayscale.width * grayscale.height)
+            non_dominant = total - max(histogram)
+            return non_dominant >= max(4, int(total * 0.0002))
+    except Exception:
+        return False
+
+
+def _formula_crop_has_glyph_geometry(path: Path) -> bool:
+    """Distinguish a formula line from an isolated rule/separator.
+
+    A thin occurrence bbox is common in two-column papers, so the bbox aspect
+    ratio alone is not evidence that the crop is a separator.  Conversely a
+    solid bar or rectangle must never authorize a much larger context crop.
+    Require ink on several vertical rows and reject crops whose ink is almost
+    entirely one or more page-wide horizontal strokes.
+    """
+
+    try:
+        from PIL import Image
+
+        with Image.open(path) as image:
+            grayscale = image.convert("RGBA")
+            background = Image.new("RGBA", grayscale.size, (255, 255, 255, 255))
+            background.alpha_composite(grayscale)
+            luminance = background.convert("L")
+            width, height = luminance.size
+            if width <= 0 or height <= 0:
+                return False
+            ink_by_row = [
+                sum(
+                    1
+                    for column in range(width)
+                    if luminance.getpixel((column, row)) < 180
+                )
+                for row in range(height)
+            ]
+    except Exception:
+        return False
+    ink_rows = [value for value in ink_by_row if value > 0]
+    if len(ink_rows) < max(5, min(10, int(height * 0.3))):
+        return False
+    total_ink = sum(ink_rows)
+    dense_ink = sum(value for value in ink_rows if value >= width * 0.55)
+    if total_ink <= 0 or dense_ink / total_ink >= 0.78:
+        return False
+    return True
+
+
+def _formula_source_crop_reasons_for_index(
+    formula_crop_diagnostics: dict[int, dict[str, Any]],
+    formula_index: int,
+) -> list[str]:
+    item = formula_crop_diagnostics.get(formula_index)
+    if not item:
+        return []
+    return [str(reason) for reason in (item.get("reasons") or [])]
+
+
+def _formula_crop_provenance_is_verified(
+    path: Path,
+    formula_crop_diagnostics: dict[int, dict[str, Any]],
+    formula_index: int,
+    *,
+    formula: dict[str, Any] | None,
+    for_context: bool,
+    expected_visual_pdf_sha256: str | None = None,
+    allow_raw_identity: bool = False,
+) -> bool:
+    item = formula_crop_diagnostics.get(formula_index)
+    if not isinstance(item, dict):
+        return False
+    metric = item.get("context" if for_context else "source")
+    if not isinstance(metric, dict):
+        return False
+    expected_path = (
+        f"formulas/formula_{formula_index}_context.png"
+        if for_context
+        else f"formulas/formula_{formula_index}.png"
+    )
+    if str(metric.get("path") or "") != expected_path:
+        return False
+    page_no = _positive_page_number(item.get("page_no"))
+    if page_no is None or _positive_page_number(metric.get("page_no")) != page_no:
+        return False
+    if not isinstance(formula, dict):
+        return False
+    formula_prov = first_prov(formula)
+    if not isinstance(formula_prov, dict):
+        return False
+    if _positive_page_number(formula_prov.get("page_no")) != page_no:
+        return False
+    item_bbox = item.get("bbox")
+    metric_bbox = metric.get("bbox")
+    if not isinstance(item_bbox, dict) or not isinstance(metric_bbox, dict):
+        return False
+    formula_bbox = formula_prov.get("bbox")
+    if not isinstance(formula_bbox, dict):
+        return False
+    item_origin = _bbox_explicit_coord_origin(item_bbox)
+    metric_origin = _bbox_explicit_coord_origin(metric_bbox)
+    formula_origin = _bbox_explicit_coord_origin(formula_bbox)
+    if (
+        item_origin is None
+        or metric_origin is None
+        or formula_origin is None
+        or len({item_origin, metric_origin, formula_origin}) != 1
+    ):
+        return False
+    item_geometry = bbox_geometry({"bbox": item_bbox})
+    metric_geometry = bbox_geometry({"bbox": metric_bbox})
+    formula_geometry = bbox_geometry(formula_prov)
+    if (
+        item_geometry is None
+        or metric_geometry is None
+        or formula_geometry is None
+    ):
+        return False
+    for key in ("l", "r", "t", "b"):
+        if abs(float(item_geometry[key]) - float(metric_geometry[key])) > 1e-6:
+            return False
+        if abs(float(formula_geometry[key]) - float(metric_geometry[key])) > 1e-6:
+            return False
+    if item_geometry.get("coord_origin") != metric_geometry.get("coord_origin"):
+        return False
+    if formula_geometry.get("coord_origin") != metric_geometry.get("coord_origin"):
+        return False
+    identity_field = (
+        "formula_raw_content_sha256"
+        if allow_raw_identity
+        else "formula_content_identity_sha256"
+    )
+    current_identity_sha256 = (
+        _formula_raw_content_sha256(str(formula.get("text") or ""))
+        if allow_raw_identity
+        else _formula_content_identity_sha256(str(formula.get("text") or ""))
+    )
+    metric_identity_sha256 = str(metric.get(identity_field) or "").lower()
+    item_identity_sha256 = str(item.get(identity_field) or "").lower()
+    if (
+        not current_identity_sha256
+        or not re.fullmatch(r"[0-9a-f]{64}", metric_identity_sha256)
+        or not re.fullmatch(r"[0-9a-f]{64}", item_identity_sha256)
+        or metric_identity_sha256 != current_identity_sha256
+        or item_identity_sha256 != current_identity_sha256
+    ):
+        return False
+    page_size = metric.get("page_size") or {}
+    try:
+        page_width = float(page_size.get("width") or 0.0)
+        page_height = float(page_size.get("height") or 0.0)
+    except (TypeError, ValueError):
+        return False
+    if (
+        page_width <= 0.0
+        or page_height <= 0.0
+        or float(metric_geometry["l"]) < 0.0
+        or float(metric_geometry["r"]) > page_width
+        or min(float(metric_geometry["t"]), float(metric_geometry["b"])) < 0.0
+        or max(float(metric_geometry["t"]), float(metric_geometry["b"]))
+        > page_height
+    ):
+        return False
+    declared_asset_sha256 = str(metric.get("asset_sha256") or "").lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", declared_asset_sha256):
+        return False
+    if path.is_symlink() or not path.is_file():
+        return False
+    try:
+        if file_sha256(path) != declared_asset_sha256:
+            return False
+    except OSError:
+        return False
+    metric_pdf_sha256 = str(metric.get("source_pdf_sha256") or "").lower()
+    item_pdf_sha256 = str(item.get("source_pdf_sha256") or "").lower()
+    if (
+        not re.fullmatch(r"[0-9a-f]{64}", metric_pdf_sha256)
+        or not re.fullmatch(r"[0-9a-f]{64}", item_pdf_sha256)
+        or metric_pdf_sha256 != item_pdf_sha256
+    ):
+        return False
+    if (
+        expected_visual_pdf_sha256
+        and metric_pdf_sha256 != str(expected_visual_pdf_sha256).strip().lower()
+    ):
+        return False
+    return True
+
+
+def _formula_crop_is_usable(
+    path: Path,
+    formula_crop_diagnostics: dict[int, dict[str, Any]],
+    formula_index: int,
+    for_context: bool = False,
+) -> bool:
+    if not path.exists():
+        return False
+
+    reason_flags = _formula_source_crop_reasons_for_index(formula_crop_diagnostics, formula_index)
+    if not for_context:
+        if any(
+            flag in {
+                "bbox_likely_line_or_separator",
+                "source_crop_likely_too_thin",
+                "source_crop_likely_useless_for_review",
+                "formula_source_crop_too_tiny",
+                "standalone_equation_number",
+            }
+            for flag in reason_flags
+        ):
+            return False
+    # Diagnostics describe the crop that was intended to be written; they do
+    # not prove the current file is a decodable image.  Always inspect the
+    # bytes on disk so a stale metric cannot make a truncated/corrupt PNG pass
+    # the final exact-source gate.
+    size = _formula_image_size(path)
+    if size is None or not _image_has_visible_content(path):
+        return False
+    width, height = size
+
+    min_width = FORMULA_SOURCE_CONTEXT_MIN_WIDTH_PX if for_context else FORMULA_SOURCE_MIN_WIDTH_PX
+    min_height = (
+        FORMULA_SOURCE_CONTEXT_MIN_HEIGHT_PX
+        if for_context
+        else FORMULA_SOURCE_MIN_HEIGHT_PX
+    )
+    if width < min_width or height < min_height:
+        return False
+
+    aspect = width / max(height, 1)
+    if aspect > FORMULA_SOURCE_MAX_ASPECT_RATIO and height < 40:
+        return False
+    if aspect < FORMULA_SOURCE_MIN_ASPECT_RATIO:
+        return False
+
+    return True
+
+
+def _extract_formula_anchor_indexes(document_html: str, document_markdown: str) -> set[int]:
+    anchor_re = re.compile(r"<!--\s*source-formula-anchor:(?P<index>\d+)\s*-->")
+    indexes: set[int] = set()
+    for match in anchor_re.finditer(document_html):
+        indexes.add(int(match.group("index")))
+    indexes.update(
+        index
+        for _start, _end, index in _markdown_source_formula_anchor_spans(
+            document_markdown
+        )
+    )
+    return indexes
+
+
+def _is_standalone_equation_number(value: str) -> bool:
+    """Recognize OCR-spaced equation labels while preserving real formula bodies."""
+
+    return bool(
+        re.fullmatch(
+            r"\s*[\(（]\s*(?:[A-Za-z]\s*\.\s*)?"
+            r"\d(?:[\s.]*\d)*\s*[\)）]\s*",
+            html.unescape(value),
+        )
+    )
+
+
+def _is_formula_number_only(value: str) -> bool:
+    raw = html.unescape(str(value or ""))
+    return _is_standalone_equation_number(raw) or bool(
+        re.fullmatch(r"\s*[+\-−]?\d(?:[\s.]*\d)*\s*", raw)
+    )
+
+
+_FORMULA_CONTEXT_FALLBACK_REASONS = {
+    "source_crop_below_minimum_dimensions",
+    "formula_source_crop_below_minimum_dimensions",
+    "source_crop_too_small",
+    "formula_source_crop_too_tiny",
+    "bbox_too_thin_for_complex_formula",
+    "bbox_crosses_expected_column_boundary",
+    "near_page_bottom_context_needed",
+    "source_crop_likely_too_thin",
+    "source_crop_likely_useless_for_review",
+    "formula_text_too_long",
+    "repeated_fraction_pattern",
+}
+
+
+def _formula_semantic_body_is_valid(value: str) -> bool:
+    raw = html.unescape(str(value or "")).strip()
+    if not raw or _is_formula_number_only(raw) or CN_CHAR_RE.search(raw):
+        return False
+    if re.fullmatch(
+        r"(?is)(?:<formula\s*/?>|formula(?:[-_ ]not[-_ ]decoded)?|"
+        r"unknown|unavailable|n/?a|none|null|[?_.\-]+)",
+        raw,
+    ):
+        return False
+    if re.fullmatch(r"(?is)(?:<loc_\d+>\s*)+", raw):
+        return False
+    return bool(_formula_content_identity(raw))
+
+
+def _formula_indexed_candidates(
+    output_dir: Path,
+    formulas: list[dict[str, Any]],
+    formula_crop_diagnostics: list[dict[str, Any]] | None = None,
+    suspicious_formula_diagnostics: list[dict[str, Any]] | None = None,
+    strict_indexes: set[int] | None = None,
+    expected_visual_pdf_sha256: str | None = None,
+    formula_by_index: dict[int, dict[str, Any]] | None = None,
+    diagnostic_only_indexes: set[int] | None = None,
+) -> list[dict[str, Any]]:
+    diagnostic_only_indexes = set(diagnostic_only_indexes or set())
+    if strict_indexes is not None:
+        target_indexes = sorted(strict_indexes)
+    elif formulas:
+        target_indexes = list(range(1, len(formulas) + 1))
+    else:
+        target_indexes = []
+
+    crop_diagnostics = _parse_formula_source_crop_diagnostics(
+        formula_crop_diagnostics,
+        suspicious_formula_diagnostics,
+    )
+    source_available = [
+        int(match.group(1))
+        for match in re.finditer(r"formulas/formula_(\d+)\.png", " ".join(
+            [path.as_posix() for path in sorted((output_dir / "formulas").glob("formula_*.png"))]
+        ))
+    ]
+    candidates: list[dict[str, Any]] = []
+    for index in target_indexes:
+        formula = (
+            formula_by_index.get(index)
+            if formula_by_index is not None
+            else (formulas[index - 1] if 1 <= index <= len(formulas) else None)
+        )
+        source_path = Path(f"formulas/formula_{index}.png")
+        context_path = Path(f"formulas/formula_{index}_context.png")
+        source_reasons = _formula_source_crop_reasons_for_index(crop_diagnostics, index)
+        formula_text = str((formula or {}).get("text") or "")
+        standalone_equation_number = _is_standalone_equation_number(formula_text)
+        formula_number_only = _is_formula_number_only(formula_text)
+        if formula_number_only:
+            number_reason = (
+                "standalone_equation_number"
+                if standalone_equation_number
+                else "formula_number_only"
+            )
+            source_reasons = sorted({*source_reasons, number_reason})
+            crop_diagnostics.setdefault(index, {"index": index})["reasons"] = source_reasons
+        source_path_abs = output_dir / source_path
+        context_path_abs = output_dir / context_path
+        selected = None
+        selected_path = None
+        diagnostic_path = None
+        reason = ""
+        source_has_visible_ink = bool(
+            source_path_abs.exists()
+            and _formula_image_size(source_path_abs) is not None
+            and _image_has_visible_content(source_path_abs)
+        )
+        source_has_glyph_geometry = bool(
+            source_has_visible_ink
+            and _formula_crop_has_glyph_geometry(source_path_abs)
+        )
+        source_provenance_verified = _formula_crop_provenance_is_verified(
+            source_path_abs,
+            crop_diagnostics,
+            index,
+            formula=formula,
+            for_context=False,
+            expected_visual_pdf_sha256=expected_visual_pdf_sha256,
+            allow_raw_identity=index in diagnostic_only_indexes,
+        )
+        context_provenance_verified = _formula_crop_provenance_is_verified(
+            context_path_abs,
+            crop_diagnostics,
+            index,
+            formula=formula,
+            for_context=True,
+            expected_visual_pdf_sha256=expected_visual_pdf_sha256,
+            allow_raw_identity=index in diagnostic_only_indexes,
+        )
+        context_usable = bool(
+            context_provenance_verified
+            and
+            _formula_crop_is_usable(
+                context_path_abs,
+                crop_diagnostics,
+                index,
+                for_context=True,
+            )
+            and context_path_abs.exists()
+        )
+        blocking_context_reasons = sorted(
+            reason_value
+            for reason_value in source_reasons
+            if (
+                reason_value not in _FORMULA_CONTEXT_FALLBACK_REASONS
+                and not (
+                    reason_value == "bbox_likely_line_or_separator"
+                    and source_has_glyph_geometry
+                )
+            )
+        )
+        context_fallback_allowed = bool(
+            source_has_visible_ink
+            and source_provenance_verified
+            and _formula_semantic_body_is_valid(formula_text)
+            and not blocking_context_reasons
+        )
+        if index in diagnostic_only_indexes:
+            if context_usable:
+                diagnostic_path = context_path
+                reason = "verified_dropped_formula_context_appendix"
+            elif (
+                source_provenance_verified
+                and source_path_abs.exists()
+                and _formula_image_size(source_path_abs) is not None
+                and _image_has_visible_content(source_path_abs)
+            ):
+                diagnostic_path = source_path
+                reason = "verified_dropped_formula_source_appendix"
+            else:
+                reason = "dropped_formula_provenance_missing_or_unusable"
+        elif formula_number_only:
+            reason = (
+                "standalone_equation_number_has_no_formula_body"
+                if standalone_equation_number
+                else "formula_number_only_has_no_formula_body"
+            )
+        elif source_provenance_verified and _formula_crop_is_usable(
+            source_path_abs, crop_diagnostics, index, for_context=False
+        ) and source_path_abs.exists():
+            selected = "source"
+            selected_path = source_path
+            reason = "source_crop_usable"
+        elif context_usable and context_fallback_allowed:
+            selected = "context"
+            selected_path = context_path
+            reason = "visible_direct_source_too_small_using_verified_context"
+        elif context_usable:
+            diagnostic_path = context_path
+            if not source_has_visible_ink:
+                reason = "context_diagnostic_only_direct_source_missing_or_blank"
+            elif not _formula_semantic_body_is_valid(formula_text):
+                reason = "context_diagnostic_only_formula_body_invalid"
+            else:
+                reason = (
+                    "context_diagnostic_only_suspicious_source:"
+                    + ",".join(blocking_context_reasons)
+                )
+
+        candidates.append(
+            {
+                "formula_index": index,
+                "source_image": source_path.as_posix(),
+                "context_image": context_path.as_posix(),
+                "selected": selected,
+                "selected_image": selected_path.as_posix() if selected_path is not None else None,
+                "diagnostic_image": (
+                    diagnostic_path.as_posix()
+                    if diagnostic_path is not None
+                    else None
+                ),
+                "selection_reason": reason,
+                "source_exists": source_path_abs.exists(),
+                "context_exists": context_path_abs.exists(),
+                "source_provenance_verified": source_provenance_verified,
+                "context_provenance_verified": context_provenance_verified,
+                "source_reasons": source_reasons,
+                "page_no": (
+                    (first_prov(formula) or {}).get("page_no")
+                    if isinstance(formula, dict)
+                    else None
+                ),
+                "appendix": index in diagnostic_only_indexes,
+            }
+        )
+
+    candidate_index_set = {int(item["formula_index"]) for item in candidates}
+    for index in ([] if strict_indexes is not None else sorted(source_available)):
+        if index in candidate_index_set:
+            continue
+        source_path = Path(f"formulas/formula_{index}.png")
+        context_path = Path(f"formulas/formula_{index}_context.png")
+        source_reasons = _formula_source_crop_reasons_for_index(crop_diagnostics, index)
+        source_path_abs = output_dir / source_path
+        context_path_abs = output_dir / context_path
+        selected = None
+        selected_path = None
+        diagnostic_path = None
+        reason = ""
+        source_provenance_verified = _formula_crop_provenance_is_verified(
+            source_path_abs,
+            crop_diagnostics,
+            index,
+            formula=None,
+            for_context=False,
+            expected_visual_pdf_sha256=expected_visual_pdf_sha256,
+        )
+        context_provenance_verified = _formula_crop_provenance_is_verified(
+            context_path_abs,
+            crop_diagnostics,
+            index,
+            formula=None,
+            for_context=True,
+            expected_visual_pdf_sha256=expected_visual_pdf_sha256,
+        )
+        if (
+            source_provenance_verified
+            and
+            _formula_crop_is_usable(
+                source_path_abs,
+                crop_diagnostics,
+                index,
+                for_context=False,
+            )
+            and source_path_abs.exists()
+        ):
+            selected = "source"
+            selected_path = source_path
+            reason = "source_crop_usable"
+        elif (
+            context_provenance_verified
+            and
+            _formula_crop_is_usable(
+                context_path_abs,
+                crop_diagnostics,
+                index,
+                for_context=True,
+            )
+            and context_path_abs.exists()
+        ):
+            # No semantic formula record exists for this orphan artifact, so
+            # expanded context may be retained only as appendix diagnostics.
+            diagnostic_path = context_path
+            reason = "context_diagnostic_only_formula_body_missing"
+
+        candidates.append(
+            {
+                "formula_index": index,
+                "source_image": source_path.as_posix(),
+                "context_image": context_path.as_posix(),
+                "selected": selected,
+                "selected_image": selected_path.as_posix() if selected_path is not None else None,
+                "diagnostic_image": (
+                    diagnostic_path.as_posix()
+                    if diagnostic_path is not None
+                    else None
+                ),
+                "selection_reason": reason,
+                "source_exists": source_path_abs.exists(),
+                "context_exists": context_path_abs.exists(),
+                "source_provenance_verified": source_provenance_verified,
+                "context_provenance_verified": context_provenance_verified,
+                "source_reasons": source_reasons,
+                "page_no": None,
+                "appendix": True,
+            }
+        )
+
+    return candidates
+
+
+def _formula_content_identity(value: str) -> str:
+    """Return a strict, presentation-insensitive formula occurrence identity."""
+
+    value = _formula_source_text(html.unescape(value))
+    value = re.sub(r"^\s*\$\$|\$\$\s*$", "", value, flags=re.S)
+    equation_label = (
+        r"(?:[A-Za-z]\s*\.\s*)?(?:\d\s*)+"
+        r"(?:\.\s*(?:\d\s*)+)*"
+    )
+    value = re.sub(
+        rf"\\tag\*?\s*\{{\s*\(?\s*{equation_label}\s*\)?\s*\}}\s*$",
+        "",
+        value,
+    )
+    value = re.sub(
+        r"(?:(?:\\quad|\\qquad|\\,|\\;|\\!)\s*)*"
+        rf"\(\s*{equation_label}\s*\)\s*$",
+        "",
+        value,
+    )
+    # Array/alignment wrappers and spacing commands are presentation only.  A
+    # semantic reflow may flatten the same rows when MathML cannot represent a
+    # malformed environment; compare the row contents, not that layout choice.
+    value = re.sub(
+        r"\\begin\s*\{\s*(?:array|aligned|align|cases|matrix|pmatrix|bmatrix)\s*\}"
+        r"(?:\s*\{[^{}]*\})?",
+        "",
+        value,
+    )
+    value = re.sub(
+        r"\\end\s*\{\s*(?:array|aligned|align|cases|matrix|pmatrix|bmatrix)\s*\}?",
+        "",
+        value,
+    )
+    # A malformed array can place the equation label before a duplicate closing
+    # environment.  Once layout wrappers are gone, remove that same label at
+    # the true semantic tail as well.
+    value = re.sub(
+        r"(?:(?:\\quad|\\qquad|\\,|\\;|\\!)\s*)*"
+        rf"\(\s*{equation_label}\s*\)\s*$",
+        "",
+        value,
+    )
+    value = value.replace("&", "")
+    value = re.sub(
+        r"\\\\|\\(?:quad|qquad|,|;|!|left|right)",
+        "",
+        value,
+    )
+    value = re.sub(r"\s+", "", value)
+    if value.startswith("{"):
+        value = value[1:]
+        if value.endswith("}"):
+            value = value[:-1]
+    return value.translate(
+        str.maketrans({"−": "-", "–": "-", "—": "-", "（": "(", "）": ")"})
+    )
+
+
+def _formula_content_identity_sha256(value: str) -> str:
+    identity = _formula_content_identity(value)
+    if not identity:
+        return ""
+    return hashlib.sha256(identity.encode("utf-8")).hexdigest()
+
+
+def _formula_raw_content_sha256(value: str) -> str:
+    raw = html.unescape(str(value or ""))
+    raw = raw.translate(
+        str.maketrans({"−": "-", "–": "-", "—": "-", "（": "(", "）": ")"})
+    )
+    raw = re.sub(r"\s+", "", raw)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest() if raw else ""
+
+
+def _html_formula_occurrence_identities(document_html: str) -> dict[int, list[str]]:
+    identities: dict[int, list[str]] = {}
+
+    def identity_from_block(block: str) -> str:
+        latex = re.search(
+            r"<details\b[^>]*>\s*<summary>\s*LaTeX\s*</summary>\s*"
+            r"<code>(?P<tex>.*?)</code>\s*</details>",
+            block,
+            flags=re.S | re.I,
+        )
+        if latex:
+            return _formula_content_identity(latex.group("tex"))
+        plain = re.sub(r"<[^>]+>", "", block)
+        return _formula_content_identity(plain)
+
+    for match in re.finditer(
+        r"(?P<block><div\b[^>]*\bdata-formula-index=[\"'](?P<index>\d+)[\"']"
+        r"[^>]*>.*?</div>)",
+        document_html,
+        flags=re.S | re.I,
+    ):
+        identities.setdefault(int(match.group("index")), []).append(
+            identity_from_block(match.group("block"))
+        )
+    for match in re.finditer(
+        r"(?P<block><div\b[^>]*class=[\"'][^\"']*\bformula\b[^\"']*[\"']"
+        r"[^>]*>.*?</div>)\s*"
+        r"<!--\s*source-formula-anchor:(?P<index>\d+)\s*-->",
+        document_html,
+        flags=re.S | re.I,
+    ):
+        index = int(match.group("index"))
+        identity = identity_from_block(match.group("block"))
+        if identity not in identities.setdefault(index, []):
+            identities[index].append(identity)
+    return identities
+
+
+def _markdown_formula_occurrence_identities(document_markdown: str) -> dict[int, list[str]]:
+    identities: dict[int, list[str]] = {}
+    for start, end in _markdown_display_math_spans(document_markdown):
+        anchor = re.match(
+            r"\s*<!--\s*source-formula-anchor:(?P<index>\d+)\s*-->",
+            document_markdown[end:],
+            flags=re.S,
+        )
+        if anchor:
+            identities.setdefault(int(anchor.group("index")), []).append(
+                _formula_content_identity(document_markdown[start:end])
+            )
+    return identities
 
 
 def append_formula_source_renderings(
     output_dir: Path,
     formulas: list[dict[str, Any]],
+    *,
+    formula_crop_diagnostics: list[dict[str, Any]] | None = None,
+    suspicious_formula_diagnostics: list[dict[str, Any]] | None = None,
+    expected_indexes: set[int] | None = None,
+    metadata: dict[str, Any] | None = None,
+    status: dict[str, Any] | None = None,
+    primary: dict[str, Any] | None = None,
+    formula_by_index: dict[int, dict[str, Any]] | None = None,
+    diagnostic_only_indexes: set[int] | None = None,
 ) -> dict[str, Any]:
-    """Append exact PDF crops so every formula and symbol remains recoverable."""
-    candidates = [
-        {
-            "formula_index": index,
-            "image": f"formulas/formula_{index}.png",
-            "context_image": f"formulas/formula_{index}_context.png",
-            "page_no": (first_prov(formula) or {}).get("page_no"),
-        }
-        for index, formula in enumerate(formulas, start=1)
-        if (output_dir / "formulas" / f"formula_{index}.png").exists()
-    ]
+    """Bind each accepted formula index to a usable crop at its occurrence.
 
-    html_applied = 0
+    Appendix-only evidence is diagnostic and deliberately does not satisfy the
+    delivery gate.  Exact index sets prevent a wrong crop with the right count
+    from being accepted.
+    """
+
+    del status  # accepted for call-site/test symmetry; this helper is pure output accounting.
+    if metadata:
+        formula_crop_diagnostics = (
+            formula_crop_diagnostics or metadata.get("formula_crop_diagnostics")
+        )
+        suspicious_formula_diagnostics = (
+            suspicious_formula_diagnostics
+            or metadata.get("suspicious_formula_diagnostics")
+        )
+
     html_path = output_dir / "document.html"
+    md_path = output_dir / "document.md"
+    document_html = html_path.read_text(encoding="utf-8") if html_path.exists() else ""
+    document_markdown = md_path.read_text(encoding="utf-8") if md_path.exists() else ""
+
+    document_html = re.sub(
+        r"<!--\s*local-ai-lab-formula-evidence:start\s*-->.*?"
+        r"<!--\s*local-ai-lab-formula-evidence:end\s*-->",
+        "",
+        document_html,
+        flags=re.S,
+    )
+    document_html = re.sub(
+        r'<figure\b[^>]*class="[^"]*\bdocling-formula-inline-source\b[^"]*"[^>]*>.*?</figure>',
+        "",
+        document_html,
+        flags=re.S | re.I,
+    )
+    document_html = re.sub(
+        r'<section\b[^>]*class="[^"]*\bdocling-formula-source-evidence-appendix\b[^"]*"[^>]*>.*?</section>',
+        "",
+        document_html,
+        flags=re.S | re.I,
+    )
+    document_markdown, _ = _markdown_sub_outside_code(
+        document_markdown,
+        r"<!--\s*local-ai-lab-formula-evidence:start\s*-->.*?"
+        r"<!--\s*local-ai-lab-formula-evidence:end\s*-->",
+        "",
+        flags=re.S,
+    )
+    document_markdown, _ = _markdown_sub_outside_code(
+        document_markdown,
+        r"\n?<!--\s*source-formula-visual:\d+\s*-->\s*\n"
+        r"!?\[[^\n]*Formula[^\n]*\]\(formulas/formula_\d+(?:_context)?\.png\)\s*",
+        "\n",
+        flags=re.I,
+    )
+
+    html_anchor_occurrences = [
+        int(value)
+        for value in re.findall(r"source-formula-anchor:(\d+)", document_html)
+    ]
+    html_data_index_occurrences = [
+        int(value)
+        for value in re.findall(
+            r"<div\b[^>]*\bdata-formula-index=[\"'](\d+)[\"']",
+            document_html,
+            flags=re.I,
+        )
+    ]
+    markdown_anchor_spans = _markdown_source_formula_anchor_spans(
+        document_markdown
+    )
+    markdown_anchor_occurrences = [index for _start, _end, index in markdown_anchor_spans]
+    html_anchor_indexes = set(html_anchor_occurrences)
+    markdown_anchor_indexes = set(markdown_anchor_occurrences)
+    html_occurrence_counts = {
+        index: (
+            html_data_index_occurrences.count(index)
+            if index in html_data_index_occurrences
+            else html_anchor_occurrences.count(index)
+        )
+        for index in set(html_data_index_occurrences) | html_anchor_indexes
+    }
+    if expected_indexes is None:
+        anchored = html_anchor_indexes | markdown_anchor_indexes
+        expected_indexes = anchored or set(range(1, len(formulas) + 1))
+    expected_indexes = {int(index) for index in expected_indexes if int(index) > 0}
+    candidates = _formula_indexed_candidates(
+        output_dir,
+        formulas,
+        formula_crop_diagnostics=formula_crop_diagnostics,
+        suspicious_formula_diagnostics=suspicious_formula_diagnostics,
+        strict_indexes=expected_indexes,
+        expected_visual_pdf_sha256=(
+            str(metadata.get("visual_evidence_input_sha256") or "") or None
+            if metadata is not None
+            else None
+        ),
+        formula_by_index=formula_by_index,
+        diagnostic_only_indexes=diagnostic_only_indexes,
+    )
+    candidate_by_index = {
+        int(candidate["formula_index"]): candidate for candidate in candidates
+    }
+    identity_formula_by_index = (
+        formula_by_index
+        if formula_by_index is not None
+        else {index: formula for index, formula in enumerate(formulas, start=1)}
+    )
+    raw_semantic_tex_by_index = (
+        primary.get("semantic_formula_tex_by_index")
+        if isinstance(primary, dict)
+        else None
+    )
+    semantic_tex_by_index: dict[int, str] = {}
+    if isinstance(raw_semantic_tex_by_index, dict):
+        for raw_index, raw_tex in raw_semantic_tex_by_index.items():
+            try:
+                normalized_index = int(raw_index)
+            except (TypeError, ValueError):
+                continue
+            if normalized_index > 0 and isinstance(raw_tex, str) and raw_tex.strip():
+                semantic_tex_by_index[normalized_index] = raw_tex
+    expected_identity_by_index = {
+        index: _formula_content_identity(
+            semantic_tex_by_index.get(index)
+            or str(formula.get("text") or "")
+        )
+        for index, formula in identity_formula_by_index.items()
+        if index not in set(diagnostic_only_indexes or set())
+    }
+    html_identity_by_index = _html_formula_occurrence_identities(document_html)
+    markdown_identity_by_index = _markdown_formula_occurrence_identities(
+        document_markdown
+    )
+    html_identity_mismatch_indexes: set[int] = set()
+    markdown_identity_mismatch_indexes: set[int] = set()
+
+    def occurrence_identity_matches(
+        formula_index: int,
+        actual_by_index: dict[int, list[str]],
+    ) -> bool:
+        expected = expected_identity_by_index.get(formula_index)
+        actual = [value for value in actual_by_index.get(formula_index, []) if value]
+        # Diagnostic-only raw drop indexes have no primary formula identity and
+        # are never permitted to satisfy occurrence coverage.
+        return bool(expected and len(actual) == 1 and actual[0] == expected)
+
+    def html_figure(candidate: dict[str, Any], *, occurrence: bool) -> str:
+        index = int(candidate["formula_index"])
+        image_path = html.escape(
+            str(
+                candidate.get("selected_image")
+                or candidate.get("diagnostic_image")
+                or ""
+            ),
+            quote=True,
+        )
+        label = (
+            "exact PDF formula at this occurrence"
+            if occurrence
+            else "formula review evidence"
+        )
+        return (
+            '<figure class="docling-formula-inline-source" '
+            f'data-formula-index="{index}" data-formula-evidence="'
+            f'{html.escape(str(candidate.get("selected") or "diagnostic-only"), quote=True)}" '
+            'style="margin:.35rem auto 1rem;text-align:center">'
+            f'<img loading="lazy" src="{image_path}" '
+            'style="max-width:100%;height:auto" '
+            f'alt="Formula {index} {label}">'
+            f'<figcaption>Formula {index} — exact rendering from the original PDF'
+            + (
+                " (expanded context crop)"
+                if candidate.get("selected") == "context"
+                else ""
+            )
+            + "</figcaption></figure>"
+        )
+
+    html_covered_indexes: set[int] = set()
+    html_appendix_indexes: set[int] = set()
     if candidates and html_path.exists():
-        document_html = html_path.read_text(encoding="utf-8")
-        if "docling-formula-source-evidence-appendix" not in document_html:
+        def replace_html_anchor(match: re.Match[str]) -> str:
+            formula_index = int(match.group("index"))
+            candidate = candidate_by_index.get(formula_index)
+            if candidate is None or not candidate.get("selected_image"):
+                return match.group(0)
+            if not occurrence_identity_matches(
+                formula_index, html_identity_by_index
+            ):
+                html_identity_mismatch_indexes.add(formula_index)
+                return match.group(0)
+            html_covered_indexes.add(formula_index)
+            return match.group(0) + "\n" + html_figure(candidate, occurrence=True)
+
+        document_html = re.sub(
+            r"<!--\s*source-formula-anchor:(?P<index>\d+)\s*-->",
+            replace_html_anchor,
+            document_html,
+        )
+
+        # CJK preserve mode has no semantic anchor comments, but the retained
+        # blocks have stable data-formula-index attributes.
+        for formula_index in sorted(expected_indexes - html_covered_indexes):
+            candidate = candidate_by_index.get(formula_index)
+            if candidate is None or not candidate.get("selected_image"):
+                continue
+            if not occurrence_identity_matches(
+                formula_index, html_identity_by_index
+            ):
+                html_identity_mismatch_indexes.add(formula_index)
+                continue
+            block_re = re.compile(
+                rf"(<div\b[^>]*data-formula-index=[\"']{formula_index}[\"'][^>]*>)",
+                flags=re.I,
+            )
+            document_html, replacement_count = block_re.subn(
+                lambda match, candidate=candidate: (
+                    match.group(1) + "\n" + html_figure(candidate, occurrence=True)
+                ),
+                document_html,
+                count=1,
+            )
+            if replacement_count:
+                html_covered_indexes.add(formula_index)
+
+        unmatched_candidates = [
+            candidate
+            for candidate in candidates
+            if (
+                candidate.get("selected_image")
+                or candidate.get("diagnostic_image")
+            )
+            and int(candidate["formula_index"]) not in html_covered_indexes
+        ]
+        if unmatched_candidates:
+            html_appendix_indexes = {
+                int(candidate["formula_index"]) for candidate in unmatched_candidates
+            }
             figures = "\n".join(
-                (
-                    '<figure class="docling-formula-source-evidence">'
-                    f'<img loading="lazy" src="{candidate["image"]}" '
-                    f'alt="Formula {candidate["formula_index"]} source rendering">'
-                    f'<figcaption>Formula {candidate["formula_index"]} — exact '
-                    "source rendering from the original PDF"
-                    + (
-                        f' (<a href="{candidate["context_image"]}">page context</a>)'
-                        if (
-                            output_dir / candidate["context_image"]
-                        ).exists()
-                        else ""
-                    )
-                    + "</figcaption></figure>"
-                )
-                for candidate in candidates
+                html_figure(candidate, occurrence=False)
+                for candidate in unmatched_candidates
             )
             appendix = (
+                "<!-- local-ai-lab-formula-evidence:start -->"
                 '<section class="docling-formula-source-evidence-appendix">'
-                "<h2>Original formula renderings</h2>"
-                "<p>These source crops preserve every mathematical symbol exactly "
-                "as printed in the original PDF.</p>"
+                "<h2>Unmatched original formula renderings</h2>"
+                "<p>These crops are retained for diagnosis, but unmatched appendix "
+                "evidence does not satisfy the delivery gate.</p>"
                 f"{figures}</section>"
+                "<!-- local-ai-lab-formula-evidence:end -->"
             )
             body_end = re.search(r"</body>", document_html, flags=re.I)
             if body_end:
@@ -1617,39 +4622,1082 @@ def append_formula_source_renderings(
                 )
             else:
                 document_html += appendix
-            html_path.write_text(document_html, encoding="utf-8")
-            html_applied = len(candidates)
+        html_path.write_text(document_html, encoding="utf-8")
 
-    markdown_applied = 0
-    md_path = output_dir / "document.md"
+    markdown_covered_indexes: set[int] = set()
+    markdown_appendix_indexes: set[int] = set()
     if candidates and md_path.exists():
-        document_markdown = md_path.read_text(encoding="utf-8")
-        if "## Original formula renderings" not in document_markdown:
+        markdown_anchor_edits: list[tuple[int, int, str]] = []
+        for start, end, formula_index in markdown_anchor_spans:
+            candidate = candidate_by_index.get(formula_index)
+            if candidate is None or not candidate.get("selected_image"):
+                continue
+            if not occurrence_identity_matches(
+                formula_index, markdown_identity_by_index
+            ):
+                markdown_identity_mismatch_indexes.add(formula_index)
+                continue
+            markdown_covered_indexes.add(formula_index)
+            markdown_anchor_edits.append(
+                (
+                    start,
+                    end,
+                    document_markdown[start:end]
+                    + "\n\n"
+                    + f"<!-- source-formula-visual:{formula_index} -->\n"
+                    + f"![Formula {formula_index} — exact PDF rendering]"
+                    + f"({candidate['selected_image']})",
+                )
+            )
+        for start, end, replacement in reversed(markdown_anchor_edits):
+            document_markdown = (
+                document_markdown[:start]
+                + replacement
+                + document_markdown[end:]
+            )
+
+        # The CJK legacy surface has display blocks but no semantic anchor.  Its
+        # order is stable, so bind indexes sequentially and expose any mismatch.
+        if expected_indexes and not markdown_anchor_indexes:
+            display_spans = _markdown_display_math_spans(document_markdown)
+            display_edits: list[tuple[int, int, str]] = []
+            for formula_index, (start, end) in zip(
+                sorted(expected_indexes - set(diagnostic_only_indexes or set())),
+                display_spans,
+            ):
+                block = document_markdown[start:end]
+                actual_identity = _formula_content_identity(block)
+                candidate = candidate_by_index.get(formula_index)
+                if candidate is None or not candidate.get("selected_image"):
+                    continue
+                if (
+                    not expected_identity_by_index.get(formula_index)
+                    or actual_identity != expected_identity_by_index[formula_index]
+                ):
+                    markdown_identity_mismatch_indexes.add(formula_index)
+                    continue
+                markdown_covered_indexes.add(formula_index)
+                display_edits.append(
+                    (
+                        start,
+                        end,
+                        block
+                        + f"\n<!-- source-formula-visual:{formula_index} -->\n\n"
+                        + f"![Formula {formula_index} — exact PDF rendering]"
+                        + f"({candidate['selected_image']})",
+                    )
+                )
+            for start, end, replacement in reversed(display_edits):
+                document_markdown = (
+                    document_markdown[:start]
+                    + replacement
+                    + document_markdown[end:]
+                )
+
+        unmatched_candidates = [
+            candidate
+            for candidate in candidates
+            if (
+                candidate.get("selected_image")
+                or candidate.get("diagnostic_image")
+            )
+            and int(candidate["formula_index"]) not in markdown_covered_indexes
+        ]
+        if unmatched_candidates:
+            markdown_appendix_indexes = {
+                int(candidate["formula_index"]) for candidate in unmatched_candidates
+            }
             parts = [
                 document_markdown.rstrip(),
                 "",
-                "## Original formula renderings",
+                "<!-- local-ai-lab-formula-evidence:start -->",
+                "## Unmatched original formula renderings",
                 "",
                 (
-                    "These source crops preserve every mathematical symbol exactly "
-                    "as printed in the original PDF."
+                    "These crops are retained for diagnosis, but unmatched appendix "
+                    "evidence does not satisfy the delivery gate."
                 ),
             ]
-            for candidate in candidates:
+            for candidate in unmatched_candidates:
                 parts.extend(
                     [
                         "",
+                        f'<!-- source-formula-appendix:{candidate["formula_index"]} -->',
                         f'![Formula {candidate["formula_index"]} — source rendering]'
+                        f'({candidate.get("selected_image") or candidate.get("diagnostic_image")})',
+                    ]
+                )
+            parts.append("<!-- local-ai-lab-formula-evidence:end -->")
+            document_markdown = "\n".join(parts) + "\n"
+        md_path.write_text(document_markdown, encoding="utf-8")
+
+    missing_candidate_indexes = {
+        int(candidate["formula_index"])
+        for candidate in candidates
+        if not candidate.get("selected_image")
+    }
+
+    return {
+        "candidate_count": len(candidates),
+        "html_applied_count": len(html_covered_indexes) + len(html_appendix_indexes),
+        "markdown_applied_count": len(markdown_covered_indexes) + len(markdown_appendix_indexes),
+        "html_inline_count": len(html_covered_indexes),
+        "markdown_inline_count": len(markdown_covered_indexes),
+        "html_appendix_count": len(html_appendix_indexes),
+        "markdown_appendix_count": len(markdown_appendix_indexes),
+        "expected_indexes": sorted(expected_indexes),
+        "html_covered_indexes": sorted(html_covered_indexes),
+        "markdown_covered_indexes": sorted(markdown_covered_indexes),
+        "html_appendix_indexes": sorted(html_appendix_indexes),
+        "markdown_appendix_indexes": sorted(markdown_appendix_indexes),
+        "missing_candidate_indexes": sorted(missing_candidate_indexes),
+        "missing_html_indexes": sorted(expected_indexes - html_covered_indexes),
+        "missing_markdown_indexes": sorted(
+            expected_indexes - markdown_covered_indexes
+        ),
+        "html_identity_mismatch_indexes": sorted(html_identity_mismatch_indexes),
+        "markdown_identity_mismatch_indexes": sorted(
+            markdown_identity_mismatch_indexes
+        ),
+        "duplicate_html_anchor_indexes": sorted(
+            index for index, count in html_occurrence_counts.items() if count > 1
+        ),
+        "duplicate_markdown_anchor_indexes": sorted(
+            {
+                index
+                for index in markdown_anchor_occurrences
+                if markdown_anchor_occurrences.count(index) > 1
+            }
+        ),
+        "html_formula_occurrence_counts": {
+            str(index): count for index, count in sorted(html_occurrence_counts.items())
+        },
+        "markdown_display_formula_count": len(
+            _markdown_display_math_spans(document_markdown)
+        ),
+        "candidates": candidates,
+    }
+
+
+def _positive_page_number(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 and str(value).strip() == str(parsed) else None
+
+
+def _document_page_size_inventory(document_json: Any) -> dict[str, Any]:
+    """Merge top-level/chunk page sizes and retain local-to-global aliases."""
+
+    page_records: dict[int, dict[str, Any]] = {}
+    ambiguous_pages: set[int] = set()
+    aliases: dict[tuple[int, int], int] = {}
+    top_level_pages: set[int] = set()
+    parts: list[dict[str, Any]] = []
+
+    def normalized_pages(document: Any) -> dict[int, dict[str, Any]]:
+        raw_pages = document.get("pages") if isinstance(document, dict) else None
+        items: list[tuple[Any, Any]]
+        if isinstance(raw_pages, dict):
+            items = list(raw_pages.items())
+        elif isinstance(raw_pages, list):
+            items = list(enumerate(raw_pages, start=1))
+        else:
+            return {}
+        normalized: dict[int, dict[str, Any]] = {}
+        for raw_page_no, record in items:
+            page_no = _positive_page_number(raw_page_no)
+            if page_no is None or not isinstance(record, dict):
+                continue
+            size = record.get("size") or {}
+            try:
+                width = float(size.get("width") or 0.0)
+                height = float(size.get("height") or 0.0)
+            except (TypeError, ValueError):
+                continue
+            if width <= 0.0 or height <= 0.0:
+                continue
+            normalized[page_no] = record
+        return normalized
+
+    def add_page(global_page_no: int, record: dict[str, Any]) -> None:
+        if global_page_no in ambiguous_pages:
+            return
+        existing = page_records.get(global_page_no)
+        if existing is None:
+            page_records[global_page_no] = record
+            return
+        existing_size = existing.get("size") or {}
+        incoming_size = record.get("size") or {}
+        if (
+            float(existing_size.get("width") or 0.0)
+            != float(incoming_size.get("width") or 0.0)
+            or float(existing_size.get("height") or 0.0)
+            != float(incoming_size.get("height") or 0.0)
+        ):
+            page_records.pop(global_page_no, None)
+            ambiguous_pages.add(global_page_no)
+
+    direct_pages = normalized_pages(document_json)
+    for page_no, record in direct_pages.items():
+        add_page(page_no, record)
+        top_level_pages.add(page_no)
+
+    raw_chunks = (
+        document_json.get("chunks") if isinstance(document_json, dict) else None
+    )
+    if isinstance(raw_chunks, list) and raw_chunks:
+        chunk_entries: list[tuple[tuple[int, int], int, dict[str, Any], Any]] = []
+        for original_index, chunk in enumerate(raw_chunks):
+            if not isinstance(chunk, dict) or not isinstance(chunk.get("document"), dict):
+                continue
+            page_range_value = chunk.get("page_range")
+            start = (
+                _positive_page_number(page_range_value[0])
+                if isinstance(page_range_value, list) and page_range_value
+                else None
+            )
+            end = (
+                _positive_page_number(page_range_value[1])
+                if isinstance(page_range_value, list) and len(page_range_value) > 1
+                else start
+            )
+            sort_key = (
+                start if start is not None else original_index + 1,
+                end if end is not None else -1,
+            )
+            chunk_entries.append(
+                (sort_key, original_index, chunk["document"], page_range_value)
+            )
+        for part_index, (_key, _original, part, page_range_value) in enumerate(
+            sorted(chunk_entries, key=lambda item: (item[0], item[1]))
+        ):
+            part_pages = normalized_pages(part)
+            start = (
+                _positive_page_number(page_range_value[0])
+                if isinstance(page_range_value, list) and page_range_value
+                else None
+            )
+            end = (
+                _positive_page_number(page_range_value[1])
+                if isinstance(page_range_value, list) and len(page_range_value) > 1
+                else start
+            )
+            length = (
+                end - start + 1
+                if start is not None and end is not None and end >= start
+                else None
+            )
+            local_numbering = bool(
+                start is not None
+                and length is not None
+                and part_pages
+                and all(1 <= page_no <= length for page_no in part_pages)
+                and (start == 1 or 1 in part_pages or any(page_no < start for page_no in part_pages))
+            )
+            for raw_page_no, record in part_pages.items():
+                if local_numbering and start is not None:
+                    global_page_no = start + raw_page_no - 1
+                elif start is not None and end is not None and start <= raw_page_no <= end:
+                    global_page_no = raw_page_no
+                elif start is not None and length is not None and 1 <= raw_page_no <= length:
+                    global_page_no = start + raw_page_no - 1
+                else:
+                    global_page_no = raw_page_no
+                aliases[(part_index, raw_page_no)] = global_page_no
+                add_page(global_page_no, record)
+            parts.append(
+                {
+                    "part_index": part_index,
+                    "document": part,
+                    "page_range": page_range_value,
+                }
+            )
+    else:
+        parts.append(
+            {"part_index": None, "document": document_json, "page_range": None}
+        )
+
+    return {
+        "page_records": page_records,
+        "aliases": aliases,
+        "top_level_pages": top_level_pages,
+        "parts": parts,
+        "ambiguous_pages": sorted(ambiguous_pages),
+    }
+
+
+def _resolve_document_page_number(
+    inventory: dict[str, Any],
+    raw_page_no: Any,
+    *,
+    part_index: Any = None,
+) -> int | None:
+    page_no = _positive_page_number(raw_page_no)
+    if page_no is None:
+        return None
+    normalized_part = (
+        part_index
+        if isinstance(part_index, int) and not isinstance(part_index, bool)
+        else None
+    )
+    aliases = inventory.get("aliases") or {}
+    if normalized_part is not None and (normalized_part, page_no) in aliases:
+        return int(aliases[(normalized_part, page_no)])
+    page_records = inventory.get("page_records") or {}
+    if page_no in (inventory.get("top_level_pages") or set()):
+        return page_no if page_no in page_records else None
+    if normalized_part is not None:
+        part = next(
+            (
+                item
+                for item in (inventory.get("parts") or [])
+                if item.get("part_index") == normalized_part
+            ),
+            None,
+        )
+        page_range_value = (part or {}).get("page_range")
+        if (
+            isinstance(page_range_value, list)
+            and page_range_value
+            and (start := _positive_page_number(page_range_value[0])) is not None
+            and len(page_range_value) > 1
+            and (end := _positive_page_number(page_range_value[1])) is not None
+            and start <= page_no <= end
+            and page_no in page_records
+        ):
+            return page_no
+        return None
+    matching_aliases = {
+        int(global_page)
+        for (alias_part, alias_page), global_page in aliases.items()
+        if alias_part is not None and alias_page == page_no
+    }
+    if len(matching_aliases) == 1:
+        resolved = next(iter(matching_aliases))
+        return resolved if resolved in page_records else None
+    return page_no if page_no in page_records and not aliases else None
+
+
+def _document_with_resolved_page_provenance(document_json: Any) -> Any:
+    """Copy a document and translate chunk-local provenance to global pages."""
+
+    if not isinstance(document_json, dict):
+        return document_json
+    normalized = copy.deepcopy(document_json)
+    inventory = _document_page_size_inventory(normalized)
+    for part in inventory.get("parts") or []:
+        part_index = part.get("part_index")
+        for node in iter_nodes(part.get("document")):
+            if not isinstance(node, dict):
+                continue
+            if part_index is not None and any(
+                key in node for key in ("label", "self_ref", "prov")
+            ):
+                node["_local_ai_lab_chunk_part_index"] = part_index
+            provs = node.get("prov")
+            if not isinstance(provs, list):
+                continue
+            for prov in provs:
+                if not isinstance(prov, dict) or "page_no" not in prov:
+                    continue
+                raw_page_no = prov.get("page_no")
+                resolved_page_no = _resolve_document_page_number(
+                    inventory,
+                    raw_page_no,
+                    part_index=part_index,
+                )
+                # Plain non-chunk documents historically crop directly from
+                # global provenance even when their optional page-size map is
+                # absent.  Preserve that compatibility; chunk provenance must
+                # resolve through the declared range/page inventory or fail
+                # closed instead of silently sampling the wrong physical page.
+                if resolved_page_no is None and part_index is None:
+                    resolved_page_no = _positive_page_number(raw_page_no)
+                prov["page_no"] = resolved_page_no
+    if (
+        normalized.get("schema_name") == "local_ai_lab_docling_serve_chunked"
+        and isinstance(normalized.get("chunks"), list)
+    ):
+        # Semantic reflow assigns raw formula/table offsets in page-range order.
+        # Keep evidence extraction in that exact order so anchor indexes cannot
+        # bind a late chunk's crop to an early chunk's formula body.
+        indexed_chunks = list(enumerate(normalized["chunks"]))
+
+        def chunk_sort_key(item: tuple[int, Any]) -> tuple[int, int, int]:
+            original_index, chunk = item
+            page_range = chunk.get("page_range") if isinstance(chunk, dict) else None
+            start = (
+                _positive_page_number(page_range[0])
+                if isinstance(page_range, list) and page_range
+                else None
+            )
+            end = (
+                _positive_page_number(page_range[1])
+                if isinstance(page_range, list) and len(page_range) > 1
+                else start
+            )
+            return (
+                start if start is not None else original_index + 1,
+                end if end is not None else -1,
+                original_index,
+            )
+
+        normalized["chunks"] = [
+            chunk for _index, chunk in sorted(indexed_chunks, key=chunk_sort_key)
+        ]
+    return normalized
+
+
+def append_inline_math_source_renderings(
+    output_dir: Path,
+    document_json: dict[str, Any],
+    regions: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Attach a source-PDF crop to every detected inline-math occurrence."""
+
+    try:
+        from PIL import Image
+    except Exception as exc:
+        return {
+            "candidate_count": len(regions),
+            "expected_anchors": sorted(
+                str(region.get("anchor"))
+                for region in regions
+                if region.get("anchor")
+            ),
+            "html_covered_anchors": [],
+            "markdown_covered_anchors": [],
+            "missing_crop_anchors": sorted(
+                str(region.get("anchor"))
+                for region in regions
+                if region.get("anchor")
+            ),
+            "source_images": [],
+            "error": f"Pillow unavailable: {exc}",
+        }
+
+    page_inventory = _document_page_size_inventory(document_json)
+    page_records = page_inventory["page_records"]
+    inline_dir = output_dir / "inline_math"
+    candidates: list[dict[str, Any]] = []
+    missing_crop_anchors: set[str] = set()
+    expected_anchors = {
+        str(region.get("anchor")) for region in regions if region.get("anchor")
+    }
+    seen_anchors: set[str] = set()
+    for ordinal, region in enumerate(regions, start=1):
+        anchor = str(region.get("anchor") or "")
+        if not anchor or anchor in seen_anchors:
+            continue
+        seen_anchors.add(anchor)
+        raw_page_no = region.get("page_no")
+        part_index = region.get("part_index")
+        page_no = _resolve_document_page_number(
+            page_inventory,
+            raw_page_no,
+            part_index=part_index,
+        )
+        bbox = region.get("bbox") or {}
+        page_record = page_records.get(page_no) or {}
+        page_size = page_record.get("size") or {}
+        page_width = float(page_size.get("width") or 0.0)
+        page_height = float(page_size.get("height") or 0.0)
+        page_image = output_dir / "pages" / f"page_{page_no}.png"
+        if (
+            not page_no
+            or not page_image.exists()
+            or not page_width
+            or not page_height
+            or not all(key in bbox for key in ("l", "r", "t", "b"))
+        ):
+            missing_crop_anchors.add(anchor)
+            continue
+        safe_anchor = re.sub(r"[^A-Za-z0-9_.-]+", "-", anchor).strip("-")
+        relative_path = Path("inline_math") / f"{ordinal:04d}-{safe_anchor}.png"
+        try:
+            with Image.open(page_image) as image:
+                crop_box = _bbox_pixel_crop_box(
+                    bbox,
+                    page_width=page_width,
+                    page_height=page_height,
+                    image_width=image.width,
+                    image_height=image.height,
+                    padding=18,
+                )
+                if crop_box is None:
+                    missing_crop_anchors.add(anchor)
+                    continue
+                inline_dir.mkdir(exist_ok=True)
+                image.crop(crop_box).save(output_dir / relative_path)
+        except Exception:
+            missing_crop_anchors.add(anchor)
+            continue
+        crop_path = output_dir / relative_path
+        if not _image_has_visible_content(crop_path):
+            try:
+                crop_path.unlink()
+            except OSError:
+                pass
+            missing_crop_anchors.add(anchor)
+            continue
+        candidates.append(
+            {
+                "anchor": anchor,
+                "image": relative_path.as_posix(),
+                "page_no": page_no,
+                "source_page_no": raw_page_no,
+                "part_index": part_index,
+                "bbox": bbox,
+                "source_text": str(region.get("source_text") or "")[:1000],
+                "unresolved": bool(region.get("unresolved")),
+            }
+        )
+
+    html_path = output_dir / "document.html"
+    html_text = html_path.read_text(encoding="utf-8") if html_path.exists() else ""
+    html_text = re.sub(
+        r'<details\b[^>]*class="[^"]*\bdocling-inline-math-source\b[^"]*"[^>]*>.*?</details>',
+        "",
+        html_text,
+        flags=re.S | re.I,
+    )
+    html_marker_occurrences = re.findall(
+        r"source-inline-math-anchor:([^\s>]+)", html_text
+    )
+    html_covered: set[str] = set()
+    for candidate in candidates:
+        anchor = str(candidate["anchor"])
+        image_path = html.escape(str(candidate["image"]), quote=True)
+        marker_re = re.compile(
+            rf"<!--\s*source-inline-math-anchor:{re.escape(anchor)}\s*-->"
+        )
+        unresolved = bool(candidate.get("unresolved"))
+        disclosure = " open" if unresolved else ""
+        warning = (
+            '<p><strong>Machine transcription incomplete.</strong> '
+            "Use this exact PDF notation as the authoritative reading.</p>"
+            if unresolved
+            else ""
+        )
+        figure = (
+            f'<details{disclosure} class="docling-inline-math-source" '
+            f'data-inline-math-anchor="{html.escape(anchor, quote=True)}" '
+            'style="margin:.25rem 0 .75rem">'
+            "<summary>Compare inline notation with the original PDF</summary>"
+            f"{warning}"
+            f'<img loading="lazy" src="{image_path}" '
+            'style="max-width:100%;height:auto" '
+            'alt="Exact inline mathematical notation from the original PDF">'
+            "</details>"
+        )
+        html_text, count = marker_re.subn(
+            lambda match, figure=figure: match.group(0) + "\n" + figure,
+            html_text,
+            count=1,
+        )
+        if count:
+            html_covered.add(anchor)
+    if html_path.exists():
+        html_path.write_text(html_text, encoding="utf-8")
+
+    md_path = output_dir / "document.md"
+    markdown_text = md_path.read_text(encoding="utf-8") if md_path.exists() else ""
+    markdown_text = re.sub(
+        r"\n?<!--\s*source-inline-math-visual:[^\s>]+\s*-->.*?</details>\s*",
+        "\n",
+        markdown_text,
+        flags=re.S | re.I,
+    )
+    markdown_marker_occurrences = re.findall(
+        r"source-inline-math-anchor:([^\s>]+)", markdown_text
+    )
+    markdown_covered: set[str] = set()
+    for candidate in candidates:
+        anchor = str(candidate["anchor"])
+        marker_re = re.compile(
+            rf"<!--\s*source-inline-math-anchor:{re.escape(anchor)}\s*-->"
+        )
+        unresolved = bool(candidate.get("unresolved"))
+        disclosure = " open" if unresolved else ""
+        warning = (
+            "\n\n**Machine transcription incomplete. Use the exact PDF notation below.**"
+            if unresolved
+            else ""
+        )
+        evidence = (
+            f"<!-- source-inline-math-visual:{anchor} -->\n\n"
+            f'<details{disclosure} class="docling-inline-math-source"><summary>'
+            f"Compare inline notation with the original PDF</summary>{warning}\n\n"
+            f"![Inline notation — exact PDF rendering]({candidate['image']})\n\n"
+            "</details>"
+        )
+        markdown_text, count = marker_re.subn(
+            lambda match, evidence=evidence: match.group(0) + "\n\n" + evidence,
+            markdown_text,
+            count=1,
+        )
+        if count:
+            markdown_covered.add(anchor)
+    if md_path.exists():
+        md_path.write_text(markdown_text, encoding="utf-8")
+
+    return {
+        "candidate_count": len(candidates),
+        "expected_anchors": sorted(expected_anchors),
+        "html_covered_anchors": sorted(html_covered),
+        "markdown_covered_anchors": sorted(markdown_covered),
+        "missing_crop_anchors": sorted(missing_crop_anchors),
+        "missing_html_anchors": sorted(expected_anchors - html_covered),
+        "missing_markdown_anchors": sorted(expected_anchors - markdown_covered),
+        "duplicate_html_anchor_ids": sorted(
+            {
+                anchor
+                for anchor in html_marker_occurrences
+                if html_marker_occurrences.count(anchor) > 1
+            }
+        ),
+        "duplicate_markdown_anchor_ids": sorted(
+            {
+                anchor
+                for anchor in markdown_marker_occurrences
+                if markdown_marker_occurrences.count(anchor) > 1
+            }
+        ),
+        "source_images": [str(candidate["image"]) for candidate in candidates],
+        "unresolved_anchors": sorted(
+            str(candidate["anchor"])
+            for candidate in candidates
+            if candidate.get("unresolved")
+        ),
+        "candidates": candidates,
+    }
+
+
+def append_code_source_renderings(
+    output_dir: Path,
+    document_json: Any,
+    *,
+    metadata: dict[str, Any] | None = None,
+    semantic_pdf_path: Path | None = None,
+    visual_pdf_path: Path | None = None,
+) -> dict[str, Any]:
+    """Append exact PDF-page crops for semantic code blocks."""
+
+    try:
+        from PIL import Image
+    except Exception:
+        return {
+            "candidate_count": 0,
+            "html_applied_count": 0,
+            "markdown_applied_count": 0,
+            "source_images": [],
+            "error": "Pillow unavailable",
+        }
+
+    page_inventory = _document_page_size_inventory(document_json)
+    page_records = page_inventory["page_records"]
+    provenance_manifest = (
+        metadata.get("structural_visual_provenance_manifest")
+        if isinstance(metadata, dict)
+        else None
+    )
+    expected_visual_pdf_sha256 = _structural_expected_visual_pdf_sha256(metadata)
+    expected_semantic_pdf_sha256 = _structural_expected_semantic_pdf_sha256(
+        metadata
+    )
+    if expected_visual_pdf_sha256 is None and visual_pdf_path is not None:
+        try:
+            expected_visual_pdf_sha256 = file_sha256(visual_pdf_path)
+        except OSError:
+            pass
+    if expected_semantic_pdf_sha256 is None and semantic_pdf_path is not None:
+        try:
+            expected_semantic_pdf_sha256 = file_sha256(semantic_pdf_path)
+        except OSError:
+            pass
+    code_nodes: list[tuple[dict[str, Any], int | None]] = []
+    for part in page_inventory["parts"]:
+        part_index = part.get("part_index")
+        for node in iter_nodes(part.get("document")):
+            if (
+                isinstance(node, dict)
+                and str(node.get("label") or "").casefold() == "code"
+                and first_prov(node)
+                # Keep this classification identical to
+                # semantic_reflow._collect_items: a code-labelled node headed
+                # ``Algorithm N`` belongs to the algorithm surface and must not
+                # consume a code-block evidence index.
+                and not re.search(
+                    r"(?i)^Algorithm\s+\d+\b",
+                    str(node.get("text") or ""),
+                )
+            ):
+                code_nodes.append((node, part_index))
+    candidates: list[dict[str, Any]] = []
+    expected_body_identity_by_ref: dict[str, str] = {}
+    provenance_verified_refs: list[str] = []
+    provenance_mismatch_refs: list[str] = []
+    provenance_diagnostics: dict[str, list[str]] = {}
+    provenance_entries: list[dict[str, Any]] = []
+    code_dir = output_dir / "code_blocks"
+    for index, (node, part_index) in enumerate(code_nodes, start=1):
+        prov = first_prov(node) or {}
+        bbox = bbox_geometry(prov)
+        raw_page_no = prov.get("page_no")
+        page_no = _resolve_document_page_number(
+            page_inventory,
+            raw_page_no,
+            part_index=part_index,
+        )
+        page_image = output_dir / "pages" / f"page_{page_no}.png"
+        page_record = page_records.get(page_no) or {}
+        page_size = page_record.get("size") or {}
+        page_width = float(page_size.get("width") or 0.0)
+        page_height = float(page_size.get("height") or 0.0)
+        if not bbox or not page_no or not page_image.exists() or not page_width or not page_height:
+            continue
+        relative_path = f"code_blocks/code_block_{index}.png"
+        page_manifest = (
+            (provenance_manifest or {}).get("pages", {}).get(str(page_no))
+            if isinstance(provenance_manifest, dict)
+            else None
+        )
+        source_ref = _structural_node_source_ref(
+            node,
+            kind="code",
+            fallback_index=index - 1,
+            part_index=part_index,
+        )
+        source_code_text = str(node.get("text") or "")
+        numbered_source_lines = _numbered_code_lines(source_code_text)
+        expected_identity = _code_body_identity(
+            "\n".join(content for _number, content in numbered_source_lines)
+            if numbered_source_lines
+            else source_code_text
+        )
+        expected_body_identity_by_ref[source_ref] = expected_identity
+        page_verified, page_verify_reasons, page_manifest = (
+            _structural_page_manifest_verify(
+                output_dir,
+                provenance_manifest,
+                page_no=page_no,
+                expected_visual_pdf_sha256=expected_visual_pdf_sha256,
+                current_semantic_page_size=page_size,
+            )
+        )
+        existing_entry, existing_lookup_reasons = (
+            _structural_manifest_entry_for_ref(
+                provenance_manifest,
+                kind="code",
+                source_ref=source_ref,
+                index=index,
+            )
+        )
+        crop_box: tuple[int, int, int, int] | None = None
+        page_image_size: dict[str, int] | None = None
+        try:
+            with Image.open(page_image) as image:
+                crop_box = _bbox_pixel_crop_box(
+                    bbox,
+                    page_width=page_width,
+                    page_height=page_height,
+                    image_width=image.width,
+                    image_height=image.height,
+                    padding=14,
+                )
+                if crop_box is None:
+                    continue
+                page_image_size = {"width": image.width, "height": image.height}
+                code_dir.mkdir(exist_ok=True)
+                image.crop(crop_box).save(output_dir / relative_path)
+        except Exception:
+            continue
+        visual_page_size = (
+            (page_manifest or {}).get("page_size")
+            if isinstance(page_manifest, dict)
+            else page_size
+        )
+        metric = {
+            "path": relative_path,
+            "page_no": page_no,
+            "bbox": _structural_bbox_snapshot((prov.get("bbox") or bbox)),
+            "asset_sha256": file_sha256(output_dir / relative_path),
+            "source_pdf_sha256": (
+                str((provenance_manifest or {}).get("visual_pdf_sha256") or "")
+                if isinstance(provenance_manifest, dict)
+                else str(expected_visual_pdf_sha256 or "")
+            ),
+            "page_image_path": f"pages/page_{page_no}.png",
+            "page_image_sha256": (
+                str((page_manifest or {}).get("page_image_sha256") or "")
+                if isinstance(page_manifest, dict)
+                else ""
+            ),
+            "padding_px": 14,
+            "pixel_box": crop_box,
+            "page_size": visual_page_size,
+            "page_image_size": page_image_size,
+        }
+        provenance_entry = _structural_visual_provenance_entry(
+            kind="code",
+            index=index,
+            source_ref=source_ref,
+            node=node,
+            body_identity=expected_identity,
+            metric=metric,
+            node_bbox=prov.get("bbox"),
+            part_index=part_index,
+            semantic_pdf_sha256=expected_semantic_pdf_sha256,
+            conversion_pdf_sha256=expected_semantic_pdf_sha256,
+            semantic_page_size=page_size,
+            crop_coordinate_page_size=page_size,
+        )
+        active_entry = existing_entry
+        if active_entry is None and page_verified:
+            index_collisions = [
+                entry
+                for entry in ((provenance_manifest or {}).get("code") or [])
+                if isinstance(entry, dict) and entry.get("index") == index
+            ] if isinstance(provenance_manifest, dict) else []
+            if index_collisions:
+                existing_lookup_reasons.append("code_manifest_index_collision")
+            else:
+                _replace_structural_manifest_entry(
+                    provenance_manifest,
+                    inventory="code",
+                    entry=provenance_entry,
+                )
+                active_entry = provenance_entry
+                existing_lookup_reasons = []
+        if isinstance(active_entry, dict):
+            provenance_entries.append(active_entry)
+        verified, verify_reasons = _structural_provenance_verify(
+            output_dir,
+            active_entry,
+            current_source_ref=source_ref,
+            current_page_no=page_no,
+            current_bbox=prov.get("bbox"),
+            current_body_identity=expected_identity,
+            current_self_ref=str(node.get("self_ref") or ""),
+            current_part_index=part_index,
+            current_semantic_page_size=page_size,
+            expected_visual_pdf_sha256=expected_visual_pdf_sha256,
+            expected_semantic_pdf_sha256=expected_semantic_pdf_sha256,
+            expected_asset_path=relative_path,
+            expected_kind="code",
+        )
+        verify_reasons = sorted(
+            set(
+                verify_reasons
+                + existing_lookup_reasons
+                + ([] if page_verified else page_verify_reasons)
+            )
+        )
+        verified = bool(verified and page_verified and not existing_lookup_reasons)
+        if verified:
+            provenance_verified_refs.append(source_ref)
+        else:
+            provenance_mismatch_refs.append(source_ref)
+            provenance_diagnostics[source_ref] = verify_reasons
+        candidates.append(
+            {
+                "code_index": index,
+                "image": relative_path,
+                "page_no": page_no,
+                "source_page_no": raw_page_no,
+                "part_index": part_index,
+                "bbox": bbox,
+                "source_ref": source_ref,
+                "provenance_verified": verified,
+                "provenance_reasons": verify_reasons,
+            }
+        )
+
+    html_applied = 0
+    html_bound_refs: list[str] = []
+    unmatched_html_candidates: list[dict[str, Any]] = []
+    html_path = output_dir / "document.html"
+    if candidates and html_path.exists():
+        document_html = html_path.read_text(encoding="utf-8")
+        for candidate in candidates:
+            source_ref = str(candidate["source_ref"])
+            escaped_ref = re.escape(html.escape(source_ref, quote=True))
+            block_re = re.compile(
+                r'(?P<block><section\b[^>]*class="[^"]*\bcode-listing\b[^"]*"[^>]*>'
+                r".*?<pre\b[^>]*data-source-ref=[\"']"
+                + escaped_ref
+                + r"[\"'][^>]*>.*?</section>)",
+                flags=re.I | re.S,
+            )
+            figure = (
+                '<figure class="docling-code-source-evidence">'
+                f'<span hidden data-source-ref="{html.escape(source_ref, quote=True)}"></span>'
+                f'<img src="{candidate["image"]}" '
+                f'alt="Code block {candidate["code_index"]} source rendering">'
+                f'<figcaption>Code block {candidate["code_index"]} — exact source '
+                "rendering from the original PDF</figcaption></figure>"
+            )
+            document_html, applied = block_re.subn(
+                lambda match, figure=figure: match.group("block") + figure,
+                document_html,
+                count=1,
+            )
+            if applied:
+                html_bound_refs.append(source_ref)
+            else:
+                unmatched_html_candidates.append(candidate)
+        if unmatched_html_candidates and "</body>" in document_html.lower():
+            figures = "".join(
+                '<figure class="docling-code-source-evidence">'
+                f'<span hidden data-source-ref="{html.escape(str(candidate["source_ref"]), quote=True)}"></span>'
+                f'<img src="{candidate["image"]}" '
+                f'alt="Code block {candidate["code_index"]} source rendering">'
+                f'<figcaption>Code block {candidate["code_index"]} — exact source '
+                "rendering from the original PDF</figcaption></figure>"
+                for candidate in unmatched_html_candidates
+            )
+            appendix = (
+                '<section class="docling-code-source-evidence-appendix">'
+                "<h2>Original code renderings</h2>"
+                + figures
+                + "</section>"
+            )
+            body_end = re.search(r"</body>", document_html, flags=re.I)
+            if body_end:
+                document_html = (
+                    document_html[: body_end.start()]
+                    + appendix
+                    + document_html[body_end.start() :]
+                )
+        html_path.write_text(document_html, encoding="utf-8")
+        html_applied = len(html_bound_refs) + (
+            len(unmatched_html_candidates)
+            if unmatched_html_candidates and "</body>" in document_html.lower()
+            else 0
+        )
+
+    markdown_applied = 0
+    markdown_bound_refs: list[str] = []
+    unmatched_markdown_candidates: list[dict[str, Any]] = []
+    md_path = output_dir / "document.md"
+    if candidates and md_path.exists():
+        document_markdown = md_path.read_text(encoding="utf-8").rstrip()
+        for candidate in candidates:
+            source_ref = str(candidate["source_ref"])
+            marker = f"<!-- source-code-ref:{source_ref} -->"
+            evidence = (
+                marker
+                + "\n\n"
+                + f'![Code block {candidate["code_index"]} — source rendering]'
+                f'({candidate["image"]})'
+            )
+            if document_markdown.count(marker) == 1:
+                document_markdown = document_markdown.replace(marker, evidence, 1)
+                markdown_bound_refs.append(source_ref)
+            else:
+                unmatched_markdown_candidates.append(candidate)
+        if unmatched_markdown_candidates:
+            parts = [
+                "",
+                "## Original code renderings",
+                "",
+                (
+                    "The following images preserve code blocks that could not be "
+                    "bound to a unique semantic occurrence."
+                ),
+            ]
+            for candidate in unmatched_markdown_candidates:
+                parts.extend(
+                    [
+                        "",
+                        f'![Code block {candidate["code_index"]} — source rendering]'
                         f'({candidate["image"]})',
                     ]
                 )
-            md_path.write_text("\n".join(parts) + "\n", encoding="utf-8")
-            markdown_applied = len(candidates)
+            document_markdown = document_markdown + "\n".join(parts)
+        md_path.write_text(document_markdown.rstrip() + "\n", encoding="utf-8")
+        markdown_applied = len(markdown_bound_refs) + len(
+            unmatched_markdown_candidates
+        )
+
+    final_html = html_path.read_text(encoding="utf-8") if html_path.exists() else ""
+    final_markdown = md_path.read_text(encoding="utf-8") if md_path.exists() else ""
+    html_body_identity_verified_refs: list[str] = []
+    markdown_body_identity_verified_refs: list[str] = []
+    html_body_identity_mismatch_refs: list[str] = []
+    markdown_body_identity_mismatch_refs: list[str] = []
+    body_identity_diagnostics: dict[str, dict[str, str]] = {}
+    for candidate in candidates:
+        source_ref = str(candidate["source_ref"])
+        expected_identity = expected_body_identity_by_ref.get(source_ref, "")
+        html_body = _html_section_pre_body_for_source_ref(
+            final_html,
+            css_class="code-listing",
+            source_ref=source_ref,
+        )
+        markdown_body = _markdown_fenced_body_for_source_ref(
+            final_markdown,
+            kind="code",
+            source_ref=source_ref,
+        )
+        html_identity = _code_body_identity(
+            html_body or "",
+            html_markup=True,
+        )
+        markdown_identity = _code_body_identity(markdown_body or "")
+        if expected_identity and html_identity == expected_identity:
+            html_body_identity_verified_refs.append(source_ref)
+        else:
+            html_body_identity_mismatch_refs.append(source_ref)
+        if expected_identity and markdown_identity == expected_identity:
+            markdown_body_identity_verified_refs.append(source_ref)
+        else:
+            markdown_body_identity_mismatch_refs.append(source_ref)
+        body_identity_diagnostics[source_ref] = {
+            "html": "verified" if expected_identity and html_identity == expected_identity else "mismatch",
+            "markdown": (
+                "verified"
+                if expected_identity and markdown_identity == expected_identity
+                else "mismatch"
+            ),
+        }
 
     return {
         "candidate_count": len(candidates),
         "html_applied_count": html_applied,
         "markdown_applied_count": markdown_applied,
+        "candidate_source_refs": [str(item["source_ref"]) for item in candidates],
+        "html_bound_source_refs": html_bound_refs,
+        "markdown_bound_source_refs": markdown_bound_refs,
+        "html_unbound_source_refs": [
+            str(item["source_ref"]) for item in unmatched_html_candidates
+        ],
+        "markdown_unbound_source_refs": [
+            str(item["source_ref"]) for item in unmatched_markdown_candidates
+        ],
+        "html_body_identity_verified_refs": sorted(
+            set(html_body_identity_verified_refs)
+        ),
+        "markdown_body_identity_verified_refs": sorted(
+            set(markdown_body_identity_verified_refs)
+        ),
+        "html_body_identity_mismatch_refs": sorted(
+            set(html_body_identity_mismatch_refs)
+        ),
+        "markdown_body_identity_mismatch_refs": sorted(
+            set(markdown_body_identity_mismatch_refs)
+        ),
+        "body_identity_diagnostics": body_identity_diagnostics,
+        "provenance_verified_refs": sorted(set(provenance_verified_refs)),
+        "provenance_mismatch_refs": sorted(set(provenance_mismatch_refs)),
+        "provenance_diagnostics": provenance_diagnostics,
+        "provenance_entries": provenance_entries,
+        "source_images": [candidate["image"] for candidate in candidates],
+        "candidates": candidates,
     }
 
 
@@ -1811,14 +5859,9 @@ def formula_review_diagnostics(
             if FORMULA_NUMBER_RE.fullmatch(str(formula_4["text"]).strip())
             else "present"
         )
-    elif "CN" in input_file.name:
-        missing.append(
-            {
-                "index": None,
-                "text": "formula 4 not found in formula labels",
-                "prov": {"page_no": 3},
-            }
-        )
+    # Do not synthesize a missing-formula finding from a filename substring.
+    # The former ``"CN" in name`` branch polluted unrelated unseen papers
+    # such as ``fooCN.pdf`` with a paper-specific formula-4 diagnostic.
 
     return {
         "formula_count": len(formulas),
@@ -2202,16 +6245,19 @@ def _polish_footnote_superscripts(document_html: str) -> tuple[str, int]:
 
 
 def _mark_math_heavy_text(document_html: str) -> tuple[str, int]:
-    math_chars = "Θ∆Φℝ𝑊𝑟𝑑𝒩×≪ˆ"
     count = 0
 
     def replace(match: re.Match[str]) -> str:
         nonlocal count
         paragraph = match.group(0)
         body = html.unescape(paragraph)
-        if "<math" in paragraph or not any(char in body for char in math_chars):
+        if "<math" in paragraph:
             return paragraph
-        if not re.search(r"[=|]|d\s*model|LoRA|∆Φ|Φ\s*0|Θ", body):
+        if not re.search(
+            r"(?:[=<>≤≥≠≈∑∏∫√]|[_^]|"
+            r"\\(?:frac|sum|prod|int|sqrt|lim|mathbb|mathcal|nabla|partial)\b)",
+            body,
+        ):
             return paragraph
         count += 1
         return paragraph.replace("<p>", '<p class="docling-math-text">', 1)
@@ -4943,6 +8989,9 @@ def _pdf_text_for_bbox(pdf_path: Path, prov: dict[str, Any], padding: float = 5.
     page_no = prov.get("page_no") if isinstance(prov, dict) else None
     if not isinstance(bbox, dict) or not isinstance(page_no, int):
         return ""
+    origin = _bbox_coord_origin(bbox)
+    if origin is None:
+        return ""
     if fitz is not None:
         try:
             doc = fitz.open(pdf_path)
@@ -4954,11 +9003,17 @@ def _pdf_text_for_bbox(pdf_path: Path, prov: dict[str, Any], padding: float = 5.
                     return ""
                 page = doc[page_no - 1]
                 height = float(page.rect.height)
+                if origin == "BOTTOMLEFT":
+                    top = height - float(bbox.get("t", height))
+                    bottom = height - float(bbox.get("b", 0))
+                else:
+                    top = float(bbox.get("t", 0.0))
+                    bottom = float(bbox.get("b", height))
                 rect = fitz.Rect(
                     float(bbox.get("l", 0)) - padding,
-                    height - float(bbox.get("t", height)) - padding,
+                    min(top, bottom) - padding,
                     float(bbox.get("r", 0)) + padding,
-                    height - float(bbox.get("b", 0)) + padding,
+                    max(top, bottom) + padding,
                 )
                 blocks = page.get_text("blocks", clip=rect, sort=True)
                 return "\n".join(
@@ -4980,13 +9035,17 @@ def _pdf_text_for_bbox(pdf_path: Path, prov: dict[str, Any], padding: float = 5.
             if not (1 <= page_no <= len(pdf.pages)):
                 return ""
             page = pdf.pages[page_no - 1]
-            top = float(page.height) - float(bbox.get("t", page.height))
-            bottom = float(page.height) - float(bbox.get("b", 0))
+            if origin == "BOTTOMLEFT":
+                top = float(page.height) - float(bbox.get("t", page.height))
+                bottom = float(page.height) - float(bbox.get("b", 0))
+            else:
+                top = float(bbox.get("t", 0.0))
+                bottom = float(bbox.get("b", page.height))
             crop_bbox = (
                 max(0.0, float(bbox.get("l", 0)) - padding),
-                max(0.0, top - padding),
+                max(0.0, min(top, bottom) - padding),
                 min(float(page.width), float(bbox.get("r", 0)) + padding),
-                min(float(page.height), bottom + padding),
+                min(float(page.height), max(top, bottom) + padding),
             )
             crop = page.crop(crop_bbox, strict=False)
             return _clean_pdfplumber_glyph_text(
@@ -5004,16 +9063,11 @@ def _pdf_text_for_bbox(pdf_path: Path, prov: dict[str, Any], padding: float = 5.
 
 
 def _clean_pdfplumber_glyph_text(text: str) -> str:
-    cleaned = (
-        text.replace("(cid:126)", "⃗")
-        .replace("(cid:16)", "(")
-        .replace("(cid:17)", ")")
-        .replace("(cid:80)", "∑")
-        .replace("(cid:40)", "")
-        .replace("\x00", "")
-        .replace("\x01", "")
-    )
-    return re.sub(r"\(cid:\d+\)", "", cleaned)
+    # CID numbers are private to each embedded font.  Mapping a number learned
+    # from one paper to a symbol in another invents semantics.  Preserve the
+    # literal token so the unresolved source text remains auditable and let the
+    # exact PDF crop carry the authoritative glyph.
+    return text.replace("\x00", "").replace("\x01", "")
 
 
 def _pdfplumber_algorithm_layout_for_bbox(
@@ -5029,18 +9083,25 @@ def _pdfplumber_algorithm_layout_for_bbox(
     page_no = prov.get("page_no") if isinstance(prov, dict) else None
     if not isinstance(bbox, dict) or not isinstance(page_no, int):
         return None
+    origin = _bbox_coord_origin(bbox)
+    if origin is None:
+        return None
     try:
         with pdfplumber.open(str(pdf_path)) as pdf:
             if not (1 <= page_no <= len(pdf.pages)):
                 return None
             page = pdf.pages[page_no - 1]
-            top = float(page.height) - float(bbox.get("t", page.height))
-            bottom = float(page.height) - float(bbox.get("b", 0))
+            if origin == "BOTTOMLEFT":
+                top = float(page.height) - float(bbox.get("t", page.height))
+                bottom = float(page.height) - float(bbox.get("b", 0))
+            else:
+                top = float(bbox.get("t", 0.0))
+                bottom = float(bbox.get("b", page.height))
             crop_bbox = (
                 max(0.0, float(bbox.get("l", 0)) - padding),
-                max(0.0, top - padding),
+                max(0.0, min(top, bottom) - padding),
                 min(float(page.width), float(bbox.get("r", 0)) + padding),
-                min(float(page.height), bottom + padding),
+                min(float(page.height), max(top, bottom) + padding),
             )
             crop = page.crop(crop_bbox, strict=False)
             extracted_lines = crop.extract_text_lines(
@@ -5176,6 +9237,9 @@ def _pdf_algorithm_layout_for_bbox(
     page_no = prov.get("page_no") if isinstance(prov, dict) else None
     if not isinstance(bbox, dict) or not isinstance(page_no, int):
         return None
+    origin = _bbox_coord_origin(bbox)
+    if origin is None:
+        return None
     try:
         doc = fitz.open(pdf_path)
     except Exception:
@@ -5185,11 +9249,17 @@ def _pdf_algorithm_layout_for_bbox(
             return None
         page = doc[page_no - 1]
         page_height = float(page.rect.height)
+        if origin == "BOTTOMLEFT":
+            top = page_height - float(bbox.get("t", page_height))
+            bottom = page_height - float(bbox.get("b", 0))
+        else:
+            top = float(bbox.get("t", 0.0))
+            bottom = float(bbox.get("b", page_height))
         rect = fitz.Rect(
             float(bbox.get("l", 0)) - padding,
-            page_height - float(bbox.get("t", page_height)) - padding,
+            min(top, bottom) - padding,
             float(bbox.get("r", 0)) + padding,
-            page_height - float(bbox.get("b", 0)) + padding,
+            max(top, bottom) + padding,
         )
         extracted = page.get_text("dict", clip=rect, sort=True)
     except Exception:
@@ -5291,12 +9361,10 @@ def _format_algorithm_text(text: str) -> str:
     lines = lines[first_algorithm_line:]
     lines = _join_algorithm_header_continuations(lines)
     cleaned: list[str] = []
-    output_seen = False
     for line in lines:
         if re.match(r"(?i)^Algorithm\s+\d+\b\s*:?", line):
             continue
         line = _normalize_algorithm_spaced_keywords(line)
-        line = _strip_letter_spaced_formula_noise(line)
         line = re.sub(r"(?i)^[a-z]{1,4}\.?\s+(?=\d+\s*:)", "", line)
         line = re.sub(r"^\{\s*((?:Input|Output|Require|Ensure|Parameters?)\s*:)", r"\1", line)
         line = re.sub(r"^\{\s*(\d+\s*:)", r"\1", line)
@@ -5308,21 +9376,6 @@ def _format_algorithm_text(text: str) -> str:
         line = re.sub(r"(?i)^size\s+.*?:\s*(?=[A-Za-z\\]+\s*(?:\[|_|\\leftarrow|←|=))", "", line)
         line = re.sub(r"\s+", " ", line).strip()
         if re.match(r"(?i)^\d+\s*:\s*$", line):
-            continue
-        if output_seen and re.match(r"(?i)^Input\s*:", line):
-            continue
-        if output_seen and re.match(r"(?i)^Output\s*:", line) and re.search(r"(?:←|=|\\leftarrow|\\frac)", line):
-            line = re.sub(r"(?i)^Output\s*:\s*", "", line).strip()
-        if re.match(r"(?i)^Output\s*:", line):
-            output_seen = True
-        if (
-            len(_normalized_noise_text(line)) < 16
-            and not re.search(
-                r"(?i)^(?:Require|Ensure|Input|Output|for|while|if|return|end|\d+\s*:)|"
-                r"(?:←|=|\\leftarrow|\\frac|\\sum|\\nabla)",
-                line,
-            )
-        ):
             continue
         if line:
             cleaned.append(line)
@@ -5353,48 +9406,10 @@ def _normalize_algorithm_spaced_keywords(line: str) -> str:
 
 
 def _dedupe_algorithm_lines(lines: list[str]) -> list[str]:
-    result: list[str] = []
-    seen_normalized: set[str] = set()
-    seen_steps: set[str] = set()
-    seen_assignment_lhs: set[str] = set()
-    compact_lines = [re.sub(r"\s+", "", _normalized_noise_text(line)).lower() for line in lines]
-    for raw_index, raw_line in enumerate(lines):
-        line = raw_line.strip()
-        if not line:
-            continue
-        normalized = _normalized_noise_text(line)
-        compact = re.sub(r"\s+", "", normalized).lower()
-        repeatable_step = bool(re.match(r"(?i)^(?:Sample|Update|Train|Add|Modify|Set|Compute|Draw)\b", normalized))
-        if compact in seen_normalized and not repeatable_step:
-            continue
-        step_match = re.match(r"^(\d+)\s*:\s*(.*)$", normalized)
-        if not step_match and not repeatable_step and len(compact) > 20:
-            if any(compact in later for later in compact_lines[raw_index + 1 :]):
-                continue
-        if step_match:
-            step_no = step_match.group(1)
-            body = step_match.group(2).strip()
-            if not re.sub(r"[{}\s]", "", body):
-                continue
-            if step_no in seen_steps:
-                continue
-            seen_steps.add(step_no)
-        if (
-            normalized.lower() in {"end for", "end while", "end if"}
-            and any(re.match(r"(?i)^\d+\s*:\s*" + re.escape(normalized) + r"\b", later) for later in lines[raw_index + 1 :])
-        ):
-            continue
-        assignment_match = re.match(r"^(.{1,80}?)(?:←|=)", normalized)
-        if assignment_match and not step_match:
-            lhs_key = re.sub(r"\W+", "", assignment_match.group(1)).lower()
-            if lhs_key and lhs_key in seen_assignment_lhs:
-                continue
-            if lhs_key:
-                seen_assignment_lhs.add(lhs_key)
-        if not repeatable_step:
-            seen_normalized.add(compact)
-        result.append(line)
-    return result
+    # Repeated operations can be semantically significant (for example the
+    # same update in two branches).  Preserve every non-empty source line;
+    # exact source visuals remain available for OCR review.
+    return [line.strip() for line in lines if line.strip()]
 
 
 def _join_algorithm_header_continuations(lines: list[str]) -> list[str]:
@@ -5509,6 +9524,12 @@ def _algorithm_record_html(record: dict[str, Any]) -> str:
         else ""
     )
     source_image = str(record.get("source_image") or "").strip()
+    source_ref = str(record.get("source_ref") or "").strip()
+    source_ref_attr = (
+        f' data-source-ref="{html.escape(source_ref, quote=True)}"'
+        if source_ref
+        else ""
+    )
     source_figure = (
         '<figure class="docling-algorithm-source-evidence">'
         f'<img src="{html.escape(source_image, quote=True)}" '
@@ -5520,7 +9541,7 @@ def _algorithm_record_html(record: dict[str, Any]) -> str:
     )
     return (
         '<div class="docling-algorithm-recovered" '
-        f'data-algorithm-source="{source}">'
+        f'data-algorithm-source="{source}"{source_ref_attr}>'
         f'<div class="docling-formula-second-pass-label docling-algorithm-label">{label}</div>'
         + caption_html
         + text
@@ -5535,13 +9556,17 @@ def _algorithm_record_markdown(record: dict[str, Any]) -> str:
     caption = str(record.get("caption") or "").strip()
     caption_text = f"\n\n{caption}\n" if caption and caption != label else ""
     source_image = str(record.get("source_image") or "").strip()
+    source_ref = str(record.get("source_ref") or "").strip()
+    source_marker = (
+        f"<!-- source-algorithm-ref:{source_ref} -->\n" if source_ref else ""
+    )
     source_figure = (
         f"\n\n![{label} source rendering]({source_image})\n"
         if source_image
         else ""
     )
     return (
-        f"\n\n**{label}**{caption_text}\n"
+        f"\n\n{source_marker}**{label}**{caption_text}\n"
         + (
             _algorithm_layout_html(record)
             or (
@@ -5778,9 +9803,117 @@ def _nearby_algorithm_caption(
     return caption, [index], [caption]
 
 
+def _code_node_has_algorithm_structure(value: str) -> bool:
+    """Require structure beyond dataset-style ``Input``/``Label`` examples."""
+
+    text = _normalized_noise_text(value)
+    if re.search(r"(?i)\bAlgorithm\s+\d+\b", text):
+        return True
+    numbered_steps = re.findall(r"(?m)(?:^|\s)(\d{1,3})\s*:", text)
+    if len(set(numbered_steps)) >= 2:
+        return True
+    if re.search(
+        r"(?i)\b(?:while|for|if|else|repeat|until|return|initialize|update)\b|"
+        r"←|:=|\\leftarrow",
+        text,
+    ):
+        return True
+    has_input = bool(re.search(r"(?i)\b(?:Input|Require)\s*:", text))
+    has_output = bool(re.search(r"(?i)\b(?:Output|Ensure)\s*:", text))
+    return has_input and has_output
+
+
+def _algorithm_source_node_binding(
+    node: dict[str, Any],
+    *,
+    source_ref: str,
+    body_identity_kind: str = "node_text",
+) -> dict[str, Any]:
+    prov = first_prov(node) or {}
+    body_identity = (
+        _table_grid_body_identity(table_grid(node))
+        if body_identity_kind == "table_grid"
+        else _structural_body_identity(str(node.get("text") or ""))
+    )
+    return {
+        "source_ref": source_ref,
+        "self_ref": str(node.get("self_ref") or ""),
+        "part_index": _structural_node_part_index(node),
+        "page_no": _positive_page_number(prov.get("page_no")),
+        "bbox": _structural_bbox_snapshot(prov.get("bbox")),
+        "body_identity_kind": body_identity_kind,
+        "body_identity_sha256": _structural_body_identity_sha256(
+            "algorithm-source-node",
+            body_identity,
+        ),
+    }
+
+
+def _algorithm_source_node_bindings_verify(
+    document_json: Any,
+    bindings: Any,
+) -> tuple[bool, list[str], list[dict[str, Any]]]:
+    if not isinstance(bindings, list) or not bindings:
+        return False, ["missing_algorithm_source_node_bindings"], []
+    nodes_by_ref = _structural_nodes_by_part_ref(document_json)
+    reasons: list[str] = []
+    bound_nodes: list[dict[str, Any]] = []
+    seen_refs: set[str] = set()
+    for binding in bindings:
+        if not isinstance(binding, dict):
+            reasons.append("malformed_algorithm_source_node_binding")
+            continue
+        self_ref = str(binding.get("self_ref") or "")
+        part_index = binding.get("part_index")
+        source_ref = str(binding.get("source_ref") or "")
+        if not self_ref or not source_ref or source_ref in seen_refs:
+            reasons.append("algorithm_source_node_binding_not_bijective")
+            continue
+        seen_refs.add(source_ref)
+        node = nodes_by_ref.get((part_index, self_ref))
+        if not isinstance(node, dict):
+            reasons.append(f"algorithm_source_node_missing:{source_ref}")
+            continue
+        if _structural_node_source_ref(
+            node,
+            kind=(
+                "table"
+                if binding.get("body_identity_kind") == "table_grid"
+                else "algorithm"
+            ),
+            fallback_index=0,
+            part_index=part_index,
+        ) != source_ref:
+            reasons.append(f"algorithm_source_node_ref_mismatch:{source_ref}")
+        prov = first_prov(node) or {}
+        if _positive_page_number(prov.get("page_no")) != _positive_page_number(
+            binding.get("page_no")
+        ):
+            reasons.append(f"algorithm_source_node_page_mismatch:{source_ref}")
+        current_bbox = _structural_bbox_snapshot(prov.get("bbox"))
+        bound_bbox = _structural_bbox_snapshot(binding.get("bbox"))
+        if current_bbox is None or current_bbox != bound_bbox:
+            reasons.append(f"algorithm_source_node_bbox_mismatch:{source_ref}")
+        body_identity = (
+            _table_grid_body_identity(table_grid(node))
+            if binding.get("body_identity_kind") == "table_grid"
+            else _structural_body_identity(str(node.get("text") or ""))
+        )
+        if str(binding.get("body_identity_sha256") or "").lower() != (
+            _structural_body_identity_sha256(
+                "algorithm-source-node",
+                body_identity,
+            )
+        ):
+            reasons.append(f"algorithm_source_node_body_mismatch:{source_ref}")
+        bound_nodes.append(node)
+    return not reasons, sorted(set(reasons)), bound_nodes
+
+
 def _algorithm_candidate_records(document_json: Any, pdf_path: Path) -> list[dict[str, Any]]:
     if not isinstance(document_json, dict):
         return []
+    document_json = _document_with_resolved_page_provenance(document_json)
     records: list[dict[str, Any]] = []
     if (
         document_json.get("schema_name") == "local_ai_lab_docling_serve_chunked"
@@ -5809,6 +9942,17 @@ def _algorithm_candidate_records(document_json: Any, pdf_path: Path) -> list[dic
             for node in (document_json.get("texts") or [])
             if isinstance(node, dict)
         ]
+
+    def source_reflow(node: dict[str, Any]) -> tuple[str, str] | None:
+        if not pdf_path.is_file():
+            return None
+        try:
+            return source_algorithm_block(node, pdf_path)
+        except Exception:
+            # Candidate discovery remains fail-closed below: an unreadable
+            # reconstruction never replaces the existing PDF/Docling body.
+            return None
+
     used_text_indexes: set[int] = set()
     formula_index = 0
     for text_index, node in enumerate(nodes):
@@ -5820,7 +9964,7 @@ def _algorithm_candidate_records(document_json: Any, pdf_path: Path) -> list[dic
             formula_no = formula_index
         algorithm_like = (
             label == "code"
-            and re.search(r"(?i)\b(?:Require|Input|Output|while)\b", node_text)
+            and _code_node_has_algorithm_structure(node_text)
         ) or (
             label == "formula"
             and _looks_like_algorithm_formula(node_text)
@@ -5837,6 +9981,22 @@ def _algorithm_candidate_records(document_json: Any, pdf_path: Path) -> list[dic
         if len(formatted) < 20:
             continue
         layout = _pdf_algorithm_layout_for_bbox(pdf_path, prov) if pdf_path.exists() else None
+        source_reflow_result = source_reflow(node)
+        source_reflow_used = False
+        if source_reflow_result is not None:
+            source_title, source_body = source_reflow_result
+            if len(_normalized_noise_text(source_body)) >= 20:
+                formatted = source_body
+                # The source reflow body already incorporates the same PDF
+                # line/cell geometry used by semantic reflow.  Retaining the
+                # older flattened layout would make both rendering and final
+                # identity checks prefer a known-fragmented view instead.
+                layout = None
+                source_reflow_used = True
+            else:
+                source_title = ""
+        else:
+            source_title = ""
         caption, caption_indexes, caption_targets = _nearby_algorithm_caption(
             nodes,
             text_index,
@@ -5848,13 +10008,18 @@ def _algorithm_candidate_records(document_json: Any, pdf_path: Path) -> list[dic
             if pdf_caption not in caption_targets:
                 caption_targets.append(pdf_caption)
         elif not caption:
-            caption = _algorithm_caption_from_text(node_text)
+            caption = source_title or _algorithm_caption_from_text(node_text)
             if caption:
                 caption_targets = [caption]
         if label == "code" and not caption and _looks_like_program_listing(
             pdf_text or node_text
         ):
             continue
+        source_ref = _structural_node_source_ref(
+            node,
+            kind="algorithm",
+            fallback_index=text_index,
+        )
         records.append(
             {
                 "id": f"algorithm-block-{len(records) + 1}",
@@ -5862,7 +10027,15 @@ def _algorithm_candidate_records(document_json: Any, pdf_path: Path) -> list[dic
                 "caption": caption,
                 "text": formatted,
                 "original_text": node_text,
-                "source": "pdf_text_bbox" if pdf_text and label != "formula" else "docling_node_text",
+                "source": (
+                    "source_geometry_reflow"
+                    if source_reflow_used
+                    else (
+                        "pdf_text_bbox"
+                        if pdf_text and label != "formula"
+                        else "docling_node_text"
+                    )
+                ),
                 "text_index": text_index,
                 "caption_text_indexes": caption_indexes,
                 "formula_no": formula_no,
@@ -5871,6 +10044,13 @@ def _algorithm_candidate_records(document_json: Any, pdf_path: Path) -> list[dic
                 "layout": layout,
                 "original_label": label,
                 "html_targets": caption_targets,
+                "source_ref": source_ref,
+                "source_node_bindings": [
+                    _algorithm_source_node_binding(
+                        node,
+                        source_ref=source_ref,
+                    )
+                ],
             }
         )
         used_text_indexes.add(text_index)
@@ -5883,32 +10063,78 @@ def _algorithm_candidate_records(document_json: Any, pdf_path: Path) -> list[dic
             pdf_path,
         )
     )
-    existing_algorithm_keys: set[tuple[str | None, Any]] = set()
-    for record in records:
-        number_match = re.search(
-            r"(?i)\bAlgorithm\s+(\d+)\b",
-            str(record.get("label") or ""),
+    existing_algorithm_keys: set[tuple[Any, ...]] = set()
+
+    def algorithm_identity_key(
+        label_value: str,
+        page_no: Any,
+        source_ref: str,
+        bbox_value: Any,
+    ) -> tuple[Any, ...]:
+        number_match = re.search(r"(?i)\bAlgorithm\s+(\d+)\b", label_value)
+        bbox_snapshot = _structural_bbox_snapshot(bbox_value)
+        bbox_fingerprint = tuple(
+            (bbox_snapshot or {}).get(key) for key in ("l", "r", "t", "b", "coord_origin")
         )
+        return (
+            number_match.group(1) if number_match else None,
+            page_no,
+            source_ref,
+            bbox_fingerprint,
+        )
+
+    for record in records:
         existing_algorithm_keys.add(
-            (
-                number_match.group(1) if number_match else None,
+            algorithm_identity_key(
+                str(record.get("label") or ""),
                 record.get("page_no"),
+                str(record.get("source_ref") or ""),
+                record.get("bbox"),
             )
         )
-    for table in extract_table_nodes(document_json):
+    for table_index, table in enumerate(extract_table_nodes(document_json), start=1):
         prov = first_prov(table) or {}
         pdf_text = _pdf_text_for_bbox(pdf_path, prov) if pdf_path.exists() else ""
         caption = _algorithm_caption_from_text(pdf_text)
-        number_match = re.search(r"(?i)\bAlgorithm\s+(\d+)\b", caption)
-        key = (
-            number_match.group(1) if number_match else None,
+        table_source_ref = _structural_node_source_ref(
+            table,
+            kind="table",
+            fallback_index=table_index - 1,
+        )
+        key = algorithm_identity_key(
+            caption,
             prov.get("page_no"),
+            table_source_ref,
+            prov.get("bbox"),
         )
         if not caption or key in existing_algorithm_keys:
             continue
         formatted = _format_algorithm_text(pdf_text)
         if len(formatted) < 40:
             continue
+        source_reflow_result = source_reflow(table)
+        source_reflow_used = False
+        layout = (
+            _pdf_algorithm_layout_for_bbox(pdf_path, prov)
+            if pdf_path.exists()
+            else None
+        )
+        if source_reflow_result is not None:
+            source_title, source_body = source_reflow_result
+            if len(_normalized_noise_text(source_body)) >= 20:
+                caption = source_title or caption
+                formatted = source_body
+                layout = None
+                source_reflow_used = True
+        semantic_numbered_steps: list[int] = []
+        for cell in ((table.get("data") or {}).get("table_cells") or []):
+            if not isinstance(cell, dict):
+                continue
+            for value in re.findall(r"(?<!\d)(\d{1,3})\s*:", str(cell.get("text") or "")):
+                number = int(value)
+                if number not in semantic_numbered_steps:
+                    semantic_numbered_steps.append(number)
+        source_ref = table_source_ref
         records.append(
             {
                 "id": f"algorithm-block-{len(records) + 1}",
@@ -5916,15 +10142,27 @@ def _algorithm_candidate_records(document_json: Any, pdf_path: Path) -> list[dic
                 "caption": caption,
                 "text": formatted,
                 "original_text": pdf_text,
-                "source": "pdf_text_from_algorithm_like_table",
+                "source": (
+                    "source_geometry_reflow"
+                    if source_reflow_used
+                    else "pdf_text_from_algorithm_like_table"
+                ),
                 "formula_no": None,
                 "page_no": prov.get("page_no"),
                 "bbox": bbox_geometry(prov),
-                "layout": _pdf_algorithm_layout_for_bbox(pdf_path, prov)
-                if pdf_path.exists()
-                else None,
+                "layout": layout,
                 "original_label": "algorithm_like_table",
+                "table_index": table_index,
                 "html_targets": [caption],
+                "numbered_steps": semantic_numbered_steps,
+                "source_ref": source_ref,
+                "source_node_bindings": [
+                    _algorithm_source_node_binding(
+                        table,
+                        source_ref=source_ref,
+                        body_identity_kind="table_grid",
+                    )
+                ],
             }
         )
         table.setdefault("local_ai_lab_qc", {})["algorithm_like_table"] = True
@@ -6186,10 +10424,7 @@ def _find_markdown_target_line_ranges(md_text: str, targets: Iterable[str]) -> l
         if boundary_positions
         else md_text
     )
-    fence_ranges = [
-        (match.start(), match.end())
-        for match in re.finditer(r"```.*?```", searchable_md, flags=re.S)
-    ]
+    code_ranges = _markdown_code_ranges(searchable_md)
     ranges: list[tuple[int, int]] = []
     for target in targets:
         normalized_target = _normalized_noise_text(target)[:96]
@@ -6197,7 +10432,10 @@ def _find_markdown_target_line_ranges(md_text: str, targets: Iterable[str]) -> l
             continue
         compact_target = re.sub(r"\s+", "", normalized_target)
         for match in re.finditer(r"(?m)^(?P<line>.+)$", searchable_md):
-            if any(start <= match.start() < end for start, end in fence_ranges):
+            if any(
+                not (match.end() <= start or match.start() >= end)
+                for start, end in code_ranges
+            ):
                 continue
             raw_line = match.group("line").lstrip()
             if raw_line.startswith("**Algorithm"):
@@ -6220,10 +10458,9 @@ def _find_markdown_target_line_ranges(md_text: str, targets: Iterable[str]) -> l
 
 
 def _markdown_visible_text_range(md_text: str, start: int, end: int) -> str:
-    visible = md_text[start:end]
+    visible = _markdown_mask_code(md_text[start:end])
     visible = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", visible)
     visible = re.sub(r"<!--.*?-->", " ", visible, flags=re.S)
-    visible = re.sub(r"`{1,3}[^`]*`{1,3}", " ", visible)
     visible = re.sub(r"[*_#>`]", " ", visible)
     return html.unescape(visible)
 
@@ -6302,7 +10539,12 @@ def _remove_markdown_target_lines(md_text: str, targets: Iterable[str]) -> tuple
 
 def _remove_orphan_math_fence_before_algorithm(md_text: str) -> str:
     updated = md_text
-    matches = list(re.finditer(r"(?m)^\$\$\s*\n+(?=\*\*Algorithm\b)", updated))
+    matches = list(
+        re.finditer(
+            r"(?m)^\$\$\s*\n+(?=\*\*Algorithm\b)",
+            _markdown_mask_code(updated),
+        )
+    )
     for match in reversed(matches):
         prefix_lines = [line.strip() for line in updated[: match.start()].splitlines() if line.strip()]
         previous = prefix_lines[-1] if prefix_lines else ""
@@ -6316,7 +10558,7 @@ def _remove_orphan_math_fence_before_algorithm(md_text: str) -> str:
 def _replace_algorithm_records_in_markdown(md_text: str, records: list[dict[str, Any]]) -> tuple[str, int]:
     updated = md_text
     changed = 0
-    formula_blocks = list(re.finditer(r"\$\$.*?\$\$", updated, re.DOTALL))
+    formula_blocks = _markdown_display_math_spans(updated)
     edits: list[tuple[int, int, str]] = []
     for record in records:
         formula_nos = [
@@ -6326,25 +10568,42 @@ def _replace_algorithm_records_in_markdown(md_text: str, records: list[dict[str,
         ]
         anchor_ranges: list[tuple[int, int]] = []
         for formula_no in dict.fromkeys(formula_nos):
+            masked_updated = _markdown_mask_code(updated)
             readable_fallback_match = re.search(
                 rf"(?s)\$\$(?:(?!\$\$).)*\$\$\s*"
                 rf"<!--\s*formula-final-output-fallback\s+formula={formula_no}\b.*?-->"
                 rf"(?:\s*```text\n.*?\n```)?",
-                updated,
+                masked_updated,
             )
             if readable_fallback_match:
-                anchor_ranges.append((readable_fallback_match.start(), readable_fallback_match.end()))
+                anchor_ranges.append(
+                    (
+                        readable_fallback_match.start(),
+                        _markdown_adjacent_text_fence_end(
+                            updated,
+                            readable_fallback_match.end(),
+                        ),
+                    )
+                )
             fallback_match = re.search(
                 rf"(?s)\*\*Formula\s+{formula_no}\s+fallback\*\*:.*?"
                 rf"<!--\s*formula-final-output-fallback\s+formula={formula_no}\b.*?-->"
                 rf"(?:\s*```text\n.*?\n```)?",
-                updated,
+                masked_updated,
             )
             if fallback_match:
-                anchor_ranges.append((fallback_match.start(), fallback_match.end()))
+                anchor_ranges.append(
+                    (
+                        fallback_match.start(),
+                        _markdown_adjacent_text_fence_end(
+                            updated,
+                            fallback_match.end(),
+                        ),
+                    )
+                )
             if not anchor_ranges and 0 < formula_no <= len(formula_blocks):
                 block = formula_blocks[formula_no - 1]
-                end = block.end()
+                end = block[1]
                 fallback_comment = re.match(
                     rf"\s*<!--\s*formula-final-output-fallback\s+formula={formula_no}\b.*?-->",
                     updated[end:],
@@ -6359,7 +10618,7 @@ def _replace_algorithm_records_in_markdown(md_text: str, records: list[dict[str,
                     )
                     if evidence_fence:
                         end += evidence_fence.end()
-                anchor_ranges.append((block.start(), end))
+                anchor_ranges.append((block[0], end))
         if anchor_ranges:
             start = min(start for start, _end in anchor_ranges)
             end = max(end for _start, end in anchor_ranges)
@@ -6371,25 +10630,25 @@ def _replace_algorithm_records_in_markdown(md_text: str, records: list[dict[str,
                     for edit_start, edit_end, edit_replacement in sorted(edits, reverse=True):
                         updated = updated[:edit_start] + edit_replacement + updated[edit_end:]
                     edits = []
-                    formula_blocks = list(re.finditer(r"\$\$.*?\$\$", updated, re.DOTALL))
+                    formula_blocks = _markdown_display_math_spans(updated)
                     anchor_ranges = []
                     for formula_no in dict.fromkeys(formula_nos):
                         if 0 < formula_no <= len(formula_blocks):
                             block = formula_blocks[formula_no - 1]
-                            anchor_ranges.append((block.start(), block.end()))
+                            anchor_ranges.append((block[0], block[1]))
                 updated, _ = _replace_algorithm_record_non_destructive_markdown(
                     updated,
                     record,
                     anchor_ranges,
                     replacement,
                 )
-                formula_blocks = list(re.finditer(r"\$\$.*?\$\$", updated, re.DOTALL))
+                formula_blocks = _markdown_display_math_spans(updated)
             changed += 1
             continue
         formula_no = record.get("formula_no")
         if isinstance(formula_no, int) and 0 < formula_no <= len(formula_blocks):
             block = formula_blocks[formula_no - 1]
-            end = block.end()
+            end = block[1]
             fallback_comment = re.match(
                 rf"\s*<!--\s*formula-final-output-fallback\s+formula={formula_no}\b.*?-->",
                 updated[end:],
@@ -6404,20 +10663,23 @@ def _replace_algorithm_records_in_markdown(md_text: str, records: list[dict[str,
                 )
                 if evidence_fence:
                     end += evidence_fence.end()
-            edits.append((block.start(), end, _algorithm_record_markdown(record)))
+            edits.append((block[0], end, _algorithm_record_markdown(record)))
             changed += 1
         elif isinstance(formula_no, int):
             fallback_match = re.search(
                 rf"(?s)\*\*Formula\s+{formula_no}\s+fallback\*\*:.*?"
                 rf"<!--\s*formula-final-output-fallback\s+formula={formula_no}\b.*?-->"
                 rf"(?:\s*```text\n.*?\n```)?",
-                updated,
+                _markdown_mask_code(updated),
             )
             if fallback_match:
                 edits.append(
                     (
                         fallback_match.start(),
-                        fallback_match.end(),
+                        _markdown_adjacent_text_fence_end(
+                            updated,
+                            fallback_match.end(),
+                        ),
                         _algorithm_record_markdown(record),
                     )
                 )
@@ -6492,71 +10754,275 @@ def _replace_algorithm_records_in_markdown(md_text: str, records: list[dict[str,
 
 def _write_algorithm_source_crops(
     output_dir: Path,
-    pdf_path: Path,
+    visual_pdf_path: Path,
     records: list[dict[str, Any]],
-) -> list[str]:
+    *,
+    document_json: Any = None,
+    semantic_pdf_path: Path | None = None,
+    metadata: dict[str, Any] | None = None,
+    return_provenance: bool = False,
+) -> list[str] | tuple[list[str], list[dict[str, Any]], dict[str, list[str]]]:
     try:
         import pdfplumber  # type: ignore
         from PIL import Image
     except Exception:
-        return []
-    page_sizes: dict[int, tuple[float, float]] = {}
+        return ([], [], {}) if return_provenance else []
+    visual_page_sizes: dict[int, tuple[float, float]] = {}
     try:
-        with pdfplumber.open(str(pdf_path)) as pdf:
-            page_sizes = {
+        with pdfplumber.open(str(visual_pdf_path)) as pdf:
+            visual_page_sizes = {
                 index: (float(page.width), float(page.height))
                 for index, page in enumerate(pdf.pages, start=1)
             }
     except Exception:
-        return []
+        return ([], [], {}) if return_provenance else []
+
+    strict_provenance = bool(
+        isinstance(document_json, dict)
+        and isinstance(metadata, dict)
+        and semantic_pdf_path is not None
+    )
+    page_inventory = _document_page_size_inventory(document_json)
+    semantic_page_records = page_inventory.get("page_records") or {}
+    manifest = (
+        metadata.get("structural_visual_provenance_manifest")
+        if isinstance(metadata, dict)
+        else None
+    )
+    expected_visual_sha = _structural_expected_visual_pdf_sha256(metadata)
+    expected_semantic_sha = _structural_expected_semantic_pdf_sha256(metadata)
+    try:
+        actual_visual_sha = file_sha256(visual_pdf_path)
+    except OSError:
+        actual_visual_sha = ""
+    try:
+        actual_semantic_sha = file_sha256(semantic_pdf_path or visual_pdf_path)
+    except OSError:
+        actual_semantic_sha = ""
 
     written: list[str] = []
+    provenance_entries: list[dict[str, Any]] = []
+    provenance_diagnostics: dict[str, list[str]] = {}
     algorithms_dir = output_dir / "algorithms"
     for index, record in enumerate(records, start=1):
         bbox = record.get("bbox")
-        page_no = record.get("page_no")
-        if not isinstance(bbox, dict) or not isinstance(page_no, int):
+        page_no = _positive_page_number(record.get("page_no"))
+        source_ref = str(record.get("source_ref") or "")
+        if not isinstance(bbox, dict) or page_no is None or not source_ref:
             continue
-        page_size = page_sizes.get(page_no)
+        semantic_page_size = (
+            (semantic_page_records.get(page_no) or {}).get("size") or None
+        )
+        visual_page_size = visual_page_sizes.get(page_no)
+        if not strict_provenance and visual_page_size is not None:
+            semantic_page_size = {
+                "width": visual_page_size[0],
+                "height": visual_page_size[1],
+            }
         page_image_path = output_dir / "pages" / f"page_{page_no}.png"
-        if page_size is None or not page_image_path.exists():
+        page_verified, page_reasons, page_manifest = (
+            _structural_page_manifest_verify(
+                output_dir,
+                manifest,
+                page_no=page_no,
+                expected_visual_pdf_sha256=expected_visual_sha,
+                current_semantic_page_size=semantic_page_size,
+            )
+        )
+        preflight_reasons = list(page_reasons)
+        if not actual_visual_sha or actual_visual_sha != expected_visual_sha:
+            preflight_reasons.append("algorithm_visual_pdf_sha256_mismatch")
+        if not actual_semantic_sha or actual_semantic_sha != expected_semantic_sha:
+            preflight_reasons.append("algorithm_semantic_pdf_sha256_mismatch")
+        if visual_page_size is None or semantic_page_size is None:
+            preflight_reasons.append("algorithm_missing_page_geometry")
+        elif not _structural_geometry_compatibility(
+            semantic_page_size,
+            {"width": visual_page_size[0], "height": visual_page_size[1]},
+        ).get("compatible"):
+            preflight_reasons.append("algorithm_visual_semantic_geometry_mismatch")
+        if strict_provenance and (
+            preflight_reasons or not page_verified or not page_image_path.exists()
+        ):
+            record["provenance_verified"] = False
+            record["provenance_reasons"] = sorted(set(preflight_reasons))
+            provenance_diagnostics[source_ref] = record["provenance_reasons"]
             continue
+        bottom_rule: int | None = None
+        crop_box: tuple[int, int, int, int] | None = None
+        page_image_size: dict[str, int] | None = None
         try:
             with Image.open(page_image_path) as image:
-                page_width, page_height = page_size
-                scale_x = image.width / max(page_width, 1.0)
+                page_size = _structural_page_size_snapshot(semantic_page_size)
+                if page_size is None:
+                    continue
+                page_width = page_size["width"]
+                page_height = page_size["height"]
                 scale_y = image.height / max(page_height, 1.0)
-                left = float(bbox.get("l") or 0.0) * scale_x
-                right = float(bbox.get("r") or 0.0) * scale_x
-                top = (page_height - float(bbox.get("t") or page_height)) * scale_y
-                bottom = (page_height - float(bbox.get("b") or 0.0)) * scale_y
                 padding_px = 12
                 record_text = _normalized_noise_text(str(record.get("text") or ""))
                 needs_lower_algorithm_context = not re.search(
                     r"(?i)(?:\bend\s+for\b|\bend\s+while\b|\breturn\b|\bend\s+end\b)",
                     record_text,
                 )
-                lower_context_px = int(90.0 * scale_y) if needs_lower_algorithm_context else 0
-                crop_box = (
-                    max(0, int(min(left, right) - padding_px)),
-                    max(0, int(min(top, bottom) - padding_px)),
-                    min(image.width, int(max(left, right) + padding_px)),
-                    min(
-                        image.height,
-                        int(max(top, bottom) + padding_px + lower_context_px),
-                    ),
+                # A provenance-gated crop is bound to the union bbox of all
+                # contributing nodes.  Extending that pixel box with an
+                # unrecorded context tail makes the asset useful to a human
+                # but impossible to recompute at the final gate.  Current
+                # algorithm clusters already include every bound node, so keep
+                # strict crops occurrence-exact; legacy diagnostic callers may
+                # retain the context extension.
+                lower_context_px = (
+                    int(220.0 * scale_y)
+                    if needs_lower_algorithm_context and not strict_provenance
+                    else 0
                 )
-                if crop_box[2] <= crop_box[0] or crop_box[3] <= crop_box[1]:
+                base_crop_box = _bbox_pixel_crop_box(
+                    bbox,
+                    page_width=page_width,
+                    page_height=page_height,
+                    image_width=image.width,
+                    image_height=image.height,
+                    padding=padding_px,
+                )
+                if base_crop_box is None:
                     continue
+                page_image_size = {"width": image.width, "height": image.height}
+                crop_box = (
+                    base_crop_box[0],
+                    base_crop_box[1],
+                    base_crop_box[2],
+                    min(image.height, base_crop_box[3] + lower_context_px),
+                )
                 algorithms_dir.mkdir(exist_ok=True)
                 relative_path = f"algorithms/algorithm_{index}.png"
-                image.crop(crop_box).save(output_dir / relative_path)
+                source_crop = image.crop(crop_box)
+                grayscale = source_crop.convert("L")
+                horizontal_rules = [
+                    row
+                    for row in range(int(grayscale.height * 0.25), grayscale.height)
+                    if sum(
+                        1
+                        for column in range(grayscale.width)
+                        if grayscale.getpixel((column, row)) < 96
+                    )
+                    >= int(grayscale.width * 0.55)
+                ]
+                if horizontal_rules:
+                    bottom_rule = max(horizontal_rules)
+                    source_crop = source_crop.crop(
+                        (0, 0, source_crop.width, min(source_crop.height, bottom_rule + 3))
+                    )
+                source_crop.save(output_dir / relative_path)
         except Exception:
             continue
         record["source_image"] = relative_path
         record["source_image_page_no"] = page_no
         record["source_image_pixel_box"] = crop_box
+        record["source_image_trimmed_at_horizontal_rule"] = bottom_rule
+        if not strict_provenance:
+            written.append(relative_path)
+            continue
+        body_identity = _algorithm_expected_body_identity(record)
+        metric = {
+            "path": relative_path,
+            "page_no": page_no,
+            "bbox": _structural_bbox_snapshot(bbox),
+            "asset_sha256": file_sha256(output_dir / relative_path),
+            "source_pdf_sha256": actual_visual_sha,
+            "page_image_path": f"pages/page_{page_no}.png",
+            "page_image_sha256": str(
+                (page_manifest or {}).get("page_image_sha256") or ""
+            ),
+            "padding_px": 12,
+            "pixel_box": crop_box,
+            "page_size": {
+                "width": visual_page_size[0],
+                "height": visual_page_size[1],
+            },
+            "page_image_size": page_image_size,
+        }
+        new_entry = _structural_visual_provenance_entry(
+            kind="algorithm",
+            index=index,
+            source_ref=source_ref,
+            node=None,
+            body_identity=body_identity,
+            metric=metric,
+            node_bbox=bbox,
+            part_index=None,
+            semantic_pdf_sha256=actual_semantic_sha,
+            conversion_pdf_sha256=actual_semantic_sha,
+            semantic_page_size=semantic_page_size,
+            crop_coordinate_page_size=semantic_page_size,
+            source_node_bindings=list(record.get("source_node_bindings") or []),
+        )
+        existing_entry, existing_lookup_reasons = _structural_manifest_entry_for_ref(
+            manifest,
+            kind="algorithms",
+            source_ref=source_ref,
+            index=index,
+        )
+        active_entry = existing_entry
+        if active_entry is None:
+            index_collisions = [
+                entry
+                for entry in ((manifest or {}).get("algorithms") or [])
+                if isinstance(entry, dict) and entry.get("index") == index
+            ] if isinstance(manifest, dict) else []
+            if index_collisions:
+                existing_lookup_reasons.append("algorithm_manifest_index_collision")
+            elif page_verified:
+                _replace_structural_manifest_entry(
+                    manifest,
+                    inventory="algorithms",
+                    entry=new_entry,
+                )
+                active_entry = new_entry
+                existing_lookup_reasons = []
+        verified, verify_reasons = _structural_provenance_verify(
+            output_dir,
+            active_entry,
+            current_source_ref=source_ref,
+            current_page_no=page_no,
+            current_bbox=bbox,
+            current_body_identity=body_identity,
+            current_self_ref="",
+            current_part_index=None,
+            current_semantic_page_size=semantic_page_size,
+            expected_visual_pdf_sha256=expected_visual_sha,
+            expected_semantic_pdf_sha256=expected_semantic_sha,
+            expected_asset_path=relative_path,
+            expected_kind="algorithm",
+        )
+        bindings_verified, binding_reasons, bound_nodes = (
+            _algorithm_source_node_bindings_verify(
+                document_json,
+                (active_entry or {}).get("source_node_bindings"),
+            )
+        )
+        merged_bbox = _merge_bbox_geometry(bound_nodes)
+        if _structural_bbox_snapshot(merged_bbox) != _structural_bbox_snapshot(bbox):
+            binding_reasons.append("algorithm_source_node_union_bbox_mismatch")
+            bindings_verified = False
+        verify_reasons = sorted(
+            set(verify_reasons + existing_lookup_reasons + binding_reasons)
+        )
+        verified = bool(
+            verified
+            and bindings_verified
+            and not existing_lookup_reasons
+            and not binding_reasons
+        )
+        record["provenance_verified"] = verified
+        record["provenance_reasons"] = verify_reasons
+        if isinstance(active_entry, dict):
+            provenance_entries.append(active_entry)
+        if not verified:
+            provenance_diagnostics[source_ref] = verify_reasons
         written.append(relative_path)
+    if return_provenance:
+        return written, provenance_entries, provenance_diagnostics
     return written
 
 
@@ -6644,15 +11110,211 @@ def _dedupe_algorithm_recovered_html(
     return document_html, len(set(remove_ranges))
 
 
+def _algorithm_body_text_from_fragment(fragment: str) -> str | None:
+    layout_lines = [
+        _structural_visible_body_text(match.group("body"), html_markup=True)
+        for match in re.finditer(
+            r'<div\b[^>]*class=["\'][^"\']*\bdocling-algorithm-layout-line\b'
+            r'[^"\']*["\'][^>]*>(?P<body>.*?)</div>',
+            fragment,
+            flags=re.I | re.S,
+        )
+    ]
+    if layout_lines:
+        return "\n".join(layout_lines)
+    pre_bodies = []
+    for match in re.finditer(
+        r"<pre\b(?P<attrs>[^>]*)>(?P<body>.*?)</pre>",
+        fragment,
+        flags=re.I | re.S,
+    ):
+        class_match = re.search(
+            r"\bclass\s*=\s*([\"'])(?P<value>.*?)\1",
+            match.group("attrs"),
+            flags=re.I | re.S,
+        )
+        classes = set((class_match.group("value") if class_match else "").split())
+        if "docling-algorithm-block" in classes or "algorithm" in classes:
+            pre_bodies.append(
+                _structural_visible_body_text(
+                    match.group("body"),
+                    html_markup=True,
+                )
+            )
+    return pre_bodies[0] if len(pre_bodies) == 1 else None
+
+
+def _algorithm_expected_body_identity(record: dict[str, Any]) -> str:
+    layout = record.get("layout")
+    if isinstance(layout, dict) and int(layout.get("line_count") or 0) >= 3:
+        visible_lines = _algorithm_layout_visible_lines(
+            record,
+            list(layout.get("lines") or []),
+        )
+        if not _algorithm_layout_fragmentation_reasons(visible_lines):
+            body = "\n".join(
+                str(line.get("text") or "")
+                for line in visible_lines
+                if isinstance(line, dict) and str(line.get("text") or "")
+            )
+            if body:
+                return _algorithm_body_identity(body)
+    return _algorithm_body_identity(str(record.get("text") or ""))
+
+
+def _algorithm_html_body_identity_for_source_ref(
+    document_html: str,
+    source_ref: str,
+) -> str:
+    semantic_body = _html_section_pre_body_for_source_ref(
+        document_html,
+        css_class="algorithm",
+        source_ref=source_ref,
+    )
+    if semantic_body is not None:
+        return _algorithm_body_identity(semantic_body, html_markup=True)
+    matching_blocks: list[str] = []
+    for start, end in _algorithm_recovered_div_ranges(document_html):
+        block = document_html[start:end]
+        opening = re.match(r"<div\b(?P<attrs>[^>]*)>", block, flags=re.I | re.S)
+        if opening and _html_source_ref(opening.group("attrs")) == source_ref:
+            matching_blocks.append(block)
+    if len(matching_blocks) != 1:
+        return ""
+    body = _algorithm_body_text_from_fragment(matching_blocks[0])
+    return _algorithm_body_identity(body or "")
+
+
+def _algorithm_markdown_body_identity_for_source_ref(
+    document_markdown: str,
+    source_ref: str,
+) -> str:
+    window = _markdown_marker_window(
+        document_markdown,
+        kind="algorithm",
+        source_ref=source_ref,
+    )
+    if window is None:
+        return ""
+    body = _algorithm_body_text_from_fragment(window)
+    return _algorithm_body_identity(body or "", html_markup=True)
+
+
+def _bind_algorithm_source_evidence_html(
+    document_html: str,
+    record: dict[str, Any],
+) -> tuple[str, bool]:
+    source_ref = str(record.get("source_ref") or "")
+    source_image = str(record.get("source_image") or "")
+    if not source_ref or not source_image:
+        return document_html, False
+    section_range = _html_section_range_for_source_ref(
+        document_html,
+        css_class="algorithm",
+        source_ref=source_ref,
+    )
+    if section_range is None:
+        return document_html, False
+    start, end = section_range
+    section = document_html[start:end]
+    if source_image in section:
+        return document_html, False
+    closing = section.rfind("</section>")
+    if closing < 0:
+        return document_html, False
+    label = str(record.get("label") or "Algorithm block")
+    figure = (
+        '<figure class="docling-algorithm-source-evidence">'
+        f'<img src="{html.escape(source_image, quote=True)}" '
+        f'alt="{html.escape(label, quote=True)} source rendering">'
+        f'<figcaption>{html.escape(label)} — exact source rendering from the '
+        "original PDF</figcaption></figure>"
+    )
+    insertion = start + closing
+    return document_html[:insertion] + figure + document_html[insertion:], True
+
+
+def _bind_algorithm_source_evidence_markdown(
+    document_markdown: str,
+    record: dict[str, Any],
+) -> tuple[str, bool]:
+    source_ref = str(record.get("source_ref") or "")
+    source_image = str(record.get("source_image") or "")
+    if not source_ref or not source_image:
+        return document_markdown, False
+    marker_range = _markdown_marker_range(
+        document_markdown,
+        kind="algorithm",
+        source_ref=source_ref,
+    )
+    if marker_range is None:
+        return document_markdown, False
+    start, end = marker_range
+    window = document_markdown[start:end]
+    if source_image in window:
+        return document_markdown, False
+    label = str(record.get("label") or "Algorithm block")
+    figure = f"\n\n![{label} — source rendering]({source_image})\n"
+    closing_pre = window.rfind("</pre>")
+    insertion = start + closing_pre + len("</pre>") if closing_pre >= 0 else end
+    return (
+        document_markdown[:insertion]
+        + figure
+        + document_markdown[insertion:]
+    ), True
+
+
 def recover_algorithm_blocks_in_outputs(
     output_dir: Path,
     document_json: Any,
     pdf_path: Path,
     metadata: dict[str, Any],
     status: dict[str, Any],
+    *,
+    visual_pdf_path: Path | None = None,
 ) -> dict[str, Any]:
     records = _algorithm_candidate_records(document_json, pdf_path)
-    source_images = _write_algorithm_source_crops(output_dir, pdf_path, records)
+    expected_algorithms = int(
+        (
+            ((status.get("quality_signals") or {}).get("primary_surface") or {}).get(
+                "counts"
+            )
+            or {}
+        ).get("algorithms")
+        or 0
+    )
+    discarded_records: list[dict[str, Any]] = []
+    if expected_algorithms and len(records) > expected_algorithms:
+        ranked = sorted(
+            enumerate(records),
+            key=lambda item: (
+                0
+                if re.match(r"(?i)^Algorithm\s+\d+\b", str(item[1].get("label") or ""))
+                else 1,
+                0 if item[1].get("formula_no") is None else 1,
+                item[0],
+            ),
+        )
+        selected_indexes = {index for index, _record in ranked[:expected_algorithms]}
+        discarded_records = [
+            record for index, record in enumerate(records) if index not in selected_indexes
+        ]
+        records = [
+            record for index, record in enumerate(records) if index in selected_indexes
+        ]
+    (
+        source_images,
+        algorithm_provenance_entries,
+        algorithm_provenance_diagnostics,
+    ) = _write_algorithm_source_crops(
+        output_dir,
+        visual_pdf_path or pdf_path,
+        records,
+        document_json=document_json,
+        semantic_pdf_path=pdf_path,
+        metadata=metadata,
+        return_provenance=True,
+    )
     html_changed = 0
     md_changed = 0
     missing_html_records: list[dict[str, Any]] = []
@@ -6667,6 +11329,12 @@ def recover_algorithm_blocks_in_outputs(
             html_text,
             records,
         )
+        for record in records:
+            html_text, source_bound = _bind_algorithm_source_evidence_html(
+                html_text,
+                record,
+            )
+            html_changed += int(source_bound)
         missing_html_records = [
             record
             for record in records
@@ -6714,8 +11382,6 @@ def recover_algorithm_blocks_in_outputs(
                         + appendix
                         + html_text[body_end.start() :]
                     )
-                else:
-                    html_text += appendix
         if html_changed or missing_html_records:
             html_path.write_text(html_text, encoding="utf-8")
     md_path = output_dir / "document.md"
@@ -6724,6 +11390,12 @@ def recover_algorithm_blocks_in_outputs(
             md_path.read_text(encoding="utf-8"),
             records,
         )
+        for record in records:
+            md_text, source_bound = _bind_algorithm_source_evidence_markdown(
+                md_text,
+                record,
+            )
+            md_changed += int(source_bound)
         missing_md_records = [
             record
             for record in records
@@ -6744,6 +11416,95 @@ def recover_algorithm_blocks_in_outputs(
                 )
         if md_changed or missing_md_records:
             md_path.write_text(md_text, encoding="utf-8")
+    final_html_text = (
+        html_path.read_text(encoding="utf-8") if html_path.exists() else ""
+    )
+    final_markdown_text = (
+        md_path.read_text(encoding="utf-8") if md_path.exists() else ""
+    )
+    candidate_source_refs = [
+        str(record.get("source_ref") or "")
+        for record in records
+        if str(record.get("source_ref") or "")
+    ]
+    html_bound_source_refs: list[str] = []
+    markdown_bound_source_refs: list[str] = []
+    for record in records:
+        source_ref = str(record.get("source_ref") or "")
+        source_image = str(record.get("source_image") or "")
+        if not source_ref or not source_image:
+            continue
+        semantic_range = _html_section_range_for_source_ref(
+            final_html_text,
+            css_class="algorithm",
+            source_ref=source_ref,
+        )
+        if (
+            semantic_range is not None
+            and source_image
+            in final_html_text[semantic_range[0] : semantic_range[1]]
+        ):
+            html_bound_source_refs.append(source_ref)
+        escaped_ref = re.escape(html.escape(source_ref, quote=True))
+        algorithm_block = re.search(
+            r'<div\b[^>]*class="[^"]*\bdocling-algorithm-recovered\b[^"]*"'
+            r'[^>]*data-source-ref=["\']'
+            + escaped_ref
+            + r'["\'][^>]*>(?P<body>.*?)(?=<div\b[^>]*class="[^"]*\bdocling-algorithm-recovered\b|</body>|\Z)',
+            final_html_text,
+            flags=re.I | re.S,
+        )
+        if (
+            source_ref not in html_bound_source_refs
+            and algorithm_block
+            and source_image in algorithm_block.group("body")
+        ):
+            html_bound_source_refs.append(source_ref)
+        marker_range = _markdown_marker_range(
+            final_markdown_text,
+            kind="algorithm",
+            source_ref=source_ref,
+        )
+        if (
+            marker_range is not None
+            and source_image
+            in final_markdown_text[marker_range[0] : marker_range[1]]
+        ):
+            markdown_bound_source_refs.append(source_ref)
+    html_body_identity_verified_refs: list[str] = []
+    markdown_body_identity_verified_refs: list[str] = []
+    html_body_identity_mismatch_refs: list[str] = []
+    markdown_body_identity_mismatch_refs: list[str] = []
+    body_identity_diagnostics: dict[str, dict[str, str]] = {}
+    for record in records:
+        source_ref = str(record.get("source_ref") or "")
+        if not source_ref:
+            continue
+        expected_identity = _algorithm_expected_body_identity(record)
+        html_identity = _algorithm_html_body_identity_for_source_ref(
+            final_html_text,
+            source_ref,
+        )
+        markdown_identity = _algorithm_markdown_body_identity_for_source_ref(
+            final_markdown_text,
+            source_ref,
+        )
+        if expected_identity and html_identity == expected_identity:
+            html_body_identity_verified_refs.append(source_ref)
+        else:
+            html_body_identity_mismatch_refs.append(source_ref)
+        if expected_identity and markdown_identity == expected_identity:
+            markdown_body_identity_verified_refs.append(source_ref)
+        else:
+            markdown_body_identity_mismatch_refs.append(source_ref)
+        body_identity_diagnostics[source_ref] = {
+            "html": "verified" if expected_identity and html_identity == expected_identity else "mismatch",
+            "markdown": (
+                "verified"
+                if expected_identity and markdown_identity == expected_identity
+                else "mismatch"
+            ),
+        }
     if records:
         (output_dir / "algorithm_blocks.json").write_text(
             json.dumps(records, indent=2, ensure_ascii=False),
@@ -6752,6 +11513,15 @@ def recover_algorithm_blocks_in_outputs(
     result = {
         "ok": True,
         "candidate_count": len(records),
+        "discarded_candidate_count": len(discarded_records),
+        "discarded_candidates": [
+            {
+                "label": record.get("label"),
+                "source": record.get("source"),
+                "formula_no": record.get("formula_no"),
+            }
+            for record in discarded_records
+        ],
         "html_replacement_count": html_changed,
         "html_deduplicated_count": html_deduplicated
         if records and html_path.exists()
@@ -6759,9 +11529,72 @@ def recover_algorithm_blocks_in_outputs(
         "markdown_replacement_count": md_changed,
         "source_image_count": len(source_images),
         "source_images": source_images,
+        "provenance_entries": algorithm_provenance_entries,
+        "provenance_verified_refs": sorted(
+            {
+                str(record.get("source_ref") or "")
+                for record in records
+                if record.get("provenance_verified")
+                and str(record.get("source_ref") or "")
+            }
+        ),
+        "provenance_mismatch_refs": sorted(
+            {
+                str(record.get("source_ref") or "")
+                for record in records
+                if not record.get("provenance_verified")
+                and str(record.get("source_ref") or "")
+            }
+        ),
+        "provenance_diagnostics": algorithm_provenance_diagnostics,
+        "candidate_source_refs": candidate_source_refs,
+        "html_bound_source_refs": html_bound_source_refs,
+        "markdown_bound_source_refs": markdown_bound_source_refs,
+        "html_unbound_source_refs": sorted(
+            set(candidate_source_refs) - set(html_bound_source_refs)
+        ),
+        "markdown_unbound_source_refs": sorted(
+            set(candidate_source_refs) - set(markdown_bound_source_refs)
+        ),
+        "html_body_identity_verified_refs": sorted(
+            set(html_body_identity_verified_refs)
+        ),
+        "markdown_body_identity_verified_refs": sorted(
+            set(markdown_body_identity_verified_refs)
+        ),
+        "html_body_identity_mismatch_refs": sorted(
+            set(html_body_identity_mismatch_refs)
+        ),
+        "markdown_body_identity_mismatch_refs": sorted(
+            set(markdown_body_identity_mismatch_refs)
+        ),
+        "body_identity_diagnostics": body_identity_diagnostics,
         "html_source_appendix_count": len(missing_html_records),
         "markdown_source_appendix_count": len(missing_md_records),
         "output": str(output_dir / "algorithm_blocks.json") if records else None,
+        "records": [
+            {
+                "label": record.get("label"),
+                "page_no": record.get("page_no"),
+                "bbox": record.get("bbox"),
+                "numbered_steps": [
+                    int(value)
+                    for value in (
+                        record.get("numbered_steps")
+                        or re.findall(
+                            r"(?m)^\s*(\d+)\s*[:.]",
+                            str(record.get("text") or ""),
+                        )
+                    )
+                ],
+                "table_index": record.get("table_index"),
+                "source_image": record.get("source_image"),
+                "source_ref": record.get("source_ref"),
+                "provenance_verified": bool(record.get("provenance_verified")),
+                "provenance_reasons": record.get("provenance_reasons") or [],
+            }
+            for record in records
+        ],
     }
     for relative_path in source_images:
         if relative_path not in metadata.setdefault("generated_outputs", []):
@@ -10530,15 +15363,15 @@ def _looks_like_algorithm_formula(text: str) -> bool:
     body = text.strip()
     if not re.search(r"\\begin\s*\{\s*array\s*\}", body):
         return False
-    return bool(
-        ALGORITHM_FORMULA_RE.search(body)
-        or re.search(
-            r"(?:\{\s*)?\d+\s*\\colon\s*(?:\\text\s*\{\s*)?"
-            r"(?:for|end|Process|In|while|if|return|/|\\slash)",
-            body,
-            flags=re.I,
-        )
+    if ALGORITHM_FORMULA_RE.search(body):
+        return True
+    control_flow_rows = re.findall(
+        r"(?i)(?:^|\\\\|[{}]\s*)\s*"
+        r"(?:\d+\s*:\s*)?"
+        r"(?:for|while|if|else|return|end|sample|train|update|initialize)\b",
+        body,
     )
+    return len(control_flow_rows) >= 2
 
 
 def _algorithm_formula_plain_text(text: str) -> str:
@@ -10574,8 +15407,6 @@ def _algorithm_tex_row_to_text(line: str) -> str:
     line = re.sub(r"\\leftarrow", "←", line)
     line = re.sub(r"\\colon", ":", line)
     line = re.sub(r"\\slash", "/", line)
-    line = re.sub(r"\\mathcal\s*\{\s*B\s*\}", "B", line)
-    line = re.sub(r"\\text\s*\{\s*BN\s*\}", "BN", line)
     line = re.sub(r"\s+", " ", line).strip()
     line = re.sub(r"^\{\s*((?:\d+\s*:|Input:|Output:|Require:|Ensure:)[^{}]*)\s*\}\s*", r"\1 ", line)
     line = re.sub(r"^(\d+\s*:)\s*\}\s*\{\s*", r"\1 ", line)
@@ -10614,6 +15445,11 @@ def _looks_like_algorithm_cluster_line(node: dict[str, Any], *, active: bool = F
         text,
     ):
         return True
+    if active and label == "section_header" and re.match(
+        r"(?i)^\d{1,3}\s*:",
+        text,
+    ):
+        return True
     if label == "formula" and _looks_like_algorithm_formula(str(node.get("text") or "")):
         return True
     if active and label in {"text", "list_item", "section_header"}:
@@ -10638,12 +15474,24 @@ def _merge_bbox_geometry(nodes: list[dict[str, Any]]) -> dict[str, Any] | None:
             bboxes.append(bbox)
     if not bboxes:
         return None
+    origins = {str(bbox.get("coord_origin")) for bbox in bboxes}
+    # A union across coordinate systems has no well-defined vertical extent.
+    # Refuse the source crop instead of producing a valid-looking image from
+    # the wrong part of the PDF page.
+    if len(origins) != 1:
+        return None
+    origin = next(iter(origins))
     left = min(float(bbox.get("l", 0)) for bbox in bboxes)
     right = max(float(bbox.get("r", 0)) for bbox in bboxes)
-    top = max(float(bbox.get("t", 0)) for bbox in bboxes)
-    bottom = min(float(bbox.get("b", 0)) for bbox in bboxes)
+    if origin == "BOTTOMLEFT":
+        top = max(float(bbox.get("t", 0)) for bbox in bboxes)
+        bottom = min(float(bbox.get("b", 0)) for bbox in bboxes)
+        height = max(0.0, top - bottom)
+    else:
+        top = min(float(bbox.get("t", 0)) for bbox in bboxes)
+        bottom = max(float(bbox.get("b", 0)) for bbox in bboxes)
+        height = max(0.0, bottom - top)
     width = max(0.0, right - left)
-    height = max(0.0, top - bottom)
     result = {
         "l": left,
         "r": right,
@@ -10651,6 +15499,7 @@ def _merge_bbox_geometry(nodes: list[dict[str, Any]]) -> dict[str, Any] | None:
         "b": bottom,
         "width": width,
         "height": height,
+        "coord_origin": origin,
     }
     if height:
         result["aspect_width_over_height"] = width / height
@@ -10662,7 +15511,13 @@ def _algorithm_cluster_reading_key(item: tuple[int, dict[str, Any]]) -> tuple[in
     bbox = bbox_geometry(first_prov(node) or {}) or {}
     top = float(bbox.get("t", 0.0) or 0.0)
     left = float(bbox.get("l", 0.0) or 0.0)
-    return (-int((first_prov(node) or {}).get("page_no") or 0), -top, left if left else float(index))
+    origin = str(bbox.get("coord_origin") or "")
+    vertical = -top if origin == "BOTTOMLEFT" else top
+    return (
+        int((first_prov(node) or {}).get("page_no") or 0),
+        vertical,
+        left if left else float(index),
+    )
 
 
 def _algorithm_cluster_records(
@@ -10694,6 +15549,7 @@ def _algorithm_cluster_records(
         cluster: list[tuple[int, dict[str, Any]]] = []
         saw_title = False
         saw_body_signal = False
+        saw_numbered_line = False
         while index < len(nodes):
             candidate = nodes[index]
             if not isinstance(candidate, dict) or index in used_text_indexes:
@@ -10704,6 +15560,14 @@ def _algorithm_cluster_records(
             label = str(candidate.get("label") or "").lower()
             text = str(candidate.get("text") or "")
             normalized = _normalized_noise_text(_algorithm_cluster_line_text(candidate))
+            numbered_line = bool(re.match(r"(?i)^\d{1,3}\s*:", normalized))
+            if (
+                cluster
+                and saw_numbered_line
+                and label in {"text", "list_item", "section_header"}
+                and not numbered_line
+            ):
+                break
             is_title = bool(re.match(r"(?i)^Algorithm\s+\d+\b\s*:?", normalized))
             is_algorithm_line = _looks_like_algorithm_cluster_line(candidate, active=bool(cluster))
             if not is_algorithm_line:
@@ -10713,6 +15577,7 @@ def _algorithm_cluster_records(
                 else:
                     break
             cluster.append((index, candidate))
+            saw_numbered_line = saw_numbered_line or numbered_line
             saw_title = saw_title or is_title
             saw_body_signal = saw_body_signal or bool(
                 re.search(
@@ -10765,6 +15630,22 @@ def _algorithm_cluster_records(
                 pdf_path,
                 {"page_no": page_no, "bbox": merged_bbox},
             )
+        source_ref = _structural_node_source_ref(
+            ordered_cluster[0][1],
+            kind="algorithm",
+            fallback_index=ordered_cluster[0][0],
+        )
+        source_node_bindings = [
+            _algorithm_source_node_binding(
+                cluster_node,
+                source_ref=_structural_node_source_ref(
+                    cluster_node,
+                    kind="algorithm",
+                    fallback_index=cluster_index,
+                ),
+            )
+            for cluster_index, cluster_node in ordered_cluster
+        ]
         records.append(
             {
                 "id": f"algorithm-block-{start_record_no + len(records)}",
@@ -10780,6 +15661,8 @@ def _algorithm_cluster_records(
                 "layout": layout,
                 "original_label": "algorithm_cluster",
                 "html_targets": [str(cluster_node.get("text") or "") for _, cluster_node in ordered_cluster],
+                "source_ref": source_ref,
+                "source_node_bindings": source_node_bindings,
             }
         )
     return records
@@ -10798,35 +15681,48 @@ def _strip_balanced_array_group(formula_text: str) -> tuple[str, bool]:
     return display, display != formula_text
 
 
-def sanitize_formula_display_text(formula_text: str) -> tuple[str, list[str]]:
+def sanitize_formula_display_text(
+    formula_text: str,
+    *,
+    render_fallback: bool = False,
+    allow_inventive_repairs: bool = False,
+) -> tuple[str, list[str]]:
     """Return a MathJax-display-safe formula body plus evidence-backed reasons."""
     reasons: list[str] = []
     display_text = formula_text
-    repaired_ocr, ocr_reasons = _repair_formula_ocr_variable_artifacts(display_text)
-    if ocr_reasons:
-        display_text = repaired_ocr
-        reasons.extend(ocr_reasons)
-    repaired_log, log_reasons = _repair_formula_log_argument_from_trailing_number(display_text)
-    if log_reasons:
-        display_text = repaired_log
-        reasons.extend(log_reasons)
-    repaired_stale_number, stale_number_reasons = _remove_stale_trailing_formula_number_artifact(display_text)
-    if stale_number_reasons:
-        display_text = repaired_stale_number
-        reasons.extend(stale_number_reasons)
+    if allow_inventive_repairs:
+        repaired_ocr, ocr_reasons = _repair_formula_ocr_variable_artifacts(display_text)
+        if ocr_reasons:
+            display_text = repaired_ocr
+            reasons.extend(ocr_reasons)
+        repaired_log, log_reasons = _repair_formula_log_argument_from_trailing_number(display_text)
+        if log_reasons:
+            display_text = repaired_log
+            reasons.extend(log_reasons)
+        repaired_stale_number, stale_number_reasons = _remove_stale_trailing_formula_number_artifact(display_text)
+        if stale_number_reasons:
+            display_text = repaired_stale_number
+            reasons.extend(stale_number_reasons)
+    if not render_fallback:
+        return display_text, reasons
+
+    structurally_repaired = False
     downgraded_delimiters, downgraded_reasons = _downgrade_unbalanced_left_right_commands(display_text)
     if downgraded_reasons:
         display_text = downgraded_delimiters
         reasons.extend(downgraded_reasons)
+        structurally_repaired = True
     else:
         repaired_delimiters, delimiter_reasons = _repair_left_right_delimiter_artifacts(display_text)
         if delimiter_reasons:
             display_text = repaired_delimiters
             reasons.extend(delimiter_reasons)
+            structurally_repaired = True
     ungrouped, group_changed = _strip_balanced_array_group(display_text)
     if group_changed:
         display_text = ungrouped
         reasons.append("removed_balanced_outer_formula_group")
+        structurally_repaired = True
     repaired_array, repaired_changed = _repair_array_row_wrappers(display_text)
     if repaired_changed:
         if _sanitized_formula_regressed(display_text, repaired_array):
@@ -10834,28 +15730,37 @@ def sanitize_formula_display_text(formula_text: str) -> tuple[str, list[str]]:
         else:
             display_text = repaired_array
             reasons.append("repaired_array_row_wrappers")
+            structurally_repaired = True
     unwrapped, changed = _unwrap_single_formula_array(display_text)
     if changed:
         display_text = unwrapped
         reasons.append("unwrapped_single_formula_array_for_display")
+        structurally_repaired = True
     if "&" in display_text and not ALIGNMENT_ENV_RE.search(display_text):
         sanitized = re.sub(r"\s*&\s*", " ", display_text)
         sanitized = re.sub(r"\s+", " ", sanitized).strip()
         if sanitized and sanitized != display_text:
             display_text = sanitized
             reasons.append("bare_alignment_marker_without_alignment_environment")
+            structurally_repaired = True
     brace_repaired, brace_changed = _repair_unmatched_formula_braces(display_text)
     if brace_changed:
         display_text = brace_repaired
         reasons.append("repaired_unmatched_display_braces")
+        structurally_repaired = True
     parenthesis_repaired, parenthesis_reasons = _repair_unmatched_formula_parentheses(display_text)
     if parenthesis_reasons:
         display_text = parenthesis_repaired
         reasons.extend(parenthesis_reasons)
+        structurally_repaired = True
     compact_spacing = re.sub(r"(?:\\quad\s*){2,}", r"\\quad ", display_text).strip()
     if compact_spacing != display_text:
         display_text = compact_spacing
         reasons.append("collapsed_duplicate_formula_spacing")
+        structurally_repaired = True
+
+    if structurally_repaired:
+        reasons.append("degraded_render_failure_fallback_repair")
     return display_text, reasons
 
 
@@ -11433,7 +16338,13 @@ def run_unified_review_qc(
         args.input_file,
     )
     formula_tex_diag = formula_tex_qc_diagnostics(formulas)
-    formula_second_pass_owns_html = args.formula_second_pass_policy != "off"
+    # Policy aliases and ``auto`` are resolved before deciding which layer owns
+    # the HTML.  Looking at the raw CLI value made ``auto``/legacy ``review``
+    # suppress formula-number recovery even when no Route-B directory existed
+    # and the effective policy was actually ``off``.
+    formula_second_pass_owns_html = (
+        effective_formula_second_pass_policy(args) == "apply-all"
+    )
     if formula_second_pass_owns_html:
         formula_number_recovered = []
     else:
@@ -11665,8 +16576,68 @@ def is_cn_accepted_path(args: argparse.Namespace) -> bool:
     )
 
 
+def _trusted_formula_second_pass_route_b(
+    args: argparse.Namespace,
+) -> Path | None:
+    """Resolve a complete, successful Route-B contract without following links."""
+
+    configured = getattr(args, "formula_second_pass_route_b_dir", None)
+    if configured is None:
+        return None
+    route_b_path = Path(configured)
+    if route_b_path.is_symlink():
+        return None
+    try:
+        resolved_root = route_b_path.resolve(strict=True)
+    except (OSError, RuntimeError):
+        return None
+    if not resolved_root.is_dir():
+        return None
+    resolved_contract: dict[str, Path] = {}
+    for name in ("document.json", "status.json", "metadata.json"):
+        path = route_b_path / name
+        if path.is_symlink():
+            return None
+        try:
+            resolved = path.resolve(strict=True)
+            resolved.relative_to(resolved_root)
+        except (OSError, RuntimeError, ValueError):
+            return None
+        if not resolved.is_file():
+            return None
+        resolved_contract[name] = resolved
+    document = _load_json_file(resolved_contract["document.json"])
+    route_b_status = _load_json_file(resolved_contract["status.json"])
+    route_b_metadata = _load_json_file(resolved_contract["metadata.json"])
+    if (
+        not isinstance(document, dict)
+        or not isinstance(route_b_status, dict)
+        or not isinstance(route_b_metadata, dict)
+    ):
+        return None
+    if route_b_status.get("ok") is not True:
+        return None
+    expected_job_id = str(
+        getattr(args, "job_id", None) or getattr(args, "sample_name", None) or ""
+    ).strip()
+    if expected_job_id and route_b_metadata.get("job_id") != expected_job_id:
+        return None
+    return resolved_root
+
+
 def effective_formula_second_pass_policy(args: argparse.Namespace) -> str:
-    return args.formula_second_pass_policy
+    requested = str(getattr(args, "formula_second_pass_policy", "off") or "off")
+    normalized = {
+        "review": "auto",
+        "apply": "apply-all",
+    }.get(requested, requested)
+    if normalized == "auto":
+        return (
+            "apply-all"
+            if _trusted_formula_second_pass_route_b(args) is not None
+            else "off"
+        )
+    return normalized
 
 
 def cn_accepted_baseline_diagnostics(output_dir: Path) -> dict[str, Any]:
@@ -11729,10 +16700,6 @@ def cn_accepted_baseline_diagnostics(output_dir: Path) -> dict[str, Any]:
             "missing_cn_final_polish_formulas="
             + ",".join(str(number) for number in missing_polish)
         )
-    accepted_text = CN_FINAL_TEXT_CORRECTIONS[0][1]
-    if accepted_text not in markdown:
-        reasons.append("accepted_cn_text_correction_missing")
-
     return {
         "ok": not reasons,
         "baseline": CN_ACCEPTED_BASELINE,
@@ -11743,7 +16710,6 @@ def cn_accepted_baseline_diagnostics(output_dir: Path) -> dict[str, Any]:
         "formula_count": len(formulas),
         "equation_numbers": equation_numbers,
         "required_final_polish_formulas": list(CN_FINAL_POLISH_FORMULA_NUMBERS),
-        "accepted_text_correction_present": accepted_text in markdown,
         "reasons": reasons,
     }
 
@@ -11802,6 +16768,1046 @@ def record_cn_accepted_baseline(
     )
 
 
+_GENERATED_ASSET_ROOT_NAMES = (
+    "pages",
+    "formulas",
+    "pictures",
+    "algorithms",
+    "code_blocks",
+    "inline_math",
+)
+
+
+def _preexisting_generated_asset_roots(
+    output_dir: Path,
+    *,
+    allowed_contract_table_names: set[str] | None = None,
+) -> list[str]:
+    """Return generated-asset roots that are unsafe to reuse.
+
+    The preflight call passes no table allow-list and therefore rejects every
+    existing table artifact before any current contract file is written.  The
+    post-contract defensive call allows only the just-written table JSON
+    records; crops and every other generated file must still be absent.
+    """
+
+    preexisting: list[str] = []
+    for asset_root_name in _GENERATED_ASSET_ROOT_NAMES:
+        asset_root = output_dir / asset_root_name
+        if asset_root.is_dir() and next(asset_root.iterdir(), None) is not None:
+            preexisting.append(asset_root_name)
+        elif asset_root.exists() and not asset_root.is_dir():
+            preexisting.append(asset_root_name)
+    tables_root = output_dir / "tables"
+    if tables_root.is_dir():
+        allowed = allowed_contract_table_names
+        if allowed is None or any(path.name not in allowed for path in tables_root.iterdir()):
+            if next(tables_root.iterdir(), None) is not None:
+                preexisting.append("tables")
+    elif tables_root.exists():
+        preexisting.append("tables")
+    return sorted(set(preexisting))
+
+
+def _preexisting_output_entries(output_dir: Path) -> list[str]:
+    """List every retained entry that makes an output directory non-fresh."""
+
+    if not output_dir.exists():
+        return []
+    if not output_dir.is_dir():
+        return [output_dir.name]
+    return sorted(path.name for path in output_dir.iterdir())
+
+
+def _safe_output_child(root: Path, candidate: Path, *, label: str) -> Path:
+    """Return a resolved job-owned path and reject traversal/symlink escapes."""
+
+    lexical_root = root.absolute()
+    if lexical_root.is_symlink():
+        raise ValueError("output_root_symlink_not_allowed")
+    root_resolved = root.resolve(strict=False)
+    lexical_candidate = candidate.absolute()
+    try:
+        relative_parts = lexical_candidate.relative_to(lexical_root).parts
+    except ValueError as exc:
+        raise ValueError(f"{label}_must_be_within_output_root") from exc
+    current = lexical_root
+    for part in relative_parts:
+        current = current / part
+        if current.is_symlink():
+            raise ValueError(f"{label}_symlink_not_allowed")
+    candidate_resolved = candidate.resolve(strict=False)
+    try:
+        candidate_resolved.relative_to(root_resolved)
+    except ValueError as exc:
+        raise ValueError(f"{label}_must_be_within_output_root") from exc
+    return candidate
+
+
+def _validate_job_name(name: str) -> str:
+    value = str(name or "").strip()
+    path_value = Path(value)
+    if (
+        not value
+        or value in {".", ".."}
+        or path_value.is_absolute()
+        or path_value.name != value
+        or "/" in value
+        or "\\" in value
+    ):
+        raise ValueError("job_id_or_sample_name_must_be_one_path_component")
+    return value
+
+
+def _job_output_dir(output_root: Path, name: str) -> Path:
+    """Resolve one adapter job directory without allowing path-like job IDs."""
+
+    value = _validate_job_name(name)
+    return _safe_output_child(
+        output_root,
+        output_root / value,
+        label="job_output_dir",
+    )
+
+
+class _InputLifecycleError(RuntimeError):
+    """Fail-closed input/lock lifecycle error with a stable machine reason."""
+
+    def __init__(self, reason: str, detail: str | None = None):
+        super().__init__(detail or reason)
+        self.reason = reason
+        self.detail = detail or reason
+
+
+def _open_output_root(output_root: Path) -> tuple[Path, int]:
+    """Create/open the lexical output root without following the root itself."""
+
+    root = output_root.absolute()
+    if root.is_symlink():
+        raise _InputLifecycleError("output_root_symlink_not_allowed")
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise _InputLifecycleError(
+            "output_root_create_failed",
+            str(exc),
+        ) from exc
+    if root.is_symlink():
+        raise _InputLifecycleError("output_root_symlink_not_allowed")
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        root_fd = os.open(root, flags)
+        root_stat = os.fstat(root_fd)
+    except OSError as exc:
+        raise _InputLifecycleError("output_root_open_failed", str(exc)) from exc
+    if not stat.S_ISDIR(root_stat.st_mode):
+        os.close(root_fd)
+        raise _InputLifecycleError("output_root_not_directory")
+    return root, root_fd
+
+
+class _PersistentJobLock:
+    """Persistent sibling inode whose advisory lock spans the whole job."""
+
+    def __init__(self, output_root: Path, job_name: str):
+        self.output_root = output_root
+        self.job_name = job_name
+        self.root_path: Path | None = None
+        self.root_fd: int | None = None
+        self.lock_directory_fd: int | None = None
+        self.lock_fd: int | None = None
+        self.lock_path: Path | None = None
+        self.lock_name: str | None = None
+        self.lock_identity: tuple[int, int] | None = None
+
+    def __enter__(self) -> "_PersistentJobLock":
+        root_path, root_fd = _open_output_root(self.output_root)
+        self.root_path = root_path
+        self.root_fd = root_fd
+        try:
+            try:
+                os.mkdir(
+                    JOB_LOCK_DIRECTORY_NAME,
+                    mode=0o700,
+                    dir_fd=root_fd,
+                )
+            except FileExistsError:
+                pass
+            directory_flags = (
+                os.O_RDONLY
+                | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_NOFOLLOW", 0)
+            )
+            self.lock_directory_fd = os.open(
+                JOB_LOCK_DIRECTORY_NAME,
+                directory_flags,
+                dir_fd=root_fd,
+            )
+            if not stat.S_ISDIR(os.fstat(self.lock_directory_fd).st_mode):
+                raise _InputLifecycleError("job_lock_root_not_directory")
+            lock_name = hashlib.sha256(self.job_name.encode("utf-8")).hexdigest() + ".lock"
+            self.lock_name = lock_name
+            self.lock_path = root_path / JOB_LOCK_DIRECTORY_NAME / lock_name
+            lock_flags = (
+                os.O_RDWR
+                | os.O_CREAT
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0)
+            )
+            try:
+                self.lock_fd = os.open(
+                    lock_name,
+                    lock_flags,
+                    0o600,
+                    dir_fd=self.lock_directory_fd,
+                )
+            except OSError as exc:
+                reason = (
+                    "job_lock_symlink_not_allowed"
+                    if exc.errno in {errno.ELOOP, errno.EMLINK}
+                    else "job_lock_open_failed"
+                )
+                raise _InputLifecycleError(reason, str(exc)) from exc
+            lock_stat = os.fstat(self.lock_fd)
+            if not stat.S_ISREG(lock_stat.st_mode):
+                raise _InputLifecycleError("job_lock_not_regular_file")
+            if lock_stat.st_nlink != 1:
+                raise _InputLifecycleError("job_lock_hardlink_not_allowed")
+            self.lock_identity = (lock_stat.st_dev, lock_stat.st_ino)
+            os.fchmod(self.lock_fd, 0o600)
+            try:
+                fcntl.flock(
+                    self.lock_fd,
+                    fcntl.LOCK_EX | fcntl.LOCK_NB,
+                )
+            except BlockingIOError as exc:
+                raise _InputLifecycleError("job_lock_already_held") from exc
+            payload = json.dumps(
+                {
+                    "job_id": self.job_name,
+                    "pid": os.getpid(),
+                    "acquired_unix": time.time(),
+                },
+                sort_keys=True,
+            ).encode("utf-8")
+            os.ftruncate(self.lock_fd, 0)
+            os.pwrite(self.lock_fd, payload, 0)
+            os.fsync(self.lock_fd)
+            self.verify()
+            return self
+        except Exception:
+            self.close()
+            raise
+
+    def close(self) -> None:
+        if self.lock_fd is not None:
+            try:
+                fcntl.flock(self.lock_fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            os.close(self.lock_fd)
+            self.lock_fd = None
+        if self.lock_directory_fd is not None:
+            os.close(self.lock_directory_fd)
+            self.lock_directory_fd = None
+        if self.root_fd is not None:
+            os.close(self.root_fd)
+            self.root_fd = None
+
+    def verify(self) -> None:
+        """Require the persistent directory entry to remain the locked inode."""
+
+        if (
+            self.lock_fd is None
+            or self.lock_directory_fd is None
+            or self.lock_name is None
+            or self.lock_identity is None
+        ):
+            raise _InputLifecycleError("job_lock_not_active")
+        opened = os.fstat(self.lock_fd)
+        try:
+            entry = os.stat(
+                self.lock_name,
+                dir_fd=self.lock_directory_fd,
+                follow_symlinks=False,
+            )
+        except OSError as exc:
+            raise _InputLifecycleError("job_lock_entry_replaced", str(exc)) from exc
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or not stat.S_ISREG(entry.st_mode)
+            or opened.st_nlink != 1
+            or entry.st_nlink != 1
+            or (opened.st_dev, opened.st_ino) != self.lock_identity
+            or (entry.st_dev, entry.st_ino) != self.lock_identity
+        ):
+            raise _InputLifecycleError("job_lock_entry_replaced")
+
+    def __exit__(self, _exc_type: Any, _exc: Any, _tb: Any) -> None:
+        self.close()
+
+
+def _write_all(fd: int, value: bytes) -> None:
+    offset = 0
+    while offset < len(value):
+        written = os.write(fd, value[offset:])
+        if written <= 0:
+            raise OSError("short write")
+        offset += written
+
+
+class _ImmutableInputSnapshot:
+    """Private same-root snapshot held open for the complete delivery run."""
+
+    def __init__(
+        self,
+        *,
+        root_path: Path,
+        root_fd: int,
+        name: str,
+        fd: int,
+        sha256: str,
+        size: int,
+        source_path: Path,
+        owns_root_directory: bool = False,
+    ):
+        self.root_path = root_path
+        self.root_fd = root_fd
+        self.name = name
+        self.path = root_path / name
+        self.fd = fd
+        self.sha256 = sha256
+        self.size = size
+        self.source_path = source_path
+        self.owns_root_directory = owns_root_directory
+        snapshot_stat = os.fstat(fd)
+        self.device = snapshot_stat.st_dev
+        self.inode = snapshot_stat.st_ino
+        self.closed = False
+
+    def verify(self) -> None:
+        if self.closed:
+            raise _InputLifecycleError("input_snapshot_closed")
+        snapshot_stat = os.fstat(self.fd)
+        if (
+            not stat.S_ISREG(snapshot_stat.st_mode)
+            or snapshot_stat.st_dev != self.device
+            or snapshot_stat.st_ino != self.inode
+            or snapshot_stat.st_size != self.size
+        ):
+            raise _InputLifecycleError("input_snapshot_identity_changed")
+        try:
+            path_stat = os.stat(
+                self.name,
+                dir_fd=self.root_fd,
+                follow_symlinks=False,
+            )
+        except OSError as exc:
+            raise _InputLifecycleError("input_snapshot_path_missing", str(exc)) from exc
+        if (
+            not stat.S_ISREG(path_stat.st_mode)
+            or path_stat.st_dev != self.device
+            or path_stat.st_ino != self.inode
+        ):
+            raise _InputLifecycleError("input_snapshot_path_replaced")
+        digest = hashlib.sha256()
+        offset = 0
+        while offset < self.size:
+            chunk = os.pread(
+                self.fd,
+                min(INPUT_SNAPSHOT_READ_SIZE, self.size - offset),
+                offset,
+            )
+            if not chunk:
+                raise _InputLifecycleError("input_snapshot_short_read")
+            digest.update(chunk)
+            offset += len(chunk)
+        if digest.hexdigest() != self.sha256:
+            raise _InputLifecycleError("input_snapshot_sha256_changed")
+
+    def read_bytes(self) -> bytes:
+        self.verify()
+        chunks: list[bytes] = []
+        offset = 0
+        while offset < self.size:
+            chunk = os.pread(
+                self.fd,
+                min(INPUT_SNAPSHOT_READ_SIZE, self.size - offset),
+                offset,
+            )
+            if not chunk:
+                raise _InputLifecycleError("input_snapshot_short_read")
+            chunks.append(chunk)
+            offset += len(chunk)
+        return b"".join(chunks)
+
+    def cleanup(self) -> None:
+        if self.closed:
+            return
+        try:
+            try:
+                path_stat = os.stat(
+                    self.name,
+                    dir_fd=self.root_fd,
+                    follow_symlinks=False,
+                )
+            except OSError:
+                path_stat = None
+            if (
+                path_stat is not None
+                and stat.S_ISREG(path_stat.st_mode)
+                and path_stat.st_dev == self.device
+                and path_stat.st_ino == self.inode
+            ):
+                os.unlink(self.name, dir_fd=self.root_fd)
+        finally:
+            os.close(self.fd)
+            self.closed = True
+            if self.owns_root_directory:
+                os.close(self.root_fd)
+                try:
+                    self.root_path.rmdir()
+                except OSError:
+                    pass
+
+
+def _create_immutable_input_snapshot(
+    input_path: Path,
+    lock: _PersistentJobLock,
+    expected_sha256: str | None,
+) -> _ImmutableInputSnapshot:
+    if lock.root_path is None or lock.root_fd is None:
+        raise _InputLifecycleError("job_lock_not_active")
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    # O_NONBLOCK is inert for regular files and prevents a path-swap to a FIFO
+    # from hanging between the lexical lstat and descriptor-level fstat.
+    source_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+        | nofollow
+    )
+    try:
+        source_lstat = os.stat(input_path, follow_symlinks=False)
+        if stat.S_ISLNK(source_lstat.st_mode):
+            raise _InputLifecycleError("input_symlink_not_allowed")
+        if not stat.S_ISREG(source_lstat.st_mode):
+            raise _InputLifecycleError("input_not_regular_file")
+        source_fd = os.open(input_path, source_flags)
+    except _InputLifecycleError:
+        raise
+    except OSError as exc:
+        reason = (
+            "input_symlink_not_allowed"
+            if exc.errno in {errno.ELOOP, errno.EMLINK}
+            else "input_open_failed"
+        )
+        raise _InputLifecycleError(reason, str(exc)) from exc
+    snapshot_fd: int | None = None
+    snapshot_name: str | None = None
+    snapshot_root: Path | None = None
+    snapshot_root_fd: int | None = None
+    try:
+        source_start = os.fstat(source_fd)
+        if not stat.S_ISREG(source_start.st_mode):
+            raise _InputLifecycleError("input_not_regular_file")
+        if (
+            source_lstat.st_dev != source_start.st_dev
+            or source_lstat.st_ino != source_start.st_ino
+        ):
+            raise _InputLifecycleError("input_path_replaced_before_snapshot")
+        if source_start.st_size > INPUT_SNAPSHOT_MAX_BYTES:
+            raise _InputLifecycleError("input_exceeds_256_mib_snapshot_limit")
+        snapshot_root = Path(tempfile.mkdtemp(prefix="quality-parity-input-"))
+        snapshot_root_fd = os.open(
+            snapshot_root,
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+        os.fchmod(snapshot_root_fd, 0o700)
+        snapshot_name = "input.pdf"
+        snapshot_fd = os.open(
+            snapshot_name,
+            os.O_RDWR
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_CLOEXEC", 0)
+            | nofollow,
+            0o600,
+            dir_fd=snapshot_root_fd,
+        )
+        digest = hashlib.sha256()
+        total = 0
+        while True:
+            chunk = os.read(source_fd, INPUT_SNAPSHOT_READ_SIZE)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > INPUT_SNAPSHOT_MAX_BYTES:
+                raise _InputLifecycleError("input_exceeds_256_mib_snapshot_limit")
+            digest.update(chunk)
+            _write_all(snapshot_fd, chunk)
+        source_end = os.fstat(source_fd)
+        try:
+            source_after = os.stat(input_path, follow_symlinks=False)
+        except OSError as exc:
+            raise _InputLifecycleError(
+                "input_path_replaced_during_snapshot",
+                str(exc),
+            ) from exc
+        stable_fields = (
+            "st_dev",
+            "st_ino",
+            "st_mode",
+            "st_size",
+            "st_mtime_ns",
+            "st_ctime_ns",
+        )
+        if (
+            total != source_start.st_size
+            or any(
+                getattr(source_start, field) != getattr(source_end, field)
+                for field in stable_fields
+            )
+            or source_after.st_dev != source_start.st_dev
+            or source_after.st_ino != source_start.st_ino
+            or source_after.st_size != source_start.st_size
+            or not stat.S_ISREG(source_after.st_mode)
+        ):
+            raise _InputLifecycleError("input_changed_during_snapshot")
+        actual_sha256 = digest.hexdigest()
+        if expected_sha256 is not None and actual_sha256 != expected_sha256:
+            raise _InputLifecycleError("expected_input_sha256_mismatch")
+        os.fsync(snapshot_fd)
+        os.fchmod(snapshot_fd, 0o400)
+        written_stat = os.fstat(snapshot_fd)
+        os.close(snapshot_fd)
+        snapshot_fd = None
+        snapshot_fd = os.open(
+            snapshot_name,
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | nofollow,
+            dir_fd=snapshot_root_fd,
+        )
+        reopened_stat = os.fstat(snapshot_fd)
+        if (
+            not stat.S_ISREG(reopened_stat.st_mode)
+            or (reopened_stat.st_dev, reopened_stat.st_ino)
+            != (written_stat.st_dev, written_stat.st_ino)
+            or reopened_stat.st_size != total
+        ):
+            raise _InputLifecycleError("input_snapshot_reopen_identity_mismatch")
+        snapshot = _ImmutableInputSnapshot(
+            root_path=snapshot_root,
+            root_fd=snapshot_root_fd,
+            name=snapshot_name,
+            fd=snapshot_fd,
+            sha256=actual_sha256,
+            size=total,
+            source_path=input_path,
+            owns_root_directory=True,
+        )
+        try:
+            snapshot.verify()
+        except Exception:
+            snapshot.cleanup()
+            snapshot_fd = None
+            snapshot_root_fd = None
+            snapshot_root = None
+            raise
+        snapshot_fd = None
+        snapshot_root_fd = None
+        return snapshot
+    finally:
+        os.close(source_fd)
+        if snapshot_fd is not None:
+            try:
+                os.close(snapshot_fd)
+            finally:
+                if snapshot_name is not None:
+                    try:
+                        if snapshot_root_fd is not None:
+                            os.unlink(snapshot_name, dir_fd=snapshot_root_fd)
+                    except FileNotFoundError:
+                        pass
+        if snapshot_root_fd is not None:
+            os.close(snapshot_root_fd)
+        if snapshot_root is not None:
+            try:
+                snapshot_root.rmdir()
+            except OSError:
+                pass
+
+
+class _FreshOutputGuard:
+    """Remove only partial output produced after a locked fresh preflight."""
+
+    def __init__(self, output_dir: Path):
+        self.output_dir = output_dir
+        self.existed_before = output_dir.exists()
+        self.initial_identity: tuple[int, int] | None = None
+        self.source_identity: tuple[int, int] | None = None
+        self.directory_fd: int | None = None
+        self.committed = False
+        if self.existed_before:
+            current = os.stat(output_dir, follow_symlinks=False)
+            if not stat.S_ISDIR(current.st_mode):
+                raise _InputLifecycleError("job_output_not_directory")
+            self.initial_identity = (current.st_dev, current.st_ino)
+
+    def claim(self, directory_fd: int, identity: tuple[int, int]) -> None:
+        if self.initial_identity is not None or self.directory_fd is not None:
+            raise _InputLifecycleError("job_output_directory_already_claimed")
+        opened = os.fstat(directory_fd)
+        current = os.stat(self.output_dir, follow_symlinks=False)
+        if (
+            not stat.S_ISDIR(opened.st_mode)
+            or not stat.S_ISDIR(current.st_mode)
+            or (opened.st_dev, opened.st_ino) != identity
+            or (current.st_dev, current.st_ino) != identity
+        ):
+            raise _InputLifecycleError("job_output_directory_replaced")
+        self.initial_identity = identity
+        self.directory_fd = directory_fd
+
+    def verify_output_directory(self) -> None:
+        if self.initial_identity is None or self.directory_fd is None:
+            raise _InputLifecycleError("job_output_directory_not_claimed")
+        opened = os.fstat(self.directory_fd)
+        current = os.stat(self.output_dir, follow_symlinks=False)
+        if (
+            not stat.S_ISDIR(opened.st_mode)
+            or not stat.S_ISDIR(current.st_mode)
+            or (opened.st_dev, opened.st_ino) != self.initial_identity
+            or (current.st_dev, current.st_ino) != self.initial_identity
+        ):
+            raise _InputLifecycleError("job_output_directory_replaced")
+
+    def _close_directory_fd(self) -> None:
+        if self.directory_fd is not None:
+            os.close(self.directory_fd)
+            self.directory_fd = None
+
+    def commit(self) -> None:
+        self.verify_output_directory()
+        self.committed = True
+        self._close_directory_fd()
+
+    def cleanup(self) -> dict[str, Any]:
+        result: dict[str, Any] = {
+            "applied": False,
+            "output_dir_removed": False,
+            "preexisting_empty_directory_preserved": self.existed_before,
+        }
+        if self.committed or not self.output_dir.exists():
+            self._close_directory_fd()
+            return result
+        # A directory that predates this run is never removed or emptied,
+        # even when it was observed empty.  Production preflight rejects such
+        # directories; retaining this guard makes cleanup safe for direct unit
+        # callers and future refactors as well.
+        if self.existed_before:
+            result["error"] = "preexisting_output_directory_preserved"
+            self._close_directory_fd()
+            return result
+        try:
+            current = os.stat(self.output_dir, follow_symlinks=False)
+        except OSError as exc:
+            result["error"] = str(exc)
+            self._close_directory_fd()
+            return result
+        if (
+            not stat.S_ISDIR(current.st_mode)
+            or self.initial_identity is None
+            or (current.st_dev, current.st_ino) != self.initial_identity
+        ):
+            result["error"] = "partial_output_identity_changed"
+            self._close_directory_fd()
+            return result
+        result["applied"] = True
+        shutil.rmtree(self.output_dir)
+        result["output_dir_removed"] = True
+        self._close_directory_fd()
+        return result
+
+
+def _claim_fresh_output_directory(
+    output_dir: Path,
+    output_guard: _FreshOutputGuard,
+    *,
+    root_fd: int | None = None,
+) -> None:
+    """Publish an already-open random directory at the visible job name."""
+
+    owns_root_fd = root_fd is None
+    if root_fd is None:
+        root_fd = os.open(
+            output_dir.parent,
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+    claim_name = f".quality-parity-claim-{secrets.token_hex(16)}"
+    claim_fd: int | None = None
+    published = False
+    try:
+        os.mkdir(claim_name, mode=0o700, dir_fd=root_fd)
+        claim_fd = os.open(
+            claim_name,
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=root_fd,
+        )
+        claim_stat = os.fstat(claim_fd)
+        identity = (claim_stat.st_dev, claim_stat.st_ino)
+        try:
+            os.rename(
+                claim_name,
+                output_dir.name,
+                src_dir_fd=root_fd,
+                dst_dir_fd=root_fd,
+            )
+        except FileExistsError as exc:
+            raise _InputLifecycleError(
+                "output_dir_created_after_fresh_preflight"
+            ) from exc
+        published = True
+        output_guard.claim(claim_fd, identity)
+        claim_fd = None
+    except _InputLifecycleError:
+        raise
+    except OSError as exc:
+        raise _InputLifecycleError("job_output_create_failed", str(exc)) from exc
+    finally:
+        if claim_fd is not None:
+            os.close(claim_fd)
+        if not published:
+            try:
+                os.rmdir(claim_name, dir_fd=root_fd)
+            except OSError:
+                pass
+        if owns_root_fd:
+            os.close(root_fd)
+
+
+def _assert_owned_output_entries(
+    output_guard: _FreshOutputGuard,
+    *,
+    allowed_names: set[str],
+) -> None:
+    output_guard.verify_output_directory()
+    unexpected: list[str] = []
+    unsafe: list[str] = []
+    for child in output_guard.output_dir.iterdir():
+        if child.name not in allowed_names:
+            unexpected.append(child.name)
+        try:
+            child_stat = os.stat(child, follow_symlinks=False)
+        except OSError:
+            unsafe.append(child.name)
+            continue
+        if stat.S_ISLNK(child_stat.st_mode):
+            unsafe.append(child.name)
+    if unexpected:
+        raise _InputLifecycleError(
+            "unexpected_job_output_entries_before_publish",
+            ",".join(sorted(unexpected)),
+        )
+    if unsafe:
+        raise _InputLifecycleError(
+            "unsafe_job_output_entries_before_publish",
+            ",".join(sorted(unsafe)),
+        )
+
+
+def _assert_safe_owned_output_tree(output_guard: _FreshOutputGuard) -> None:
+    """Reject links and non-regular assets before and after mutable phases."""
+
+    output_guard.verify_output_directory()
+    pending = [output_guard.output_dir]
+    unsafe: list[str] = []
+    while pending:
+        directory = pending.pop()
+        try:
+            entries = list(os.scandir(directory))
+        except OSError as exc:
+            raise _InputLifecycleError(
+                "job_output_tree_scan_failed",
+                str(exc),
+            ) from exc
+        for entry in entries:
+            relative = str(Path(entry.path).relative_to(output_guard.output_dir))
+            try:
+                entry_stat = entry.stat(follow_symlinks=False)
+            except OSError:
+                unsafe.append(relative)
+                continue
+            if stat.S_ISDIR(entry_stat.st_mode):
+                pending.append(Path(entry.path))
+                continue
+            if (
+                not stat.S_ISREG(entry_stat.st_mode)
+                or entry_stat.st_nlink != 1
+            ):
+                unsafe.append(relative)
+    if unsafe:
+        raise _InputLifecycleError(
+            "unsafe_job_output_tree_entry",
+            ",".join(sorted(unsafe)),
+        )
+    output_guard.verify_output_directory()
+
+
+def _persist_job_source(
+    snapshot: _ImmutableInputSnapshot,
+    output_dir: Path,
+    output_guard: _FreshOutputGuard,
+) -> Path:
+    snapshot.verify()
+    _assert_owned_output_entries(output_guard, allowed_names=set())
+    source_path = output_dir / "source.pdf"
+    temporary_name = f".source-{secrets.token_hex(16)}.tmp"
+    flags = (
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    directory_fd = os.open(
+        output_dir,
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0),
+    )
+    target_fd: int | None = None
+    try:
+        directory_stat = os.fstat(directory_fd)
+        if (
+            output_guard.initial_identity is None
+            or (directory_stat.st_dev, directory_stat.st_ino)
+            != output_guard.initial_identity
+        ):
+            raise _InputLifecycleError("job_output_directory_replaced")
+        target_fd = os.open(
+            temporary_name,
+            flags,
+            0o600,
+            dir_fd=directory_fd,
+        )
+        digest = hashlib.sha256()
+        offset = 0
+        while offset < snapshot.size:
+            chunk = os.pread(
+                snapshot.fd,
+                min(INPUT_SNAPSHOT_READ_SIZE, snapshot.size - offset),
+                offset,
+            )
+            if not chunk:
+                raise _InputLifecycleError("input_snapshot_short_read")
+            digest.update(chunk)
+            _write_all(target_fd, chunk)
+            offset += len(chunk)
+        if digest.hexdigest() != snapshot.sha256:
+            raise _InputLifecycleError("job_source_pdf_sha256_mismatch")
+        os.fsync(target_fd)
+        os.fchmod(target_fd, 0o400)
+        target_stat = os.fstat(target_fd)
+        os.close(target_fd)
+        target_fd = None
+        os.link(
+            temporary_name,
+            "source.pdf",
+            src_dir_fd=directory_fd,
+            dst_dir_fd=directory_fd,
+            follow_symlinks=False,
+        )
+        os.unlink(temporary_name, dir_fd=directory_fd)
+        os.fsync(directory_fd)
+    except Exception:
+        try:
+            os.unlink(temporary_name, dir_fd=directory_fd)
+        except FileNotFoundError:
+            pass
+        raise
+    finally:
+        if target_fd is not None:
+            os.close(target_fd)
+        os.close(directory_fd)
+    output_guard.source_identity = _verify_job_source(
+        snapshot,
+        source_path,
+        expected_identity=(target_stat.st_dev, target_stat.st_ino),
+    )
+    return source_path
+
+
+def _verify_job_source(
+    snapshot: _ImmutableInputSnapshot,
+    source_path: Path,
+    *,
+    expected_identity: tuple[int, int] | None = None,
+) -> tuple[int, int]:
+    """Hash the published source through a no-follow regular-file descriptor."""
+
+    try:
+        before = os.stat(source_path, follow_symlinks=False)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or stat.S_ISLNK(before.st_mode)
+            or before.st_nlink != 1
+        ):
+            raise _InputLifecycleError("job_source_pdf_not_regular")
+        source_fd = os.open(
+            source_path,
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+    except _InputLifecycleError:
+        raise
+    except OSError as exc:
+        raise _InputLifecycleError("job_source_pdf_open_failed", str(exc)) from exc
+    try:
+        opened = os.fstat(source_fd)
+        identity = (opened.st_dev, opened.st_ino)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or identity != (before.st_dev, before.st_ino)
+            or opened.st_nlink != 1
+            or (expected_identity is not None and identity != expected_identity)
+            or opened.st_size != snapshot.size
+        ):
+            raise _InputLifecycleError("job_source_pdf_identity_mismatch")
+        digest = hashlib.sha256()
+        offset = 0
+        while offset < snapshot.size:
+            chunk = os.pread(
+                source_fd,
+                min(INPUT_SNAPSHOT_READ_SIZE, snapshot.size - offset),
+                offset,
+            )
+            if not chunk:
+                raise _InputLifecycleError("job_source_pdf_short_read")
+            digest.update(chunk)
+            offset += len(chunk)
+        after_fd = os.fstat(source_fd)
+        after_path = os.stat(source_path, follow_symlinks=False)
+        if (
+            (after_fd.st_dev, after_fd.st_ino) != identity
+            or (after_path.st_dev, after_path.st_ino) != identity
+            or after_fd.st_nlink != 1
+            or after_path.st_nlink != 1
+            or after_fd.st_size != snapshot.size
+            or digest.hexdigest() != snapshot.sha256
+        ):
+            raise _InputLifecycleError("job_source_pdf_sha256_mismatch")
+        return identity
+    finally:
+        os.close(source_fd)
+
+
+def _replace_temporary_path_values(value: Any, temporary: str, published: str) -> Any:
+    if isinstance(value, dict):
+        return {
+            key: _replace_temporary_path_values(item, temporary, published)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [
+            _replace_temporary_path_values(item, temporary, published)
+            for item in value
+        ]
+    if isinstance(value, str):
+        return value.replace(temporary, published)
+    return value
+
+
+def _bind_published_input_contract(
+    metadata: dict[str, Any],
+    status: dict[str, Any],
+    *,
+    snapshot: _ImmutableInputSnapshot,
+    source_path: Path,
+    submitted_path: Path,
+    expected_sha256: str | None,
+) -> None:
+    published = "source.pdf"
+    temporary = str(snapshot.path)
+    scrubbed_metadata = _replace_temporary_path_values(
+        metadata,
+        temporary,
+        published,
+    )
+    scrubbed_status = _replace_temporary_path_values(
+        status,
+        temporary,
+        published,
+    )
+    job_root = str(source_path.parent)
+    scrubbed_metadata = _replace_temporary_path_values(
+        scrubbed_metadata,
+        job_root,
+        ".",
+    )
+    scrubbed_status = _replace_temporary_path_values(
+        scrubbed_status,
+        job_root,
+        ".",
+    )
+    metadata.clear()
+    metadata.update(scrubbed_metadata)
+    status.clear()
+    status.update(scrubbed_status)
+    metadata.update(
+        {
+            "input_file": published,
+            "original_input_file": published,
+            "conversion_input_file": published,
+            "visual_evidence_input_file": published,
+            "submitted_input_file": str(submitted_path),
+            "input_sha256": snapshot.sha256,
+            "original_input_sha256": snapshot.sha256,
+            "conversion_input_sha256": snapshot.sha256,
+            "visual_evidence_input_sha256": snapshot.sha256,
+            "expected_input_sha256": expected_sha256,
+            "source_pdf": "source.pdf",
+            "output_dir": ".",
+            "metadata_path": "metadata.json",
+            "status_path": "status.json",
+        }
+    )
+    status.update(
+        {
+            "output_dir": ".",
+            "metadata_path": "metadata.json",
+            "status_path": "status.json",
+        }
+    )
+    lifecycle = {
+        "ok": True,
+        "submitted_input_file": str(submitted_path),
+        "source_pdf": "source.pdf",
+        "snapshot_sha256": snapshot.sha256,
+        "snapshot_size_bytes": snapshot.size,
+        "expected_input_sha256": expected_sha256,
+        "expected_sha256_verified": (
+            expected_sha256 is None or expected_sha256 == snapshot.sha256
+        ),
+        "all_delivery_phases_use_submitted_snapshot": True,
+    }
+    metadata["input_lifecycle"] = lifecycle
+    status.setdefault("quality_signals", {})["input_lifecycle"] = lifecycle
+    generated = metadata.setdefault("generated_outputs", [])
+    if "source.pdf" not in generated:
+        generated.append("source.pdf")
+
+
 def restore_review_artifact_layer(
     output_dir: Path,
     response: dict[str, Any],
@@ -11811,32 +17817,84 @@ def restore_review_artifact_layer(
 ) -> None:
     document = response.get("document") or {}
     document_json = document.get("json_content")
-    tables = extract_table_nodes(document_json)
-    formulas = extract_label_nodes(document_json, "formula")
-    pictures = extract_label_nodes(document_json, "picture")
+    evidence_document_json = _document_with_resolved_page_provenance(document_json)
+    tables = extract_table_nodes(evidence_document_json)
+    # Rendering into a reused directory can silently mix crops from a previous
+    # PDF with the current contract.  Fail closed and require a fresh staging
+    # directory; do not delete anything because an operator may be preserving
+    # that earlier evidence intentionally.
+    allowed_contract_tables = {
+        f"table_{index}.json" for index in range(1, len(tables) + 1)
+    }
+    preexisting_asset_roots = _preexisting_generated_asset_roots(
+        output_dir,
+        allowed_contract_table_names=allowed_contract_tables,
+    )
+    if preexisting_asset_roots:
+        raise RuntimeError(
+            "generated_asset_roots_must_be_empty_use_fresh_output_dir:"
+            + ",".join(preexisting_asset_roots)
+        )
+    formulas = extract_label_nodes(evidence_document_json, "formula")
+    pictures = extract_label_nodes(evidence_document_json, "picture")
 
     table_outputs = write_table_review_artifacts(output_dir, tables)
-    crop_counts, crop_warnings, formula_crop_diagnostics = render_page_images_and_crops(
-        args.input_file, output_dir, tables, formulas, pictures
+    (
+        crop_counts,
+        crop_warnings,
+        formula_crop_diagnostics,
+        structural_visual_provenance_manifest,
+    ) = render_page_images_and_crops(
+        args.input_file,
+        output_dir,
+        tables,
+        formulas,
+        pictures,
+        document_json=evidence_document_json,
+        semantic_pdf_sha256=str(metadata.get("input_sha256") or "") or None,
+        conversion_pdf_sha256=(
+            str(metadata.get("conversion_input_sha256") or "") or None
+        ),
+    )
+    metadata["structural_visual_provenance_manifest"] = (
+        structural_visual_provenance_manifest
     )
     table_visual_fallbacks = inject_empty_table_visual_fallbacks(
         output_dir,
-        document_json,
+        evidence_document_json,
         tables,
+        provenance_manifest=structural_visual_provenance_manifest,
+        expected_visual_pdf_sha256=_structural_expected_visual_pdf_sha256(
+            metadata
+        ),
+        expected_semantic_pdf_sha256=_structural_expected_semantic_pdf_sha256(
+            metadata
+        ),
     )
     table_source_renderings = append_structured_table_source_renderings(
         output_dir,
-        document_json,
+        evidence_document_json,
         tables,
+        provenance_manifest=structural_visual_provenance_manifest,
+        expected_visual_pdf_sha256=_structural_expected_visual_pdf_sha256(
+            metadata
+        ),
+        expected_semantic_pdf_sha256=_structural_expected_semantic_pdf_sha256(
+            metadata
+        ),
     )
     formula_source_renderings = append_formula_source_renderings(
         output_dir,
         formulas,
+        formula_crop_diagnostics=formula_crop_diagnostics,
+        metadata=metadata,
     )
+    evidence_document = dict(document)
+    evidence_document["json_content"] = evidence_document_json
     diagnostics = formula_review_diagnostics(
         formulas,
         output_dir,
-        document,
+        evidence_document,
         args.input_file,
         formula_crop_diagnostics,
     )
@@ -11975,7 +18033,10 @@ def _second_pass_formula_display_text(entry: dict[str, Any]) -> str:
         entry.setdefault("final_output_repairs", []).extend(
             repair for repair in repairs if repair not in entry.get("final_output_repairs", [])
         )
-    display_text, sanitize_reasons = sanitize_formula_display_text(normalized)
+    display_text, sanitize_reasons = sanitize_formula_display_text(
+        normalized,
+        render_fallback=True,
+    )
     if sanitize_reasons:
         entry.setdefault("final_output_repairs", []).extend(
             reason for reason in sanitize_reasons if reason not in entry.get("final_output_repairs", [])
@@ -12082,7 +18143,14 @@ def _render_formula_fallback_html(
         else ""
     )
     source_formula_render = ""
-    if source_formula and _looks_like_algorithm_formula(source_formula):
+    if source_formula and _looks_like_misdetected_formula_prose(source_formula):
+        source_formula_render = (
+            '<p class="docling-formula-unavailable">'
+            "The recognized formula text was withheld because it mixed prose or "
+            "layout noise into the equation; the exact source rendering is preserved "
+            "below.</p>"
+        )
+    elif source_formula and _looks_like_algorithm_formula(source_formula):
         source_formula_render = (
             '<pre class="docling-algorithm-block docling-formula-preserved-source">'
             f"{html.escape(_algorithm_formula_plain_text(source_formula))}</pre>"
@@ -12107,11 +18175,6 @@ def _render_formula_fallback_html(
             "The recognized formula text was withheld because it failed safety "
             "checks; the exact source rendering is preserved below."
             "</p>"
-        )
-    elif source_formula and _looks_like_misdetected_formula_prose(source_formula):
-        source_formula_render = (
-            '<p class="docling-formula-unavailable">Readable formula fallback was not available; '
-            "the exact source rendering is preserved below.</p>"
         )
     elif source_formula and not _formula_output_safety_reasons(source_formula):
         display_formula, _sanitize_reasons = sanitize_formula_display_text(source_formula)
@@ -12269,7 +18332,10 @@ def _original_formula_visible_ranges(html_text: str) -> list[re.Match[str]]:
 
 
 def _formula_output_safety_reasons(text: str) -> list[str]:
-    body, _sanitize_reasons = sanitize_formula_display_text(text)
+    body, _sanitize_reasons = sanitize_formula_display_text(
+        text,
+        render_fallback=True,
+    )
     body = body.strip()
     reasons: list[str] = []
     if _looks_like_algorithm_formula(text):
@@ -12398,9 +18464,13 @@ def _readable_formula_fallback_display_text(entry: dict[str, Any]) -> tuple[str,
         if not candidate.strip():
             continue
         normalized, _repairs = canonicalize_formula_output(candidate, eq_number)
-        display_text, sanitize_reasons = sanitize_formula_display_text(normalized)
-        full_safety_reasons = formula_hallucination_reasons(display_text)
-        full_safety_reasons.extend(f"latex_{reason}" for reason in _validated_latex_reasons(display_text))
+        allow_inventive_repairs = source == "second_pass_candidate"
+        display_text, sanitize_reasons = sanitize_formula_display_text(
+            normalized,
+            render_fallback=True,
+            allow_inventive_repairs=allow_inventive_repairs,
+        )
+        full_safety_reasons = _formula_output_safety_reasons(display_text)
         if display_text and _formula_like_row_score(display_text) >= 4 and not full_safety_reasons:
             score = (0, 0, -_formula_like_row_score(display_text))
             ranked.append((score, display_text[:1600], source, sanitize_reasons))
@@ -12415,7 +18485,11 @@ def _readable_formula_fallback_display_text(entry: dict[str, Any]) -> tuple[str,
             display = r"\begin{aligned} " + display + r" \end{aligned}"
         if eq_number and not re.search(r"\(\s*" + re.escape(str(eq_number)) + r"\s*\)", display):
             display = f"{display} \\quad ({eq_number})"
-        display, sanitize_reasons = sanitize_formula_display_text(display)
+            display, sanitize_reasons = sanitize_formula_display_text(
+                display,
+                render_fallback=True,
+                allow_inventive_repairs=source == "second_pass_candidate",
+            )
         safety_reasons = formula_hallucination_reasons(display)
         safety_reasons.extend(f"latex_{reason}" for reason in _validated_latex_reasons(display))
         score = (len(safety_reasons), 0 if len(rows) > 1 else 1, -_formula_like_row_score(display))
@@ -12439,7 +18513,10 @@ def _best_formula_fallback_text(entry: dict[str, Any]) -> tuple[str, str]:
         normalized, _repairs = canonicalize_formula_output(candidate, eq_number)
         if not normalized or formula_hallucination_reasons(normalized):
             continue
-        display_text, _sanitize_reasons = sanitize_formula_display_text(normalized)
+        display_text, _sanitize_reasons = sanitize_formula_display_text(
+            normalized,
+            render_fallback=True,
+        )
         ranked.append((_formula_candidate_rank(display_text, eq_number), display_text, source))
     if not ranked:
         return "", "unavailable"
@@ -12486,23 +18563,32 @@ def _render_formula_fallback_markdown(entry: dict[str, Any]) -> str:
 
 
 def _collapse_markdown_formula_fallbacks(md_text: str) -> tuple[str, int]:
-    pattern = re.compile(
-        r"\$\$(?P<body>.*?)\$\$\s*"
-        r"<!--\s*formula-final-output-fallback\s+formula=(?P<formula>\d+)\s+"
-        r"reason=(?P<reason>.*?)\s*-->",
-        flags=re.S,
-    )
-
-    def replace(match: re.Match[str]) -> str:
-        return _render_formula_fallback_markdown(
-            {
-                "formula_no": int(match.group("formula")),
-                "fallback_reason": match.group("reason").strip(),
-                "route_a_text": match.group("body").strip(),
-            }
+    edits: list[tuple[int, int, str]] = []
+    for start, end in _markdown_display_math_spans(md_text):
+        fallback = re.match(
+            r"\s*<!--\s*formula-final-output-fallback\s+"
+            r"formula=(?P<formula>\d+)\s+reason=(?P<reason>.*?)\s*-->",
+            md_text[end:],
+            flags=re.S,
         )
-
-    return pattern.subn(replace, md_text)
+        if not fallback:
+            continue
+        edits.append(
+            (
+                start,
+                end + fallback.end(),
+                _render_formula_fallback_markdown(
+                    {
+                        "formula_no": int(fallback.group("formula")),
+                        "fallback_reason": fallback.group("reason").strip(),
+                        "route_a_text": md_text[start + 2 : end - 2].strip(),
+                    }
+                ),
+            )
+        )
+    for start, end, replacement in reversed(edits):
+        md_text = md_text[:start] + replacement + md_text[end:]
+    return md_text, len(edits)
 
 
 def _original_formula_html_ranges(html_text: str) -> tuple[list[re.Match[str]], dict[int, re.Match[str]]]:
@@ -12925,7 +19011,7 @@ def synchronize_formula_contract_outputs(
     md_path = output_dir / "document.md"
     if md_path.exists():
         md_text = md_path.read_text(encoding="utf-8")
-        blocks = list(re.finditer(r"\$\$.*?\$\$", md_text, re.DOTALL))
+        blocks = _markdown_formula_slots(md_text)
         edits: list[tuple[int, int, str]] = []
         for entry in replacement_log:
             formula_no = entry.get("formula_no")
@@ -12938,15 +19024,20 @@ def synchronize_formula_contract_outputs(
                 output_text = _second_pass_formula_display_text(entry)
                 replacement = f"$${output_text}$$"
             else:
+                slot_text = md_text[blocks[formula_no - 1][0] : blocks[formula_no - 1][1]]
                 replacement = _render_formula_fallback_markdown(
                     {
                         **entry,
-                        "route_a_text": blocks[formula_no - 1].group(0)[2:-2].strip(),
+                        "route_a_text": (
+                            slot_text[2:-2].strip()
+                            if slot_text.startswith("$$") and slot_text.endswith("$$")
+                            else str(entry.get("route_a_text") or "")
+                        ),
                     },
                 )
             block = blocks[formula_no - 1]
-            if block.group(0) != replacement:
-                edits.append((block.start(), block.end(), replacement))
+            if md_text[block[0] : block[1]] != replacement:
+                edits.append((block[0], block[1], replacement))
                 markdown_patched.append(formula_no)
         for start, end, replacement in sorted(edits, reverse=True):
             md_text = md_text[:start] + replacement + md_text[end:]
@@ -12981,7 +19072,14 @@ def validate_formula_second_pass_html(
     document = _load_json_file(output_dir / "document.json")
     json_formulas = extract_label_nodes(document, "formula") if isinstance(document, dict) else []
     md_text = (output_dir / "document.md").read_text(encoding="utf-8") if (output_dir / "document.md").exists() else ""
-    md_blocks = [match.group(0)[2:-2].strip() for match in re.finditer(r"\$\$.*?\$\$", md_text, re.DOTALL)]
+    md_blocks: list[str | None] = []
+    for start, end in _markdown_formula_slots(md_text):
+        slot = md_text[start:end]
+        md_blocks.append(
+            slot[2:-2].strip()
+            if slot.startswith("$$") and slot.endswith("$$")
+            else None
+        )
     for entry in replacement_log:
         formula_no = entry.get("formula_no")
         marker = f'data-formula-index="{formula_no}"'
@@ -13284,21 +19382,15 @@ def _patch_formula_json_nodes(
 
 def _replace_markdown_formula_block(md_text: str, formula_no: int, formula_text: str) -> tuple[str, bool]:
     patterns = [
-        r"\$\$[^$]*?\(\s*" + re.escape(str(formula_no)) + r"\s*\)[^$]*?\$\$",
+        r"\(\s*" + re.escape(str(formula_no)) + r"\s*\)",
     ]
     if formula_no >= 10:
         spaced = r"\s+".join(re.escape(char) for char in str(formula_no))
-        patterns.append(r"\$\$[^$]*?\(\s*" + spaced + r"\s*\)[^$]*?\$\$")
-    for pattern in patterns:
-        updated, count = re.subn(
-            pattern,
-            lambda _match: f"$${formula_text}$$",
-            md_text,
-            count=1,
-            flags=re.DOTALL,
-        )
-        if count:
-            return updated, True
+        patterns.append(r"\(\s*" + spaced + r"\s*\)")
+    for start, end in _markdown_display_math_spans(md_text):
+        block = md_text[start:end]
+        if any(re.search(pattern, block, flags=re.S) for pattern in patterns):
+            return md_text[:start] + f"$${formula_text}$$" + md_text[end:], True
     return md_text, False
 
 
@@ -13312,18 +19404,13 @@ def _patch_markdown_formula_blocks(output_dir: Path, formula_texts: dict[int, st
     # ``formula-not-decoded`` placeholders for difficult pages.  Treat the
     # combined sequence as the document's formula order so a guarded visual
     # recognizer can restore formulas without appending them out of context.
-    formula_slots = list(
-        re.finditer(
-            r"(?s)\$\$.*?\$\$|<!--\s*formula-not-decoded\s*-->",
-            md_text,
-        )
-    )
+    formula_slots = _markdown_formula_slots(md_text)
     ordered_edits: list[tuple[int, int, str]] = []
     for formula_no, formula_text in formula_texts.items():
         if 0 < formula_no <= len(formula_slots):
             slot = formula_slots[formula_no - 1]
             ordered_edits.append(
-                (slot.start(), slot.end(), f"$$\n{formula_text}\n$$")
+                (slot[0], slot[1], f"$$\n{formula_text}\n$$")
             )
             patched.append(formula_no)
     for start, end, replacement in reversed(ordered_edits):
@@ -13333,41 +19420,33 @@ def _patch_markdown_formula_blocks(output_dir: Path, formula_texts: dict[int, st
             continue
         md_text, changed = _replace_markdown_formula_block(md_text, formula_no, formula_text)
         if not changed:
-            blocks = list(re.finditer(r"\$\$.*?\$\$", md_text, re.DOTALL))
+            blocks = _markdown_display_math_spans(md_text)
             if 0 < formula_no <= len(blocks):
                 match = blocks[formula_no - 1]
-                md_text = md_text[: match.start()] + f"$${formula_text}$$" + md_text[match.end() :]
+                md_text = md_text[: match[0]] + f"$${formula_text}$$" + md_text[match[1] :]
                 changed = True
         if changed:
             patched.append(formula_no)
             safety_reasons = _formula_output_safety_reasons(formula_text)
             if safety_reasons:
-                blocks = list(re.finditer(r"\$\$.*?\$\$", md_text, re.DOTALL))
+                blocks = _markdown_display_math_spans(md_text)
                 if 0 < formula_no <= len(blocks):
                     block = blocks[formula_no - 1]
                     comment = (
                         "\n<!-- formula-final-output-fallback "
                         f"formula={formula_no} reason={','.join(safety_reasons)} -->"
                     )
-                    md_text = md_text[: block.end()] + comment + md_text[block.end() :]
-    text_corrections: list[str] = []
-    for pattern, new in CN_FINAL_TEXT_CORRECTIONS:
-        md_text, count = pattern.subn(new, md_text)
-        if count:
-            text_corrections.append(new)
+                    md_text = md_text[: block[1]] + comment + md_text[block[1] :]
     md_text, collapsed_count = _collapse_markdown_formula_fallbacks(md_text)
-    if patched or text_corrections or collapsed_count:
+    if patched or collapsed_count:
         md_path.write_text(md_text, encoding="utf-8")
     return patched
 
 
 def _patch_html_text_corrections(html_text: str) -> tuple[str, list[str]]:
-    applied: list[str] = []
-    for pattern, new in CN_FINAL_TEXT_CORRECTIONS:
-        html_text, count = pattern.subn(new, html_text)
-        if count:
-            applied.append(new)
-    return html_text, applied
+    """Preserve source prose; final polish is structural/formula-only."""
+
+    return html_text, []
 
 
 def _complete_cn_formula_html_sequence(
@@ -13888,7 +19967,7 @@ def _replace_unsafe_markdown_formula_blocks_with_source_images(
     if not markdown_path.exists() or not unsafe_indexes:
         return 0
     markdown = markdown_path.read_text(encoding="utf-8")
-    formula_blocks = list(re.finditer(r"\$\$.*?\$\$", markdown, flags=re.DOTALL))
+    formula_blocks = _markdown_display_math_spans(markdown)
     edits: list[tuple[int, int, str]] = []
     for formula_no in unsafe_indexes:
         if not (0 < formula_no <= len(formula_blocks)):
@@ -13904,7 +19983,7 @@ def _replace_unsafe_markdown_formula_blocks_with_source_images(
             f"![Formula {formula_no} source rendering]"
             f"(formulas/formula_{formula_no}.png)"
         )
-        edits.append((block.start(), block.end(), replacement))
+        edits.append((block[0], block[1], replacement))
     for start, end, replacement in reversed(edits):
         markdown = markdown[:start] + replacement + markdown[end:]
     if edits:
@@ -14437,7 +20516,10 @@ def run_portable_formula_ocr(
             raw_latex,
             equation_numbers.get(index),
         )
-        display, _display_repairs = sanitize_formula_display_text(normalized)
+        display, _display_repairs = sanitize_formula_display_text(
+            normalized,
+            render_fallback=True,
+        )
         adapter_reasons = _formula_output_safety_reasons(display)
         if adapter_reasons:
             post_validation_fallback_indexes.append(index)
@@ -14483,7 +20565,10 @@ def run_portable_formula_ocr(
             raw_latex,
             equation_numbers.get(index),
         )
-        display, display_repairs = sanitize_formula_display_text(normalized)
+        display, display_repairs = sanitize_formula_display_text(
+            normalized,
+            render_fallback=True,
+        )
         reasons = list(item.get("safety_reasons") or [])
         reasons.extend(_formula_output_safety_reasons(display))
         reasons = list(dict.fromkeys(str(reason) for reason in reasons if reason))
@@ -14623,7 +20708,7 @@ def run_optional_formula_second_pass(
     if requested_policy != policy:
         status["warnings"].append(
             f"formula_second_pass_policy_resolved:{requested_policy}->{policy}:"
-            "preserve_accepted_cn_0854aa1_path"
+            "safe_route_b_policy_resolution"
         )
     portable_formula = status.get("quality_signals", {}).get("portable_formula_ocr")
     if (
@@ -14650,12 +20735,30 @@ def run_optional_formula_second_pass(
         )
         return
     if policy == "off":
-        apply_current_formula_display_fallback(
-            output_dir,
-            metadata,
-            status,
-            args,
-            reason="formula_second_pass_policy_off",
+        current_document = _load_json_file(output_dir / "document.json")
+        formula_count = (
+            len(extract_label_nodes(current_document, "formula"))
+            if isinstance(current_document, dict)
+            else 0
+        )
+        result = {
+            "ok": True,
+            "skipped": True,
+            "policy": "off",
+            "reason": "formula_second_pass_policy_off",
+            "formula_count": formula_count,
+            "replaced_count": 0,
+        }
+        metadata["formula_second_pass"] = result
+        metadata["formula_second_pass_applied"] = False
+        status["quality_signals"]["formula_second_pass"] = result
+        status["quality_signals"]["formula_second_pass_applied"] = False
+        status["warnings"].append("formula_second_pass_skipped:policy_off")
+        (output_dir / "metadata.json").write_text(
+            json.dumps(metadata, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+        (output_dir / "status.json").write_text(
+            json.dumps(status, indent=2, ensure_ascii=False), encoding="utf-8"
         )
         return
 
@@ -14668,8 +20771,56 @@ def run_optional_formula_second_pass(
         )
 
     route_b_dir = args.formula_second_pass_route_b_dir
-    sidecar_dir = args.formula_second_pass_output_dir or (output_dir / "formula_second_pass")
+    configured_sidecar = args.formula_second_pass_output_dir
+    sidecar_dir = Path(configured_sidecar) if configured_sidecar else (
+        output_dir / "formula_second_pass"
+    )
+    if not sidecar_dir.is_absolute():
+        sidecar_dir = output_dir / sidecar_dir
+    try:
+        sidecar_dir = _safe_output_child(
+            output_dir,
+            sidecar_dir,
+            label="formula_second_pass_output_dir",
+        )
+    except ValueError as exc:
+        formula_summary = {
+            "ok": False,
+            "policy": policy,
+            "route_a_dir": str(output_dir),
+            "route_b_dir": str(route_b_dir) if route_b_dir else None,
+            "output_dir": str(sidecar_dir),
+            "error": str(exc),
+        }
+        metadata["formula_second_pass"] = formula_summary
+        metadata["formula_second_pass_applied"] = False
+        status["quality_signals"]["formula_second_pass"] = formula_summary
+        status["quality_signals"]["formula_second_pass_applied"] = False
+        status["ok"] = False
+        status["success_class"] = "degraded_failure"
+        status["warnings"].append(str(exc))
+        write_updated_contract_state()
+        return
     if route_b_dir is None:
+        if policy == "apply-all":
+            message = "formula_second_pass_route_b_dir_required"
+            formula_summary = {
+                "ok": False,
+                "policy": policy,
+                "route_a_dir": str(output_dir),
+                "route_b_dir": None,
+                "output_dir": str(sidecar_dir),
+                "error": message,
+            }
+            metadata["formula_second_pass"] = formula_summary
+            metadata["formula_second_pass_applied"] = False
+            status["quality_signals"]["formula_second_pass"] = formula_summary
+            status["quality_signals"]["formula_second_pass_applied"] = False
+            status["warnings"].append(message)
+            status["ok"] = False
+            status["success_class"] = "degraded_failure"
+            write_updated_contract_state()
+            return
         current_document = _load_json_file(output_dir / "document.json")
         current_formula_count = (
             len(extract_label_nodes(current_document, "formula"))
@@ -14764,9 +20915,24 @@ def run_optional_formula_second_pass(
         "render_failed_latex_count": result.get("render_failed_latex_count"),
         "guarded_fallback_eqs": sorted(args.formula_second_pass_guarded_fallback_eq),
         "error": result.get("error"),
+        "route_job_identity_check": copy.deepcopy(
+            result.get("route_job_identity_check")
+        ),
+        "route_b_source_identity_check": copy.deepcopy(
+            result.get("route_b_source_identity_check")
+        ),
+        "evidence_gaps": copy.deepcopy(result.get("evidence_gaps") or []),
     }
+    raw_replacement_log = list(result.get("replacement_log") or [])
+    formula_summary["replacement_log"] = copy.deepcopy(
+        raw_replacement_log[:FORMULA_SECOND_PASS_REPLACEMENT_LOG_LIMIT]
+    )
+    formula_summary["replacement_log_count"] = len(raw_replacement_log)
+    formula_summary["replacement_log_truncated"] = bool(
+        len(raw_replacement_log) > FORMULA_SECOND_PASS_REPLACEMENT_LOG_LIMIT
+    )
     alignment_diag = formula_second_pass_alignment_diagnostics(
-        list(result.get("replacement_log") or []),
+        raw_replacement_log,
         result.get("route_a_formula_count"),
     )
     formula_summary["alignment_diagnostics"] = alignment_diag
@@ -14850,31 +21016,97 @@ def run_optional_formula_second_pass(
             f"count={alignment_diag.get('second_pass_not_applied_count')}"
         )
     if policy in {"apply", "apply-all"}:
-        shutil.copyfile(sidecar_dir / "document.md", output_dir / "document.md")
-        shutil.copyfile(sidecar_dir / "document.json", output_dir / "document.json")
+        primary_surface_snapshots: dict[Path, bytes | None] = {
+            output_dir / name: (
+                (output_dir / name).read_bytes()
+                if (output_dir / name).exists()
+                else None
+            )
+            for name in (
+                "document.html",
+                "document.md",
+                "document.json",
+                "formulas.tex",
+            )
+        }
+        missing_snapshot_value = object()
+        metadata_formula_latex_before = metadata.get(
+            "formula_latex_sources", missing_snapshot_value
+        )
+        status_formula_latex_before = status["quality_signals"].get(
+            "formula_latex_sources", missing_snapshot_value
+        )
+
+        def restore_primary_apply_state() -> None:
+            for path, payload in primary_surface_snapshots.items():
+                if payload is None:
+                    if path.exists():
+                        path.unlink()
+                else:
+                    path.write_bytes(payload)
+            if metadata_formula_latex_before is missing_snapshot_value:
+                metadata.pop("formula_latex_sources", None)
+            else:
+                metadata["formula_latex_sources"] = metadata_formula_latex_before
+            if status_formula_latex_before is missing_snapshot_value:
+                status["quality_signals"].pop("formula_latex_sources", None)
+            else:
+                status["quality_signals"][
+                    "formula_latex_sources"
+                ] = status_formula_latex_before
+
+        def abort_primary_apply(stage: str, exc: Exception) -> None:
+            restore_primary_apply_state()
+            metadata["formula_second_pass_applied"] = False
+            status["quality_signals"]["formula_second_pass_applied"] = False
+            formula_summary["primary_apply_ok"] = False
+            status["ok"] = False
+            status["success_class"] = "degraded_failure"
+            status["warnings"].append(
+                "formula_second_pass_primary_apply_exception_rolled_back:"
+                f"{stage}:{type(exc).__name__}:{exc}"
+            )
+            write_updated_contract_state()
+
+        try:
+            shutil.copyfile(sidecar_dir / "document.md", output_dir / "document.md")
+            shutil.copyfile(sidecar_dir / "document.json", output_dir / "document.json")
+        except Exception as exc:
+            abort_primary_apply("copy_sidecar_contract", exc)
+            return
         patched_document = _load_json_file(output_dir / "document.json")
         if isinstance(patched_document, dict):
-            patched_formulas = extract_label_nodes(patched_document, "formula")
-            formula_latex_sources = write_formula_latex_sources(output_dir, patched_formulas)
+            try:
+                patched_formulas = extract_label_nodes(patched_document, "formula")
+                formula_latex_sources = write_formula_latex_sources(output_dir, patched_formulas)
+            except Exception as exc:
+                abort_primary_apply("write_formula_latex_sources", exc)
+                return
             metadata["formula_latex_sources"] = formula_latex_sources
             status["quality_signals"]["formula_latex_sources"] = formula_latex_sources
-        if is_cn_accepted_path(args):
-            html_patch = {
-                "ok": True,
-                "applied": False,
-                "reason": "cn_accepted_path_owns_formula_html",
-            }
-        else:
-            html_patch = patch_document_html_for_formula_second_pass(
+        try:
+            if is_cn_accepted_path(args):
+                html_patch = {
+                    "ok": True,
+                    "applied": False,
+                    "reason": "cn_accepted_path_owns_formula_html",
+                }
+            else:
+                html_patch = patch_document_html_for_formula_second_pass(
+                    output_dir,
+                    sidecar_dir,
+                    list(result.get("replacement_log") or []),
+                )
+            contract_sync = synchronize_formula_contract_outputs(
                 output_dir,
-                sidecar_dir,
                 list(result.get("replacement_log") or []),
             )
-        contract_sync = synchronize_formula_contract_outputs(
-            output_dir,
-            list(result.get("replacement_log") or []),
-        )
-        cn_final_polish = apply_cn_final_document_polish(output_dir, sidecar_dir, args)
+            cn_final_polish = apply_cn_final_document_polish(
+                output_dir, sidecar_dir, args
+            )
+        except Exception as exc:
+            abort_primary_apply("patch_and_synchronize_primary_contract", exc)
+            return
         validation_log = list(result.get("replacement_log") or [])
         if cn_final_polish.get("applied"):
             final_document = _load_json_file(output_dir / "document.json")
@@ -14897,19 +21129,27 @@ def run_optional_formula_second_pass(
                             "fallback_reason": formula_meta.get("fallback_reason"),
                         }
                     )
-        html_gate = validate_formula_second_pass_html(
-            output_dir,
-            validation_log,
-        )
+        try:
+            html_gate = validate_formula_second_pass_html(
+                output_dir,
+                validation_log,
+            )
+        except Exception as exc:
+            abort_primary_apply("validate_primary_formula_html", exc)
+            return
         markdown_supplement = {"ok": True, "applied": False, "reason": "cn_accepted_path"}
         if not is_cn_accepted_path(args):
             current_document = _load_json_file(output_dir / "document.json")
-            markdown_supplement = apply_markdown_main_flow_supplement(
-                output_dir,
-                current_document,
-                metadata,
-                status,
-            )
+            try:
+                markdown_supplement = apply_markdown_main_flow_supplement(
+                    output_dir,
+                    current_document,
+                    metadata,
+                    status,
+                )
+            except Exception as exc:
+                abort_primary_apply("apply_markdown_main_flow_supplement", exc)
+                return
         metadata["formula_second_pass_html_patch"] = html_patch
         metadata["formula_second_pass_html_gate"] = html_gate
         metadata["formula_second_pass_contract_sync"] = contract_sync
@@ -14920,11 +21160,22 @@ def run_optional_formula_second_pass(
         status["quality_signals"]["formula_second_pass_contract_sync"] = contract_sync
         status["quality_signals"]["cn_final_document_polish"] = cn_final_polish
         status["quality_signals"]["post_formula_markdown_main_flow_supplement"] = markdown_supplement
-        if not html_patch.get("ok") or not html_gate.get("ok") or not cn_final_polish.get("ok"):
+        primary_apply_ok = bool(
+            html_patch.get("ok")
+            and html_gate.get("ok")
+            and contract_sync.get("ok")
+            and cn_final_polish.get("ok")
+            and markdown_supplement.get("ok")
+        )
+        if not primary_apply_ok:
+            # The sidecar remains available for diagnosis, but primary Route-A
+            # files are an atomic contract.  Never leave JSON/Markdown patched
+            # when HTML or a later synchronization gate rejects the result.
+            restore_primary_apply_state()
             status["ok"] = False
             status["success_class"] = "degraded_failure"
             status["warnings"].append(
-                "formula_second_pass_html_gate_failed:"
+                "formula_second_pass_primary_apply_rolled_back:"
                 f"missing={html_gate.get('missing_replacements')}:"
                 f"unpatched={html_patch.get('missing_indexes')}"
             )
@@ -14946,13 +21197,83 @@ def run_optional_formula_second_pass(
                     if source.startswith("anchor-missing-")
                 )
             )
-        metadata["formula_second_pass_applied"] = True
-        status["quality_signals"]["formula_second_pass_applied"] = True
+        metadata["formula_second_pass_applied"] = primary_apply_ok
+        status["quality_signals"]["formula_second_pass_applied"] = primary_apply_ok
+        formula_summary["primary_apply_ok"] = primary_apply_ok
     else:
         metadata["formula_second_pass_applied"] = False
         status["quality_signals"]["formula_second_pass_applied"] = False
 
     write_updated_contract_state()
+
+
+def run_optional_formula_second_pass_safely(
+    output_dir: Path,
+    metadata: dict[str, Any],
+    status: dict[str, Any],
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    """Converge outer I/O failures without leaving a half-applied primary."""
+
+    protected_names = ("document.html", "document.md", "document.json", "formulas.tex")
+    file_snapshots = {
+        name: (output_dir / name).read_bytes() if (output_dir / name).is_file() else None
+        for name in protected_names
+    }
+    metadata_snapshot = copy.deepcopy(metadata)
+    status_snapshot = copy.deepcopy(status)
+    try:
+        run_optional_formula_second_pass(output_dir, metadata, status, args)
+        return {"ok": True, "error": None}
+    except Exception as exc:
+        restore_errors: list[str] = []
+        for name, payload in file_snapshots.items():
+            path = output_dir / name
+            try:
+                if payload is None:
+                    if path.exists() and path.is_file():
+                        path.unlink()
+                else:
+                    path.write_bytes(payload)
+            except OSError as restore_exc:
+                restore_errors.append(f"{name}:{restore_exc}")
+        metadata.clear()
+        metadata.update(metadata_snapshot)
+        status.clear()
+        status.update(status_snapshot)
+        error = f"formula_second_pass_outer_exception:{exc.__class__.__name__}:{exc}"
+        result = {
+            "ok": False,
+            "error": error,
+            "primary_restored": not restore_errors,
+            "restore_errors": restore_errors,
+        }
+        metadata["formula_second_pass"] = result
+        metadata["formula_second_pass_applied"] = False
+        status.setdefault("quality_signals", {})["formula_second_pass"] = result
+        status["quality_signals"]["formula_second_pass_applied"] = False
+        status["ok"] = False
+        status["success_class"] = "degraded_failure"
+        status.setdefault("warnings", []).append(error)
+        if restore_errors:
+            status["warnings"].append(
+                "formula_second_pass_primary_restore_failed:"
+                + "|".join(restore_errors)
+            )
+        for contract_name, payload in (
+            ("metadata.json", metadata),
+            ("status.json", status),
+        ):
+            try:
+                (output_dir / contract_name).write_text(
+                    json.dumps(payload, indent=2, ensure_ascii=False),
+                    encoding="utf-8",
+                )
+            except OSError as write_exc:
+                result.setdefault("contract_write_errors", []).append(
+                    f"{contract_name}:{write_exc}"
+                )
+        return result
 
 
 def page_count_from_document(document_json: Any) -> int | None:
@@ -15085,6 +21406,7 @@ def summarize_response(
         "job_id": name,
         "sample_name": args.sample_name,
         "input_file": str(args.input_file),
+        "input_sha256": file_sha256(args.input_file),
         "output_dir": str(output_dir),
         "serve_url": args.serve_url.rstrip("/"),
         "serve_status": response.get("status"),
@@ -15219,7 +21541,7 @@ def run_conversion(
             "ocr_fallback_cn_ocrmac_full_page_requested:"
             f"{args.cn_ocr_request_shape}:{','.join(CN_OCR_LANG)}"
         )
-    output_dir = args.output_root / name
+    output_dir = _job_output_dir(args.output_root, name)
     metadata, status = summarize_response(
         name, response, wall_time, options, warnings, args, output_dir
     )
@@ -15268,7 +21590,7 @@ def run_cn_chunked_fallback(
         merged["status"] = "partial_success" if chunk_responses else "failure"
         merged["errors"] = list(merged.get("errors") or []) + chunk_failures
 
-    output_dir = args.output_root / name
+    output_dir = _job_output_dir(args.output_root, name)
     warnings = [
         "text_quality_failed_gxx; full-document CN OCR fallback failed; "
         "attempted all-page chunked OCRMac fallback",
@@ -15410,7 +21732,7 @@ def run_transient_chunked_fallback(
         merged["status"] = "partial_success" if chunk_responses else "failure"
         merged["errors"] = list(merged.get("errors") or []) + chunk_failures
 
-    output_dir = args.output_root / name
+    output_dir = _job_output_dir(args.output_root, name)
     options = base_options(args, force_ocr=False)
     conversion_mode = (
         "forced_chunked_conversion"
@@ -15503,12 +21825,11 @@ def reconcile_final_surface_status(
     quality_signals = status.setdefault("quality_signals", {})
     structural = quality_signals.get("structural_quarantine_qc") or {}
     unresolved_count = int(structural.get("unresolved_footnote_count") or 0)
-    final_surface_resolved = bool(
-        status.get("ok")
-        and (quality_signals.get("primary_surface") or {}).get("ok")
-        and unresolved_count > 0
-        and len(linked_ids) >= unresolved_count
-    )
+    # A count match cannot establish that the previously unresolved footnotes
+    # are the ones now linked; unrelated footnotes could otherwise erase real
+    # warnings.  Keep pre-reflow diagnostics until an exact identifier mapping
+    # is available in the contract.
+    final_surface_resolved = False
     removed: list[str] = []
     if final_surface_resolved:
         stale_prefixes = (
@@ -15529,10 +21850,1801 @@ def reconcile_final_surface_status(
         "linked_footnote_count": len(linked_ids),
         "pre_reflow_unresolved_footnote_count": unresolved_count,
         "pre_reflow_diagnostics_resolved": final_surface_resolved,
+        "resolution_reason": (
+            "no_unresolved_footnotes"
+            if unresolved_count == 0
+            else "exact_unresolved_footnote_identity_mapping_unavailable"
+        ),
         "removed_stale_warning_count": len(removed),
     }
     metadata["final_surface_reconciliation"] = result
     quality_signals["final_surface_reconciliation"] = result
+    return result
+
+
+def restore_final_delivery_visuals(
+    output_dir: Path,
+    document_json: dict[str, Any],
+    pdf_path: Path,
+    metadata: dict[str, Any],
+    status: dict[str, Any],
+    *,
+    visual_pdf_path: Path | None = None,
+) -> dict[str, Any]:
+    """Restore source-backed visuals after semantic reflow rewrites surfaces."""
+
+    evidence_document_json = _document_with_resolved_page_provenance(document_json)
+    tables = extract_table_nodes(evidence_document_json)
+    formulas = extract_label_nodes(evidence_document_json, "formula")
+    structural_provenance_manifest = metadata.get(
+        "structural_visual_provenance_manifest"
+    )
+    expected_visual_pdf_sha256 = _structural_expected_visual_pdf_sha256(metadata)
+    expected_semantic_pdf_sha256 = _structural_expected_semantic_pdf_sha256(
+        metadata
+    )
+    empty_tables = inject_empty_table_visual_fallbacks(
+        output_dir,
+        evidence_document_json,
+        tables,
+        provenance_manifest=structural_provenance_manifest,
+        expected_visual_pdf_sha256=expected_visual_pdf_sha256,
+        expected_semantic_pdf_sha256=expected_semantic_pdf_sha256,
+    )
+    structured_tables = append_structured_table_source_renderings(
+        output_dir,
+        evidence_document_json,
+        tables,
+        provenance_manifest=structural_provenance_manifest,
+        expected_visual_pdf_sha256=expected_visual_pdf_sha256,
+        expected_semantic_pdf_sha256=expected_semantic_pdf_sha256,
+    )
+    quality_signals = status.setdefault("quality_signals", {})
+    primary = quality_signals.get("primary_surface") or {}
+    primary_counts = primary.get("counts") or {}
+    dropped_formula_artifacts = list(primary.get("dropped_formula_artifacts") or [])
+    html_before = (output_dir / "document.html").read_text(encoding="utf-8")
+    markdown_before = (output_dir / "document.md").read_text(encoding="utf-8")
+    semantic_formula_indexes = _extract_formula_anchor_indexes(
+        html_before,
+        markdown_before,
+    )
+    expected_formula_indexes = (
+        semantic_formula_indexes
+        if semantic_formula_indexes
+        else set(range(1, len(formulas) + 1))
+    )
+    declared_drop_indexes = [
+        item.get("raw_formula_index")
+        for item in dropped_formula_artifacts
+        if isinstance(item, dict)
+        and isinstance(item.get("raw_formula_index"), int)
+        and not isinstance(item.get("raw_formula_index"), bool)
+    ]
+    semantic_maximum_index = max(
+        expected_formula_indexes,
+        default=len(formulas),
+    )
+    maximum_raw_index = (
+        len(formulas)
+        if len(formulas) >= semantic_maximum_index
+        else max(
+            semantic_maximum_index,
+            len(formulas) + len(set(declared_drop_indexes)),
+        )
+    )
+    formula_by_index: dict[int, dict[str, Any]] = {}
+    if len(formulas) == maximum_raw_index:
+        formula_by_index = {
+            index: formula for index, formula in enumerate(formulas, start=1)
+        }
+    elif semantic_formula_indexes and len(formulas) == len(semantic_formula_indexes):
+        formula_by_index = {
+            index: formula
+            for index, formula in zip(sorted(semantic_formula_indexes), formulas)
+        }
+
+    crop_diagnostics_by_index = _parse_formula_source_crop_diagnostics(
+        metadata.get("formula_crop_diagnostics"),
+        metadata.get("suspicious_formula_diagnostics"),
+    )
+    allowed_dropped_indexes: set[int] = set()
+    validated_dropped_artifacts: list[dict[str, Any]] = []
+    disallowed_dropped_artifacts: list[Any] = []
+    for artifact in dropped_formula_artifacts:
+        reasons: list[str] = []
+        if not isinstance(artifact, dict):
+            disallowed_dropped_artifacts.append(artifact)
+            continue
+        raw_index = artifact.get("raw_formula_index")
+        if (
+            not isinstance(raw_index, int)
+            or isinstance(raw_index, bool)
+            or raw_index <= 0
+            or raw_index > maximum_raw_index
+        ):
+            reasons.append("dropped_formula_raw_index_out_of_range")
+        elif declared_drop_indexes.count(raw_index) != 1:
+            reasons.append("duplicate_dropped_formula_raw_index")
+        elif raw_index in semantic_formula_indexes:
+            reasons.append("dropped_formula_overlaps_semantic_anchor")
+        if str(artifact.get("reason") or "") not in ALLOWED_FORMULA_DROPOUT_REASONS:
+            reasons.append("dropped_formula_reason_not_allowed")
+        artifact_bbox = _structural_bbox_snapshot(artifact.get("bbox"))
+        artifact_page_no = _positive_page_number(artifact.get("page_no"))
+        artifact_text = str(artifact.get("text") or "")
+        if artifact_bbox is None or artifact_page_no is None or not artifact_text:
+            reasons.append("dropped_formula_missing_page_bbox_or_body")
+        raw_formula = formula_by_index.get(raw_index) if isinstance(raw_index, int) else None
+        if isinstance(raw_formula, dict):
+            raw_prov = first_prov(raw_formula) or {}
+            if _positive_page_number(raw_prov.get("page_no")) != artifact_page_no:
+                reasons.append("dropped_formula_page_mismatch")
+            if _structural_bbox_snapshot(raw_prov.get("bbox")) != artifact_bbox:
+                reasons.append("dropped_formula_bbox_mismatch")
+            if _formula_raw_content_sha256(str(raw_formula.get("text") or "")) != (
+                _formula_raw_content_sha256(artifact_text)
+            ):
+                reasons.append("dropped_formula_body_mismatch")
+        elif artifact_bbox is not None and artifact_page_no is not None and artifact_text:
+            raw_formula = {
+                "self_ref": f"dropped-formula:{raw_index}",
+                "label": "formula",
+                "text": artifact_text,
+                "prov": [
+                    {
+                        "page_no": artifact_page_no,
+                        "bbox": artifact_bbox,
+                    }
+                ],
+            }
+        if isinstance(raw_index, int) and isinstance(raw_formula, dict):
+            source_verified = _formula_crop_provenance_is_verified(
+                output_dir / "formulas" / f"formula_{raw_index}.png",
+                crop_diagnostics_by_index,
+                raw_index,
+                formula=raw_formula,
+                for_context=False,
+                expected_visual_pdf_sha256=expected_visual_pdf_sha256,
+                allow_raw_identity=True,
+            )
+            context_verified = _formula_crop_provenance_is_verified(
+                output_dir / "formulas" / f"formula_{raw_index}_context.png",
+                crop_diagnostics_by_index,
+                raw_index,
+                formula=raw_formula,
+                for_context=True,
+                expected_visual_pdf_sha256=expected_visual_pdf_sha256,
+                allow_raw_identity=True,
+            )
+            if not source_verified or not context_verified:
+                reasons.append("dropped_formula_crop_manifest_unverified")
+        if reasons or not isinstance(raw_index, int) or not isinstance(raw_formula, dict):
+            rejected = dict(artifact)
+            rejected["validation_reasons"] = sorted(set(reasons))
+            disallowed_dropped_artifacts.append(rejected)
+            continue
+        enriched = dict(artifact)
+        enriched.update(
+            {
+                "source_ref": _structural_node_source_ref(
+                    raw_formula,
+                    kind="formula",
+                    fallback_index=raw_index - 1,
+                    part_index=_structural_node_part_index(raw_formula),
+                ),
+                "formula_raw_content_sha256": _formula_raw_content_sha256(
+                    artifact_text
+                ),
+                "crop_manifest_verified": True,
+            }
+        )
+        validated_dropped_artifacts.append(enriched)
+        allowed_dropped_indexes.add(raw_index)
+        formula_by_index[raw_index] = raw_formula
+    formula_sources = append_formula_source_renderings(
+        output_dir,
+        formulas,
+        formula_crop_diagnostics=metadata.get("formula_crop_diagnostics"),
+        suspicious_formula_diagnostics=metadata.get(
+            "suspicious_formula_diagnostics"
+        ),
+        # Dropped compact/number-only raw nodes are not primary semantic
+        # formulas, but they still require a usable context crop in the
+        # diagnostic appendix.  This prevents a short yet meaningful formula
+        # from disappearing merely because a layout heuristic dropped it.
+        expected_indexes=expected_formula_indexes | allowed_dropped_indexes,
+        metadata=metadata,
+        status=status,
+        primary=primary,
+        formula_by_index=formula_by_index,
+        diagnostic_only_indexes=allowed_dropped_indexes,
+    )
+    inline_math_sources = append_inline_math_source_renderings(
+        output_dir,
+        evidence_document_json,
+        list(primary.get("inline_math_source_regions") or []),
+    )
+    expected_algorithms = int(primary_counts.get("algorithms") or 0)
+    # Always inspect the raw document for algorithm candidates.  Skipping this
+    # when the semantic classifier reported zero made a missed algorithm a
+    # vacuous PASS (zero expected == zero checked).
+    algorithm_sources = recover_algorithm_blocks_in_outputs(
+        output_dir,
+        evidence_document_json,
+        pdf_path,
+        metadata,
+        status,
+        visual_pdf_path=visual_pdf_path,
+    )
+    code_sources = append_code_source_renderings(
+        output_dir,
+        evidence_document_json,
+        metadata=metadata,
+        semantic_pdf_path=pdf_path,
+        visual_pdf_path=visual_pdf_path,
+    )
+    for relative_path in inline_math_sources.get("source_images") or []:
+        if relative_path not in metadata.setdefault("generated_outputs", []):
+            metadata["generated_outputs"].append(relative_path)
+    for relative_path in code_sources.get("source_images") or []:
+        if relative_path not in metadata.setdefault("generated_outputs", []):
+            metadata["generated_outputs"].append(relative_path)
+
+    html_text = (output_dir / "document.html").read_text(encoding="utf-8")
+    markdown_text = (output_dir / "document.md").read_text(encoding="utf-8")
+
+    def unique_refs(pattern: str, value: str) -> int:
+        return len(set(re.findall(pattern, value)))
+
+    def indexed_refs(pattern: str, value: str) -> set[int]:
+        return {int(index) for index in re.findall(pattern, value)}
+
+    def valid_indexed_images(directory: str, prefix: str, indexes: set[int]) -> set[int]:
+        return {
+            index
+            for index in indexes
+            if _formula_image_size(output_dir / directory / f"{prefix}_{index}.png")
+            is not None
+            and _image_has_visible_content(
+                output_dir / directory / f"{prefix}_{index}.png"
+            )
+        }
+
+    raw_formula_indexes = set(range(1, maximum_raw_index + 1))
+    unaccounted_raw_formula_indexes = sorted(
+        raw_formula_indexes - expected_formula_indexes - allowed_dropped_indexes
+    )
+    formula_html_indexes = {
+        int(value)
+        for value in formula_sources.get("html_covered_indexes") or []
+    }
+    formula_markdown_indexes = {
+        int(value)
+        for value in formula_sources.get("markdown_covered_indexes") or []
+    }
+    formula_missing_indexes = sorted(
+        (expected_formula_indexes - formula_html_indexes)
+        | (expected_formula_indexes - formula_markdown_indexes)
+    )
+    formula_unexpected_indexes = sorted(
+        (formula_html_indexes | formula_markdown_indexes) - expected_formula_indexes
+    )
+    raw_table_indexes = set(range(1, len(tables) + 1))
+    algorithm_table_indexes = {
+        int(record["table_index"])
+        for record in (algorithm_sources.get("records") or [])
+        if isinstance(record, dict) and isinstance(record.get("table_index"), int)
+    }
+    table_expected_indexes = raw_table_indexes - algorithm_table_indexes
+    empty_table_expected_indexes = {
+        index
+        for index, table in enumerate(tables, start=1)
+        if index in table_expected_indexes and not table_grid(table)
+    }
+    structured_table_expected_indexes = (
+        table_expected_indexes - empty_table_expected_indexes
+    )
+    table_source_ref_by_index = {
+        index: _structural_node_source_ref(
+            table,
+            kind="table",
+            fallback_index=index - 1,
+        )
+        for index, table in enumerate(tables, start=1)
+        if index in table_expected_indexes
+    }
+    table_expected_source_refs = {
+        table_source_ref_by_index[index]
+        for index in table_expected_indexes
+        if index in table_source_ref_by_index
+    }
+    table_body_identity_expected_refs = {
+        table_source_ref_by_index[index]
+        for index in structured_table_expected_indexes
+        if index in table_source_ref_by_index
+    }
+    empty_table_expected_refs = {
+        table_source_ref_by_index[index]
+        for index in empty_table_expected_indexes
+        if index in table_source_ref_by_index
+    }
+    empty_table_candidate_refs = {
+        str(value)
+        for value in empty_tables.get("candidate_source_refs") or []
+        if str(value)
+    }
+    structured_table_html_bound_source_refs = {
+        str(value)
+        for value in structured_tables.get("html_bound_source_refs") or []
+        if str(value) in table_expected_source_refs
+    }
+    structured_table_markdown_bound_source_refs = {
+        str(value)
+        for value in structured_tables.get("markdown_bound_source_refs") or []
+        if str(value) in table_expected_source_refs
+    }
+    empty_table_html_bound_source_refs = {
+        str(value)
+        for value in empty_tables.get("html_bound_source_refs") or []
+        if str(value) in empty_table_expected_refs
+    }
+    empty_table_markdown_bound_source_refs = {
+        str(value)
+        for value in empty_tables.get("markdown_bound_source_refs") or []
+        if str(value) in empty_table_expected_refs
+    }
+    table_html_bound_source_refs = (
+        structured_table_html_bound_source_refs
+        | empty_table_html_bound_source_refs
+    )
+    table_markdown_bound_source_refs = (
+        structured_table_markdown_bound_source_refs
+        | empty_table_markdown_bound_source_refs
+    )
+    table_html_body_identity_verified_refs = {
+        str(value)
+        for value in structured_tables.get("html_body_identity_verified_refs") or []
+        if str(value) in table_body_identity_expected_refs
+    }
+    table_markdown_body_identity_verified_refs = {
+        str(value)
+        for value in structured_tables.get("markdown_body_identity_verified_refs") or []
+        if str(value) in table_body_identity_expected_refs
+    }
+    table_html_body_identity_mismatch_refs = {
+        str(value)
+        for value in structured_tables.get("html_body_identity_mismatch_refs") or []
+        if str(value) in table_body_identity_expected_refs
+    }
+    table_markdown_body_identity_mismatch_refs = {
+        str(value)
+        for value in structured_tables.get("markdown_body_identity_mismatch_refs") or []
+        if str(value) in table_body_identity_expected_refs
+    }
+    table_html_all_indexes = indexed_refs(r"tables/table_(\d+)\.png", html_text)
+    table_markdown_all_indexes = indexed_refs(
+        r"tables/table_(\d+)\.png", markdown_text
+    )
+    table_html_indexes = table_html_all_indexes & table_expected_indexes
+    table_markdown_indexes = (
+        table_markdown_all_indexes & table_expected_indexes
+    )
+    table_unexpected_indexes = (
+        (table_html_all_indexes | table_markdown_all_indexes)
+        - table_expected_indexes
+        - algorithm_table_indexes
+    )
+    table_valid_indexes = valid_indexed_images(
+        "tables", "table", table_expected_indexes
+    )
+    empty_table_valid_indexes = table_valid_indexes & empty_table_expected_indexes
+    # Expected evidence is defined by the authoritative semantic surface, not
+    # by whatever source images happened to be generated.  Deriving this set
+    # from source_images made an empty generation result look like exact
+    # coverage (empty == empty == empty).
+    algorithm_expected_indexes = set(range(1, expected_algorithms + 1))
+    algorithm_html_indexes = indexed_refs(
+        r"algorithms/algorithm_(\d+)\.png", html_text
+    )
+    algorithm_markdown_indexes = indexed_refs(
+        r"algorithms/algorithm_(\d+)\.png", markdown_text
+    )
+    algorithm_valid_indexes = valid_indexed_images(
+        "algorithms", "algorithm", algorithm_expected_indexes
+    )
+    algorithm_candidate_source_refs = {
+        str(value)
+        for value in algorithm_sources.get("candidate_source_refs") or []
+        if str(value)
+    }
+    algorithm_html_bound_source_refs = {
+        str(value)
+        for value in algorithm_sources.get("html_bound_source_refs") or []
+        if str(value)
+    }
+    algorithm_markdown_bound_source_refs = {
+        str(value)
+        for value in algorithm_sources.get("markdown_bound_source_refs") or []
+        if str(value)
+    }
+    algorithm_html_body_identity_verified_refs = {
+        str(value)
+        for value in algorithm_sources.get("html_body_identity_verified_refs") or []
+        if str(value) in algorithm_candidate_source_refs
+    }
+    algorithm_markdown_body_identity_verified_refs = {
+        str(value)
+        for value in algorithm_sources.get("markdown_body_identity_verified_refs") or []
+        if str(value) in algorithm_candidate_source_refs
+    }
+    algorithm_html_body_identity_mismatch_refs = {
+        str(value)
+        for value in algorithm_sources.get("html_body_identity_mismatch_refs") or []
+        if str(value) in algorithm_candidate_source_refs
+    }
+    algorithm_markdown_body_identity_mismatch_refs = {
+        str(value)
+        for value in algorithm_sources.get("markdown_body_identity_mismatch_refs") or []
+        if str(value) in algorithm_candidate_source_refs
+    }
+    code_expected_count = int(primary_counts.get("code_blocks") or 0)
+    code_expected_indexes = set(range(1, code_expected_count + 1))
+    code_html_indexes = indexed_refs(r"code_blocks/code_block_(\d+)\.png", html_text)
+    code_markdown_indexes = indexed_refs(
+        r"code_blocks/code_block_(\d+)\.png", markdown_text
+    )
+    code_valid_indexes = valid_indexed_images(
+        "code_blocks", "code_block", code_expected_indexes
+    )
+    code_candidate_source_refs = {
+        str(value)
+        for value in code_sources.get("candidate_source_refs") or []
+        if str(value)
+    }
+    code_html_bound_source_refs = {
+        str(value)
+        for value in code_sources.get("html_bound_source_refs") or []
+        if str(value)
+    }
+    code_markdown_bound_source_refs = {
+        str(value)
+        for value in code_sources.get("markdown_bound_source_refs") or []
+        if str(value)
+    }
+    code_html_body_identity_verified_refs = {
+        str(value)
+        for value in code_sources.get("html_body_identity_verified_refs") or []
+        if str(value) in code_candidate_source_refs
+    }
+    code_markdown_body_identity_verified_refs = {
+        str(value)
+        for value in code_sources.get("markdown_body_identity_verified_refs") or []
+        if str(value) in code_candidate_source_refs
+    }
+    code_html_body_identity_mismatch_refs = {
+        str(value)
+        for value in code_sources.get("html_body_identity_mismatch_refs") or []
+        if str(value) in code_candidate_source_refs
+    }
+    code_markdown_body_identity_mismatch_refs = {
+        str(value)
+        for value in code_sources.get("markdown_body_identity_mismatch_refs") or []
+        if str(value) in code_candidate_source_refs
+    }
+    table_provenance_verified_refs = {
+        str(value)
+        for source in (structured_tables, empty_tables)
+        for value in source.get("provenance_verified_refs") or []
+        if str(value) in table_expected_source_refs
+    }
+    table_provenance_mismatch_refs = {
+        str(value)
+        for source in (structured_tables, empty_tables)
+        for value in source.get("provenance_mismatch_refs") or []
+        if str(value) in table_expected_source_refs
+    }
+    algorithm_provenance_verified_refs = {
+        str(value)
+        for value in algorithm_sources.get("provenance_verified_refs") or []
+        if str(value) in algorithm_candidate_source_refs
+    }
+    algorithm_provenance_mismatch_refs = {
+        str(value)
+        for value in algorithm_sources.get("provenance_mismatch_refs") or []
+        if str(value) in algorithm_candidate_source_refs
+    }
+    code_provenance_verified_refs = {
+        str(value)
+        for value in code_sources.get("provenance_verified_refs") or []
+        if str(value) in code_candidate_source_refs
+    }
+    code_provenance_mismatch_refs = {
+        str(value)
+        for value in code_sources.get("provenance_mismatch_refs") or []
+        if str(value) in code_candidate_source_refs
+    }
+
+    result = {
+        "formula_source_candidate_count": len(formulas),
+        "formula_source_expected_indexes": sorted(expected_formula_indexes),
+        "formula_source_html_indexes": sorted(formula_html_indexes),
+        "formula_source_markdown_indexes": sorted(formula_markdown_indexes),
+        "formula_source_missing_indexes": formula_missing_indexes,
+        "formula_source_unexpected_indexes": formula_unexpected_indexes,
+        "formula_source_duplicate_html_anchor_indexes": formula_sources.get(
+            "duplicate_html_anchor_indexes", []
+        ),
+        "formula_source_duplicate_markdown_anchor_indexes": formula_sources.get(
+            "duplicate_markdown_anchor_indexes", []
+        ),
+        "formula_source_html_ref_count": len(formula_html_indexes),
+        "formula_source_markdown_ref_count": len(formula_markdown_indexes),
+        "formula_source_html_appendix_indexes": formula_sources.get(
+            "html_appendix_indexes", []
+        ),
+        "formula_source_markdown_appendix_indexes": formula_sources.get(
+            "markdown_appendix_indexes", []
+        ),
+        "formula_source_dropped_artifacts": validated_dropped_artifacts,
+        "formula_source_declared_dropped_artifacts": dropped_formula_artifacts,
+        "formula_source_allowed_dropped_indexes": sorted(allowed_dropped_indexes),
+        "formula_source_disallowed_dropped_artifacts": disallowed_dropped_artifacts,
+        "formula_source_unaccounted_raw_indexes": unaccounted_raw_formula_indexes,
+        "inline_math_source_expected_anchors": inline_math_sources.get(
+            "expected_anchors", []
+        ),
+        "inline_math_source_html_anchors": inline_math_sources.get(
+            "html_covered_anchors", []
+        ),
+        "inline_math_source_markdown_anchors": inline_math_sources.get(
+            "markdown_covered_anchors", []
+        ),
+        "inline_math_source_missing_crop_anchors": inline_math_sources.get(
+            "missing_crop_anchors", []
+        ),
+        "inline_math_source_missing_html_anchors": inline_math_sources.get(
+            "missing_html_anchors", []
+        ),
+        "inline_math_source_missing_markdown_anchors": inline_math_sources.get(
+            "missing_markdown_anchors", []
+        ),
+        "inline_math_source_duplicate_html_anchors": inline_math_sources.get(
+            "duplicate_html_anchor_ids", []
+        ),
+        "inline_math_source_duplicate_markdown_anchors": inline_math_sources.get(
+            "duplicate_markdown_anchor_ids", []
+        ),
+        # An appendix-only crop is useful review evidence, but it is not bound
+        # to the body occurrence and therefore cannot certify that inline math
+        # retained the PDF's meaning.  Treat every non-inline binding as
+        # unbound so the final gate fails closed instead of degraded-success.
+        "inline_math_source_unbound_regions": [
+            *list(primary.get("inline_math_source_missing") or []),
+            *list(primary.get("inline_math_source_binding_diagnostics") or []),
+            *[
+                {
+                    "anchor": region.get("anchor"),
+                    "reason": "inline_math_source_not_bound_to_body_occurrence",
+                    "binding_mode": region.get("binding_mode"),
+                }
+                for region in (primary.get("inline_math_source_regions") or [])
+                if isinstance(region, dict)
+                and str(region.get("binding_mode") or "inline") != "inline"
+            ],
+        ],
+        "table_source_candidate_count": len(tables),
+        "table_source_reclassified_algorithm_indexes": sorted(
+            algorithm_table_indexes
+        ),
+        "table_source_expected_indexes": sorted(table_expected_indexes),
+        "table_source_html_indexes": sorted(table_html_indexes),
+        "table_source_markdown_indexes": sorted(table_markdown_indexes),
+        "table_source_valid_image_indexes": sorted(table_valid_indexes),
+        "table_source_unexpected_indexes": sorted(table_unexpected_indexes),
+        "table_source_expected_refs": sorted(table_expected_source_refs),
+        "table_source_provenance_verified_refs": sorted(
+            table_provenance_verified_refs
+        ),
+        "table_source_provenance_mismatch_refs": sorted(
+            table_provenance_mismatch_refs
+        ),
+        "table_source_provenance_diagnostics": {
+            **dict(structured_tables.get("provenance_diagnostics") or {}),
+            **dict(empty_tables.get("provenance_diagnostics") or {}),
+        },
+        "table_source_body_identity_expected_refs": sorted(
+            table_body_identity_expected_refs
+        ),
+        "table_source_html_bound_refs": sorted(table_html_bound_source_refs),
+        "table_source_markdown_bound_refs": sorted(
+            table_markdown_bound_source_refs
+        ),
+        "table_source_html_body_identity_verified_refs": sorted(
+            table_html_body_identity_verified_refs
+        ),
+        "table_source_markdown_body_identity_verified_refs": sorted(
+            table_markdown_body_identity_verified_refs
+        ),
+        "table_source_html_body_identity_mismatch_refs": sorted(
+            table_html_body_identity_mismatch_refs
+        ),
+        "table_source_markdown_body_identity_mismatch_refs": sorted(
+            table_markdown_body_identity_mismatch_refs
+        ),
+        "table_empty_fallback_expected_indexes": sorted(
+            empty_table_expected_indexes
+        ),
+        "table_empty_fallback_valid_image_indexes": sorted(
+            empty_table_valid_indexes
+        ),
+        "table_empty_fallback_expected_refs": sorted(empty_table_expected_refs),
+        "table_empty_fallback_candidate_refs": sorted(empty_table_candidate_refs),
+        "table_empty_fallback_html_bound_refs": sorted(
+            empty_table_html_bound_source_refs
+        ),
+        "table_empty_fallback_markdown_bound_refs": sorted(
+            empty_table_markdown_bound_source_refs
+        ),
+        "table_empty_fallback_exact_coverage": bool(
+            empty_table_expected_refs == empty_table_candidate_refs
+            == empty_table_html_bound_source_refs
+            == empty_table_markdown_bound_source_refs
+            and empty_table_expected_indexes == empty_table_valid_indexes
+        ),
+        "table_source_exact_coverage": bool(
+            table_expected_indexes == table_html_indexes
+            == table_markdown_indexes
+            == table_valid_indexes
+            and table_expected_source_refs == table_html_bound_source_refs
+            == table_markdown_bound_source_refs
+            and table_body_identity_expected_refs
+            == table_html_body_identity_verified_refs
+            == table_markdown_body_identity_verified_refs
+            and not table_html_body_identity_mismatch_refs
+            and not table_markdown_body_identity_mismatch_refs
+            and table_expected_source_refs == table_provenance_verified_refs
+            and not table_provenance_mismatch_refs
+            and empty_table_expected_refs == empty_table_candidate_refs
+            == empty_table_html_bound_source_refs
+            == empty_table_markdown_bound_source_refs
+            and empty_table_expected_indexes == empty_table_valid_indexes
+            and not table_unexpected_indexes
+        ),
+        "table_source_html_ref_count": unique_refs(
+            r"tables/(table_\d+\.png)", html_text
+        ),
+        "table_source_markdown_ref_count": unique_refs(
+            r"tables/(table_\d+\.png)", markdown_text
+        ),
+        "algorithm_source_candidate_count": int(
+            algorithm_sources.get("candidate_count") or 0
+        ),
+        "algorithm_source_expected_indexes": sorted(algorithm_expected_indexes),
+        "algorithm_source_html_indexes": sorted(algorithm_html_indexes),
+        "algorithm_source_markdown_indexes": sorted(algorithm_markdown_indexes),
+        "algorithm_source_valid_image_indexes": sorted(algorithm_valid_indexes),
+        "algorithm_source_expected_refs": sorted(algorithm_candidate_source_refs),
+        "algorithm_source_provenance_verified_refs": sorted(
+            algorithm_provenance_verified_refs
+        ),
+        "algorithm_source_provenance_mismatch_refs": sorted(
+            algorithm_provenance_mismatch_refs
+        ),
+        "algorithm_source_provenance_diagnostics": dict(
+            algorithm_sources.get("provenance_diagnostics") or {}
+        ),
+        "algorithm_source_html_bound_refs": sorted(
+            algorithm_html_bound_source_refs
+        ),
+        "algorithm_source_markdown_bound_refs": sorted(
+            algorithm_markdown_bound_source_refs
+        ),
+        "algorithm_source_body_identity_expected_refs": sorted(
+            algorithm_candidate_source_refs
+        ),
+        "algorithm_source_html_body_identity_verified_refs": sorted(
+            algorithm_html_body_identity_verified_refs
+        ),
+        "algorithm_source_markdown_body_identity_verified_refs": sorted(
+            algorithm_markdown_body_identity_verified_refs
+        ),
+        "algorithm_source_html_body_identity_mismatch_refs": sorted(
+            algorithm_html_body_identity_mismatch_refs
+        ),
+        "algorithm_source_markdown_body_identity_mismatch_refs": sorted(
+            algorithm_markdown_body_identity_mismatch_refs
+        ),
+        "algorithm_source_exact_coverage": bool(
+            algorithm_expected_indexes == algorithm_html_indexes
+            == algorithm_markdown_indexes
+            == algorithm_valid_indexes
+            and algorithm_candidate_source_refs == algorithm_html_bound_source_refs
+            == algorithm_markdown_bound_source_refs
+            and algorithm_candidate_source_refs
+            == algorithm_html_body_identity_verified_refs
+            == algorithm_markdown_body_identity_verified_refs
+            and not algorithm_html_body_identity_mismatch_refs
+            and not algorithm_markdown_body_identity_mismatch_refs
+            and algorithm_candidate_source_refs
+            == algorithm_provenance_verified_refs
+            and not algorithm_provenance_mismatch_refs
+        ),
+        "algorithm_source_html_ref_count": unique_refs(
+            r"algorithms/(algorithm_\d+\.png)", html_text
+        ),
+        "algorithm_source_markdown_ref_count": unique_refs(
+            r"algorithms/(algorithm_\d+\.png)", markdown_text
+        ),
+        "code_source_candidate_count": int(code_sources.get("candidate_count") or 0),
+        "code_source_expected_indexes": sorted(code_expected_indexes),
+        "code_source_html_indexes": sorted(code_html_indexes),
+        "code_source_markdown_indexes": sorted(code_markdown_indexes),
+        "code_source_valid_image_indexes": sorted(code_valid_indexes),
+        "code_source_expected_refs": sorted(code_candidate_source_refs),
+        "code_source_provenance_verified_refs": sorted(
+            code_provenance_verified_refs
+        ),
+        "code_source_provenance_mismatch_refs": sorted(
+            code_provenance_mismatch_refs
+        ),
+        "code_source_provenance_diagnostics": dict(
+            code_sources.get("provenance_diagnostics") or {}
+        ),
+        "code_source_html_bound_refs": sorted(code_html_bound_source_refs),
+        "code_source_markdown_bound_refs": sorted(code_markdown_bound_source_refs),
+        "code_source_body_identity_expected_refs": sorted(
+            code_candidate_source_refs
+        ),
+        "code_source_html_body_identity_verified_refs": sorted(
+            code_html_body_identity_verified_refs
+        ),
+        "code_source_markdown_body_identity_verified_refs": sorted(
+            code_markdown_body_identity_verified_refs
+        ),
+        "code_source_html_body_identity_mismatch_refs": sorted(
+            code_html_body_identity_mismatch_refs
+        ),
+        "code_source_markdown_body_identity_mismatch_refs": sorted(
+            code_markdown_body_identity_mismatch_refs
+        ),
+        "code_source_exact_coverage": bool(
+            code_expected_indexes == code_html_indexes
+            == code_markdown_indexes
+            == code_valid_indexes
+            and code_candidate_source_refs == code_html_bound_source_refs
+            == code_markdown_bound_source_refs
+            and code_candidate_source_refs
+            == code_html_body_identity_verified_refs
+            == code_markdown_body_identity_verified_refs
+            and not code_html_body_identity_mismatch_refs
+            and not code_markdown_body_identity_mismatch_refs
+            and code_candidate_source_refs == code_provenance_verified_refs
+            and not code_provenance_mismatch_refs
+        ),
+        "code_source_html_ref_count": unique_refs(
+            r"code_blocks/(code_block_\d+\.png)", html_text
+        ),
+        "code_source_markdown_ref_count": unique_refs(
+            r"code_blocks/(code_block_\d+\.png)", markdown_text
+        ),
+        "table_body_identity_mismatch_refs": sorted(
+            table_html_body_identity_mismatch_refs
+            | table_markdown_body_identity_mismatch_refs
+        ),
+        "algorithm_body_identity_mismatch_refs": sorted(
+            algorithm_html_body_identity_mismatch_refs
+            | algorithm_markdown_body_identity_mismatch_refs
+        ),
+        "code_body_identity_mismatch_refs": sorted(
+            code_html_body_identity_mismatch_refs
+            | code_markdown_body_identity_mismatch_refs
+        ),
+        "body_identity_mismatch_refs": sorted(
+            table_html_body_identity_mismatch_refs
+            | table_markdown_body_identity_mismatch_refs
+            | algorithm_html_body_identity_mismatch_refs
+            | algorithm_markdown_body_identity_mismatch_refs
+            | code_html_body_identity_mismatch_refs
+            | code_markdown_body_identity_mismatch_refs
+        ),
+        "empty_table_visual_fallbacks": empty_tables,
+        "structured_table_source_renderings": structured_tables,
+        "formula_source_renderings": formula_sources,
+        "inline_math_source_renderings": inline_math_sources,
+        "algorithm_source_renderings": algorithm_sources,
+        "code_source_renderings": code_sources,
+    }
+    visual_asset_paths = sorted(
+        path.relative_to(output_dir).as_posix()
+        for directory_name in (
+            "pages",
+            "tables",
+            "formulas",
+            "pictures",
+            "algorithms",
+            "code_blocks",
+            "inline_math",
+        )
+        for path in (output_dir / directory_name).glob("*.png")
+        if path.is_file()
+    )
+    if "asset_count" in metadata:
+        metadata["pre_final_visual_asset_count"] = int(metadata["asset_count"] or 0)
+    metadata["final_visual_asset_count"] = len(visual_asset_paths)
+    metadata["asset_count"] = len(visual_asset_paths)
+    metadata["final_visual_assets"] = visual_asset_paths
+    metadata["final_source_visuals"] = result
+    quality_signals["final_source_visuals"] = result
+    return result
+
+
+def _reverify_final_structural_provenance(
+    output_dir: Path,
+    metadata: dict[str, Any],
+    source_visuals: dict[str, Any],
+) -> None:
+    """Refresh structural provenance from current bytes and current JSON."""
+
+    manifest = metadata.get("structural_visual_provenance_manifest")
+    expected_visual_sha = _structural_expected_visual_pdf_sha256(metadata)
+    expected_semantic_sha = _structural_expected_semantic_pdf_sha256(metadata)
+    document = _load_json_file(output_dir / "document.json")
+    normalized_document = _document_with_resolved_page_provenance(document)
+    html_text = (
+        (output_dir / "document.html").read_text(encoding="utf-8")
+        if (output_dir / "document.html").is_file()
+        else ""
+    )
+    markdown_text = (
+        (output_dir / "document.md").read_text(encoding="utf-8")
+        if (output_dir / "document.md").is_file()
+        else ""
+    )
+    page_inventory = _document_page_size_inventory(normalized_document)
+    page_records = page_inventory.get("page_records") or {}
+    algorithm_payload = _load_json_file(output_dir / "algorithm_blocks.json")
+    algorithm_records = (
+        algorithm_payload if isinstance(algorithm_payload, list) else []
+    )
+
+    def page_size(page_no: Any) -> Any:
+        parsed = _positive_page_number(page_no)
+        return ((page_records.get(parsed) or {}).get("size") or None)
+
+    for kind in ("table", "code", "algorithm"):
+        source_visuals[f"{kind}_source_provenance_verified_refs"] = []
+        source_visuals[f"{kind}_source_provenance_mismatch_refs"] = []
+        source_visuals[f"{kind}_source_provenance_diagnostics"] = {}
+        source_visuals[f"{kind}_source_current_refs"] = []
+        source_visuals[f"{kind}_source_current_body_identity_refs"] = []
+        source_visuals[f"{kind}_source_html_body_identity_verified_refs"] = []
+        source_visuals[f"{kind}_source_markdown_body_identity_verified_refs"] = []
+        source_visuals[f"{kind}_source_html_body_identity_mismatch_refs"] = []
+        source_visuals[f"{kind}_source_markdown_body_identity_mismatch_refs"] = []
+
+    def record_provenance_mismatch(
+        kind: str,
+        source_ref: str,
+        reasons: Iterable[str],
+    ) -> None:
+        normalized_reasons = sorted({str(reason) for reason in reasons if str(reason)})
+        if not normalized_reasons:
+            return
+        source_visuals[f"{kind}_source_provenance_mismatch_refs"].append(
+            source_ref
+        )
+        diagnostics = source_visuals[f"{kind}_source_provenance_diagnostics"]
+        diagnostics[source_ref] = sorted(
+            set(diagnostics.get(source_ref) or []) | set(normalized_reasons)
+        )
+
+    def record_body_identity(
+        kind: str,
+        source_ref: str,
+        *,
+        expected_identity: str,
+        html_identity: str,
+        markdown_identity: str,
+    ) -> None:
+        for surface, actual_identity in (
+            ("html", html_identity),
+            ("markdown", markdown_identity),
+        ):
+            suffix = (
+                "verified_refs"
+                if expected_identity and actual_identity == expected_identity
+                else "mismatch_refs"
+            )
+            source_visuals[
+                f"{kind}_source_{surface}_body_identity_{suffix}"
+            ].append(source_ref)
+
+    expected_table_refs = {
+        str(value)
+        for value in source_visuals.get("table_source_expected_refs") or []
+        if str(value)
+    }
+    current_tables = extract_table_nodes(normalized_document)
+    algorithm_table_refs = {
+        str(binding.get("source_ref") or "")
+        for record in algorithm_records
+        if isinstance(record, dict)
+        for binding in (record.get("source_node_bindings") or [])
+        if isinstance(binding, dict)
+        and binding.get("body_identity_kind") == "table_grid"
+        and str(binding.get("source_ref") or "")
+    }
+    table_by_ref: dict[str, list[tuple[int, dict[str, Any]]]] = {}
+    for index, table in enumerate(current_tables, start=1):
+        source_ref = _structural_node_source_ref(
+            table,
+            kind="table",
+            fallback_index=index - 1,
+            part_index=_structural_node_part_index(table),
+        )
+        table_by_ref.setdefault(source_ref, []).append((index, table))
+    current_table_refs = set(table_by_ref) - algorithm_table_refs
+    current_table_body_refs = {
+        source_ref
+        for source_ref in current_table_refs
+        if len(table_by_ref.get(source_ref) or []) == 1
+        and table_grid((table_by_ref[source_ref])[0][1])
+    }
+    source_visuals["table_source_current_refs"] = sorted(current_table_refs)
+    source_visuals["table_source_current_body_identity_refs"] = sorted(
+        current_table_body_refs
+    )
+    for source_ref in sorted(current_table_refs - expected_table_refs):
+        record_provenance_mismatch(
+            "table",
+            source_ref,
+            ["current_table_ref_unexpected"],
+        )
+    for source_ref in sorted(expected_table_refs):
+        matches = table_by_ref.get(source_ref) or []
+        reasons: list[str] = []
+        if len(matches) != 1:
+            reasons.append("current_table_ref_missing_or_ambiguous")
+        else:
+            index, table = matches[0]
+            prov = first_prov(table) or {}
+            entry, lookup_reasons = _structural_manifest_entry_for_ref(
+                manifest,
+                kind="tables",
+                source_ref=source_ref,
+                index=index,
+            )
+            verified, verify_reasons = _structural_provenance_verify(
+                output_dir,
+                entry,
+                current_source_ref=source_ref,
+                current_page_no=prov.get("page_no"),
+                current_bbox=prov.get("bbox"),
+                current_body_identity=_table_grid_body_identity(table_grid(table)),
+                current_self_ref=str(table.get("self_ref") or ""),
+                current_part_index=_structural_node_part_index(table),
+                current_semantic_page_size=page_size(prov.get("page_no")),
+                expected_visual_pdf_sha256=expected_visual_sha,
+                expected_semantic_pdf_sha256=expected_semantic_sha,
+                expected_asset_path=f"tables/table_{index}.png",
+                expected_kind="table",
+            )
+            page_verified, page_reasons, page_entry = _structural_page_manifest_verify(
+                output_dir,
+                manifest,
+                page_no=_positive_page_number(prov.get("page_no")) or 0,
+                expected_visual_pdf_sha256=expected_visual_sha,
+                current_semantic_page_size=page_size(prov.get("page_no")),
+            )
+            verify_reasons.extend(
+                page_reasons
+                + _structural_entry_page_manifest_reasons(entry, page_entry)
+            )
+            verified = bool(verified and page_verified and not verify_reasons)
+            reasons.extend(lookup_reasons + verify_reasons)
+            if verified and not lookup_reasons:
+                source_visuals["table_source_provenance_verified_refs"].append(
+                    source_ref
+                )
+        if reasons:
+            record_provenance_mismatch("table", source_ref, reasons)
+
+    declared_table_body_refs = {
+        str(value)
+        for value in source_visuals.get("table_source_body_identity_expected_refs")
+        or []
+        if str(value)
+    }
+    for source_ref in sorted(declared_table_body_refs | current_table_body_refs):
+        matches = table_by_ref.get(source_ref) or []
+        expected_identity = (
+            _table_grid_body_identity(table_grid(matches[0][1]))
+            if len(matches) == 1 and table_grid(matches[0][1])
+            else ""
+        )
+        html_grid = _html_table_grid_for_source_ref(html_text, source_ref)
+        markdown_grid = _markdown_table_grid_for_source_ref(
+            markdown_text,
+            source_ref,
+        )
+        record_body_identity(
+            "table",
+            source_ref,
+            expected_identity=expected_identity,
+            html_identity=(
+                _table_grid_body_identity(html_grid)
+                if html_grid is not None
+                else ""
+            ),
+            markdown_identity=(
+                _table_grid_body_identity(markdown_grid)
+                if markdown_grid is not None
+                else ""
+            ),
+        )
+
+    expected_code_refs = {
+        str(value)
+        for value in source_visuals.get("code_source_expected_refs") or []
+        if str(value)
+    }
+    current_code_nodes: list[tuple[dict[str, Any], int | None]] = []
+    for part in page_inventory.get("parts") or []:
+        part_index = part.get("part_index")
+        for node in iter_nodes(part.get("document")):
+            if (
+                isinstance(node, dict)
+                and str(node.get("label") or "").casefold() == "code"
+                and not re.search(
+                    r"(?i)^Algorithm\s+\d+\b",
+                    str(node.get("text") or ""),
+                )
+            ):
+                current_code_nodes.append((node, part_index))
+    code_by_ref: dict[str, list[tuple[int, dict[str, Any], int | None]]] = {}
+    for index, (node, part_index) in enumerate(current_code_nodes, start=1):
+        source_ref = _structural_node_source_ref(
+            node,
+            kind="code",
+            fallback_index=index - 1,
+            part_index=part_index,
+        )
+        code_by_ref.setdefault(source_ref, []).append((index, node, part_index))
+    current_code_refs = set(code_by_ref)
+    source_visuals["code_source_current_refs"] = sorted(current_code_refs)
+    source_visuals["code_source_current_body_identity_refs"] = sorted(
+        current_code_refs
+    )
+    for source_ref in sorted(current_code_refs - expected_code_refs):
+        record_provenance_mismatch(
+            "code",
+            source_ref,
+            ["current_code_ref_unexpected"],
+        )
+    for source_ref in sorted(expected_code_refs):
+        matches = code_by_ref.get(source_ref) or []
+        reasons = []
+        if len(matches) != 1:
+            reasons.append("current_code_ref_missing_or_ambiguous")
+        else:
+            index, node, part_index = matches[0]
+            prov = first_prov(node) or {}
+            raw_text = str(node.get("text") or "")
+            numbered = _numbered_code_lines(raw_text)
+            body_identity = _code_body_identity(
+                "\n".join(content for _number, content in numbered)
+                if numbered
+                else raw_text
+            )
+            entry, lookup_reasons = _structural_manifest_entry_for_ref(
+                manifest,
+                kind="code",
+                source_ref=source_ref,
+                index=index,
+            )
+            verified, verify_reasons = _structural_provenance_verify(
+                output_dir,
+                entry,
+                current_source_ref=source_ref,
+                current_page_no=prov.get("page_no"),
+                current_bbox=prov.get("bbox"),
+                current_body_identity=body_identity,
+                current_self_ref=str(node.get("self_ref") or ""),
+                current_part_index=part_index,
+                current_semantic_page_size=page_size(prov.get("page_no")),
+                expected_visual_pdf_sha256=expected_visual_sha,
+                expected_semantic_pdf_sha256=expected_semantic_sha,
+                expected_asset_path=f"code_blocks/code_block_{index}.png",
+                expected_kind="code",
+            )
+            page_verified, page_reasons, page_entry = _structural_page_manifest_verify(
+                output_dir,
+                manifest,
+                page_no=_positive_page_number(prov.get("page_no")) or 0,
+                expected_visual_pdf_sha256=expected_visual_sha,
+                current_semantic_page_size=page_size(prov.get("page_no")),
+            )
+            verify_reasons.extend(
+                page_reasons
+                + _structural_entry_page_manifest_reasons(entry, page_entry)
+            )
+            verified = bool(verified and page_verified and not verify_reasons)
+            reasons.extend(lookup_reasons + verify_reasons)
+            if verified and not lookup_reasons:
+                source_visuals["code_source_provenance_verified_refs"].append(
+                    source_ref
+                )
+        if reasons:
+            record_provenance_mismatch("code", source_ref, reasons)
+
+    declared_code_body_refs = {
+        str(value)
+        for value in source_visuals.get("code_source_body_identity_expected_refs")
+        or []
+        if str(value)
+    }
+    for source_ref in sorted(declared_code_body_refs | current_code_refs):
+        matches = code_by_ref.get(source_ref) or []
+        expected_identity = ""
+        if len(matches) == 1:
+            _index, node, _part_index = matches[0]
+            raw_text = str(node.get("text") or "")
+            numbered = _numbered_code_lines(raw_text)
+            expected_identity = _code_body_identity(
+                "\n".join(content for _number, content in numbered)
+                if numbered
+                else raw_text
+            )
+        record_body_identity(
+            "code",
+            source_ref,
+            expected_identity=expected_identity,
+            html_identity=_code_body_identity(
+                _html_section_pre_body_for_source_ref(
+                    html_text,
+                    css_class="code-listing",
+                    source_ref=source_ref,
+                )
+                or "",
+                html_markup=True,
+            ),
+            markdown_identity=_code_body_identity(
+                _markdown_fenced_body_for_source_ref(
+                    markdown_text,
+                    kind="code",
+                    source_ref=source_ref,
+                )
+                or ""
+            ),
+        )
+
+    expected_algorithm_refs = {
+        str(value)
+        for value in source_visuals.get("algorithm_source_expected_refs") or []
+        if str(value)
+    }
+    algorithm_by_ref: dict[str, list[tuple[int, dict[str, Any]]]] = {}
+    for index, record in enumerate(algorithm_records, start=1):
+        if not isinstance(record, dict):
+            continue
+        source_ref = str(record.get("source_ref") or "")
+        if source_ref:
+            algorithm_by_ref.setdefault(source_ref, []).append((index, record))
+    bound_algorithm_node_refs = {
+        str(binding.get("source_ref") or "")
+        for record in algorithm_records
+        if isinstance(record, dict)
+        for binding in (record.get("source_node_bindings") or [])
+        if isinstance(binding, dict) and str(binding.get("source_ref") or "")
+    }
+    explicit_algorithm_nodes_by_ref: dict[str, list[dict[str, Any]]] = {}
+    for fallback_index, node in enumerate(iter_nodes(normalized_document)):
+        if not isinstance(node, dict):
+            continue
+        label = str(node.get("label") or "").casefold()
+        node_text = str(node.get("text") or "")
+        # This direct-node inventory is deliberately conservative: an
+        # explicit Algorithm heading or an algorithm-shaped formula can never
+        # be hidden behind an older algorithm_blocks.json sidecar.  Cluster
+        # captions and ordinary program listings remain certified through the
+        # sidecar's complete contributor bindings instead of being double
+        # counted as independent algorithms.
+        explicit_algorithm = bool(
+            (label == "code" and re.search(r"(?i)^\s*Algorithm\s+\d+\b", node_text))
+            or (label == "formula" and _looks_like_algorithm_formula(node_text))
+        )
+        if not explicit_algorithm:
+            continue
+        source_ref = _structural_node_source_ref(
+            node,
+            kind="algorithm",
+            fallback_index=fallback_index,
+            part_index=_structural_node_part_index(node),
+        )
+        explicit_algorithm_nodes_by_ref.setdefault(source_ref, []).append(node)
+    current_explicit_algorithm_refs = set(explicit_algorithm_nodes_by_ref)
+    source_visuals["algorithm_source_current_node_refs"] = sorted(
+        current_explicit_algorithm_refs
+    )
+    source_visuals["algorithm_source_bound_node_refs"] = sorted(
+        bound_algorithm_node_refs
+    )
+    for source_ref, nodes in sorted(explicit_algorithm_nodes_by_ref.items()):
+        reasons = []
+        if len(nodes) != 1:
+            reasons.append("current_algorithm_node_ref_ambiguous")
+        if source_ref not in bound_algorithm_node_refs:
+            reasons.append("current_algorithm_node_unbound_from_sidecar")
+        record_provenance_mismatch("algorithm", source_ref, reasons)
+    current_algorithm_refs = set(algorithm_by_ref)
+    source_visuals["algorithm_source_current_refs"] = sorted(
+        current_algorithm_refs
+    )
+    source_visuals["algorithm_source_current_body_identity_refs"] = sorted(
+        current_algorithm_refs
+    )
+    for source_ref in sorted(current_algorithm_refs - expected_algorithm_refs):
+        record_provenance_mismatch(
+            "algorithm",
+            source_ref,
+            ["current_algorithm_ref_unexpected"],
+        )
+    for source_ref in sorted(expected_algorithm_refs):
+        matches = algorithm_by_ref.get(source_ref) or []
+        reasons = []
+        if len(matches) != 1:
+            reasons.append("current_algorithm_ref_missing_or_ambiguous")
+        else:
+            index, record = matches[0]
+            page_no = record.get("page_no")
+            entry, lookup_reasons = _structural_manifest_entry_for_ref(
+                manifest,
+                kind="algorithms",
+                source_ref=source_ref,
+                index=index,
+            )
+            verified, verify_reasons = _structural_provenance_verify(
+                output_dir,
+                entry,
+                current_source_ref=source_ref,
+                current_page_no=page_no,
+                current_bbox=record.get("bbox"),
+                current_body_identity=_algorithm_expected_body_identity(record),
+                current_self_ref="",
+                current_part_index=None,
+                current_semantic_page_size=page_size(page_no),
+                expected_visual_pdf_sha256=expected_visual_sha,
+                expected_semantic_pdf_sha256=expected_semantic_sha,
+                expected_asset_path=f"algorithms/algorithm_{index}.png",
+                expected_kind="algorithm",
+            )
+            page_verified, page_reasons, page_entry = _structural_page_manifest_verify(
+                output_dir,
+                manifest,
+                page_no=_positive_page_number(page_no) or 0,
+                expected_visual_pdf_sha256=expected_visual_sha,
+                current_semantic_page_size=page_size(page_no),
+            )
+            verify_reasons.extend(
+                page_reasons
+                + _structural_entry_page_manifest_reasons(entry, page_entry)
+            )
+            verified = bool(verified and page_verified and not verify_reasons)
+            bindings_verified, binding_reasons, bound_nodes = (
+                _algorithm_source_node_bindings_verify(
+                    normalized_document,
+                    (entry or {}).get("source_node_bindings"),
+                )
+            )
+            if _structural_bbox_snapshot(_merge_bbox_geometry(bound_nodes)) != (
+                _structural_bbox_snapshot(record.get("bbox"))
+            ):
+                binding_reasons.append("algorithm_source_node_union_bbox_mismatch")
+                bindings_verified = False
+            reasons.extend(
+                lookup_reasons + verify_reasons + binding_reasons
+            )
+            if verified and bindings_verified and not lookup_reasons:
+                source_visuals[
+                    "algorithm_source_provenance_verified_refs"
+                ].append(source_ref)
+        if reasons:
+            record_provenance_mismatch("algorithm", source_ref, reasons)
+
+    declared_algorithm_body_refs = {
+        str(value)
+        for value in source_visuals.get(
+            "algorithm_source_body_identity_expected_refs"
+        )
+        or []
+        if str(value)
+    }
+    for source_ref in sorted(
+        declared_algorithm_body_refs | current_algorithm_refs
+    ):
+        matches = algorithm_by_ref.get(source_ref) or []
+        expected_identity = (
+            _algorithm_expected_body_identity(matches[0][1])
+            if len(matches) == 1
+            else ""
+        )
+        record_body_identity(
+            "algorithm",
+            source_ref,
+            expected_identity=expected_identity,
+            html_identity=_algorithm_html_body_identity_for_source_ref(
+                html_text,
+                source_ref,
+            ),
+            markdown_identity=_algorithm_markdown_body_identity_for_source_ref(
+                markdown_text,
+                source_ref,
+            ),
+        )
+
+    for kind in ("table", "code", "algorithm"):
+        for suffix in (
+            "verified_refs",
+            "mismatch_refs",
+            "html_body_identity_verified_refs",
+            "markdown_body_identity_verified_refs",
+            "html_body_identity_mismatch_refs",
+            "markdown_body_identity_mismatch_refs",
+        ):
+            key = f"{kind}_source_provenance_{suffix}"
+            if "body_identity" in suffix:
+                key = f"{kind}_source_{suffix}"
+            source_visuals[key] = sorted(set(source_visuals.get(key) or []))
+        source_visuals[f"{kind}_body_identity_mismatch_refs"] = sorted(
+            set(
+                source_visuals.get(
+                    f"{kind}_source_html_body_identity_mismatch_refs"
+                )
+                or []
+            )
+            | set(
+                source_visuals.get(
+                    f"{kind}_source_markdown_body_identity_mismatch_refs"
+                )
+                or []
+            )
+        )
+    source_visuals["body_identity_mismatch_refs"] = sorted(
+        {
+            source_ref
+            for kind in ("table", "code", "algorithm")
+            for source_ref in source_visuals.get(
+                f"{kind}_body_identity_mismatch_refs"
+            )
+            or []
+        }
+    )
+
+
+def validate_final_structural_surfaces(
+    output_dir: Path,
+    metadata: dict[str, Any],
+    status: dict[str, Any],
+) -> dict[str, Any]:
+    """Require final structure blocks to retain exact PDF visual evidence."""
+
+    html_text = (output_dir / "document.html").read_text(encoding="utf-8")
+    markdown_text = (output_dir / "document.md").read_text(encoding="utf-8")
+    quality_signals = status.setdefault("quality_signals", {})
+    primary_counts = (quality_signals.get("primary_surface") or {}).get("counts") or {}
+    source_visuals = quality_signals.get("final_source_visuals") or {}
+    if isinstance(source_visuals, dict):
+        _reverify_final_structural_provenance(
+            output_dir,
+            metadata,
+            source_visuals,
+        )
+    expected_tables = int(primary_counts.get("tables") or 0)
+    expected_algorithms = int(primary_counts.get("algorithms") or 0)
+    expected_code = int(primary_counts.get("code_blocks") or 0)
+
+    def exact_visual_coverage(kind: str, expected_count: int) -> bool | None:
+        expected_key = f"{kind}_source_expected_indexes"
+        if expected_key not in source_visuals:
+            return None
+        declared = {
+            int(value) for value in source_visuals.get(expected_key) or []
+        }
+        required = set(range(1, expected_count + 1))
+        if kind == "table":
+            raw_count = int(source_visuals.get("table_source_candidate_count") or 0)
+            reclassified = {
+                int(value)
+                for value in source_visuals.get(
+                    "table_source_reclassified_algorithm_indexes"
+                ) or []
+            }
+            raw_indexes = set(range(1, raw_count + 1))
+            if (
+                len(declared) != expected_count
+                or declared & reclassified
+                or declared | reclassified != raw_indexes
+                or source_visuals.get("table_source_unexpected_indexes")
+            ):
+                return False
+            required = declared
+        html_indexes = {
+            int(value)
+            for value in source_visuals.get(f"{kind}_source_html_indexes") or []
+        }
+        markdown_indexes = {
+            int(value)
+            for value in source_visuals.get(f"{kind}_source_markdown_indexes") or []
+        }
+        valid_indexes = {
+            int(value)
+            for value in source_visuals.get(f"{kind}_source_valid_image_indexes") or []
+        }
+        indexes_exact = bool(
+            declared == required
+            and html_indexes == required
+            and markdown_indexes == required
+            and valid_indexes == required
+        )
+        expected_refs_key = f"{kind}_source_expected_refs"
+        if expected_refs_key not in source_visuals:
+            return indexes_exact
+        expected_refs = {
+            str(value)
+            for value in source_visuals.get(expected_refs_key) or []
+            if str(value)
+        }
+        current_refs_key = f"{kind}_source_current_refs"
+        if current_refs_key not in source_visuals:
+            return False
+        current_refs = {
+            str(value)
+            for value in source_visuals.get(current_refs_key) or []
+            if str(value)
+        }
+        html_bound_refs = {
+            str(value)
+            for value in source_visuals.get(f"{kind}_source_html_bound_refs") or []
+            if str(value)
+        }
+        markdown_bound_refs = {
+            str(value)
+            for value in source_visuals.get(
+                f"{kind}_source_markdown_bound_refs"
+            ) or []
+            if str(value)
+        }
+        body_expected_key = f"{kind}_source_body_identity_expected_refs"
+        if expected_refs and body_expected_key not in source_visuals:
+            return False
+        body_expected_refs = {
+            str(value)
+            for value in source_visuals.get(body_expected_key) or []
+            if str(value)
+        }
+        html_body_verified_refs = {
+            str(value)
+            for value in source_visuals.get(
+                f"{kind}_source_html_body_identity_verified_refs"
+            ) or []
+            if str(value)
+        }
+        markdown_body_verified_refs = {
+            str(value)
+            for value in source_visuals.get(
+                f"{kind}_source_markdown_body_identity_verified_refs"
+            ) or []
+            if str(value)
+        }
+        html_body_mismatch_refs = {
+            str(value)
+            for value in source_visuals.get(
+                f"{kind}_source_html_body_identity_mismatch_refs"
+            ) or []
+            if str(value)
+        }
+        markdown_body_mismatch_refs = {
+            str(value)
+            for value in source_visuals.get(
+                f"{kind}_source_markdown_body_identity_mismatch_refs"
+            ) or []
+            if str(value)
+        }
+        required_body_refs = expected_refs
+        if kind == "table":
+            empty_fallback_refs = {
+                str(value)
+                for value in source_visuals.get(
+                    "table_empty_fallback_expected_refs"
+                ) or []
+                if str(value)
+            }
+            if not empty_fallback_refs <= expected_refs:
+                return False
+            required_body_refs = expected_refs - empty_fallback_refs
+        current_body_refs_key = f"{kind}_source_current_body_identity_refs"
+        if current_body_refs_key not in source_visuals:
+            return False
+        current_body_refs = {
+            str(value)
+            for value in source_visuals.get(current_body_refs_key) or []
+            if str(value)
+        }
+        body_identity_exact = bool(
+            current_body_refs == body_expected_refs == required_body_refs
+            and body_expected_refs == html_body_verified_refs
+            == markdown_body_verified_refs
+            and not html_body_mismatch_refs
+            and not markdown_body_mismatch_refs
+        )
+        empty_fallback_exact = True
+        if kind == "table" and "table_empty_fallback_exact_coverage" in source_visuals:
+            empty_fallback_exact = bool(
+                source_visuals.get("table_empty_fallback_exact_coverage")
+            )
+        provenance_verified_key = f"{kind}_source_provenance_verified_refs"
+        provenance_mismatch_key = f"{kind}_source_provenance_mismatch_refs"
+        if expected_refs and provenance_verified_key not in source_visuals:
+            return False
+        provenance_verified_refs = {
+            str(value)
+            for value in source_visuals.get(provenance_verified_key) or []
+            if str(value)
+        }
+        provenance_mismatch_refs = {
+            str(value)
+            for value in source_visuals.get(provenance_mismatch_key) or []
+            if str(value)
+        }
+        provenance_exact = bool(
+            expected_refs == provenance_verified_refs
+            and not provenance_mismatch_refs
+        )
+        return bool(
+            indexes_exact
+            and len(expected_refs) == expected_count
+            and current_refs == expected_refs
+            and expected_refs == html_bound_refs == markdown_bound_refs
+            and body_identity_exact
+            and empty_fallback_exact
+            and provenance_exact
+        )
+
+    empty_table_count = 0
+    for match in re.finditer(
+        r'<figure\b[^>]*class="[^"]*\bsemantic-table\b[^"]*"[^>]*>'
+        r"(?P<body>.*?)</figure>",
+        html_text,
+        flags=re.I | re.S,
+    ):
+        table = re.search(r"<table\b[^>]*>(?P<body>.*?)</table>", match.group("body"), re.I | re.S)
+        if table and not re.search(r"<(?:td|th)\b", table.group("body"), re.I):
+            empty_table_count += 1
+
+    algorithm_step_sets: list[list[int]] = []
+    algorithm_discontinuities: list[list[int]] = []
+    for match in re.finditer(
+        r'<section\b[^>]*class="[^"]*\balgorithm\b[^"]*"[^>]*>'
+        r"(?P<body>.*?)</section>",
+        html_text,
+        flags=re.I | re.S,
+    ):
+        body = match.group("body")
+        numbers = [
+            int(value)
+            for value in re.findall(
+                r'<span\b[^>]*class="[^"]*\bline-number\b[^"]*"[^>]*>\s*(\d+)\s*</span>',
+                body,
+                flags=re.I,
+            )
+        ]
+        if not numbers:
+            visible = html.unescape(HTML_TAG_RE.sub(" ", body))
+            numbers = [
+                int(value)
+                for value in re.findall(r"(?m)^\s*(\d+)\s*[:.]", visible)
+            ]
+        if numbers:
+            algorithm_step_sets.append(numbers)
+        if len(numbers) >= 2 and numbers != list(range(numbers[0], numbers[-1] + 1)):
+            algorithm_discontinuities.append(numbers)
+
+    failure_reasons: list[str] = []
+    warning_reasons: list[str] = []
+    body_identity_mismatch_by_kind: dict[str, list[str]] = {}
+    provenance_mismatch_by_kind: dict[str, list[str]] = {}
+    for kind in ("table", "algorithm", "code"):
+        mismatches = {
+            str(value)
+            for key in (
+                f"{kind}_body_identity_mismatch_refs",
+                f"{kind}_source_html_body_identity_mismatch_refs",
+                f"{kind}_source_markdown_body_identity_mismatch_refs",
+            )
+            for value in source_visuals.get(key) or []
+            if str(value)
+        }
+        body_identity_mismatch_by_kind[kind] = sorted(mismatches)
+        if mismatches:
+            failure_reasons.append(f"{kind}_body_identity_mismatch")
+        expected_provenance_refs = {
+            str(value)
+            for value in source_visuals.get(f"{kind}_source_expected_refs") or []
+            if str(value)
+        }
+        verified_provenance_refs = {
+            str(value)
+            for value in source_visuals.get(
+                f"{kind}_source_provenance_verified_refs"
+            ) or []
+            if str(value)
+        }
+        mismatched_provenance_refs = {
+            str(value)
+            for value in source_visuals.get(
+                f"{kind}_source_provenance_mismatch_refs"
+            ) or []
+            if str(value)
+        }
+        current_provenance_refs = {
+            str(value)
+            for value in source_visuals.get(f"{kind}_source_current_refs") or []
+            if str(value)
+        }
+        provenance_mismatch_by_kind[kind] = sorted(
+            (expected_provenance_refs - verified_provenance_refs)
+            | (expected_provenance_refs ^ current_provenance_refs)
+            | mismatched_provenance_refs
+        )
+        if (
+            expected_provenance_refs != verified_provenance_refs
+            or expected_provenance_refs != current_provenance_refs
+            or mismatched_provenance_refs
+        ):
+            failure_reasons.append(f"{kind}_source_provenance_mismatch")
+    body_identity_mismatch_refs = sorted(
+        {
+            str(value)
+            for values in body_identity_mismatch_by_kind.values()
+            for value in values
+        }
+        | {
+            str(value)
+            for value in source_visuals.get("body_identity_mismatch_refs") or []
+            if str(value)
+        }
+    )
+    if body_identity_mismatch_refs:
+        failure_reasons.append("structural_body_identity_mismatch")
+    raw_table_expected_count = len(
+        source_visuals.get("table_source_expected_indexes") or []
+    )
+    raw_algorithm_candidate_count = int(
+        source_visuals.get("algorithm_source_candidate_count") or 0
+    )
+    raw_code_candidate_count = int(
+        source_visuals.get("code_source_candidate_count") or 0
+    )
+    if raw_table_expected_count != expected_tables:
+        failure_reasons.append("semantic_table_inventory_mismatch")
+    if raw_algorithm_candidate_count != expected_algorithms:
+        failure_reasons.append("semantic_algorithm_inventory_mismatch")
+    if raw_code_candidate_count != expected_code:
+        failure_reasons.append("semantic_code_inventory_mismatch")
+    if empty_table_count:
+        failure_reasons.append("empty_semantic_table_without_visual_replacement")
+    table_source_exact = exact_visual_coverage("table", expected_tables)
+    if table_source_exact is None:
+        table_source_exact = source_visuals.get("table_source_exact_coverage")
+    if (expected_tables or raw_table_expected_count) and (
+        table_source_exact is False
+        or (
+            table_source_exact is None
+            and (
+                int(source_visuals.get("table_source_html_ref_count") or 0)
+                < expected_tables
+                or int(source_visuals.get("table_source_markdown_ref_count") or 0)
+                < expected_tables
+            )
+        )
+    ):
+        failure_reasons.append("incomplete_table_source_visual_coverage")
+    algorithm_source_exact = exact_visual_coverage(
+        "algorithm", expected_algorithms
+    )
+    if algorithm_source_exact is None:
+        algorithm_source_exact = source_visuals.get(
+            "algorithm_source_exact_coverage"
+        )
+    if (expected_algorithms or raw_algorithm_candidate_count) and (
+        algorithm_source_exact is False
+        or (
+            algorithm_source_exact is None
+            and (
+                int(source_visuals.get("algorithm_source_html_ref_count") or 0)
+                < expected_algorithms
+                or int(source_visuals.get("algorithm_source_markdown_ref_count") or 0)
+                < expected_algorithms
+            )
+        )
+    ):
+        failure_reasons.append("incomplete_algorithm_source_visual_coverage")
+    algorithm_sources = source_visuals.get("algorithm_source_renderings") or {}
+    discarded_algorithm_candidates = int(
+        algorithm_sources.get("discarded_candidate_count") or 0
+    )
+    if expected_algorithms and discarded_algorithm_candidates:
+        failure_reasons.append("discarded_algorithm_source_candidates")
+    source_algorithm_step_sets = [
+        [int(value) for value in (record.get("numbered_steps") or [])]
+        for record in (algorithm_sources.get("records") or [])
+        if record.get("numbered_steps")
+    ]
+    if expected_algorithms and (
+        bool(algorithm_step_sets) != bool(source_algorithm_step_sets)
+        or (
+            algorithm_step_sets
+            and source_algorithm_step_sets
+            and algorithm_step_sets != source_algorithm_step_sets
+        )
+    ):
+        failure_reasons.append("algorithm_step_identity_mismatch")
+    code_source_exact = exact_visual_coverage("code", expected_code)
+    if code_source_exact is None:
+        code_source_exact = source_visuals.get("code_source_exact_coverage")
+    if (expected_code or raw_code_candidate_count) and (
+        code_source_exact is False
+        or (
+            code_source_exact is None
+            and (
+                int(source_visuals.get("code_source_html_ref_count") or 0)
+                < expected_code
+                or int(source_visuals.get("code_source_markdown_ref_count") or 0)
+                < expected_code
+            )
+        )
+    ):
+        failure_reasons.append("incomplete_code_source_visual_coverage")
+    if algorithm_discontinuities:
+        warning_reasons.append("machine_algorithm_step_discontinuity_source_visual_authoritative")
+    if '<section class="code-listing">' in html_text and "```" not in markdown_text:
+        failure_reasons.append("code_block_missing_markdown_fence")
+
+    result = {
+        "ok": not failure_reasons,
+        "expected_tables": expected_tables,
+        "expected_algorithms": expected_algorithms,
+        "expected_code_blocks": expected_code,
+        "empty_semantic_table_count": empty_table_count,
+        "algorithm_discontinuities": algorithm_discontinuities,
+        "algorithm_step_sets": algorithm_step_sets,
+        "source_algorithm_step_sets": source_algorithm_step_sets,
+        "discarded_algorithm_candidate_count": discarded_algorithm_candidates,
+        "body_identity_mismatch_refs": body_identity_mismatch_refs,
+        "body_identity_mismatch_by_kind": body_identity_mismatch_by_kind,
+        "provenance_mismatch_by_kind": provenance_mismatch_by_kind,
+        "provenance_mismatch_refs": sorted(
+            {
+                source_ref
+                for values in provenance_mismatch_by_kind.values()
+                for source_ref in values
+            }
+        ),
+        "failure_reasons": failure_reasons,
+        "warning_reasons": warning_reasons,
+    }
+    metadata["final_structural_surface"] = result
+    quality_signals["final_structural_surface"] = result
+    if failure_reasons:
+        status["ok"] = False
+        status["success_class"] = "degraded_failure"
+        warning = "final_structural_surface_failed:" + ",".join(failure_reasons)
+        if warning not in status.setdefault("warnings", []):
+            status["warnings"].append(warning)
+    for reason in warning_reasons:
+        if reason not in status.setdefault("warnings", []):
+            status["warnings"].append(reason)
     return result
 
 
@@ -15549,6 +23661,16 @@ def validate_final_formula_surfaces(
     markdown_text = (
         markdown_path.read_text(encoding="utf-8") if markdown_path.exists() else ""
     )
+    # Formula control tokens inside literal code are content, not formula
+    # delimiters.  Shell snippets such as ``echo $$`` and examples containing
+    # ``<formula>`` must survive verbatim without tripping the document gate.
+    markdown_formula_scan_text = _markdown_mask_code(markdown_text)
+    html_formula_scan_text = re.sub(
+        r"<(?:pre|code|style|script)\b[^>]*>.*?</(?:pre|code|style|script)>",
+        " ",
+        html_text,
+        flags=re.S | re.I,
+    )
     quality_signals = status.setdefault("quality_signals", {})
     primary = quality_signals.get("primary_surface") or {}
     document = _load_json_file(output_dir / "document.json")
@@ -15561,10 +23683,18 @@ def validate_final_formula_surfaces(
         (quality_signals.get("portable_formula_ocr") or {}).get("formula_count")
         or 0
     )
-    formula_count = max(
-        int((primary.get("counts") or {}).get("formulas") or 0),
-        document_formula_count,
-        portable_formula_count,
+    primary_formula_count = int((primary.get("counts") or {}).get("formulas") or 0)
+    primary_is_authoritative = bool(
+        primary.get("ok")
+        and primary.get("applied")
+        and {"document.html", "document.md"}.issubset(
+            set(primary.get("authoritative_surfaces") or [])
+        )
+    )
+    formula_count = (
+        primary_formula_count
+        if primary_is_authoritative
+        else max(primary_formula_count, document_formula_count, portable_formula_count)
     )
     html_math_count = len(re.findall(r"<math(?:\s|>)", html_text))
     html_fallback_count = len(
@@ -15574,93 +23704,962 @@ def validate_final_formula_surfaces(
             re.IGNORECASE,
         )
     )
-    markdown_math_block_count = markdown_text.count("$$") // 2
+    markdown_math_delimiter_count = markdown_formula_scan_text.count("$$")
+    markdown_math_block_count = markdown_math_delimiter_count // 2
+    markdown_math_delimiters_balanced = markdown_math_delimiter_count % 2 == 0
     raw_model_token_count = len(
-        re.findall(r"</?formula\b", html_text + "\n" + markdown_text, re.IGNORECASE)
+        re.findall(
+            r"</?formula\b",
+            html_formula_scan_text + "\n" + markdown_formula_scan_text,
+            re.IGNORECASE,
+        )
     )
     undecoded_placeholder_count = len(
         re.findall(
             r"<!--\s*formula-not-decoded\s*-->|"
             r'<(?:div|span|p)\b[^>]*class="[^"]*\bformula-not-decoded\b',
-            html_text + "\n" + markdown_text,
+            html_formula_scan_text + "\n" + markdown_formula_scan_text,
             re.IGNORECASE,
         )
     )
-    failure_reasons: list[str] = []
+    markdown_without_display_math = markdown_formula_scan_text
+    for start, end in reversed(
+        _markdown_display_math_spans(markdown_formula_scan_text)
+    ):
+        markdown_without_display_math = (
+            markdown_without_display_math[:start]
+            + " " * (end - start)
+            + markdown_without_display_math[end:]
+        )
+    html_without_display_math = re.sub(
+        r"<(?:math|pre|code|style|script)\b[^>]*>.*?</(?:math|pre|code|style|script)>",
+        " ",
+        html_text,
+        flags=re.S | re.I,
+    )
+    html_without_display_math = html.unescape(
+        re.sub(r"<[^>]+>", " ", html_without_display_math)
+    )
+    inline_residual_patterns = {
+        "real_vector_space_script_lost": (
+            r"\b[A-Za-z]\s*∈\s*R\s+[A-Z](?:\s*×\s*[A-Z])*"
+        ),
+        "matrix_transpose_script_lost": r"\b[A-Z]{2,4}\s+T\b",
+        "inverse_square_root_script_lost": r"\b[nm]\s*[-−]\s*1\s*/\s*2\b",
+        "ambient_dimension_script_lost": r"\bR\s+d\b",
+        "subscript_script_lost": (
+            r"\b(?:[XKHPT]\s+i|[TΨEK]\s+P\s+0|s\s+null|[ŝs]\s+i\s*,\s*j)\b"
+        ),
+        "natural_number_subscript_lost": r"\bN\s+0\b",
+        "positive_integer_subscript_lost": r"\bN\s*[<>]\s*0\b",
+        "product_limits_lost": r"(?:×|∏)\s+d\s+i\s*=\s*1",
+        "superscript_dimension_lost": r"\bX\s+d\b",
+        "inverse_map_script_lost": r"\bf\s*[-−]\s*1\s*\(",
+    }
+    inline_math_residuals = [
+        reason
+        for reason, pattern in inline_residual_patterns.items()
+        if re.search(pattern, markdown_without_display_math)
+        or re.search(pattern, html_without_display_math)
+    ]
+    source_visuals = quality_signals.get("final_source_visuals") or {}
+    source_visual_html_count = int(
+        source_visuals.get("formula_source_html_ref_count") or 0
+    )
+    source_visual_markdown_count = int(
+        source_visuals.get("formula_source_markdown_ref_count") or 0
+    )
+    formula_expected_indexes = {
+        int(value)
+        for value in source_visuals.get("formula_source_expected_indexes") or []
+    }
+    formula_html_indexes = {
+        int(value)
+        for value in source_visuals.get("formula_source_html_indexes") or []
+    }
+    formula_markdown_indexes = {
+        int(value)
+        for value in source_visuals.get("formula_source_markdown_indexes") or []
+    }
+    declared_drops = list(
+        source_visuals.get("formula_source_dropped_artifacts")
+        or source_visuals.get("formula_source_dropped")
+        or []
+    )
+    allowed_declared_drop_indexes = {
+        int(item.get("raw_formula_index", item.get("index")))
+        for item in declared_drops
+        if isinstance(item, dict)
+        and isinstance(item.get("raw_formula_index", item.get("index")), int)
+        and str(item.get("reason") or "") in ALLOWED_FORMULA_DROPOUT_REASONS
+    }
+    disallowed_declared_drops = [
+        item
+        for item in declared_drops
+        if not isinstance(item, dict)
+        or not isinstance(item.get("raw_formula_index", item.get("index")), int)
+        or str(item.get("reason") or "") not in ALLOWED_FORMULA_DROPOUT_REASONS
+    ]
+    effective_formula_expected_indexes = (
+        formula_expected_indexes - allowed_declared_drop_indexes
+    )
+    declared_missing_indexes = {
+        int(value)
+        for value in (
+            source_visuals.get("formula_source_missing_indexes")
+            or source_visuals.get("formula_source_missing")
+            or []
+        )
+        if isinstance(value, int)
+    }
+    unresolved_declared_missing_indexes = (
+        declared_missing_indexes - allowed_declared_drop_indexes
+    )
+    declared_unexpected_indexes = {
+        int(value)
+        for value in (
+            source_visuals.get("formula_source_unexpected_indexes")
+            or source_visuals.get("formula_source_unexpected")
+            or []
+        )
+        if isinstance(value, int)
+    }
+    formula_html_appendix_indexes = {
+        int(value)
+        for value in source_visuals.get("formula_source_html_appendix_indexes") or []
+    }
+    formula_markdown_appendix_indexes = {
+        int(value)
+        for value in source_visuals.get(
+            "formula_source_markdown_appendix_indexes"
+        ) or []
+    }
+    allowed_drop_visual_ok = bool(
+        allowed_declared_drop_indexes <= formula_html_appendix_indexes
+        and allowed_declared_drop_indexes <= formula_markdown_appendix_indexes
+    )
+    index_aware_formula_coverage = "formula_source_expected_indexes" in source_visuals
+    if index_aware_formula_coverage:
+        formula_count_matches_evidence = bool(
+            (
+                formula_count == 0
+                and not formula_expected_indexes
+                and not formula_html_indexes
+                and not formula_markdown_indexes
+                and source_visual_html_count == 0
+                and source_visual_markdown_count == 0
+            )
+            or (
+                formula_count > 0
+                and len(effective_formula_expected_indexes) == formula_count
+            )
+        )
+        source_visual_ok = bool(
+            formula_count_matches_evidence
+            and
+            effective_formula_expected_indexes == formula_html_indexes
+            and effective_formula_expected_indexes == formula_markdown_indexes
+            and not unresolved_declared_missing_indexes
+            and not declared_unexpected_indexes
+            and not source_visuals.get("formula_source_unaccounted_raw_indexes")
+            and not source_visuals.get("formula_source_disallowed_dropped_artifacts")
+            and not source_visuals.get(
+                "formula_source_duplicate_html_anchor_indexes"
+            )
+            and not source_visuals.get(
+                "formula_source_duplicate_markdown_anchor_indexes"
+            )
+            and allowed_drop_visual_ok
+            and not disallowed_declared_drops
+        )
+    else:
+        source_visual_ok = bool(
+            (
+                formula_count == 0
+                and source_visual_html_count == 0
+                and source_visual_markdown_count == 0
+            )
+            or (
+                formula_count > 0
+                and source_visual_html_count >= formula_count
+                and source_visual_markdown_count >= formula_count
+            )
+        )
+
+    inline_expected_anchors = {
+        str(value)
+        for value in source_visuals.get("inline_math_source_expected_anchors") or []
+    }
+    inline_html_anchors = {
+        str(value)
+        for value in source_visuals.get("inline_math_source_html_anchors") or []
+    }
+    inline_markdown_anchors = {
+        str(value)
+        for value in source_visuals.get("inline_math_source_markdown_anchors") or []
+    }
+    inline_source_visual_ok = bool(
+        not source_visuals.get("inline_math_source_unbound_regions")
+        and (
+            not inline_expected_anchors
+            or (
+                inline_expected_anchors == inline_html_anchors
+                and inline_expected_anchors == inline_markdown_anchors
+                and not source_visuals.get("inline_math_source_missing_crop_anchors")
+                and not source_visuals.get("inline_math_source_missing_html_anchors")
+                and not source_visuals.get(
+                    "inline_math_source_missing_markdown_anchors"
+                )
+                and not source_visuals.get(
+                    "inline_math_source_duplicate_html_anchors"
+                )
+                and not source_visuals.get(
+                    "inline_math_source_duplicate_markdown_anchors"
+                )
+            )
+        )
+    )
+    machine_warning_reasons: list[str] = []
     if html_math_count < formula_count:
-        failure_reasons.append("incomplete_mathml_coverage")
+        machine_warning_reasons.append("incomplete_mathml_coverage")
     if html_fallback_count:
-        failure_reasons.append("html_formula_tex_fallback_present")
+        machine_warning_reasons.append("html_formula_tex_fallback_present")
     if markdown_math_block_count < formula_count:
-        failure_reasons.append("incomplete_markdown_math_coverage")
+        machine_warning_reasons.append("incomplete_markdown_math_coverage")
+    if inline_expected_anchors:
+        machine_warning_reasons.append("inline_math_source_visual_review_required")
+    if inline_math_residuals and inline_source_visual_ok and inline_expected_anchors:
+        machine_warning_reasons.append("inline_math_machine_transcription_degraded")
+    failure_reasons: list[str] = []
+    if not source_visual_ok:
+        failure_reasons.append("incomplete_formula_source_visual_coverage")
+    if not inline_source_visual_ok:
+        failure_reasons.append("incomplete_inline_math_source_visual_coverage")
     if raw_model_token_count:
         failure_reasons.append("raw_formula_model_tokens")
     if undecoded_placeholder_count:
         failure_reasons.append("undecoded_formula_placeholders")
+    if not markdown_math_delimiters_balanced:
+        failure_reasons.append("unbalanced_markdown_formula_delimiters")
+    if formula_count == 0 and (
+        html_math_count
+        or html_fallback_count
+        or markdown_math_block_count
+        or "docling-formula-second-pass" in html_text
+    ):
+        failure_reasons.append("unexpected_unaccounted_formula_surface")
+    elif html_math_count > formula_count or markdown_math_block_count > formula_count:
+        failure_reasons.append("unexpected_formula_surface_count")
+    if inline_math_residuals and not (
+        inline_source_visual_ok and inline_expected_anchors
+    ):
+        failure_reasons.append("unrepaired_inline_math_residuals")
     result = {
         "ok": not failure_reasons,
+        "machine_surface_ok": not machine_warning_reasons,
         "formula_count": formula_count,
+        "formula_count_source": (
+            "primary_surface" if primary_is_authoritative else "raw_surface_fallback"
+        ),
+        "raw_document_formula_count": document_formula_count,
+        "portable_formula_count": portable_formula_count,
         "html_math_count": html_math_count,
         "html_tex_fallback_count": html_fallback_count,
         "markdown_math_block_count": markdown_math_block_count,
+        "markdown_math_delimiter_count": markdown_math_delimiter_count,
+        "markdown_math_delimiters_balanced": markdown_math_delimiters_balanced,
+        "source_visual_html_count": source_visual_html_count,
+        "source_visual_markdown_count": source_visual_markdown_count,
+        "source_visual_authoritative": source_visual_ok,
+        "source_visual_expected_indexes": sorted(formula_expected_indexes),
+        "source_visual_effective_expected_indexes": sorted(
+            effective_formula_expected_indexes
+        ),
+        "source_visual_html_indexes": sorted(formula_html_indexes),
+        "source_visual_markdown_indexes": sorted(formula_markdown_indexes),
+        "source_visual_allowed_dropped_indexes": sorted(
+            allowed_declared_drop_indexes
+        ),
+        "source_visual_allowed_drop_html_appendix_indexes": sorted(
+            formula_html_appendix_indexes
+        ),
+        "source_visual_allowed_drop_markdown_appendix_indexes": sorted(
+            formula_markdown_appendix_indexes
+        ),
+        "source_visual_allowed_drop_evidence_complete": allowed_drop_visual_ok,
+        "source_visual_disallowed_drops": disallowed_declared_drops,
+        "source_visual_unresolved_missing_indexes": sorted(
+            unresolved_declared_missing_indexes
+        ),
+        "source_visual_unexpected_indexes": sorted(declared_unexpected_indexes),
+        "inline_source_visual_authoritative": inline_source_visual_ok,
+        "inline_source_expected_anchors": sorted(inline_expected_anchors),
+        "inline_source_html_anchors": sorted(inline_html_anchors),
+        "inline_source_markdown_anchors": sorted(inline_markdown_anchors),
         "raw_model_token_count": raw_model_token_count,
         "undecoded_placeholder_count": undecoded_placeholder_count,
+        "inline_math_repair_count": int(
+            (primary.get("counts") or {}).get("inline_math_repairs") or 0
+        ),
+        "inline_math_residuals": inline_math_residuals,
         "failure_reasons": failure_reasons,
+        "warning_reasons": machine_warning_reasons,
     }
     metadata["final_formula_surface"] = result
     quality_signals["final_formula_surface"] = result
-    if failure_reasons and status.get("ok"):
+    if failure_reasons:
         status["ok"] = False
         status["success_class"] = "degraded_failure"
-        status.setdefault("warnings", []).append(
-            "final_formula_surface_failed:" + ",".join(failure_reasons)
-        )
+        warning = "final_formula_surface_failed:" + ",".join(failure_reasons)
+        if warning not in status.setdefault("warnings", []):
+            status["warnings"].append(warning)
+    elif machine_warning_reasons and status.get("ok"):
+        status["success_class"] = "degraded_success"
+    for reason in machine_warning_reasons:
+        warning = "machine_formula_surface_warning:" + reason
+        if warning not in status.setdefault("warnings", []):
+            status["warnings"].append(warning)
     return result
 
 
-def main() -> int:
-    args = parse_args()
-    try:
-        selected_page_range = page_range(args)
-    except ValueError as exc:
-        print(json.dumps({"ok": False, "blocked": str(exc)}, indent=2))
-        return 2
+def _coerce_non_negative_int(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value >= 0 else None
+    if isinstance(value, str) and value.isdigit():
+        return int(value)
+    return None
 
-    if not args.input_file.exists():
-        print(
-            json.dumps(
-                {"ok": False, "blocked": f"input file not found: {args.input_file}"},
-                indent=2,
+
+def _is_valid_sha256(value: Any) -> bool:
+    return _normalize_sha256(value) is not None
+
+
+def _normalize_sha256(value: Any) -> str | None:
+    value_str = str(value or "").strip().lower()
+    if re.fullmatch(r"[0-9a-f]{64}", value_str):
+        return value_str
+    return None
+
+
+def _sanitize_pdf_inventory_error_reason(
+    reason: str, source_pdf_path: Path
+) -> str:
+    return str(reason).replace(str(source_pdf_path), "source.pdf")
+
+
+def _is_inventory_fatal_reason(reason: Any) -> bool:
+    if not isinstance(reason, str):
+        return False
+    value = reason.strip()
+    if not value:
+        return False
+    if value in {"input_file_not_found", "line_extraction_no_lines", "unreadable"}:
+        return True
+    if value.startswith("hash_failed:") or value.startswith("line_extraction_failed:"):
+        return True
+    return False
+
+
+def _pdf_inventory_unavailable_diagnostic(reason: str) -> dict[str, Any]:
+    return {
+        "available": False,
+        "reason": reason,
+        "source_pdf_sha256": None,
+        "page_count": 0,
+        "text_health": {"available": False},
+        "counts": {kind: {"high_confidence": 0, "ambiguous": 0, "records": []} for kind in KIND_ORDER},
+        "no_structure_proof": {kind: KIND_UNKNOWN for kind in KIND_ORDER},
+    }
+
+
+def _summarize_inventory_counts(counts: Any) -> dict[str, Any]:
+    summary: dict[str, Any] = {}
+    for kind in KIND_ORDER:
+        bucket = counts.get(kind) if isinstance(counts, dict) else None
+        if not isinstance(bucket, dict):
+            summary[kind] = {
+                "high_confidence": 0,
+                "ambiguous": 0,
+                "records": [],
+                "record_count": 0,
+                "truncated": False,
+            }
+            continue
+        records = bucket.get("records") if isinstance(bucket.get("records"), list) else []
+        visible_records = []
+        for record in records[:20]:
+            if isinstance(record, dict):
+                visible_records.append(
+                    {
+                        "text": record.get("text"),
+                        "page_no": record.get("page_no"),
+                        "confidence": record.get("confidence"),
+                        "source": record.get("source"),
+                    }
+                )
+        summary[kind] = {
+            "high_confidence": _coerce_non_negative_int(bucket.get("high_confidence"))
+            or 0,
+            "ambiguous": _coerce_non_negative_int(bucket.get("ambiguous")) or 0,
+            "records": visible_records,
+            "record_count": len(records),
+            "truncated": len(records) > 20,
+        }
+    return summary
+
+
+def _normalize_inventory_text_health(text_health: Any) -> dict[str, Any]:
+    if not isinstance(text_health, dict):
+        return {
+            "available": False,
+            "status": None,
+            "page_no_continuous": False,
+            "reason": None,
+            "page_count": 0,
+            "pages": [],
+            "truncated_pages": False,
+        }
+    pages = text_health.get("pages")
+    if isinstance(pages, list):
+        normalized_pages = [
+            {
+                "page_no": page.get("page_no"),
+                "healthy": page.get("healthy"),
+                "reasons": page.get("reasons", []),
+            }
+            for page in pages
+            if isinstance(page, dict)
+        ]
+    else:
+        normalized_pages = []
+    return {
+        "available": bool(text_health.get("available")),
+        "status": text_health.get("status"),
+        "page_no_continuous": (
+            text_health.get("page_no_continuous")
+            if isinstance(text_health.get("page_no_continuous"), bool)
+            else False
+        ),
+        "reason": text_health.get("reason"),
+        "page_count": _coerce_non_negative_int(text_health.get("page_count")),
+        "pages": normalized_pages[:50],
+        "truncated_pages": len(normalized_pages) > 50,
+    }
+
+
+def _evaluate_pdf_inventory_gate(
+    inventory: dict[str, Any],
+    structural: dict[str, Any],
+    formula: dict[str, Any],
+    *,
+    expected_source_pdf_sha256: str | None,
+    source_pdf: str = "source.pdf",
+) -> dict[str, Any]:
+    global_reasons: list[str] = []
+    structural_failure_reasons: list[str] = []
+    formula_failure_reasons: list[str] = []
+
+    if not isinstance(inventory, dict):
+        global_reasons.append("pdf_inventory_schema_invalid")
+        inventory = {}
+
+    reason = inventory.get("reason")
+    source_pdf_sha256 = _normalize_sha256(inventory.get("source_pdf_sha256"))
+    text_health = inventory.get("text_health")
+    available = inventory.get("available")
+    counts = inventory.get("counts")
+    proof_status = inventory.get("no_structure_proof")
+
+    if not isinstance(available, bool) or not available:
+        global_reasons.append("pdf_inventory_unavailable")
+    if reason is not None and not isinstance(reason, str):
+        global_reasons.append("pdf_inventory_reason_invalid")
+    if _is_inventory_fatal_reason(reason):
+        global_reasons.append(f"pdf_inventory_reason:{reason}")
+    expected_source_pdf_sha256 = _normalize_sha256(expected_source_pdf_sha256)
+    if source_pdf_sha256 is None:
+        global_reasons.append("pdf_inventory_actual_sha256_invalid")
+    if expected_source_pdf_sha256 is None:
+        global_reasons.append("pdf_inventory_expected_sha256_invalid")
+    elif source_pdf_sha256 and expected_source_pdf_sha256 and source_pdf_sha256 != expected_source_pdf_sha256:
+        global_reasons.append("pdf_inventory_sha256_mismatch")
+
+    page_count = _coerce_non_negative_int(inventory.get("page_count"))
+    if page_count is None or page_count < 1:
+        global_reasons.append("pdf_inventory_page_count_invalid")
+
+    if not isinstance(text_health, dict):
+        global_reasons.append("pdf_inventory_text_health_missing")
+    else:
+        if not isinstance(text_health.get("available"), bool) or not text_health.get("available"):
+            global_reasons.append("pdf_inventory_text_health_unavailable")
+        if text_health.get("status") != KIND_HEALTHY:
+            global_reasons.append("pdf_inventory_text_health_status_not_healthy")
+        page_no_continuous = text_health.get("page_no_continuous")
+        if page_no_continuous is not True:
+            global_reasons.append("pdf_inventory_text_health_page_sequence_broken")
+        text_health_page_count = _coerce_non_negative_int(text_health.get("page_count"))
+        if text_health_page_count is None:
+            global_reasons.append("pdf_inventory_text_health_page_count_invalid")
+        else:
+            if text_health_page_count != page_count:
+                global_reasons.append("pdf_inventory_text_health_page_count_mismatch")
+        pages = text_health.get("pages")
+        if not isinstance(pages, list):
+            global_reasons.append("pdf_inventory_text_health_pages_invalid")
+            valid_page_numbers: list[int] = []
+        else:
+            all_page_numbers: list[int] = []
+            valid_page_numbers = []
+            for page in pages:
+                if not isinstance(page, dict):
+                    global_reasons.append("pdf_inventory_text_health_page_invalid")
+                    continue
+                page_no = page.get("page_no")
+                if isinstance(page_no, bool) or not isinstance(page_no, int):
+                    global_reasons.append("pdf_inventory_text_health_page_no_invalid")
+                    continue
+                all_page_numbers.append(page_no)
+                page_no = _coerce_non_negative_int(page.get("page_no"))
+                if page_no is None or page_no == 0:
+                    global_reasons.append("pdf_inventory_text_health_page_invalid")
+                    continue
+                if not (text_health_page_count and 1 <= page_no <= text_health_page_count):
+                    global_reasons.append("pdf_inventory_text_health_page_no_out_of_range")
+                    continue
+                if page.get("healthy") is not True:
+                    global_reasons.append("pdf_inventory_text_health_page_unhealthy")
+                reasons = page.get("reasons")
+                if reasons is None:
+                    reasons = []
+                if not isinstance(reasons, list):
+                    global_reasons.append("pdf_inventory_text_health_page_reason_invalid")
+                    reasons = []
+                else:
+                    reasons = {str(value) for value in reasons}
+                    if reasons.intersection({"image_only", "empty_text", "short_text"}):
+                        global_reasons.append("pdf_inventory_text_health_page_reason_disallowed")
+                        break
+                valid_page_numbers.append(page_no)
+            if text_health_page_count is not None:
+                if len(all_page_numbers) != text_health_page_count:
+                    global_reasons.append("pdf_inventory_text_health_pages_missing")
+                if len(set(valid_page_numbers)) != len(valid_page_numbers):
+                    global_reasons.append("pdf_inventory_text_health_pages_non_continuous")
+                elif valid_page_numbers:
+                    sorted_pages = sorted(set(valid_page_numbers))
+                    if sorted_pages != list(range(1, text_health_page_count + 1)):
+                        global_reasons.append("pdf_inventory_text_health_pages_non_continuous")
+
+    if global_reasons:
+        structural_failure_reasons.extend(global_reasons)
+        formula_failure_reasons.extend(global_reasons)
+
+    expected_counts = {}
+    expected_structural_sources: tuple[tuple[str, str], ...] = (
+        ("table", "expected_tables"),
+        ("algorithm", "expected_algorithms"),
+        ("code", "expected_code_blocks"),
+    )
+    for kind, key in expected_structural_sources:
+        expected_value = structural.get(key)
+        if expected_value is None:
+            structural_failure_reasons.append(
+                f"pdf_inventory_expected_count_missing:{kind}"
             )
-        )
-        return 2
+            expected_counts[kind] = 0
+        else:
+            normalized_expected = _coerce_non_negative_int(expected_value)
+            if normalized_expected is None:
+                structural_failure_reasons.append(
+                    f"pdf_inventory_expected_count_invalid:{kind}"
+                )
+                expected_counts[kind] = 0
+            else:
+                expected_counts[kind] = normalized_expected
+    formula_expected = formula.get("formula_count")
+    if formula_expected is None:
+        formula_failure_reasons.append("pdf_inventory_expected_count_missing:formula")
+        expected_counts["formula"] = 0
+    else:
+        normalized_formula_expected = _coerce_non_negative_int(formula_expected)
+        if normalized_formula_expected is None:
+            formula_failure_reasons.append("pdf_inventory_expected_count_invalid:formula")
+            expected_counts["formula"] = 0
+        else:
+            expected_counts["formula"] = normalized_formula_expected
+    if not isinstance(counts, dict):
+        global_reasons.append("pdf_inventory_counts_missing")
+        counts = {}
+    if not isinstance(proof_status, dict):
+        global_reasons.append("pdf_inventory_no_structure_proof_missing")
+        proof_status = {}
 
-    original_input_file = args.input_file
-    text_layer_recovery = find_text_layer_recovery_source(original_input_file)
+    for kind in KIND_ORDER:
+        bucket = counts.get(kind) if isinstance(counts, dict) else None
+        if not isinstance(bucket, dict):
+            missing_reason = f"pdf_inventory_counts_bucket_missing:{kind}"
+            if kind == "formula":
+                formula_failure_reasons.append(missing_reason)
+            else:
+                structural_failure_reasons.append(missing_reason)
+            continue
+
+        records = bucket.get("records")
+        records_are_list = isinstance(records, list)
+        records_invalid = not records_are_list
+        if records_are_list:
+            records_invalid = any(
+                not isinstance(record, dict) for record in records
+            )
+        declared_record_count = bucket.get("record_count")
+        if declared_record_count is not None:
+            normalized_record_count = _coerce_non_negative_int(
+                declared_record_count
+            )
+            records_invalid = (
+                records_invalid
+                or normalized_record_count is None
+                or not records_are_list
+                or normalized_record_count != len(records)
+            )
+        if records_invalid:
+            invalid_reason = f"pdf_inventory_records_invalid:{kind}"
+            if kind == "formula":
+                formula_failure_reasons.append(invalid_reason)
+            else:
+                structural_failure_reasons.append(invalid_reason)
+
+        high_confidence = _coerce_non_negative_int(bucket.get("high_confidence"))
+        ambiguous = _coerce_non_negative_int(bucket.get("ambiguous"))
+        if high_confidence is None or ambiguous is None:
+            invalid_reason = f"pdf_inventory_counts_invalid:{kind}"
+            if kind == "formula":
+                formula_failure_reasons.append(invalid_reason)
+            else:
+                structural_failure_reasons.append(invalid_reason)
+            continue
+        proof = proof_status.get(kind)
+        if proof not in (KIND_HEALTHY, KIND_UNKNOWN):
+            invalid_reason = f"pdf_inventory_proof_invalid:{kind}"
+            if kind == "formula":
+                formula_failure_reasons.append(invalid_reason)
+            else:
+                structural_failure_reasons.append(invalid_reason)
+            continue
+
+        expected = expected_counts[kind]
+        if kind == "formula":
+            if expected == 0:
+                if high_confidence != 0:
+                    reason = f"pdf_inventory_formula_unexpected_high:{high_confidence}"
+                    formula_failure_reasons.append(reason)
+                if ambiguous != 0:
+                    reason = f"pdf_inventory_formula_unexpected_ambiguous:{ambiguous}"
+                    formula_failure_reasons.append(reason)
+                if proof != KIND_HEALTHY:
+                    reason = f"pdf_inventory_formula_proof_not_healthy:{proof}"
+                    formula_failure_reasons.append(reason)
+            elif high_confidence > expected:
+                reason = (
+                    f"pdf_inventory_formula_high_count_exceeds_expected:{high_confidence}>"
+                    f"{expected}"
+                )
+                formula_failure_reasons.append(reason)
+        else:
+            if expected == 0:
+                if high_confidence != 0:
+                    reason = (
+                        f"pdf_inventory_{kind}_unexpected_high:{high_confidence}"
+                    )
+                    structural_failure_reasons.append(reason)
+                if ambiguous != 0:
+                    reason = (
+                        f"pdf_inventory_{kind}_unexpected_ambiguous:{ambiguous}"
+                    )
+                    structural_failure_reasons.append(reason)
+                if proof != KIND_HEALTHY:
+                    reason = f"pdf_inventory_{kind}_proof_not_healthy:{proof}"
+                    structural_failure_reasons.append(reason)
+            elif high_confidence > expected:
+                reason = f"pdf_inventory_{kind}_high_count_exceeds_expected:{high_confidence}>{expected}"
+                structural_failure_reasons.append(reason)
+
+    for reason in global_reasons:
+        if reason not in structural_failure_reasons:
+            structural_failure_reasons.append(reason)
+        if reason not in formula_failure_reasons:
+            formula_failure_reasons.append(reason)
+
+    structural_ok = not structural_failure_reasons
+    formula_ok = not formula_failure_reasons
+    all_ok = not (global_reasons or structural_failure_reasons or formula_failure_reasons)
+
+    return {
+        "ok": all_ok,
+        "source_pdf": source_pdf,
+        "expected_source_pdf_sha256": (
+            expected_source_pdf_sha256
+        ),
+        "actual_source_pdf_sha256": (
+            source_pdf_sha256
+        ),
+        "page_count": page_count or 0,
+        "text_health": _normalize_inventory_text_health(text_health),
+        "counts": _summarize_inventory_counts(counts),
+        "proof": {
+            kind: str(proof_status.get(kind, KIND_UNKNOWN))
+            for kind in KIND_ORDER
+            if isinstance(proof_status, dict)
+        },
+        "structural": {
+            "ok": structural_ok,
+            "expected_counts": {
+                key: expected_counts[key] for key in ("table", "algorithm", "code")
+            },
+            "failure_reasons": structural_failure_reasons,
+        },
+        "formula": {
+            "ok": formula_ok,
+            "expected_count": expected_counts["formula"],
+            "failure_reasons": formula_failure_reasons,
+        },
+        "global_failure_reasons": sorted(set(global_reasons)),
+        "structural_failure_reasons": sorted(set(structural_failure_reasons)),
+        "formula_failure_reasons": sorted(set(formula_failure_reasons)),
+        "failure_reasons": sorted(
+            set(global_reasons + structural_failure_reasons + formula_failure_reasons)
+        ),
+    }
+
+
+def _run_pdf_inventory_gate(
+    source_pdf_path: Path,
+    snapshot: _ImmutableInputSnapshot,
+    *,
+    expected_identity: tuple[int, int] | None = None,
+    expected_output_dir: Path | None = None,
+) -> dict[str, Any]:
+    snapshot.verify()
+    try:
+        if source_pdf_path.name != "source.pdf":
+            raise _InputLifecycleError(
+                "job_source_pdf_unexpected_name",
+                "unexpected source pdf filename",
+            )
+        if (
+            expected_output_dir is not None
+            and source_pdf_path.parent != expected_output_dir
+        ):
+            raise _InputLifecycleError(
+                "job_source_pdf_unexpected_directory",
+                "unexpected source pdf directory",
+            )
+        _verify_job_source(
+            snapshot,
+            source_pdf_path,
+            expected_identity=expected_identity,
+        )
+        try:
+            result = pdf_structure_inventory(source_pdf_path)
+        finally:
+            _verify_job_source(
+                snapshot,
+                source_pdf_path,
+                expected_identity=expected_identity,
+            )
+        return result
+    except Exception as exc:  # pragma: no cover - exercised by explicit tests
+        reason = (
+            exc.reason
+            if isinstance(exc, _InputLifecycleError)
+            else f"{type(exc).__name__}:{exc}"
+        )
+        return _pdf_inventory_unavailable_diagnostic(
+            _sanitize_pdf_inventory_error_reason(reason, source_pdf_path)
+        )
+    finally:
+        snapshot.verify()
+
+
+def _finalize_delivery_surfaces(
+    output_dir: Path,
+    semantic_document: Any,
+    source_pdf_path: Path,
+    visual_pdf_path: Path,
+    metadata: dict[str, Any],
+    status: dict[str, Any],
+    args: argparse.Namespace,
+    *,
+    pdf_inventory: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Apply the last structural mutation before rebuilding and gating evidence."""
+
+    # The accepted-CN path applies the generic structural quarantine a second
+    # time after semantic reflow.  It mutates document.json, HTML, and Markdown,
+    # so it must precede both final evidence inventory and the final gates.
+    record_cn_accepted_baseline(output_dir, metadata, status, args)
+    final_document = _load_json_file(output_dir / "document.json")
+    document_reload = {
+        "ok": isinstance(final_document, dict),
+        "path": "document.json",
+        "after_cn_structural_mutation": True,
+    }
+    metadata["final_document_reload"] = document_reload
+    status.setdefault("quality_signals", {})["final_document_reload"] = (
+        document_reload
+    )
+    if not isinstance(final_document, dict):
+        status["ok"] = False
+        status["success_class"] = "degraded_failure"
+        warning = "final_document_reload_failed_after_structural_mutation"
+        if warning not in status.setdefault("warnings", []):
+            status["warnings"].append(warning)
+    visuals = None
+    if isinstance(final_document, dict):
+        visuals = restore_final_delivery_visuals(
+            output_dir,
+            final_document,
+            source_pdf_path,
+            metadata,
+            status,
+            visual_pdf_path=visual_pdf_path,
+        )
+    formula = validate_final_formula_surfaces(output_dir, metadata, status)
+    structural = validate_final_structural_surfaces(output_dir, metadata, status)
+    if pdf_inventory is None:
+        expected_source_pdf_sha256 = _normalize_sha256(
+            metadata.get("visual_evidence_input_sha256")
+            or metadata.get("source_pdf_sha256")
+        )
+        inventory = {
+            "ok": True,
+            "applied": False,
+            "source_pdf": "source.pdf",
+            "expected_source_pdf_sha256": expected_source_pdf_sha256,
+            "actual_source_pdf_sha256": expected_source_pdf_sha256,
+            "page_count": 0,
+            "text_health": {},
+            "counts": {
+                kind: {"high_confidence": 0, "ambiguous": 0, "records": []}
+                for kind in KIND_ORDER
+            },
+            "proof": {kind: KIND_UNKNOWN for kind in KIND_ORDER},
+            "structural": {
+                "ok": True,
+                "expected_counts": {"table": 0, "algorithm": 0, "code": 0},
+                "failure_reasons": [],
+            },
+            "formula": {"ok": True, "expected_count": 0, "failure_reasons": []},
+            "failure_reasons": [],
+            "global_failure_reasons": [],
+            "structural_failure_reasons": [],
+            "formula_failure_reasons": [],
+        }
+    else:
+        inventory = _evaluate_pdf_inventory_gate(
+            pdf_inventory,
+            structural,
+            formula,
+            expected_source_pdf_sha256=metadata.get("visual_evidence_input_sha256")
+            or metadata.get("source_pdf_sha256"),
+            source_pdf="source.pdf",
+        )
+    if not inventory["ok"]:
+        failure_reasons = {
+            str(reason)
+            for reason in (
+                inventory.get("failure_reasons")
+                or inventory.get("global_failure_reasons")
+                or []
+            )
+        }
+        formula = dict(formula)
+        structural = dict(structural)
+        formula_failure_reasons = [
+            str(reason)
+            for reason in dict.fromkeys(
+                [*formula.get("failure_reasons", []), *inventory.get("formula_failure_reasons", []), *failure_reasons]
+            ).keys()
+        ]
+        structural_failure_reasons = [
+            str(reason)
+            for reason in dict.fromkeys(
+                [*structural.get("failure_reasons", []), *inventory.get("structural_failure_reasons", []), *failure_reasons]
+            ).keys()
+        ]
+        formula["failure_reasons"] = formula_failure_reasons
+        structural["failure_reasons"] = structural_failure_reasons
+        formula["ok"] = False
+        structural["ok"] = False
+        metadata["final_formula_surface"] = formula
+        metadata["final_structural_surface"] = structural
+        status.setdefault("quality_signals", {})["final_formula_surface"] = formula
+        status.setdefault("quality_signals", {})["final_structural_surface"] = structural
+
+    metadata["pdf_structure_inventory"] = inventory
+    metadata["final_pdf_inventory"] = inventory
+    quality_signals = status.setdefault("quality_signals", {})
+    quality_signals["pdf_structure_inventory"] = inventory
+    quality_signals["final_pdf_inventory"] = inventory
+    if not inventory["ok"]:
+        status["ok"] = False
+        status["success_class"] = "degraded_failure"
+        warning = "final_pdf_inventory_failed:" + ",".join(inventory["failure_reasons"])
+        if warning not in status.setdefault("warnings", []):
+            status["warnings"].append(warning)
+    reconciliation = reconcile_final_surface_status(output_dir, metadata, status)
+    return {
+        "visuals": visuals,
+        "formula": formula,
+        "structural": structural,
+        "reconciliation": reconciliation,
+        "pdf_inventory": inventory,
+    }
+
+
+def _run_snapshot_job(
+    args: argparse.Namespace,
+    *,
+    name: str,
+    output_dir: Path,
+    selected_page_range: list[int] | None,
+    submitted_input_file: Path,
+    snapshot: _ImmutableInputSnapshot,
+    output_guard: _FreshOutputGuard,
+    job_lock: _PersistentJobLock,
+) -> int:
+    """Run every delivery phase against one already-verified snapshot."""
+
+    def checkpoint(*, verify_tree: bool = False) -> None:
+        job_lock.verify()
+        output_guard.verify_output_directory()
+        snapshot.verify()
+        if verify_tree:
+            _assert_safe_owned_output_tree(output_guard)
+
+    original_input_file = snapshot.path
     conversion_args = args
-    if text_layer_recovery.get("applied") and text_layer_recovery.get("source_path"):
-        conversion_args = args_with_conversion_input(
-            args,
-            Path(str(text_layer_recovery["source_path"])),
-        )
-
-    name = args.job_id or args.sample_name or args.input_file.stem
-    output_dir = args.output_root / name
+    checkpoint(verify_tree=True)
+    input_profile = pdf_text_layer_profile(snapshot.path)
+    text_layer_recovery = {
+        "applied": False,
+        "reason": "automatic_sibling_text_layer_recovery_disabled",
+        "policy": "submitted_snapshot_authoritative",
+        "input_profile": input_profile,
+        "candidates": [],
+    }
+    checkpoint(verify_tree=True)
 
     try:
         version = get_json(f"{args.serve_url.rstrip('/')}/version")
     except (urllib.error.URLError, TimeoutError) as exc:
-        print(
-            json.dumps(
-                {
-                    "ok": False,
-                    "blocked": f"Docling Server is not reachable: {exc}",
-                    "start_command": START_COMMAND,
-                },
-                indent=2,
-            )
-        )
-        return 2
+        raise _InputLifecycleError(
+            "docling_server_unreachable",
+            f"{exc}; {START_COMMAND}",
+        ) from exc
 
     if conversion_args.force_chunked_conversion:
         input_profile = pdf_text_layer_profile(conversion_args.input_file)
@@ -15693,8 +24692,11 @@ def main() -> int:
                 )
             else:
                 raise
+    checkpoint(verify_tree=True)
     metadata["original_input_file"] = str(original_input_file)
     metadata["conversion_input_file"] = str(conversion_args.input_file)
+    metadata["original_input_sha256"] = snapshot.sha256
+    metadata["conversion_input_sha256"] = snapshot.sha256
     metadata["text_layer_recovery"] = text_layer_recovery
     status["quality_signals"]["text_layer_recovery"] = text_layer_recovery
     if text_layer_recovery.get("applied"):
@@ -15759,7 +24761,7 @@ def main() -> int:
                 )
             else:
                 response = failure_response("required OCR fallback failed", exc)
-                output_dir = args.output_root / name
+                output_dir = _job_output_dir(args.output_root, name)
                 options = base_options(
                     conversion_args,
                     force_ocr=True,
@@ -15836,27 +24838,76 @@ def main() -> int:
                     f"density={fallback_gxx_density}"
                 ),
             )
+        checkpoint(verify_tree=True)
 
     metadata["known_gaps"] = []
     metadata["processing_notes"] = [
         "HTML and Markdown are authoritative semantic surfaces produced by the quality adapter.",
-        "Rendered page images are review evidence and are not embedded as primary document content.",
+        "PDF source crops are embedded as the authoritative visual evidence layer for formulas, tables, algorithms, and code.",
+        "Machine-readable MathML, TeX, and semantic blocks remain searchable transcriptions and must not replace conflicting source visuals.",
     ]
     metadata["n8n_callable"] = True
     metadata["effective_page_range"] = selected_page_range
-
-    write_contract_outputs(output_dir, response, metadata, status)
-    restore_review_artifact_layer(output_dir, response, metadata, status, conversion_args)
-    run_portable_formula_ocr(output_dir, metadata, status, conversion_args)
-    run_optional_formula_second_pass(output_dir, metadata, status, conversion_args)
-    recovered_document = _load_json_file(output_dir / "document.json")
-    recover_algorithm_blocks_in_outputs(
-        output_dir,
-        recovered_document if isinstance(recovered_document, dict) else response,
-        conversion_args.input_file,
+    metadata["original_input_file"] = str(original_input_file)
+    metadata["conversion_input_file"] = str(conversion_args.input_file)
+    metadata["original_input_sha256"] = snapshot.sha256
+    metadata["conversion_input_sha256"] = snapshot.sha256
+    metadata["input_sha256"] = metadata["conversion_input_sha256"]
+    checkpoint(verify_tree=True)
+    source_pdf_path = _persist_job_source(snapshot, output_dir, output_guard)
+    pdf_inventory = _run_pdf_inventory_gate(
+        source_pdf_path,
+        snapshot,
+        expected_identity=output_guard.source_identity,
+        expected_output_dir=output_dir,
+    )
+    checkpoint(verify_tree=True)
+    fresh_preflight = {
+        "ok": True,
+        "checked_before_network": True,
+        "preexisting_output_entries": [],
+        "job_directory_claimed_before_network": True,
+        "contract_files_written": False,
+    }
+    metadata["fresh_output_preflight"] = fresh_preflight
+    status.setdefault("quality_signals", {})["fresh_output_preflight"] = (
+        fresh_preflight
+    )
+    _bind_published_input_contract(
         metadata,
         status,
+        snapshot=snapshot,
+        source_path=source_pdf_path,
+        submitted_path=submitted_input_file,
+        expected_sha256=getattr(args, "expected_input_sha256", None),
     )
+
+    visual_args = conversion_args
+    write_contract_outputs(
+        output_dir,
+        response,
+        metadata,
+        status,
+        output_guard=output_guard,
+    )
+    fresh_preflight["contract_files_written"] = True
+    metadata["fresh_output_preflight"]["contract_files_written"] = True
+    status["quality_signals"]["fresh_output_preflight"][
+        "contract_files_written"
+    ] = True
+    checkpoint(verify_tree=True)
+    restore_review_artifact_layer(output_dir, response, metadata, status, visual_args)
+    checkpoint(verify_tree=True)
+    run_portable_formula_ocr(output_dir, metadata, status, visual_args)
+    checkpoint(verify_tree=True)
+    run_optional_formula_second_pass_safely(
+        output_dir,
+        metadata,
+        status,
+        conversion_args,
+    )
+    checkpoint(verify_tree=True)
+    recovered_document = _load_json_file(output_dir / "document.json")
     semantic_document = (
         recovered_document
         if isinstance(recovered_document, dict)
@@ -15870,22 +24921,62 @@ def main() -> int:
             metadata,
             status,
         )
+        checkpoint(verify_tree=True)
     else:
         status["ok"] = False
         status["success_class"] = "degraded_failure"
         status["warnings"].append(
             "semantic_source_reflow_not_applied:document_json_missing"
         )
-    validate_final_formula_surfaces(output_dir, metadata, status)
-    reconcile_final_surface_status(output_dir, metadata, status)
-    record_cn_accepted_baseline(output_dir, metadata, status, conversion_args)
+    _finalize_delivery_surfaces(
+        output_dir,
+        semantic_document,
+        conversion_args.input_file,
+        original_input_file,
+        metadata,
+        status,
+        conversion_args,
+        pdf_inventory=pdf_inventory,
+    )
+    checkpoint(verify_tree=True)
+    _verify_job_source(
+        snapshot,
+        source_pdf_path,
+        expected_identity=output_guard.source_identity,
+    )
     refresh_final_broken_local_refs(output_dir, metadata, status)
-    (output_dir / "metadata.json").write_text(
-        json.dumps(metadata, indent=2, ensure_ascii=False), encoding="utf-8"
+    checkpoint(verify_tree=True)
+    _bind_published_input_contract(
+        metadata,
+        status,
+        snapshot=snapshot,
+        source_path=source_pdf_path,
+        submitted_path=submitted_input_file,
+        expected_sha256=getattr(args, "expected_input_sha256", None),
     )
-    (output_dir / "status.json").write_text(
-        json.dumps(status, indent=2, ensure_ascii=False), encoding="utf-8"
+    checkpoint(verify_tree=True)
+    _verify_job_source(
+        snapshot,
+        source_pdf_path,
+        expected_identity=output_guard.source_identity,
     )
+    _atomic_write_output_text(
+        output_dir / "metadata.json",
+        json.dumps(metadata, indent=2, ensure_ascii=False),
+        expected_parent_identity=output_guard.initial_identity,
+    )
+    _atomic_write_output_text(
+        output_dir / "status.json",
+        json.dumps(status, indent=2, ensure_ascii=False),
+        expected_parent_identity=output_guard.initial_identity,
+    )
+    checkpoint(verify_tree=True)
+    _verify_job_source(
+        snapshot,
+        source_pdf_path,
+        expected_identity=output_guard.source_identity,
+    )
+    output_guard.commit()
     summary = {
         "ok": status["ok"],
         "output_dir": str(output_dir),
@@ -15894,6 +24985,128 @@ def main() -> int:
     }
     print(json.dumps(summary, indent=2, ensure_ascii=False))
     return 0 if status["ok"] else 1
+
+
+def _print_lifecycle_failure(
+    *,
+    reason: str,
+    detail: str,
+    output_dir: Path | None,
+    cleanup: dict[str, Any] | None = None,
+) -> None:
+    payload: dict[str, Any] = {
+        "ok": False,
+        "blocked": reason,
+        "detail": detail,
+    }
+    if output_dir is not None:
+        payload["output_dir"] = str(output_dir)
+    if cleanup is not None:
+        payload["partial_output_cleanup"] = cleanup
+    print(json.dumps(payload, indent=2, ensure_ascii=False))
+
+
+def main() -> int:
+    args = parse_args()
+    try:
+        selected_page_range = page_range(args)
+    except ValueError as exc:
+        _print_lifecycle_failure(
+            reason="invalid_page_range",
+            detail=str(exc),
+            output_dir=None,
+        )
+        return 2
+
+    submitted_input_file = args.input_file
+    raw_name = args.job_id or args.sample_name or submitted_input_file.stem
+    try:
+        name = _validate_job_name(raw_name)
+    except ValueError as exc:
+        _print_lifecycle_failure(
+            reason="invalid_job_output_path",
+            detail=str(exc),
+            output_dir=None,
+        )
+        return 2
+
+    output_dir: Path | None = None
+    try:
+        with _PersistentJobLock(args.output_root, name) as job_lock:
+            job_lock.verify()
+            assert job_lock.root_path is not None
+            output_dir = _job_output_dir(job_lock.root_path, name)
+            # A retained job directory is never reused, even if empty.  This
+            # makes rollback unambiguous: any later job directory was created
+            # by this lock holder and can be removed without touching old data.
+            if output_dir.exists() or output_dir.is_symlink():
+                entries = _preexisting_output_entries(output_dir)
+                reason = "output_dir_must_not_exist_use_fresh_job_dir"
+                if entries:
+                    reason += ":" + ",".join(entries)
+                raise _InputLifecycleError(reason)
+            output_guard = _FreshOutputGuard(output_dir)
+            _claim_fresh_output_directory(
+                output_dir,
+                output_guard,
+                root_fd=job_lock.root_fd,
+            )
+            job_lock.verify()
+            _assert_owned_output_entries(output_guard, allowed_names=set())
+            snapshot: _ImmutableInputSnapshot | None = None
+            try:
+                snapshot = _create_immutable_input_snapshot(
+                    submitted_input_file,
+                    job_lock,
+                    getattr(args, "expected_input_sha256", None),
+                )
+                snapshot_args = args_with_conversion_input(args, snapshot.path)
+                snapshot_args._input_snapshot = snapshot
+                snapshot_args._submitted_input_name = submitted_input_file.name
+                result = _run_snapshot_job(
+                    snapshot_args,
+                    name=name,
+                    output_dir=output_dir,
+                    selected_page_range=selected_page_range,
+                    submitted_input_file=submitted_input_file,
+                    snapshot=snapshot,
+                    output_guard=output_guard,
+                    job_lock=job_lock,
+                )
+                if not output_guard.committed:
+                    output_guard.cleanup()
+                return result
+            except Exception as exc:
+                cleanup = output_guard.cleanup()
+                reason = (
+                    exc.reason
+                    if isinstance(exc, _InputLifecycleError)
+                    else "quality_parity_job_failed"
+                )
+                _print_lifecycle_failure(
+                    reason=reason,
+                    detail=str(exc),
+                    output_dir=output_dir,
+                    cleanup=cleanup,
+                )
+                return 2 if isinstance(exc, _InputLifecycleError) else 1
+            finally:
+                if snapshot is not None:
+                    snapshot.cleanup()
+    except _InputLifecycleError as exc:
+        _print_lifecycle_failure(
+            reason=exc.reason,
+            detail=exc.detail,
+            output_dir=output_dir,
+        )
+        return 2
+    except Exception as exc:
+        _print_lifecycle_failure(
+            reason="input_lifecycle_initialization_failed",
+            detail=str(exc),
+            output_dir=output_dir,
+        )
+        return 2
 
 
 if __name__ == "__main__":
