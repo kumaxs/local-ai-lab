@@ -13,7 +13,7 @@ Metal, MPS, Apple Vision, or macOS frameworks.
 
 ## Pull and start on another machine
 
-Download and verify the `docling-service-1.1.0` bundle from the `v1.1.0` GitHub
+Download and verify the `docling-service-1.1.1` bundle from the `v1.1.1` GitHub
 Release, extract it, and run:
 
 ```bash
@@ -58,7 +58,7 @@ Stop without deleting persisted models, jobs, or outputs with:
 ## Build from tagged source
 
 The source-build fallback remains available from an intact release bundle or
-the exact `v1.1.0` repository checkout:
+the exact `v1.1.1` repository checkout:
 
 ```bash
 docker compose \

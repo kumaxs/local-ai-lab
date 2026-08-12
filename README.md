@@ -1,7 +1,7 @@
 # Local AI Lab
 
 本地优先的文档理解与自动化工程。当前主要交付是 **Docling Service
-1.1.0**：接收 PDF，异步生成 HTML、Markdown、结构化 JSON、图片、公式与
+1.1.1**：接收 PDF，异步生成 HTML、Markdown、结构化 JSON、图片、公式与
 可审计元数据，并通过标准 HTTP API、Webhook 和一次性 ZIP 下载对接 n8n
 或其他业务系统。
 
@@ -43,14 +43,14 @@ Canonical GitHub: `https://github.com/kumaxs/local-ai-lab`
 
 ## 获取与部署
 
-正式版本由一个 Git 标签 `v1.1.0` 统一锚定。标签触发测试、多架构镜像、
+正式版本由一个 Git 标签 `v1.1.1` 统一锚定。标签触发测试、多架构镜像、
 macOS/通用分发包和 GitHub Release；Docker 与 macOS 不再使用两个会漂移的
 平台标签。
 
 ### Docker：直接用 Compose 部署
 
-从 [GitHub Release v1.1.0](https://github.com/kumaxs/local-ai-lab/releases/tag/v1.1.0)
-下载并校验 `docling-service-1.1.0.zip` 或 `.tar.gz`。目标机器只需 Docker
+从 [GitHub Release v1.1.1](https://github.com/kumaxs/local-ai-lab/releases/tag/v1.1.1)
+下载并校验 `docling-service-1.1.1.zip` 或 `.tar.gz`。目标机器只需 Docker
 Engine 和 Compose v2；不需要 Git、Python，也不必执行 `.sh` 文件：
 
 ```bash
@@ -67,9 +67,9 @@ docker compose \
 
 Release Compose 拉取以下 GHCR 镜像：
 
-- `ghcr.io/kumaxs/local-ai-lab-docling-api:1.1.0`
-- `ghcr.io/kumaxs/local-ai-lab-docling-backend:1.1.0`
-- `ghcr.io/kumaxs/local-ai-lab-docling-formula:1.1.0`
+- `ghcr.io/kumaxs/local-ai-lab-docling-api:1.1.1`
+- `ghcr.io/kumaxs/local-ai-lab-docling-backend:1.1.1`
+- `ghcr.io/kumaxs/local-ai-lab-docling-formula:1.1.1`
 
 源码版 [`compose.yaml`](services/docling-service/deploy/docker/compose.yaml)
 中的 `../../../..` 是合法的相对 build context：它让 Docker 构建能读取仓库

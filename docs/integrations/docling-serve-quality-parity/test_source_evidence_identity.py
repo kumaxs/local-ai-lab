@@ -76,7 +76,7 @@ def _formula_crop_diagnostic(
         path = output_dir / "formulas" / f"formula_{index}{suffix}.png"
         if not path.is_file():
             continue
-        from PIL import Image
+        from PIL import Image, ImageDraw
 
         with Image.open(path) as image:
             width, height = image.size
@@ -346,6 +346,189 @@ def _structural_gate_fixture(
 
 
 class SourceEvidenceIdentityTests(unittest.TestCase):
+    def test_malformed_bbox_nan_inf_fails_closed_before_crop_or_manifest(self) -> None:
+        malformed = {
+            "l": 0.0,
+            "r": float("inf"),
+            "t": float("nan"),
+            "b": 10.0,
+            "coord_origin": "TOPLEFT",
+        }
+        self.assertIsNone(adapter._structural_bbox_snapshot(malformed))
+        self.assertIsNone(
+            adapter._bbox_pixel_crop_box(
+                malformed,
+                page_width=100,
+                page_height=100,
+                image_width=100,
+                image_height=100,
+                padding=0,
+            )
+        )
+
+    def test_midpoint_clamped_crop_provenance_recomputes_clip_and_rejects_tamper(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            (output_dir / "pages").mkdir()
+            (output_dir / "tables").mkdir()
+            page_path = output_dir / "pages" / "page_1.png"
+            asset_path = output_dir / "tables" / "table_1.png"
+            _visible_png(page_path, size=(100, 100))
+            _visible_png(asset_path, size=(40, 40))
+            node_bbox = {
+                "l": 20.0,
+                "r": 30.0,
+                "t": 80.0,
+                "b": 60.0,
+                "coord_origin": "BOTTOMLEFT",
+            }
+            clip_bounds = {
+                "l": 0.0,
+                "r": 40.0,
+                "t": 100.0,
+                "b": 0.0,
+                "coord_origin": "BOTTOMLEFT",
+            }
+            raw_box = adapter._bbox_pixel_crop_box(
+                node_bbox,
+                page_width=100,
+                page_height=100,
+                image_width=100,
+                image_height=100,
+                padding=10,
+            )
+            clip_box = adapter._bbox_pixel_crop_box(
+                clip_bounds,
+                page_width=100,
+                page_height=100,
+                image_width=100,
+                image_height=100,
+                padding=0,
+            )
+            self.assertIsNotNone(raw_box)
+            self.assertIsNotNone(clip_box)
+            pixel_box = (
+                max(raw_box[0], clip_box[0]),
+                max(raw_box[1], clip_box[1]),
+                min(raw_box[2], clip_box[2]),
+                min(raw_box[3], clip_box[3]),
+            )
+            node = {
+                "self_ref": "#/tables/0",
+                "label": "table",
+                "data": _table_data([["cell"]]),
+                "prov": [{"page_no": 1, "bbox": node_bbox}],
+            }
+            visual_sha = "a" * 64
+            semantic_sha = "b" * 64
+            metric = {
+                "path": "tables/table_1.png",
+                "page_no": 1,
+                "bbox": node_bbox,
+                "crop_clamp_applied": True,
+                "crop_clip_bounds": clip_bounds,
+                "asset_sha256": adapter.file_sha256(asset_path),
+                "source_pdf_sha256": visual_sha,
+                "page_image_path": "pages/page_1.png",
+                "page_image_sha256": adapter.file_sha256(page_path),
+                "padding_px": 10,
+                "pixel_box": pixel_box,
+                "page_size": {"width": 100, "height": 100},
+                "page_image_size": {"width": 100, "height": 100},
+            }
+            body_identity = adapter._table_grid_body_identity(adapter.table_grid(node))
+            entry = adapter._structural_visual_provenance_entry(
+                kind="table",
+                index=1,
+                source_ref="#/tables/0",
+                node=node,
+                body_identity=body_identity,
+                metric=metric,
+                node_bbox=node_bbox,
+                part_index=None,
+                semantic_pdf_sha256=semantic_sha,
+                conversion_pdf_sha256=semantic_sha,
+                semantic_page_size={"width": 100, "height": 100},
+                crop_coordinate_page_size={"width": 100, "height": 100},
+            )
+            verified, reasons = adapter._structural_provenance_verify(
+                output_dir,
+                entry,
+                current_source_ref="#/tables/0",
+                current_page_no=1,
+                current_bbox=node_bbox,
+                current_body_identity=body_identity,
+                current_self_ref="#/tables/0",
+                current_part_index=None,
+                current_semantic_page_size={"width": 100, "height": 100},
+                expected_visual_pdf_sha256=visual_sha,
+                expected_semantic_pdf_sha256=semantic_sha,
+                expected_asset_path="tables/table_1.png",
+                expected_kind="table",
+            )
+            self.assertTrue(verified, reasons)
+            self.assertEqual(clip_bounds, entry["crop_clip_bounds"])
+
+            tampered = dict(entry)
+            tampered["crop_clip_bounds"] = dict(clip_bounds, r=25.0)
+            tampered_ok, tampered_reasons = adapter._structural_provenance_verify(
+                output_dir,
+                tampered,
+                current_source_ref="#/tables/0",
+                current_page_no=1,
+                current_bbox=node_bbox,
+                current_body_identity=body_identity,
+                current_self_ref="#/tables/0",
+                current_part_index=None,
+                current_semantic_page_size={"width": 100, "height": 100},
+                expected_visual_pdf_sha256=visual_sha,
+                expected_semantic_pdf_sha256=semantic_sha,
+                expected_asset_path="tables/table_1.png",
+                expected_kind="table",
+            )
+            self.assertFalse(tampered_ok)
+            self.assertIn("crop_clip_bounds_excludes_node", tampered_reasons)
+
+            out_of_page = dict(entry)
+            out_of_page["crop_clip_bounds"] = dict(clip_bounds, r=1000.0)
+            out_ok, out_reasons = adapter._structural_provenance_verify(
+                output_dir,
+                out_of_page,
+                current_source_ref="#/tables/0",
+                current_page_no=1,
+                current_bbox=node_bbox,
+                current_body_identity=body_identity,
+                current_self_ref="#/tables/0",
+                current_part_index=None,
+                current_semantic_page_size={"width": 100, "height": 100},
+                expected_visual_pdf_sha256=visual_sha,
+                expected_semantic_pdf_sha256=semantic_sha,
+                expected_asset_path="tables/table_1.png",
+                expected_kind="table",
+            )
+            self.assertFalse(out_ok)
+            self.assertIn("crop_clip_bounds_out_of_page_bounds", out_reasons)
+
+            excludes_node = dict(entry)
+            excludes_node["crop_clip_bounds"] = dict(clip_bounds, l=25.0)
+            excludes_ok, excludes_reasons = adapter._structural_provenance_verify(
+                output_dir,
+                excludes_node,
+                current_source_ref="#/tables/0",
+                current_page_no=1,
+                current_bbox=node_bbox,
+                current_body_identity=body_identity,
+                current_self_ref="#/tables/0",
+                current_part_index=None,
+                current_semantic_page_size={"width": 100, "height": 100},
+                expected_visual_pdf_sha256=visual_sha,
+                expected_semantic_pdf_sha256=semantic_sha,
+                expected_asset_path="tables/table_1.png",
+                expected_kind="table",
+            )
+            self.assertFalse(excludes_ok)
+            self.assertIn("crop_clip_bounds_excludes_node", excludes_reasons)
+
     def test_structural_crop_provenance_uses_declared_pdf_render_scale(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             output_dir = Path(tmpdir)
@@ -611,6 +794,7 @@ class SourceEvidenceIdentityTests(unittest.TestCase):
             }
 
             result = adapter.append_code_source_renderings(output_dir, document)
+            adapter.append_code_source_renderings(output_dir, document)
 
             self.assertEqual([source_ref], result["html_bound_source_refs"])
             self.assertEqual([source_ref], result["markdown_bound_source_refs"])
@@ -618,6 +802,12 @@ class SourceEvidenceIdentityTests(unittest.TestCase):
             self.assertEqual(
                 [source_ref], result["markdown_body_identity_verified_refs"]
             )
+            html_text = (output_dir / "document.html").read_text(encoding="utf-8")
+            markdown_text = (output_dir / "document.md").read_text(encoding="utf-8")
+            self.assertEqual(1, html_text.count("docling-code-source-disclosure"))
+            self.assertEqual(1, html_text.count("code_blocks/code_block_1.png"))
+            self.assertEqual(1, markdown_text.count("docling-code-source-disclosure"))
+            self.assertEqual(1, markdown_text.count("code_blocks/code_block_1.png"))
 
     def test_chunk_local_code_page_maps_to_global_source_crop(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1300,6 +1490,32 @@ class SourceEvidenceIdentityTests(unittest.TestCase):
 
         self.assertTrue(html_changed)
         self.assertTrue(markdown_changed)
+        # A second bind must replace the prior evidence wrapper rather than
+        # leave a naked/duplicate source image behind.
+        cleaned_html = adapter._strip_source_disclosure_blocks(
+            updated_html,
+            extra_class="docling-algorithm-source-disclosure",
+        )
+        cleaned_markdown = re.sub(
+            r'<details\b[^>]*class="[^"]*\bdocling-algorithm-source-disclosure\b[^"]*"[^>]*>.*?</details>',
+            "",
+            updated_markdown,
+            flags=re.I | re.S,
+        )
+        rebound_html, rebound_html_changed = adapter._bind_algorithm_source_evidence_html(
+            cleaned_html,
+            record,
+        )
+        rebound_markdown, rebound_markdown_changed = adapter._bind_algorithm_source_evidence_markdown(
+            cleaned_markdown,
+            record,
+        )
+        self.assertTrue(rebound_html_changed)
+        self.assertTrue(rebound_markdown_changed)
+        self.assertEqual(1, rebound_html.count("docling-algorithm-source-disclosure"))
+        self.assertEqual(1, rebound_html.count(record["source_image"]))
+        self.assertEqual(1, rebound_markdown.count("docling-algorithm-source-disclosure"))
+        self.assertEqual(1, rebound_markdown.count(record["source_image"]))
         html_range = adapter._html_section_range_for_source_ref(
             updated_html,
             css_class="algorithm",
@@ -2667,6 +2883,71 @@ class SourceEvidenceIdentityTests(unittest.TestCase):
             self.assertIsNone(stale_asset[0]["selected"])
             self.assertFalse(stale_asset[0]["source_provenance_verified"])
 
+    def test_formula_crop_provenance_validates_clamped_pixel_geometry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            (output_dir / "formulas").mkdir()
+            source_path = output_dir / "formulas" / "formula_1.png"
+            _visible_png(source_path, size=(100, 100))
+            formula = _formula_node("x_i=y_i+1")
+            diagnostic = _formula_crop_diagnostic(
+                output_dir,
+                1,
+                formula=formula,
+                source_pdf_sha256="a" * 64,
+            )
+            metric = diagnostic["source"]
+            bbox = metric["bbox"]
+            metric.update(
+                {
+                    "padding_px": 0,
+                    "render_scale": 1.0,
+                    "page_image_size": {"width": 100, "height": 100},
+                    "pixel_box": list(
+                        adapter._bbox_pixel_crop_box(
+                            bbox,
+                            page_width=100,
+                            page_height=100,
+                            image_width=100,
+                            image_height=100,
+                            padding=0,
+                            render_scale=1.0,
+                        )
+                    ),
+                    "crop_clamp_applied": True,
+                    "crop_clip_bounds": {
+                        "l": 0.0,
+                        "r": 100.0,
+                        "t": 100.0,
+                        "b": 0.0,
+                        "coord_origin": "BOTTOMLEFT",
+                    },
+                }
+            )
+            diagnostics = {1: diagnostic}
+            self.assertTrue(
+                adapter._formula_crop_provenance_is_verified(
+                    source_path,
+                    diagnostics,
+                    1,
+                    formula=formula,
+                    for_context=False,
+                    expected_visual_pdf_sha256="a" * 64,
+                )
+            )
+            tampered = dict(diagnostic)
+            tampered["source"] = dict(metric, crop_clip_bounds=dict(metric["crop_clip_bounds"], r=1000.0))
+            self.assertFalse(
+                adapter._formula_crop_provenance_is_verified(
+                    source_path,
+                    {1: tampered},
+                    1,
+                    formula=formula,
+                    for_context=False,
+                    expected_visual_pdf_sha256="a" * 64,
+                )
+            )
+
     def test_final_polish_does_not_apply_paper_specific_cjk_rewrite(self) -> None:
         source_text = "获取历史时刻知识状态的权重力；未知中文正文保持原样。"
         html_text = f"<p>{source_text}</p>"
@@ -2778,6 +3059,119 @@ class SourceEvidenceIdentityTests(unittest.TestCase):
             self.assertEqual([1], result["markdown_covered_indexes"])
             self.assertEqual([], result["html_identity_mismatch_indexes"])
             self.assertEqual([], result["markdown_identity_mismatch_indexes"])
+
+    def test_cjk_data_equation_and_tagged_math_bind_unique_source_crops(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            (output_dir / "formulas").mkdir()
+            formulas = [_formula_node("x=y"), _formula_node(r"z=\frac{a}{b}")]
+            for index, formula in enumerate(formulas, start=1):
+                _visible_png(output_dir / "formulas" / f"formula_{index}.png")
+                diagnostics = _formula_crop_diagnostic(
+                    output_dir,
+                    index,
+                    formula=formula,
+                )
+                if index == 1:
+                    diagnostics_1 = diagnostics
+                else:
+                    diagnostics_2 = diagnostics
+            (output_dir / "document.html").write_text(
+                "<html><body>"
+                '<div class="formula" data-equation="1">'
+                "<details><summary>LaTeX</summary><code>x=y</code></details>"
+                "</div>"
+                '<div class="formula" data-equation="2">'
+                r"<details><summary>LaTeX</summary><code>z=\frac{a}{b}</code></details>"
+                "</div>"
+                "</body></html>",
+                encoding="utf-8",
+            )
+            (output_dir / "document.md").write_text(
+                r"$$x=y\tag{1}$$" + "\n\n" +
+                r"$$z=\frac{a}{b}\tag{2}$$" + "\n",
+                encoding="utf-8",
+            )
+
+            result = adapter.append_formula_source_renderings(
+                output_dir,
+                formulas,
+                formula_crop_diagnostics=[diagnostics_1, diagnostics_2],
+                expected_indexes={1, 2},
+            )
+
+            self.assertEqual([1, 2], result["html_covered_indexes"])
+            self.assertEqual([1, 2], result["markdown_covered_indexes"])
+            self.assertEqual([], result["html_appendix_indexes"])
+            self.assertEqual([], result["markdown_appendix_indexes"])
+            html_text = (output_dir / "document.html").read_text(encoding="utf-8")
+            markdown_text = (output_dir / "document.md").read_text(encoding="utf-8")
+            self.assertEqual(2, html_text.count("docling-formula-source-disclosure"))
+            self.assertEqual(2, markdown_text.count("docling-formula-source-disclosure"))
+
+    def test_cjk_data_equation_and_tagged_math_reject_body_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            (output_dir / "formulas").mkdir()
+            formula = _formula_node("x=y")
+            _visible_png(output_dir / "formulas" / "formula_1.png")
+            (output_dir / "document.html").write_text(
+                '<html><body><div class="formula" data-equation="1">'
+                "<details><summary>LaTeX</summary><code>y=z</code></details>"
+                "</div></body></html>",
+                encoding="utf-8",
+            )
+            (output_dir / "document.md").write_text(
+                r"$$y=z\tag{1}$$" + "\n",
+                encoding="utf-8",
+            )
+            result = adapter.append_formula_source_renderings(
+                output_dir,
+                [formula],
+                formula_crop_diagnostics=[
+                    _formula_crop_diagnostic(output_dir, 1, formula=formula)
+                ],
+                expected_indexes={1},
+            )
+            self.assertEqual([], result["html_covered_indexes"])
+            self.assertEqual([], result["markdown_covered_indexes"])
+            self.assertEqual([1], result["html_identity_mismatch_indexes"])
+            self.assertEqual([1], result["markdown_identity_mismatch_indexes"])
+
+    def test_cjk_data_equation_and_tagged_math_reject_duplicate_occurrences(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            (output_dir / "formulas").mkdir()
+            formula = _formula_node("x=y")
+            _visible_png(output_dir / "formulas" / "formula_1.png")
+            (output_dir / "document.html").write_text(
+                '<html><body>'
+                '<div class="formula" data-equation="1">'
+                "<details><summary>LaTeX</summary><code>x=y</code></details>"
+                "</div>"
+                '<div class="formula" data-equation="1">'
+                "<details><summary>LaTeX</summary><code>x=y</code></details>"
+                "</div>"
+                "</body></html>",
+                encoding="utf-8",
+            )
+            (output_dir / "document.md").write_text(
+                r"$$x=y\tag{1}$$" + "\n\n" +
+                r"$$x=y\tag{1}$$" + "\n",
+                encoding="utf-8",
+            )
+            result = adapter.append_formula_source_renderings(
+                output_dir,
+                [formula],
+                formula_crop_diagnostics=[
+                    _formula_crop_diagnostic(output_dir, 1, formula=formula)
+                ],
+                expected_indexes={1},
+            )
+            self.assertEqual([], result["html_covered_indexes"])
+            self.assertEqual([], result["markdown_covered_indexes"])
+            self.assertEqual([1], result["duplicate_html_occurrence_indexes"])
+            self.assertEqual([1], result["duplicate_markdown_tag_indexes"])
 
     def test_formula_identity_preserves_all_rows_from_docling_payload(self) -> None:
         raw = (
@@ -2904,9 +3298,74 @@ class SourceEvidenceIdentityTests(unittest.TestCase):
             markdown_text = (output_dir / "document.md").read_text(encoding="utf-8")
 
             self.assertEqual(["inline-1"], result["unresolved_anchors"])
-            self.assertIn("<details open", html_text)
+            self.assertNotIn("<details open", html_text)
+            self.assertIn("docling-source-disclosure", html_text)
             self.assertIn("Machine transcription incomplete", html_text)
-            self.assertIn("<details open", markdown_text)
+            self.assertNotIn("<details open", markdown_text)
+
+    def test_inline_crop_clip_bounds_limit_pixel_crop_and_fail_closed(self) -> None:
+        from PIL import Image, ImageDraw
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            (output_dir / "pages").mkdir()
+            page_image = Image.new("RGB", (200, 200), "white")
+            ImageDraw.Draw(page_image).line((5, 5, 190, 190), fill="black", width=3)
+            page_image.save(output_dir / "pages" / "page_1.png")
+            marker = "<!-- source-inline-math-anchor:inline-clip -->"
+            (output_dir / "document.html").write_text(marker, encoding="utf-8")
+            (output_dir / "document.md").write_text(marker, encoding="utf-8")
+            document = {"pages": {"1": {"size": {"width": 100, "height": 100}}}}
+            bbox = {
+                "l": 20,
+                "r": 40,
+                "t": 40,
+                "b": 60,
+                "coord_origin": "TOPLEFT",
+            }
+            region = {
+                "anchor": "inline-clip",
+                "page_no": 1,
+                "bbox": bbox,
+                "crop_clip_bounds": {
+                    "l": 0,
+                    "r": 50,
+                    "t": 0,
+                    "b": 100,
+                    "coord_origin": "TOPLEFT",
+                },
+            }
+            result = adapter.append_inline_math_source_renderings(
+                output_dir, document, [region]
+            )
+            self.assertEqual(1, result["candidate_count"])
+            candidate = result["candidates"][0]
+            self.assertEqual(50.0, candidate["crop_clip_bounds"]["r"])
+            self.assertLessEqual(candidate["pixel_box"][2], 100)
+            with Image.open(output_dir / candidate["image"]) as crop:
+                self.assertGreater(crop.width, 0)
+            html_text = (output_dir / "document.html").read_text(encoding="utf-8")
+            self.assertNotIn('loading="lazy"', html_text)
+
+            for bad_clip, reason in (
+                (
+                    dict(region["crop_clip_bounds"], r=1000),
+                    "inline_crop_clip_out_of_page_bounds",
+                ),
+                (
+                    dict(region["crop_clip_bounds"], r=35),
+                    "inline_crop_clip_excludes_bbox",
+                ),
+            ):
+                bad_region = dict(region, crop_clip_bounds=bad_clip)
+                bad_result = adapter.append_inline_math_source_renderings(
+                    output_dir, document, [bad_region]
+                )
+                self.assertEqual(["inline-clip"], bad_result["missing_crop_anchors"])
+                self.assertIn(
+                    reason,
+                    [item["reason"] for item in bad_result["missing_crop_diagnostics"]],
+                )
 
     def test_chunk_local_unresolved_inline_uses_global_page_inventory(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

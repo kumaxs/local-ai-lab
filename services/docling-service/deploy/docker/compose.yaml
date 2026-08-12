@@ -10,7 +10,7 @@ services:
     build:
       context: ../../../..
       dockerfile: services/docling-service/deploy/docker/Dockerfile.backend
-    image: local-ai-lab/docling-backend:1.1.0
+    image: local-ai-lab/docling-backend:1.1.1
     init: true
     restart: unless-stopped
     environment:
@@ -32,7 +32,7 @@ services:
     build:
       context: ../../../..
       dockerfile: services/docling-service/deploy/docker/Dockerfile.formula
-    image: local-ai-lab/docling-formula:1.1.0
+    image: local-ai-lab/docling-formula:1.1.1
     init: true
     restart: unless-stopped
     environment:
@@ -55,7 +55,7 @@ services:
     build:
       context: ../../../..
       dockerfile: services/docling-service/deploy/docker/Dockerfile.api
-    image: local-ai-lab/docling-api:1.1.0
+    image: local-ai-lab/docling-api:1.1.1
     init: true
     restart: unless-stopped
     depends_on:

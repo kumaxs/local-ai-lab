@@ -7,7 +7,7 @@ services:
       options:
         max-size: "${DOCLING_DOCKER_LOG_MAX_SIZE:-10m}"
         max-file: "${DOCLING_DOCKER_LOG_MAX_FILE:-3}"
-    image: "${DOCLING_IMAGE_NAMESPACE:-ghcr.io/kumaxs}/local-ai-lab-docling-backend:${DOCLING_VERSION:-1.1.0}"
+    image: "${DOCLING_IMAGE_NAMESPACE:-ghcr.io/kumaxs}/local-ai-lab-docling-backend:${DOCLING_VERSION:-1.1.1}"
     pull_policy: always
     init: true
     restart: unless-stopped
@@ -27,7 +27,7 @@ services:
       options:
         max-size: "${DOCLING_DOCKER_LOG_MAX_SIZE:-10m}"
         max-file: "${DOCLING_DOCKER_LOG_MAX_FILE:-3}"
-    image: "${DOCLING_IMAGE_NAMESPACE:-ghcr.io/kumaxs}/local-ai-lab-docling-formula:${DOCLING_VERSION:-1.1.0}"
+    image: "${DOCLING_IMAGE_NAMESPACE:-ghcr.io/kumaxs}/local-ai-lab-docling-formula:${DOCLING_VERSION:-1.1.1}"
     pull_policy: always
     init: true
     restart: unless-stopped
@@ -48,7 +48,7 @@ services:
       options:
         max-size: "${DOCLING_DOCKER_LOG_MAX_SIZE:-10m}"
         max-file: "${DOCLING_DOCKER_LOG_MAX_FILE:-3}"
-    image: "${DOCLING_IMAGE_NAMESPACE:-ghcr.io/kumaxs}/local-ai-lab-docling-api:${DOCLING_VERSION:-1.1.0}"
+    image: "${DOCLING_IMAGE_NAMESPACE:-ghcr.io/kumaxs}/local-ai-lab-docling-api:${DOCLING_VERSION:-1.1.1}"
     pull_policy: always
     init: true
     restart: unless-stopped

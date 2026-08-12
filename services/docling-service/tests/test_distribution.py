@@ -54,7 +54,7 @@ class DistributionTests(unittest.TestCase):
         project_text = (SERVICE_ROOT / "pyproject.toml").read_text(encoding="utf-8")
         project_version = re.search(r'^version = "([^"]+)"$', project_text, re.MULTILINE)
         self.assertIsNotNone(project_version)
-        self.assertEqual("1.1.0", project_version.group(1))
+        self.assertEqual("1.1.1", project_version.group(1))
         self.assertEqual(project_version.group(1), RELEASE_VERSION)
         self.assertEqual(RELEASE_VERSION, FORMULA_SERVICE_VERSION)
         for path in (

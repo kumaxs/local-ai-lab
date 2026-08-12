@@ -1,9 +1,11 @@
-# docling-service 1.1.0
+# docling-service 1.1.1
 
 Formal quality-first PDF conversion service for Local AI Lab. It produces
 semantic HTML, Markdown, Docling JSON, quality metadata, review evidence, and
-machine-readable job status. The release path includes the semantic reconstruction
-that passed the combined old/new and blind random-paper human acceptance runs.
+machine-readable job status. The v1.1.1 path retains auditable source evidence
+and fail-closed gates, while its known blind-holdout generalization limits are
+recorded explicitly in the release notes rather than being presented as a
+production-readiness approval.
 
 Two deployments implement one API and one output contract:
 

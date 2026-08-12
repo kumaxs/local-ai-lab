@@ -8,6 +8,7 @@ import keyword
 import re
 import token
 import tokenize
+from collections import defaultdict
 from pathlib import Path
 import unicodedata
 import xml.etree.ElementTree as ET
@@ -2609,8 +2610,140 @@ class FlowItem:
     collection_index: int | None = None
     inline_math_repaired: bool = False
     inline_math_source_anchor: str | None = None
+    inline_math_source_scope: str | None = None
+    inline_math_source_reason: str | None = None
+    inline_math_source_unresolved: bool = False
     inline_math_unresolved_regions: list[dict[str, Any]] = field(default_factory=list)
+    inline_math_source_clip_bounds: dict[str, Any] | None = None
     source_readability_diagnostic: dict[str, Any] = field(default_factory=dict)
+    source_charspan: tuple[int, int] | None = None
+
+
+def _document_page_size(document: dict[str, Any], page_no: int) -> tuple[float, float]:
+    """Return page dimensions with safe fallbacks for missing metadata."""
+
+    page_record = (document.get("pages") or {}).get(str(page_no)) or {}
+    page_size = page_record.get("size") or {}
+    width = float(page_size.get("width") or 612.0)
+    height = float(page_size.get("height") or 792.0)
+    if not (width > 0.0 and height > 0.0):
+        width = 612.0 if not width > 0.0 else width
+        height = 792.0 if not height > 0.0 else height
+    return width, height
+
+
+def _safe_page_text_column(
+    document: dict[str, Any],
+    page_no: int,
+    bbox: dict[str, float],
+) -> str | None:
+    width, _height = _document_page_size(document, page_no)
+    left = float(bbox.get("l") or 0.0)
+    right = float(bbox.get("r") or 0.0)
+    midpoint = width / 2.0
+    if right <= midpoint:
+        return "left"
+    if left >= midpoint:
+        return "right"
+    return None
+
+
+def _page_clip_bounds(
+    document: dict[str, Any],
+    page_no: int,
+    bbox: dict[str, float],
+    *,
+    column: str | None,
+) -> dict[str, float]:
+    width, height = _document_page_size(document, page_no)
+    origin = str(bbox.get("coord_origin") or "BOTTOMLEFT").upper()
+    if origin == "TOPLEFT":
+        result = {
+            "l": 0.0,
+            "r": width,
+            "t": 0.0,
+            "b": height,
+            "coord_origin": "TOPLEFT",
+        }
+        if column == "left":
+            result["r"] = width / 2.0
+        elif column == "right":
+            result["l"] = width / 2.0
+    else:
+        result = {
+            "l": 0.0,
+            "r": width,
+            "t": height,
+            "b": 0.0,
+            "coord_origin": "BOTTOMLEFT",
+        }
+        if column == "left":
+            result["r"] = width / 2.0
+        elif column == "right":
+            result["l"] = width / 2.0
+    return result
+
+
+def _union_flowitem_bbox(items: Iterable[FlowItem]) -> dict[str, float] | None:
+    return _inline_geometry_bbox_union([item.bbox for item in items if item.bbox])
+
+
+def _flowitem_charspan_rank_key(item: FlowItem) -> tuple[int, int, float]:
+    span = item.source_charspan
+    if span is None:
+        return (2**31, 2**31, item.rank)
+    return (span[0], span[1], item.rank)
+
+
+def _merged_source_text_from_group(
+    ordered_group: list[FlowItem],
+) -> tuple[str, bool]:
+    node_text = (
+        str((ordered_group[0].node or {}).get("text") or "")
+        if ordered_group
+        else ""
+    )
+    ordered_by_span = sorted(
+        ordered_group,
+        key=_flowitem_charspan_rank_key,
+    )
+    has_charspan = any(item.source_charspan is not None for item in ordered_by_span)
+    if node_text and has_charspan:
+        pieces: list[str] = []
+        previous_end: int | None = None
+        for grouped_item in ordered_by_span:
+            if grouped_item.source_charspan is not None:
+                start, end = grouped_item.source_charspan
+                if previous_end is not None and start > previous_end:
+                    pieces.append(node_text[previous_end:start])
+                transformed = str(grouped_item.source_text or "")
+                raw_span = node_text[start:end]
+                if not raw_span:
+                    pieces.append(transformed)
+                elif transformed == raw_span:
+                    pieces.append(raw_span)
+                else:
+                    leading = len(raw_span) - len(raw_span.lstrip())
+                    trailing = len(raw_span) - len(raw_span.rstrip())
+                    pieces.append(
+                        f"{raw_span[:leading]}{transformed}{raw_span[len(raw_span)-trailing:]}"
+                    )
+                previous_end = end
+                continue
+
+            part = str(grouped_item.source_text or "")
+            if not part:
+                continue
+            if pieces and not pieces[-1].endswith(" ") and not part.startswith(" "):
+                pieces.append(" ")
+            pieces.append(part)
+        return "".join(pieces), True
+    plain_parts = [
+        str(grouped_item.source_text or "")
+        for grouped_item in ordered_by_span
+        if grouped_item.source_text is not None
+    ]
+    return " ".join(part for part in plain_parts if part.strip()), False
 
 
 def _walk_body_refs(document: dict[str, Any]) -> Iterable[tuple[float, str]]:
@@ -2934,6 +3067,52 @@ def _short_text_inside_picture(
     return False
 
 
+_INLINE_SUBFIGURE_LABEL_RE = re.compile(
+    r"^\s*\(\s*(?P<label>[A-Za-z0-9]+)\s*\)\s+(?P<caption>.+)$",
+    re.UNICODE,
+)
+
+
+def _is_inline_subfigure_label(text: str) -> bool:
+    match = _INLINE_SUBFIGURE_LABEL_RE.match(str(text))
+    if not match:
+        return False
+    caption = str(match.group("caption") or "").strip()
+    words = [value for value in re.split(r"\s+", caption) if value]
+    if len(words) < 2:
+        return False
+    first_word = words[0].strip()
+    if not first_word:
+        return False
+    if re.match(r"^[ivx]+\s*$", first_word, flags=re.IGNORECASE):
+        return False
+    if len(caption) < 6:
+        return False
+    stop_words = {
+        "a",
+        "an",
+        "the",
+        "of",
+        "in",
+        "on",
+        "to",
+        "for",
+        "with",
+        "is",
+        "are",
+        "this",
+        "that",
+        "as",
+        "if",
+        "when",
+        "by",
+    }
+    normalized_first = first_word.lower()
+    if normalized_first in stop_words:
+        return False
+    return True
+
+
 _ALGORITHM_SECTION_HEADER_HINT_RE = re.compile(
     r"(?i)^(?:"
     r"(?:Input|Output|Parameters?|Require|Ensure|Procedure|Initialization|Initialize|"
@@ -3205,6 +3384,111 @@ def _algorithm_group_blocks(
     return blocks, consumed
 
 
+def _group_text_node_paragraph_items(
+    document: dict[str, Any],
+    items: list[FlowItem],
+) -> list[FlowItem]:
+    if not items:
+        return []
+    text_kinds = {"text", "list_item", "footnote"}
+    text_groups: dict[tuple[int, int, str | None], list[FlowItem]] = {}
+    for item in items:
+        if item.kind not in text_kinds or not item.page_no or not item.node:
+            continue
+        column = _safe_page_text_column(document, item.page_no, item.bbox)
+        text_groups.setdefault((item.page_no, id(item.node), column), []).append(item)
+
+    grouped_item_ids: set[int] = set()
+    result: list[FlowItem] = []
+    for item in items:
+        if item.kind not in text_kinds:
+            result.append(item)
+            continue
+        if id(item) in grouped_item_ids:
+            continue
+        column = _safe_page_text_column(document, item.page_no, item.bbox)
+        group = text_groups.get((item.page_no, id(item.node), column), [])
+        if not group:
+            result.append(item)
+            grouped_item_ids.add(id(item))
+            continue
+        ordered_group = sorted(group, key=lambda entry: entry.rank)
+        merged_bbox = _union_flowitem_bbox(ordered_group)
+        if not merged_bbox:
+            continue
+        evidence_member = next(
+            (
+                grouped_item
+                for grouped_item in ordered_group
+                if grouped_item.inline_math_source_scope
+            ),
+            ordered_group[0],
+        )
+        has_inline_math = any(
+            grouped_item.inline_math_source_scope for grouped_item in ordered_group
+        )
+        if not has_inline_math:
+            for grouped_item in ordered_group:
+                result.append(grouped_item)
+            for grouped_item in ordered_group:
+                grouped_item_ids.add(id(grouped_item))
+            continue
+        merged_source_text = _merged_source_text_from_group(ordered_group)[0]
+        merged_regions = [
+            region
+            for grouped_item in ordered_group
+            for region in grouped_item.inline_math_unresolved_regions
+            if isinstance(region, dict)
+        ]
+        if merged_regions:
+            merged_region = dict(merged_regions[0])
+            merged_region["source_text"] = merged_source_text
+            merged_regions = [merged_region]
+        merged_clip_bounds = _page_clip_bounds(
+            document,
+            item.page_no,
+            merged_bbox,
+            column=column,
+        )
+        representative = ordered_group[0]
+        merged = FlowItem(
+            kind=ordered_group[0].kind,
+            node=ordered_group[0].node,
+            rank=ordered_group[0].rank,
+            page_no=ordered_group[0].page_no,
+            bbox=merged_bbox,
+            prov=ordered_group[0].prov,
+            source_text=merged_source_text,
+            collection_index=ordered_group[0].collection_index,
+            inline_math_repaired=any(
+                grouped_item.inline_math_repaired for grouped_item in ordered_group
+            ),
+            inline_math_source_anchor=evidence_member.inline_math_source_anchor,
+            inline_math_source_scope=evidence_member.inline_math_source_scope,
+            inline_math_source_reason=evidence_member.inline_math_source_reason,
+            inline_math_source_unresolved=any(
+                grouped_item.inline_math_source_unresolved
+                for grouped_item in ordered_group
+            ),
+            inline_math_unresolved_regions=merged_regions,
+            inline_math_source_clip_bounds=merged_clip_bounds,
+            source_readability_diagnostic=(
+                ordered_group[0].source_readability_diagnostic
+                if ordered_group[0].source_readability_diagnostic
+                else representative.source_readability_diagnostic
+            ),
+        )
+        if not evidence_member.inline_math_source_scope:
+            merged.inline_math_source_anchor = None
+            merged.inline_math_source_reason = None
+            merged.inline_math_source_unresolved = False
+            merged.inline_math_unresolved_regions = []
+        result.append(merged)
+        for grouped_item in ordered_group:
+            grouped_item_ids.add(id(grouped_item))
+    return result
+
+
 def _collect_items(
     document: dict[str, Any],
     source: SourceReader,
@@ -3330,6 +3614,7 @@ def _collect_items(
                 for value in (node.get("prov") or [])
                 if isinstance(value, dict) and _bbox(value)
             ]
+            suppress_secondary_provenances_for_first_span = False
             for offset, prov in enumerate(provs):
                 box = _bbox(prov)
                 assert box is not None
@@ -3337,6 +3622,7 @@ def _collect_items(
                 charspan = prov.get("charspan")
                 node_text = str(node.get("text") or "")
                 source_text = ""
+                source_charspan: tuple[int, int] | None = None
                 if (
                     isinstance(charspan, list)
                     and len(charspan) == 2
@@ -3344,6 +3630,7 @@ def _collect_items(
                 ):
                     start, end = charspan
                     source_text = node_text[start:end].strip()
+                    source_charspan = (start, end)
                 source_text, readability_diagnostic = _choose_readable_source_text(
                     source_text,
                     physical_source,
@@ -3409,11 +3696,38 @@ def _collect_items(
                         inline_math_evidence = bool(inline_math_detector(prov))
                     except Exception:
                         inline_math_evidence = False
+                near_picture = _short_text_inside_picture(
+                    source_text,
+                    page_no,
+                    box,
+                    pictures,
+                )
+                if near_picture:
+                    if offset == 0 and _is_inline_subfigure_label(source_text):
+                        suppress_secondary_provenances_for_first_span = True
+                        break
+                    if not suppress_secondary_provenances_for_first_span:
+                        continue
                 inline_math_source_anchor: str | None = None
-                # Repaired-only inline math is machine-readable and does not
-                # need a paragraph-sized crop.  Keep an anchor only for a
-                # genuinely unresolved cluster (including an unknown CID).
+                inline_math_source_scope: str | None = None
+                inline_math_source_reason: str | None = None
+                inline_math_source_unresolved = False
                 if inline_math_unresolved_regions:
+                    inline_math_source_scope = "inline_math_unresolved"
+                    inline_math_source_unresolved = True
+                    inline_math_source_reason = str(
+                        inline_math_unresolved_regions[0].get("reason")
+                        or "inline_math_unresolved"
+                    )
+                elif inline_math_evidence:
+                    inline_math_source_scope = "inline_math_evidence"
+                    inline_math_source_reason = "inline_math_evidence"
+                    inline_math_unresolved_regions = [{"reason": "inline_math_evidence"}]
+                elif inline_math_repaired:
+                    inline_math_source_scope = "inline_math_repaired"
+                    inline_math_source_reason = "inline_math_repaired"
+                    inline_math_unresolved_regions = [{"reason": "inline_math_repaired"}]
+                if inline_math_source_scope:
                     inline_math_source_anchor = _inline_math_anchor_id(
                         page_no=page_no,
                         collection=collection,
@@ -3422,7 +3736,7 @@ def _collect_items(
                         part_index=inline_math_anchor_part,
                         bbox=box,
                     )
-                if _short_text_inside_picture(source_text, page_no, box, pictures):
+                if near_picture:
                     continue
                 if (box["r"] - box["l"]) < 18 or (box["t"] - box["b"]) < 3:
                     continue
@@ -3437,13 +3751,19 @@ def _collect_items(
                         bbox=box,
                         prov=prov,
                         source_text=source_text,
+                        source_charspan=source_charspan,
                         collection_index=index,
                         inline_math_repaired=inline_math_repaired,
                         inline_math_source_anchor=inline_math_source_anchor,
+                        inline_math_source_scope=inline_math_source_scope,
+                        inline_math_source_reason=inline_math_source_reason,
+                        inline_math_source_unresolved=inline_math_source_unresolved,
                         inline_math_unresolved_regions=inline_math_unresolved_regions,
                         source_readability_diagnostic=readability_diagnostic,
                     )
                 )
+            if suppress_secondary_provenances_for_first_span:
+                continue
             continue
         prov = _first_prov(node)
         box = _bbox(prov)
@@ -3606,7 +3926,9 @@ def _collect_items(
                     ),
                 )
             )
-    return items
+    return _group_text_node_paragraph_items(document, items)
+
+
 
 
 def _sort_items(
@@ -5070,6 +5392,7 @@ def _collect_cjk_inline_math_source_regions(
                 continue
             chars = source._pypdfium_characters(page_no, prov.get("bbox"))
             source_evidence = _cjk_inline_math_source_evidence(node_text, chars)
+            tight_bbox = _cjk_inline_math_tight_bbox(bbox, chars)
             strong_hint = _cjk_inline_math_hint_is_strong(node_text)
             # A weak mixed-language hint without source glyph evidence is
             # ordinary prose (e.g. a venue title) and is not a candidate.
@@ -5084,7 +5407,7 @@ def _collect_cjk_inline_math_source_regions(
                 index=collection_index,
                 offset=0,
                 part_index=part_index,
-                bbox=_cjk_inline_math_tight_bbox(bbox, chars),
+                bbox=tight_bbox,
             )
             marker = f"<!-- source-inline-math-anchor:{anchor} -->"
             html_node_text = html.escape(node_text, quote=False)
@@ -5120,12 +5443,14 @@ def _collect_cjk_inline_math_source_regions(
                 {
                     "anchor": anchor,
                     "page_no": page_no,
-                    "bbox": _cjk_inline_math_tight_bbox(bbox, chars),
+                    "bbox": dict(bbox),
+                    "trigger_bbox": tight_bbox,
                     "source_text": _paragraph_text(source.text(prov)),
                     "collection_index": collection_index,
                     "rank": float(collection_index),
                     "part_index": part_index,
                     "binding_mode": binding_mode,
+                    "scope": "paragraph",
                 }
             )
     for node_text, marker in html_markers:
@@ -5191,20 +5516,120 @@ def _collect_cjk_inline_math_source_regions(
     }
 
 
+def _markdown_code_ranges(markdown_text: str) -> list[tuple[int, int]]:
+    """Return protected ranges for fenced/inline Markdown code segments."""
+    code_ranges: list[tuple[int, int]] = []
+    fenced_start_re = re.compile(r"^[ \t]{0,3}([`~]{3,})(.*)$", re.MULTILINE)
+    in_fenced_block = False
+    fence_char = ""
+    fence_len = 0
+    block_start = 0
+    cursor = 0
+    for line in markdown_text.splitlines(keepends=True):
+        if in_fenced_block:
+            close_match = re.match(
+                rf"^[ \t]{{0,3}}{re.escape(fence_char)}{{{fence_len},}}[ \t]*$",
+                line.rstrip("\r\n"),
+            )
+            if close_match:
+                close_end = cursor + len(line)
+                if line.endswith("\r\n"):
+                    close_end -= 2
+                elif line.endswith("\n") or line.endswith("\r"):
+                    close_end -= 1
+                code_ranges.append((block_start, close_end))
+                in_fenced_block = False
+                fence_char = ""
+                fence_len = 0
+        else:
+            open_match = fenced_start_re.match(line)
+            if open_match:
+                opener = open_match.group(1)
+                if opener:
+                    in_fenced_block = True
+                    fence_char = opener[0]
+                    fence_len = len(opener)
+                    block_start = cursor
+        cursor += len(line)
+    if in_fenced_block:
+        code_ranges.append((block_start, len(markdown_text)))
+
+    inline_pattern = re.compile(r"(?<!\\)(`+)(.+?)(?<!`)\1(?!`)", re.S)
+    for match in inline_pattern.finditer(markdown_text):
+        start, end = match.span()
+        in_code = False
+        for code_start, code_end in code_ranges:
+            if code_end <= start:
+                continue
+            if code_start >= end:
+                break
+            in_code = True
+            break
+        if not in_code:
+            code_ranges.append((start, end))
+
+    code_ranges.sort(key=lambda value: value[0])
+    merged: list[tuple[int, int]] = []
+    for start, end in code_ranges:
+        if not merged or start > merged[-1][1]:
+            merged.append((start, end))
+        else:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+    return merged
+
+
+def _markdown_cleanup_matches_outside_code(
+    markdown_text: str,
+    pattern: re.Pattern[str],
+    replacement: str,
+    code_ranges: list[tuple[int, int]],
+) -> tuple[str, int]:
+    candidates: list[tuple[int, int]] = []
+    for match in pattern.finditer(markdown_text):
+        start, end = match.span()
+        in_code = False
+        for code_start, code_end in code_ranges:
+            if code_end <= start:
+                continue
+            if code_start >= end:
+                break
+            in_code = True
+            break
+        if not in_code:
+            candidates.append((start, end))
+
+    for start, end in reversed(candidates):
+        markdown_text = (
+            markdown_text[:start] + replacement + markdown_text[end:]
+        )
+    return markdown_text, len(candidates)
+
+
 def _remove_review_evidence_from_primary_surfaces(
     output_dir: Path,
 ) -> dict[str, int]:
     counts = {
         "html_appendices_removed": 0,
         "html_formula_source_links_removed": 0,
+        "html_source_disclosure_removed": 0,
         "markdown_appendices_removed": 0,
+        "markdown_source_disclosure_removed": 0,
     }
     html_path = output_dir / "document.html"
     if html_path.exists():
         html_text = html_path.read_text(encoding="utf-8")
+        html_text, removed = re.subn(
+            r'(?is)<details\b[^>]*class=["\'][^"\']*\bdocling-source-disclosure\b[^"\']*["\'][^>]*>.*?</details>',
+            "",
+            html_text,
+        )
+        counts["html_source_disclosure_removed"] += removed
         for css_class in (
             "docling-table-source-evidence-appendix",
             "docling-formula-source-evidence-appendix",
+            "docling-code-source-evidence-appendix",
+            "docling-algorithm-source-evidence-appendix",
+            "docling-inline-math-source-appendix",
         ):
             html_text, removed = re.subn(
                 rf'(?s)<section class="{css_class}">.*?</section>',
@@ -5223,12 +5648,31 @@ def _remove_review_evidence_from_primary_surfaces(
     markdown_path = output_dir / "document.md"
     if markdown_path.exists():
         markdown_text = markdown_path.read_text(encoding="utf-8")
-        markdown_text, removed = re.subn(
-            r"(?s)\n## Original table renderings\s*\n.*$",
-            "\n",
+        markdown_text, removed = _markdown_cleanup_matches_outside_code(
             markdown_text,
+            re.compile(
+                r'(?is)<details\b[^>]*class=["\'][^"\']*\bdocling-source-disclosure\b[^"\']*["\'][^>]*>.*?</details>',
+            ),
+            "",
+            _markdown_code_ranges(markdown_text),
         )
-        counts["markdown_appendices_removed"] += removed
+        counts["markdown_source_disclosure_removed"] += removed
+        for heading in (
+            "Original table renderings",
+            "Original formula renderings",
+            "Original code renderings",
+            "Original algorithm renderings",
+            "Inline math source review appendix",
+        ):
+            markdown_text, removed = _markdown_cleanup_matches_outside_code(
+                markdown_text,
+                re.compile(
+                    rf"(?s)\n## {re.escape(heading)}\s*\n.*?(?=\n## |\Z)",
+                ),
+                "",
+                _markdown_code_ranges(markdown_text),
+            )
+            counts["markdown_appendices_removed"] += removed
         markdown_path.write_text(markdown_text.rstrip() + "\n", encoding="utf-8")
     return counts
 
@@ -5945,68 +6389,55 @@ def _inline_math_source_region_records(
     *,
     part_index: int,
 ) -> list[dict[str, Any]]:
-    """Return source crops only for unresolved inline spans.
+    """Return source crops for inline-math-supporting paragraphs.
 
-    Repaired-only paragraphs remain a clean machine surface and should not
-    acquire a broad, paragraph-sized review image.  When an unresolved
-    diagnostic has no tight geometry, fall back to the item's provenance box
-    explicitly and mark that degradation for the adapter/UI.
+    For inline math evidence and repaired text, include one paragraph-scope
+    review crop when any indicator is active.  For unresolved diagnostics this
+    is still a paragraph scope, with the unresolved flag preserved.
     """
 
-    if not item.inline_math_source_anchor or not item.inline_math_unresolved_regions:
+    if not item.inline_math_source_anchor:
         return []
-    records: list[dict[str, Any]] = []
-    for cluster_index, cluster in enumerate(
-        item.inline_math_unresolved_regions,
-        start=1,
-    ):
-        if not isinstance(cluster, dict):
-            continue
-        cluster_anchor = (
-            f"{item.inline_math_source_anchor}-cluster{cluster_index}"
-        )
-        cluster["anchor"] = cluster_anchor
-        cluster_bbox = cluster.get("bbox")
-        try:
-            bbox_is_usable = (
-                isinstance(cluster_bbox, dict)
-                and abs(
-                    float(cluster_bbox.get("r") or 0.0)
-                    - float(cluster_bbox.get("l") or 0.0)
-                ) > 0.0
-                and abs(
-                    float(cluster_bbox.get("t") or 0.0)
-                    - float(cluster_bbox.get("b") or 0.0)
-                ) > 0.0
-            )
-        except (TypeError, ValueError):
-            bbox_is_usable = False
-        fallback_whole_paragraph = not bbox_is_usable
-        if fallback_whole_paragraph:
-            cluster_bbox = dict(item.bbox)
-        records.append(
-            {
-                "anchor": cluster_anchor,
-                "page_no": item.page_no,
-                "bbox": cluster_bbox,
-                "repair_bbox": cluster.get("repair_bbox"),
-                "source_text": str(cluster.get("source_text") or item.source_text),
-                "collection_index": item.collection_index,
-                "rank": item.rank,
-                "part_index": part_index,
-                "unresolved": True,
-                "reason": str(
-                    cluster.get("reason")
-                    or (
-                        "inline_math_unresolved_fallback_whole_paragraph"
-                        if fallback_whole_paragraph
-                        else "inline_math_geometry_unresolved"
-                    )
-                ),
-                "fallback_whole_paragraph": fallback_whole_paragraph,
-            }
-        )
-    return records
+    source_regions: list[dict[str, Any]] = [
+        region for region in item.inline_math_unresolved_regions if isinstance(region, dict)
+    ]
+    region = source_regions[0] if source_regions else {}
+    unresolved_source_text = region.get("source_text")
+    region_reason = region.get("reason")
+    return [
+        {
+            "anchor": item.inline_math_source_anchor,
+            "page_no": item.page_no,
+            "bbox": dict(item.bbox),
+            "repair_bbox": region.get("repair_bbox"),
+            "source_text": item.source_text,
+            "crop_clip_bounds": (
+                dict(item.inline_math_source_clip_bounds)
+                if isinstance(item.inline_math_source_clip_bounds, dict)
+                else None
+            ),
+            "unresolved_source_text": (
+                str(unresolved_source_text)
+                if unresolved_source_text is not None
+                else None
+            ),
+            "collection_index": item.collection_index,
+            "rank": item.rank,
+            "part_index": part_index,
+            "unresolved": bool(item.inline_math_source_unresolved),
+            "scope": "paragraph",
+            "reason": str(
+                region_reason
+                or item.inline_math_source_reason
+                or (
+                    "inline_math_unresolved"
+                    if item.inline_math_source_unresolved
+                    else "inline_math_source_crop"
+                )
+            ),
+            "fallback_whole_paragraph": False,
+        }
+    ]
 
 
 def _structure_block_source_ref(item: FlowItem) -> str:
@@ -6158,6 +6589,14 @@ def _render(
                 for region in item.inline_math_unresolved_regions
                 if region.get("anchor")
             )
+            if (
+                item.inline_math_source_anchor
+                and item.inline_math_source_scope
+                and item.inline_math_source_anchor not in unresolved_anchor_comments
+            ):
+                unresolved_anchor_comments += _inline_math_anchor_comment(
+                    item.inline_math_source_anchor
+                )
             anchor_comments = unresolved_anchor_comments
             if reference_number is not None:
                 text = re.sub(r"^\[\d+\]\s*", "", text)
@@ -6800,33 +7239,11 @@ def rebuild_semantic_surfaces(
                 "cjk_machine_formula_normalization_unavailable:"
                 f"{type(exc).__name__}:{exc}"
             )
-            cjk_semantic_fallback = {
-                "reason": fallback_reason,
-                "review_evidence_cleanup": evidence_cleanup,
-                "inline_source": cjk_inline_source,
-            }
-            # A legacy CJK HTML surface may omit display formulas or contain
-            # number-only placeholders.  Prefer the same source-backed
-            # semantic reconstruction used for every other document; it
-            # produces stable table/formula refs and explicit dropped-formula
-            # records.  Preserve the legacy surface only when that stronger
-            # reconstruction itself is unavailable.
-            inline_math_source_regions = []
-            source_readability_diagnostics = []
-            dropped_formula_artifacts = []
-            metadata.pop("cjk_inline_math_source_binding_diagnostics", None)
-            try:
-                source = SourceReader(input_file)
-            except Exception as source_exc:
-                return preserve_cjk_surfaces(
-                    reason=(
-                        fallback_reason
-                        + ":semantic_fallback_source_unavailable:"
-                        + f"{type(source_exc).__name__}:{source_exc}"
-                    ),
-                    evidence_cleanup=evidence_cleanup,
-                    cjk_inline_source=cjk_inline_source,
-                )
+            return preserve_cjk_surfaces(
+                reason=f"{fallback_reason}:cjk_semantic_fallback_disabled",
+                evidence_cleanup=evidence_cleanup,
+                cjk_inline_source=cjk_inline_source,
+            )
         else:
             inline_math_source_regions = list(cjk_inline_source.get("regions") or [])
             inline_math_source_missing = list(cjk_inline_source.get("missing") or [])

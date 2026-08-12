@@ -38,7 +38,7 @@ from .persistence import SQLiteStore
 from .webhook import WebhookDispatcher, validate_callback_url
 
 
-RELEASE_VERSION = "1.1.0"
+RELEASE_VERSION = "1.1.1"
 TERMINAL_STATES = {"succeeded", "failed", "interrupted"}
 
 

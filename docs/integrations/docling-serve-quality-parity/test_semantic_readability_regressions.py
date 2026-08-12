@@ -695,7 +695,7 @@ class SemanticReadabilityRegressionTests(unittest.TestCase):
         )
         self.assertEqual("unmerged_formula_script", dropped[0]["reason"])
 
-    def test_repaired_only_inline_math_has_no_source_region(self):
+    def test_repaired_inline_math_has_paragraph_scope_source_region(self):
         item = semantic_reflow.FlowItem(
             kind="text",
             node={"label": "text"},
@@ -706,6 +706,8 @@ class SemanticReadabilityRegressionTests(unittest.TestCase):
             source_text="The repaired notation is readable.",
             inline_math_repaired=True,
             inline_math_source_anchor="inline-math-text-1",
+            inline_math_source_scope="inline_math_repaired",
+            inline_math_source_reason="inline_math_repaired",
         )
 
         self.assertEqual(
@@ -713,10 +715,440 @@ class SemanticReadabilityRegressionTests(unittest.TestCase):
                 item,
                 part_index=0,
             ),
-            [],
+            [
+                {
+                    "anchor": "inline-math-text-1",
+                    "page_no": 1,
+                    "bbox": {"l": 0.0, "r": 100.0, "t": 100.0, "b": 80.0},
+                    "repair_bbox": None,
+                    "source_text": "The repaired notation is readable.",
+                    "crop_clip_bounds": None,
+                    "collection_index": None,
+                    "rank": 1.0,
+                    "part_index": 0,
+                    "unresolved": False,
+                    "scope": "paragraph",
+                    "reason": "inline_math_repaired",
+                    "unresolved_source_text": None,
+                    "fallback_whole_paragraph": False,
+                }
+            ],
         )
 
-    def test_unresolved_inline_math_uses_tight_bbox_or_explicit_fallback(self):
+    def test_same_text_node_same_column_multiple_provs_union_into_single_paragraph_region(self):
+        class _InlineEvidenceSource:
+            _pypdf = object()
+            _math_aware_diagnostics: dict[
+                tuple[int, float, float, float, float], dict[str, Any]
+            ] = {}
+
+            def __init__(self, text: str):
+                self.text_content = text
+
+            def text(self, prov, *, layout=False, padding=0.0):
+                charspan = prov.get("charspan")
+                if (
+                    isinstance(charspan, list)
+                    and len(charspan) == 2
+                    and all(isinstance(value, int) for value in charspan)
+                ):
+                    start, end = charspan
+                    return self.text_content[start:end]
+                return ""
+
+            @staticmethod
+            def _math_diagnostic_key(_prov):
+                return None
+
+            @staticmethod
+            def math_aware_text(_prov, value):
+                return value
+
+            @staticmethod
+            def inline_math_evidence(_prov):
+                return True
+
+        left_first = "LeftA"
+        left_second = "LeftB"
+        right = "RightC"
+        text = left_first + left_second + right
+        source = _InlineEvidenceSource(text)
+        first_span = {
+            "l": 50.0,
+            "r": 160.0,
+            "t": 700.0,
+            "b": 680.0,
+            "coord_origin": "BOTTOMLEFT",
+        }
+        second_span = {
+            "l": 80.0,
+            "r": 170.0,
+            "t": 700.0,
+            "b": 680.0,
+            "coord_origin": "BOTTOMLEFT",
+        }
+        third_span = {
+            "l": 360.0,
+            "r": 430.0,
+            "t": 700.0,
+            "b": 680.0,
+            "coord_origin": "BOTTOMLEFT",
+        }
+        document = {
+            "pages": {"1": {"size": {"width": 600.0, "height": 800.0}}},
+            "texts": [
+                {
+                    "label": "text",
+                    "text": text,
+                    "prov": [
+                        {
+                            "page_no": 1,
+                            "charspan": [0, len(left_first)],
+                            "bbox": first_span,
+                        },
+                        {
+                            "page_no": 1,
+                            "charspan": [
+                                len(left_first),
+                                len(left_first) + len(left_second),
+                            ],
+                            "bbox": second_span,
+                        },
+                        {
+                            "page_no": 1,
+                            "charspan": [
+                                len(left_first) + len(left_second),
+                                len(text),
+                            ],
+                            "bbox": third_span,
+                        },
+                    ],
+                }
+            ],
+            "body": {"children": [{"$ref": "#/texts/0"}]},
+        }
+
+        items = semantic_reflow._collect_items(document, source)
+        self.assertEqual(len(items), 2)
+        self.assertEqual(items[0].kind, "text")
+        self.assertEqual(items[1].kind, "text")
+        regions = [
+            region
+            for item in items
+            for region in semantic_reflow._inline_math_source_region_records(
+                item,
+                part_index=0,
+            )
+            if region.get("anchor")
+        ]
+        self.assertEqual(len(regions), 2)
+
+        left_item = next(
+            item
+            for item in items
+            if float(item.bbox["r"]) <= 300.0 and float(item.bbox["l"]) < 300.0
+        )
+        right_item = next(
+            item
+            for item in items
+            if float(item.bbox["l"]) >= 300.0
+        )
+        left_region = next(region for region in regions if region["scope"] == "paragraph" and float(region["bbox"]["r"]) <= 300.0)
+        right_region = next(region for region in regions if region["scope"] == "paragraph" and float(region["bbox"]["l"]) >= 300.0)
+
+        self.assertEqual(left_item.source_text, left_first + left_second)
+        self.assertEqual(
+            left_item.bbox,
+            {"l": 50.0, "r": 170.0, "t": 700.0, "b": 680.0, "coord_origin": "BOTTOMLEFT"},
+        )
+        self.assertEqual(
+            left_region["crop_clip_bounds"],
+            {"l": 0.0, "r": 300.0, "t": 800.0, "b": 0.0, "coord_origin": "BOTTOMLEFT"},
+        )
+        self.assertEqual(left_region["source_text"], left_first + left_second)
+        self.assertEqual(
+            right_item.bbox,
+            {"l": 360.0, "r": 430.0, "t": 700.0, "b": 680.0, "coord_origin": "BOTTOMLEFT"},
+        )
+        self.assertEqual(right_item.source_text, right)
+        self.assertEqual(
+            right_region["crop_clip_bounds"],
+            {"l": 300.0, "r": 600.0, "t": 800.0, "b": 0.0, "coord_origin": "BOTTOMLEFT"},
+        )
+        self.assertEqual(right_region["source_text"], right)
+        self.assertEqual(len({region["anchor"] for region in regions}), 2)
+
+    def test_same_text_node_same_column_multiple_provs_without_inline_math_stay_unmerged(self):
+        class _PlainSource:
+            _pypdf = None
+            _math_aware_diagnostics: dict[
+                tuple[int, float, float, float, float], dict[str, Any]
+            ] = {}
+
+            def __init__(self, text: str):
+                self.text_content = text
+
+            def text(self, prov, *, layout=False, padding=0.0):
+                charspan = prov.get("charspan")
+                if (
+                    isinstance(charspan, list)
+                    and len(charspan) == 2
+                    and all(isinstance(value, int) for value in charspan)
+                ):
+                    start, end = charspan
+                    return self.text_content[start:end]
+                return ""
+
+            @staticmethod
+            def _math_diagnostic_key(_prov):
+                return None
+
+            @staticmethod
+            def math_aware_text(_prov, value):
+                return value
+
+            @staticmethod
+            def inline_math_evidence(_prov):
+                return False
+
+        text = "alpha beta"
+        source = _PlainSource(text)
+        document = {
+            "pages": {"1": {"size": {"width": 600.0, "height": 800.0}}},
+            "texts": [
+                {
+                    "label": "text",
+                    "text": text,
+                    "prov": [
+                        {
+                            "page_no": 1,
+                            "charspan": [0, 5],
+                            "bbox": {
+                                "l": 50.0,
+                                "r": 160.0,
+                                "t": 700.0,
+                                "b": 680.0,
+                                "coord_origin": "BOTTOMLEFT",
+                            },
+                        },
+                        {
+                            "page_no": 1,
+                            "charspan": [6, 10],
+                            "bbox": {
+                                "l": 190.0,
+                                "r": 250.0,
+                                "t": 700.0,
+                                "b": 680.0,
+                                "coord_origin": "BOTTOMLEFT",
+                            },
+                        },
+                    ],
+                }
+            ],
+            "body": {"children": [{"$ref": "#/texts/0"}]},
+        }
+
+        items = semantic_reflow._collect_items(document, source)
+        self.assertEqual(len(items), 2)
+        self.assertEqual(items[0].source_text, "alpha")
+        self.assertEqual(items[1].source_text, "beta")
+
+    def test_inline_math_source_merges_preserve_charspan_spacing(self):
+        class _InlineEvidenceSource:
+            _pypdf = object()
+            _math_aware_diagnostics: dict[
+                tuple[int, float, float, float, float], dict[str, Any]
+            ] = {}
+
+            def __init__(self, text: str):
+                self.text_content = text
+
+            def text(self, prov, *, layout=False, padding=0.0):
+                charspan = prov.get("charspan")
+                if (
+                    isinstance(charspan, list)
+                    and len(charspan) == 2
+                    and all(isinstance(value, int) for value in charspan)
+                ):
+                    start, end = charspan
+                    return self.text_content[start:end]
+                return ""
+
+            @staticmethod
+            def _math_diagnostic_key(_prov):
+                return None
+
+            @staticmethod
+            def math_aware_text(_prov, value):
+                return value
+
+            @staticmethod
+            def inline_math_evidence(_prov):
+                return True
+
+        left = "Alpha "
+        right = "Beta"
+        text = left + right
+        source = _InlineEvidenceSource(text)
+        document = {
+            "pages": {"1": {"size": {"width": 600.0, "height": 800.0}}},
+            "texts": [
+                {
+                    "label": "text",
+                    "text": text,
+                    "prov": [
+                        {
+                            "page_no": 1,
+                            "charspan": [0, len(left)],
+                            "bbox": {
+                                "l": 50.0,
+                                "r": 150.0,
+                                "t": 700.0,
+                                "b": 680.0,
+                                "coord_origin": "BOTTOMLEFT",
+                            },
+                        },
+                        {
+                            "page_no": 1,
+                            "charspan": [len(left), len(text)],
+                            "bbox": {
+                                "l": 155.0,
+                                "r": 220.0,
+                                "t": 700.0,
+                                "b": 680.0,
+                                "coord_origin": "BOTTOMLEFT",
+                            },
+                        },
+                    ],
+                }
+            ],
+            "body": {"children": [{"$ref": "#/texts/0"}]},
+        }
+
+        items = semantic_reflow._collect_items(document, source)
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0].source_text, "Alpha Beta")
+
+    def test_inline_math_source_preserves_transformed_span_text_when_merging(self):
+        class _InlineEvidenceSource:
+            _pypdf = object()
+            _math_aware_diagnostics: dict[
+                tuple[int, float, float, float, float], dict[str, Any]
+            ] = {}
+
+            def __init__(self, text: str):
+                self.text_content = text
+
+            def text(self, prov, *, layout=False, padding=0.0):
+                charspan = prov.get("charspan")
+                if (
+                    isinstance(charspan, list)
+                    and len(charspan) == 2
+                    and all(isinstance(value, int) for value in charspan)
+                ):
+                    start, end = charspan
+                    return self.text_content[start:end]
+                return ""
+
+            @staticmethod
+            def _math_diagnostic_key(_prov):
+                return None
+
+            @staticmethod
+            def math_aware_text(_prov, value):
+                if value == "x y":
+                    return "x_y"
+                return value
+
+            @staticmethod
+            def inline_math_evidence(_prov):
+                return True
+
+        text = "Plain x y tail"
+        source = _InlineEvidenceSource(text)
+        document = {
+            "pages": {"1": {"size": {"width": 600.0, "height": 800.0}}},
+            "texts": [
+                {
+                    "label": "text",
+                    "text": text,
+                    "prov": [
+                        {
+                            "page_no": 1,
+                            "charspan": [0, 6],
+                            "bbox": {
+                                "l": 40.0,
+                                "r": 130.0,
+                                "t": 700.0,
+                                "b": 680.0,
+                                "coord_origin": "BOTTOMLEFT",
+                            },
+                        },
+                        {
+                            "page_no": 1,
+                            "charspan": [6, 9],
+                            "bbox": {
+                                "l": 140.0,
+                                "r": 180.0,
+                                "t": 700.0,
+                                "b": 680.0,
+                                "coord_origin": "BOTTOMLEFT",
+                            },
+                        },
+                        {
+                            "page_no": 1,
+                            "charspan": [9, 14],
+                            "bbox": {
+                                "l": 185.0,
+                                "r": 255.0,
+                                "t": 700.0,
+                                "b": 680.0,
+                                "coord_origin": "BOTTOMLEFT",
+                            },
+                        },
+                    ],
+                }
+            ],
+            "body": {"children": [{"$ref": "#/texts/0"}]},
+        }
+
+        items = semantic_reflow._collect_items(document, source)
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0].source_text, "Plain x_y tail")
+        regions = semantic_reflow._inline_math_source_region_records(items[0], part_index=0)
+        self.assertEqual(regions[0]["source_text"], "Plain x_y tail")
+
+    def test_inline_math_evidence_generates_paragraph_scope_source_region(self):
+        item = semantic_reflow.FlowItem(
+            kind="text",
+            node={"label": "text"},
+            rank=1.0,
+            page_no=1,
+            bbox={"l": 10.0, "r": 120.0, "t": 210.0, "b": 160.0},
+            prov={"page_no": 1, "bbox": {}},
+            source_text="Formula-style proof fragment.",
+            inline_math_source_anchor="inline-math-text-evidence",
+            inline_math_source_scope="inline_math_evidence",
+            inline_math_source_reason="inline_math_evidence",
+            inline_math_unresolved_regions=[{"reason": "inline_math_evidence"}],
+        )
+        regions = semantic_reflow._inline_math_source_region_records(
+            item,
+            part_index=1,
+        )
+        self.assertEqual(len(regions), 1)
+        self.assertEqual(regions[0]["anchor"], "inline-math-text-evidence")
+        self.assertEqual(regions[0]["scope"], "paragraph")
+        self.assertFalse(regions[0]["unresolved"])
+        self.assertEqual(regions[0]["bbox"], item.bbox)
+        self.assertEqual(regions[0]["part_index"], 1)
+        self.assertIsNone(regions[0]["crop_clip_bounds"])
+        self.assertEqual(
+            regions[0]["source_text"],
+            item.source_text,
+        )
+
+    def test_inline_math_repaired_evidence_or_unresolved_uses_paragraph_region(self):
         tight = semantic_reflow.FlowItem(
             kind="text",
             node={"label": "text"},
@@ -726,11 +1158,11 @@ class SemanticReadabilityRegressionTests(unittest.TestCase):
             prov={"page_no": 1, "bbox": {}},
             source_text="A span needs review.",
             inline_math_source_anchor="inline-math-text-2",
+            inline_math_source_scope="inline_math_unresolved",
+            inline_math_source_reason="inline_math_unresolved_geometry",
+            inline_math_source_unresolved=True,
             inline_math_unresolved_regions=[
-                {
-                    "bbox": {"l": 40.0, "r": 55.0, "t": 98.0, "b": 84.0},
-                    "reason": "fraction_span",
-                }
+                {"reason": "fraction_span", "source_text": "A span needs review."}
             ],
         )
         fallback = semantic_reflow.FlowItem(
@@ -742,6 +1174,9 @@ class SemanticReadabilityRegressionTests(unittest.TestCase):
             prov={"page_no": 1, "bbox": {}},
             source_text="A span needs review.",
             inline_math_source_anchor="inline-math-text-3",
+            inline_math_source_scope="inline_math_unresolved",
+            inline_math_source_reason="inline_math_unresolved",
+            inline_math_source_unresolved=True,
             inline_math_unresolved_regions=[{"reason": "missing_geometry"}],
         )
 
@@ -754,10 +1189,20 @@ class SemanticReadabilityRegressionTests(unittest.TestCase):
             part_index=0,
         )
 
-        self.assertEqual(tight_records[0]["bbox"]["l"], 40.0)
-        self.assertFalse(tight_records[0]["fallback_whole_paragraph"])
+        self.assertEqual(tight_records[0]["bbox"], tight.bbox)
         self.assertEqual(fallback_records[0]["bbox"], fallback.bbox)
-        self.assertTrue(fallback_records[0]["fallback_whole_paragraph"])
+        self.assertEqual(tight_records[0]["source_text"], tight.source_text)
+        self.assertEqual(
+            tight_records[0]["unresolved_source_text"],
+            tight.inline_math_unresolved_regions[0]["source_text"],
+        )
+        self.assertIsNone(fallback_records[0]["unresolved_source_text"])
+        self.assertTrue(tight_records[0]["unresolved"])
+        self.assertTrue(fallback_records[0]["unresolved"])
+        self.assertEqual(tight_records[0]["scope"], "paragraph")
+        self.assertEqual(fallback_records[0]["scope"], "paragraph")
+        self.assertIsNone(tight_records[0]["crop_clip_bounds"])
+        self.assertIsNone(fallback_records[0]["crop_clip_bounds"])
 
     def test_legacy_formula_labels_keep_decimal_equation_number_separate_from_raw_ordinal(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1361,6 +1806,9 @@ class SemanticReadabilityRegressionTests(unittest.TestCase):
                 self.assertEqual(result["counts"]["text"], 1)
                 self.assertEqual(result["counts"]["tables"], table_count)
                 self.assertEqual(result["counts"]["formulas"], formula_count)
+                self.assertEqual(result["mode"], "preserve_existing_cjk_body_source_visual_authoritative")
+                self.assertFalse(result["machine_surface_ok"])
+                self.assertFalse(result["applied"])
                 self.assertTrue(
                     any(
                         warning.startswith(
@@ -1381,7 +1829,7 @@ class SemanticReadabilityRegressionTests(unittest.TestCase):
             semantic_reflow.SourceReader = original_source_reader
             semantic_reflow._normalize_legacy_formula_surfaces = original_normalizer
 
-    def test_cjk_legacy_formula_failure_uses_source_backed_semantic_reflow(self):
+    def test_cjk_legacy_formula_failure_preserves_existing_surfaces(self):
         class CompleteCJKSource:
             _pypdf = None
             _math_aware_diagnostics: dict[Any, Any] = {}
@@ -1446,14 +1894,29 @@ class SemanticReadabilityRegressionTests(unittest.TestCase):
         semantic_reflow.SourceReader = CompleteCJKSource
         semantic_reflow._normalize_legacy_formula_surfaces = failing_normalization
         try:
+            stable_formula_marker = "FORMULA_LOCK_MARKER_CJK_V1"
+            formula_body = r"l_q=O(l_q)\\times W_l (4)"
+            expected_html_body = (
+                "<html><head></head><body><p>中文正文。</p>"
+                f'<div class="docling-formula-second-pass" data-formula-index="4">'
+                f"<pre class=\"docling-formula-tex\">{formula_body}</pre>"
+                "</div>"
+                f"<!-- {stable_formula_marker}:4 -->"
+                "</body></html>"
+            )
+            expected_markdown_body = (
+                "中文正文。\n\n"
+                f"$$\n{formula_body}\n$$\n"
+                f"<!-- {stable_formula_marker}:4 -->\n"
+            )
             with tempfile.TemporaryDirectory() as directory:
                 output_dir = Path(directory)
                 (output_dir / "document.html").write_text(
-                    "<html><head></head><body><p>中文正文。</p></body></html>",
+                    expected_html_body,
                     encoding="utf-8",
                 )
                 (output_dir / "document.md").write_text(
-                    "中文正文。\n",
+                    expected_markdown_body,
                     encoding="utf-8",
                 )
                 bbox = {
@@ -1518,31 +1981,442 @@ class SemanticReadabilityRegressionTests(unittest.TestCase):
                     encoding="utf-8"
                 )
 
-            self.assertTrue(result["ok"])
-            self.assertEqual(result["mode"], "cjk_semantic_source_reflow_fallback")
-            self.assertTrue(result["machine_surface_ok"])
-            self.assertEqual(result["counts"]["formulas"], 1)
-            self.assertEqual(
-                result["dropped_formula_artifacts"][0]["raw_formula_index"],
-                2,
-            )
-            self.assertEqual(
-                result["dropped_formula_artifacts"][0]["reason"],
-                "standalone_equation_number",
-            )
-            self.assertIn("source-formula-anchor:1", html_text)
-            self.assertNotIn("source-formula-anchor:2", html_text)
-            self.assertIn("source-formula-anchor:1", markdown_text)
-            self.assertEqual(status["success_class"], "degraded_success")
-            self.assertTrue(
-                any(
-                    warning.startswith("cjk_semantic_source_reflow_fallback:")
-                    for warning in status["warnings"]
+                self.assertTrue(result["ok"])
+                self.assertFalse(result["machine_surface_ok"])
+                self.assertEqual(
+                    result["mode"],
+                    "preserve_existing_cjk_body_source_visual_authoritative",
                 )
-            )
+                self.assertFalse(result["applied"])
+                self.assertEqual(result["counts"]["formulas"], 2)
+                self.assertEqual(result["dropped_formula_artifacts"], [])
+                self.assertEqual(html_text, expected_html_body)
+                self.assertEqual(markdown_text, expected_markdown_body)
+                self.assertNotIn("source-formula-anchor", html_text)
+                self.assertNotIn("source-formula-anchor", markdown_text)
+                self.assertIn(stable_formula_marker, html_text)
+                self.assertIn(stable_formula_marker, markdown_text)
+                self.assertEqual(result["inline_math_source_region_count"], 0)
+                self.assertTrue(
+                    any(
+                        warning.startswith(
+                            "cjk_machine_formula_normalization_unavailable:"
+                        )
+                        for warning in status["warnings"]
+                    )
+                )
+                self.assertTrue(
+                    any(
+                        "cjk_semantic_fallback_disabled" in warning
+                        for warning in status["warnings"]
+                    )
+                )
+                self.assertEqual(status["success_class"], "degraded_success")
+
+                # Prove a second rebuild does not overwrite the stable patched
+                # legacy formula body.
+                status = {
+                    "ok": True,
+                    "success_class": "success",
+                    "warnings": [],
+                    "quality_signals": {},
+                }
+                metadata = {}
+                second_result = semantic_reflow.rebuild_semantic_surfaces(
+                    output_dir,
+                    document,
+                    output_dir / "paper.pdf",
+                    metadata,
+                    status,
+                )
+                second_html = (output_dir / "document.html").read_text(
+                    encoding="utf-8"
+                )
+                second_markdown = (output_dir / "document.md").read_text(
+                    encoding="utf-8"
+                )
+
+                self.assertEqual(html_text, second_html)
+                self.assertEqual(markdown_text, second_markdown)
+                self.assertEqual(second_result["mode"], result["mode"])
+                self.assertFalse(second_result["machine_surface_ok"])
+                self.assertFalse(second_result["applied"])
+                self.assertEqual(second_result["counts"]["formulas"], 2)
+                self.assertEqual(second_result["dropped_formula_artifacts"], [])
+                self.assertEqual(second_result["inline_math_source_region_count"], 0)
+                self.assertEqual(second_html, expected_html_body)
+                self.assertEqual(second_markdown, expected_markdown_body)
+                self.assertTrue(
+                    any(
+                        warning.startswith(
+                            "cjk_machine_formula_normalization_unavailable:"
+                        )
+                        for warning in status["warnings"]
+                    )
+                )
+                self.assertTrue(
+                    any(
+                        "cjk_semantic_fallback_disabled" in warning
+                        for warning in status["warnings"]
+                    )
+                )
         finally:
             semantic_reflow.SourceReader = original_source_reader
             semantic_reflow._normalize_legacy_formula_surfaces = original_normalizer
+
+    def test_cjk_inline_math_source_region_uses_paragraph_bbox_and_trigger_bbox(self):
+        class CJKSource:
+            _pypdf = None
+            _math_aware_diagnostics: dict[Any, Any] = {}
+
+            @staticmethod
+            def _pypdfium_characters(_page_no: int, _bbox: dict[str, Any]) -> list[dict[str, Any]]:
+                return [
+                    {
+                        "text": "∑",
+                        "bbox": {
+                            "l": 120.0,
+                            "r": 131.0,
+                            "t": 746.0,
+                            "b": 736.0,
+                            "coord_origin": "BOTTOMLEFT",
+                        },
+                    }
+                ]
+
+            @staticmethod
+            def text(_prov: dict[str, Any], *, layout: bool = False, padding: float = 0.0) -> str:
+                del layout, padding
+                return "本文含有 ER′x 的示例。"
+
+        with tempfile.TemporaryDirectory() as directory:
+            output_dir = Path(directory)
+            node_text = "本文含有 ER′x 的示例。"
+            (output_dir / "document.html").write_text(
+                f"<html><body>{node_text}</body></html>",
+                encoding="utf-8",
+            )
+            (output_dir / "document.md").write_text(f"{node_text}\n", encoding="utf-8")
+
+            paragraph_bbox = {
+                "l": 44.0,
+                "r": 352.0,
+                "t": 752.0,
+                "b": 699.0,
+                "coord_origin": "BOTTOMLEFT",
+            }
+            document = {
+                "texts": [
+                    {
+                        "label": "text",
+                        "text": node_text,
+                        "prov": [
+                            {
+                                "page_no": 1,
+                                "bbox": paragraph_bbox,
+                            }
+                        ],
+                    }
+                ]
+            }
+
+            regions = semantic_reflow._collect_cjk_inline_math_source_regions(
+                output_dir,
+                document,
+                CJKSource(),
+            )["regions"]
+
+            self.assertEqual(len(regions), 1)
+            self.assertEqual(regions[0]["scope"], "paragraph")
+            self.assertEqual(regions[0]["bbox"], paragraph_bbox)
+            self.assertEqual(
+                regions[0]["trigger_bbox"],
+                {
+                    "l": 120.0,
+                    "r": 131.0,
+                    "t": 746.0,
+                    "b": 736.0,
+                    "coord_origin": "BOTTOMLEFT",
+                },
+            )
+            self.assertEqual(regions[0]["binding_mode"], "inline")
+            self.assertEqual(
+                regions[0]["source_text"],
+                "本文含有 ER′x 的示例。",
+            )
+            self.assertGreaterEqual(regions[0]["trigger_bbox"]["l"], regions[0]["bbox"]["l"])
+            self.assertLessEqual(regions[0]["trigger_bbox"]["r"], regions[0]["bbox"]["r"])
+            self.assertGreaterEqual(regions[0]["trigger_bbox"]["t"], regions[0]["bbox"]["b"])
+            self.assertLessEqual(regions[0]["trigger_bbox"]["b"], regions[0]["bbox"]["t"])
+
+    def test_remove_review_evidence_from_primary_surfaces_strips_source_disclosures_only(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output_dir = Path(directory)
+            html_text = (
+                "<html><body>"
+                '<details class="docling-source-disclosure docling-table-source-disclosure">'
+                '<summary>Compare table crop</summary>'
+                "<p>table source</p>"
+                "</details>"
+                '<details class="docling-source-disclosure docling-formula-source-disclosure">'
+                '<summary>Compare formula crop</summary>'
+                "<p>formula source</p>"
+                "</details>"
+                "<details class='docling-source-disclosure docling-code-source-disclosure'>"
+                "<summary>Compare code crop</summary>"
+                "<p>code source</p>"
+                "</details>"
+                "<details class='docling-source-disclosure docling-algorithm-source-disclosure'>"
+                "<summary>Compare algorithm crop</summary>"
+                "<p>algorithm source</p>"
+                "</details>"
+                "<details class='docling-source-disclosure docling-inline-math-source'>"
+                "<summary>Compare inline notation with the original PDF</summary>"
+                "<p>inline math source</p>"
+                "</details>"
+                '<details><summary>LaTeX</summary><span>x=1</span></details>'
+                '<section class="docling-table-source-evidence-appendix">table appendix</section>'
+                '<section class="docling-formula-source-evidence-appendix">formula appendix</section>'
+                '<section class="docling-code-source-evidence-appendix">code appendix</section>'
+                '<section class="docling-algorithm-source-evidence-appendix">algorithm appendix</section>'
+                '<section class="docling-inline-math-source-appendix">inline appendix</section>'
+                '<div class="docling-formula-source">old formula link</div>'
+                "</body></html>"
+            )
+            md_text = (
+                "Body.\n"
+                '<details><summary>LaTeX</summary><span>x=1</span></details>\n'
+                "```text\n"
+                '<details class="docling-source-disclosure docling-code-source-disclosure">'
+                "<summary>In code fence should keep</summary>"
+                "<p>fenced code source</p>"
+                "</details>\n"
+                "```\n"
+                "~~~markdown\n"
+                "<details class='docling-source-disclosure docling-formula-source-disclosure'>"
+                "<summary>In alt fence should keep</summary>"
+                "<p>tilde fenced code source</p>"
+                "</details>\n"
+                "~~~\n"
+                '<details class="docling-source-disclosure docling-inline-math-source"><summary>Compare inline notation with the original PDF</summary>'
+                "\n![inline](inline.png)\n"
+                "</details>\n"
+                "## Original table renderings\n"
+                "table appendix\n"
+                "## Original formula renderings\n"
+                "formula appendix\n"
+                "## Original code renderings\n"
+                "code appendix\n"
+                "## Original algorithm renderings\n"
+                "algorithm appendix\n"
+                "## Inline math source review appendix\n"
+                "inline appendix\n"
+            )
+            (output_dir / "document.html").write_text(html_text, encoding="utf-8")
+            (output_dir / "document.md").write_text(md_text, encoding="utf-8")
+
+            first = semantic_reflow._remove_review_evidence_from_primary_surfaces(output_dir)
+            first_html = (output_dir / "document.html").read_text(encoding="utf-8")
+            first_md = (output_dir / "document.md").read_text(encoding="utf-8")
+
+            self.assertEqual(first["html_source_disclosure_removed"], 5)
+            self.assertEqual(first["markdown_source_disclosure_removed"], 1)
+            self.assertIn('<details><summary>LaTeX</summary><span>x=1</span></details>', first_html)
+            self.assertIn('<details><summary>LaTeX</summary><span>x=1</span></details>', first_md)
+            self.assertNotIn("docling-source-disclosure", first_html)
+            self.assertNotIn("Compare table crop", first_html)
+            self.assertNotIn("Compare formula crop", first_html)
+            self.assertNotIn("Compare code crop", first_html)
+            self.assertNotIn("Compare algorithm crop", first_html)
+            self.assertNotIn("Compare inline notation with the original PDF", first_html)
+            self.assertNotIn("Compare table crop", first_md)
+            self.assertNotIn("Compare formula crop", first_md)
+            self.assertNotIn("Compare code crop", first_md)
+            self.assertNotIn("Compare algorithm crop", first_md)
+            self.assertNotIn("Compare inline notation with the original PDF", first_md)
+            self.assertNotIn(
+                '<details class="docling-source-disclosure docling-inline-math-source">',
+                first_md,
+            )
+            self.assertNotIn(
+                "<details class='docling-source-disclosure docling-inline-math-source'>",
+                first_md,
+            )
+            self.assertNotIn("table source", first_html)
+            self.assertNotIn("formula source", first_html)
+            self.assertNotIn("code source", first_html)
+            self.assertNotIn("algorithm source", first_html)
+            self.assertNotIn("inline math source", first_html)
+            self.assertNotIn("![inline](inline.png)", first_md)
+            self.assertIn(
+                '<details class="docling-source-disclosure docling-code-source-disclosure"><summary>In code fence should keep</summary><p>fenced code source</p></details>',
+                first_md,
+            )
+            self.assertIn(
+                "<details class='docling-source-disclosure docling-formula-source-disclosure'><summary>In alt fence should keep</summary><p>tilde fenced code source</p></details>",
+                first_md,
+            )
+            self.assertNotIn("docling-inline-math-source-appendix", first_html)
+            self.assertNotIn("## Original table renderings", first_md)
+            self.assertNotIn("## Inline math source review appendix", first_md)
+
+            second = semantic_reflow._remove_review_evidence_from_primary_surfaces(output_dir)
+            second_html = (output_dir / "document.html").read_text(encoding="utf-8")
+            second_md = (output_dir / "document.md").read_text(encoding="utf-8")
+
+            self.assertEqual(first_html, second_html)
+            self.assertEqual(first_md, second_md)
+            self.assertEqual(second["html_source_disclosure_removed"], 0)
+            self.assertEqual(second["markdown_source_disclosure_removed"], 0)
+            self.assertEqual(
+                len(re.findall(r"<details><summary>LaTeX</summary><span>x=1</span></details>", first_html)),
+                1,
+            )
+            self.assertEqual(
+                len(re.findall(r"<details><summary>LaTeX</summary><span>x=1</span></details>", first_md)),
+                1,
+            )
+
+    def test_remove_review_evidence_from_primary_surfaces_offsets(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output_dir = Path(directory)
+            md_text = (
+                "Body.\n"
+                '<details class="docling-source-disclosure docling-inline-math-source"><summary>Compare inline notation with the original PDF</summary>'
+                "\n![inline](inline.png)\n"
+                "</details>\n"
+                "```text\n"
+                "## Original table renderings\n"
+                '<details class="docling-source-disclosure docling-code-source-disclosure">'
+                "<summary>In backtick fence should stay</summary>"
+                "<p>fenced code source</p>"
+                "</details>\n"
+                "```\n"
+                "~~~markdown\n"
+                "## Inline math source review appendix\n"
+                "<details class='docling-source-disclosure docling-formula-source-disclosure'>"
+                "<summary>In tilde fence should stay</summary>"
+                "<p>tilde fenced code source</p>"
+                "</details>\n"
+                "~~~\n"
+                "## Original table renderings\n"
+                "outside appendix\n"
+                "## Original formula renderings\n"
+                "outside formula appendix\n"
+            )
+            (output_dir / "document.md").write_text(md_text, encoding="utf-8")
+
+            first = semantic_reflow._remove_review_evidence_from_primary_surfaces(output_dir)
+            first_md = (output_dir / "document.md").read_text(encoding="utf-8")
+
+            self.assertEqual(first["markdown_source_disclosure_removed"], 1)
+            self.assertEqual(first["markdown_appendices_removed"], 2)
+            self.assertNotIn("![inline](inline.png)", first_md)
+            self.assertEqual(first_md.count("## Original table renderings"), 1)
+            self.assertEqual(first_md.count("## Inline math source review appendix"), 1)
+            self.assertEqual(
+                first_md.count('<details class="docling-source-disclosure docling-code-source-disclosure">'),
+                1,
+            )
+            self.assertEqual(
+                first_md.count("<details class='docling-source-disclosure docling-formula-source-disclosure'>"),
+                1,
+            )
+            self.assertIn("```text", first_md)
+            self.assertIn("~~~markdown", first_md)
+
+    def test_subfigure_inline_label_provenance_drops_node_with_secondary_spans(self):
+        class EmptyPhysicalSource:
+            _pypdf = None
+            _math_aware_diagnostics: dict[Any, Any] = {}
+
+            @staticmethod
+            def text(_prov: dict[str, Any], *, layout=False, padding: float = 0.0) -> str:
+                del layout, padding
+                return ""
+
+        document = {
+            "texts": [
+                {
+                    "label": "text",
+                    "text": "(b) Entity table Right-handed Left-handed",
+                    "prov": [
+                        {
+                            "page_no": 1,
+                            "charspan": [0, 16],
+                            "bbox": {
+                                "l": 10.0,
+                                "r": 12.0,
+                                "t": 110.0,
+                                "b": 90.0,
+                                "coord_origin": "BOTTOMLEFT",
+                            },
+                        },
+                        {
+                            "page_no": 1,
+                            "charspan": [17, 41],
+                            "bbox": {
+                                "l": 150.0,
+                                "r": 250.0,
+                                "t": 110.0,
+                                "b": 90.0,
+                                "coord_origin": "BOTTOMLEFT",
+                            },
+                        },
+                    ],
+                },
+                {
+                    "label": "text",
+                    "text": "(c) Matrix table Right-handed Left-handed",
+                    "prov": [
+                        {
+                            "page_no": 1,
+                            "charspan": [0, 16],
+                            "bbox": {
+                                "l": 9.0,
+                                "r": 14.0,
+                                "t": 132.0,
+                                "b": 110.0,
+                                "coord_origin": "BOTTOMLEFT",
+                            },
+                        },
+                        {
+                            "page_no": 1,
+                            "charspan": [17, 41],
+                            "bbox": {
+                                "l": 145.0,
+                                "r": 255.0,
+                                "t": 132.0,
+                                "b": 110.0,
+                                "coord_origin": "BOTTOMLEFT",
+                            },
+                        },
+                    ],
+                },
+            ],
+            "pictures": [
+                {
+                    "label": "picture",
+                    "prov": [
+                        {
+                            "page_no": 1,
+                            "bbox": {
+                                "l": 0.0,
+                                "r": 80.0,
+                                "t": 120.0,
+                                "b": 80.0,
+                                "coord_origin": "BOTTOMLEFT",
+                            },
+                        }
+                    ],
+                }
+            ],
+            "body": {"children": [{"$ref": "#/texts/0"}, {"$ref": "#/texts/1"}]},
+        }
+
+        items = semantic_reflow._collect_items(document, EmptyPhysicalSource())
+
+        self.assertEqual(len(items), 0)
 
 
 if __name__ == "__main__":

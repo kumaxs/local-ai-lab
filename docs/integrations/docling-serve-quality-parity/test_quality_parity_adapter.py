@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import html
 import hashlib
+import copy
 import json
 import multiprocessing
 import os
@@ -94,6 +95,176 @@ def _write_formula_text_test_png(path: Path, size: tuple[int, int] = (120, 20)) 
     image = Image.new("RGB", size, "white")
     ImageDraw.Draw(image).text((4, 3), "x = y + z", fill="black")
     image.save(path)
+
+
+def _ruled_grid_nested_fixture() -> tuple[bytes, dict[str, object]]:
+    """Build a 5x5 ruled fixture with To colspan=3 and From rowspan=3."""
+
+    from PIL import Image, ImageDraw
+
+    size = 500
+    lines = [10, 110, 210, 310, 410, 490]
+    image = Image.new("RGB", (size, size), "white")
+    draw = ImageDraw.Draw(image)
+    for coordinate in lines:
+        draw.line((lines[0], coordinate, lines[-1], coordinate), fill="black", width=3)
+    for coordinate in lines:
+        draw.line((coordinate, lines[0], coordinate, lines[-1]), fill="black", width=3)
+    # To spans columns 2..4 on the first row; From spans rows 2..4 in column 0.
+    for coordinate in (310, 410):
+        draw.line((coordinate, lines[0] + 2, coordinate, lines[1] - 2), fill="white", width=7)
+    for coordinate in (310, 410):
+        draw.line((lines[0] + 2, coordinate, lines[1] - 2, coordinate), fill="white", width=7)
+
+    text_positions = [
+        ("To", (350, 60)),
+        ("Solid", (260, 160)),
+        ("Liquid", (360, 160)),
+        ("Gas", (450, 160)),
+        ("From", (60, 350)),
+        ("Solid", (160, 260)),
+        ("Solid trans", (260, 260)),
+        ("Melting", (360, 260)),
+        ("Sublimation", (450, 260)),
+        ("Liquid", (160, 360)),
+        ("Freezing", (260, 360)),
+        ("Boiling", (450, 360)),
+        ("Gas", (160, 460)),
+        ("Deposition", (260, 460)),
+        ("Condensation", (360, 460)),
+    ]
+    for text, (center_x, center_y) in text_positions:
+        draw.text((center_x - 18, center_y - 7), text, fill="black")
+    # The retry OCR intentionally omits these two visible literal dashes.
+    draw.line((352, 360, 368, 360), fill="black", width=2)
+    draw.line((442, 450, 458, 450), fill="black", width=2)
+    buffer = io.BytesIO()
+    image.save(buffer, format="PNG")
+
+    text_nodes = []
+    for text, (center_x, center_y) in text_positions:
+        text_nodes.append(
+            {
+                "label": "text",
+                "text": text,
+                "prov": [{
+                    "page_no": 1,
+                    "bbox": {
+                        "l": center_x - 18,
+                        "r": center_x + 18,
+                        "t": center_y - 7,
+                        "b": center_y + 7,
+                        "coord_origin": "TOPLEFT",
+                    },
+                }],
+            }
+        )
+    response = {
+        "status": "success",
+        "document": {
+            "json_content": {
+                "pages": {"1": {"size": {"width": size, "height": size}}},
+                "texts": text_nodes,
+            }
+        },
+    }
+    return buffer.getvalue(), response
+
+
+def _ruled_grid_sparse_chart_fixture() -> tuple[bytes, dict[str, object]]:
+    from PIL import Image, ImageDraw
+
+    size = 300
+    # Reviewer repro: only three horizontal/vertical rules make a 2x2 chart
+    # with four labels.  Every cell is covered, so coverage alone must not
+    # make this visual box look like a recovered semantic table.
+    lines = [10, 150, 290]
+    image = Image.new("RGB", (size, size), "white")
+    draw = ImageDraw.Draw(image)
+    for coordinate in lines:
+        draw.line((lines[0], coordinate, lines[-1], coordinate), fill="black", width=3)
+        draw.line((coordinate, lines[0], coordinate, lines[-1]), fill="black", width=3)
+    labels = [("SeriesA", 80, 80), ("SeriesB", 220, 80), ("x1", 80, 220), ("x2", 220, 220)]
+    for text, center_x, center_y in labels:
+        draw.text((center_x - 8, center_y - 7), text, fill="black")
+    buffer = io.BytesIO()
+    image.save(buffer, format="PNG")
+    response = {
+        "status": "success",
+        "document": {
+            "json_content": {
+                "pages": {"1": {"size": {"width": size, "height": size}}},
+                "texts": [
+                    {
+                        "label": "text",
+                        "text": text,
+                        "prov": [{
+                            "page_no": 1,
+                            "bbox": {
+                                "l": center_x - 8,
+                                "r": center_x + 8,
+                                "t": center_y - 7,
+                                "b": center_y + 7,
+                                "coord_origin": "TOPLEFT",
+                            },
+                        }],
+                    }
+                    for text, center_x, center_y in labels
+                ],
+            }
+        },
+    }
+    return buffer.getvalue(), response
+
+
+def _ruled_grid_full_chart_fixture() -> tuple[bytes, dict[str, object]]:
+    """A fully labelled 3x3 chart with no nested/merged semantics."""
+
+    from PIL import Image, ImageDraw
+
+    size = 300
+    # Keep a safe 40px padding around the grid; detector must validate its own
+    # span/intersections rather than require rules to touch the crop edge.
+    lines = [40, 120, 200, 280]
+    image = Image.new("RGB", (size, size), "white")
+    draw = ImageDraw.Draw(image)
+    for coordinate in lines:
+        draw.line((lines[0], coordinate, lines[-1], coordinate), fill="black", width=3)
+        draw.line((coordinate, lines[0], coordinate, lines[-1]), fill="black", width=3)
+    text_nodes = []
+    for row in range(3):
+        for col in range(3):
+            center_x = (lines[col] + lines[col + 1]) // 2
+            center_y = (lines[row] + lines[row + 1]) // 2
+            text = f"Series{row}{col}"
+            draw.text((center_x - 24, center_y - 7), text, fill="black")
+            text_nodes.append(
+                {
+                    "label": "text",
+                    "text": text,
+                    "prov": [{
+                        "page_no": 1,
+                        "bbox": {
+                            "l": center_x - 24,
+                            "r": center_x + 24,
+                            "t": center_y - 7,
+                            "b": center_y + 7,
+                            "coord_origin": "TOPLEFT",
+                        },
+                    }],
+                }
+            )
+    buffer = io.BytesIO()
+    image.save(buffer, format="PNG")
+    return buffer.getvalue(), {
+        "status": "success",
+        "document": {
+            "json_content": {
+                "pages": {"1": {"size": {"width": size, "height": size}}},
+                "texts": text_nodes,
+            }
+        },
+    }
 
 
 def _formula_test_node(text: str, *, page_no: int = 1) -> dict[str, object]:
@@ -4158,7 +4329,7 @@ class SemanticReflowTests(unittest.TestCase):
             markdown_text = (output_dir / "document.md").read_text(encoding="utf-8")
             self.assertEqual(counts["html_appendices_removed"], 2)
             self.assertEqual(counts["html_formula_source_links_removed"], 1)
-            self.assertEqual(counts["markdown_appendices_removed"], 1)
+            self.assertEqual(counts["markdown_appendices_removed"], 2)
             self.assertEqual(html_text, "<p>semantic body</p>")
             self.assertEqual(markdown_text, "semantic body\n")
 
@@ -4803,10 +4974,32 @@ class EnglishReviewPolishTests(unittest.TestCase):
             input_file=Path("/tmp/CN.pdf"),
             cn_ocr_parity=True,
             legacy_cn_accepted_baseline=True,
+            expected_input_sha256=adapter.CN_ACCEPTED_BASELINE["source_pdf_sha256"],
         )
 
         self.assertTrue(adapter.effective_cn_ocr_parity(args))
         self.assertTrue(adapter.is_cn_accepted_path(args))
+
+    def test_legacy_cn_baseline_uses_submitted_name_after_input_snapshot(self) -> None:
+        args = Namespace(
+            input_file=Path("/private/tmp/quality-parity-input/random/input.pdf"),
+            _submitted_input_name="CN.pdf",
+            cn_ocr_parity=True,
+            legacy_cn_accepted_baseline=True,
+            expected_input_sha256=adapter.CN_ACCEPTED_BASELINE["source_pdf_sha256"],
+        )
+
+        self.assertTrue(adapter.is_cn_accepted_path(args))
+
+    def test_legacy_cn_baseline_rejects_different_pdf_identity(self) -> None:
+        args = Namespace(
+            input_file=Path("/tmp/CN.pdf"),
+            cn_ocr_parity=True,
+            legacy_cn_accepted_baseline=True,
+            expected_input_sha256="0" * 64,
+        )
+
+        self.assertFalse(adapter.is_cn_accepted_path(args))
 
     def test_transformers_formula_uses_server_side_granite_preset(self) -> None:
         args = Namespace(
@@ -5733,6 +5926,7 @@ class EnglishReviewPolishTests(unittest.TestCase):
         self.assertIn("formulas/formula_1.png", html_text)
         self.assertIn("formulas/formula_2.png", html_text)
         self.assertIn("docling-formula-inline-source", html_text)
+        self.assertNotIn('loading="lazy"', html_text)
         self.assertIn("formulas/formula_1.png", markdown)
         self.assertIn("formulas/formula_2.png", markdown)
 
@@ -5954,6 +6148,11 @@ class EnglishReviewPolishTests(unittest.TestCase):
         self.assertIn("docling-formula-inline-source", html_text)
         self.assertIn("formulas/formula_2.png", html_text)
         self.assertIn("formulas/formula_2.png", markdown)
+        self.assertIn(
+            '<details class="docling-source-disclosure docling-formula-source-disclosure">',
+            markdown,
+        )
+        self.assertNotIn("<details open", markdown)
         self.assertNotIn("Original formula renderings", html_text)
 
     def test_formula_review_targets_accepts_context_crops(self) -> None:
@@ -6101,7 +6300,7 @@ class EnglishReviewPolishTests(unittest.TestCase):
         self.assertNotIn(r"duplicate \quad (12)", updated)
         self.assertEqual(updated.count('data-formula-index="12"'), 1)
 
-    def test_cn_formula_sources_use_general_candidate_selection(self) -> None:
+    def test_cn_formula_sources_reject_unbound_custom_candidates(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             guarded = root / "guarded"
@@ -6141,14 +6340,130 @@ class EnglishReviewPolishTests(unittest.TestCase):
                 ]
             )
 
-            texts, sources = adapter._cn_accepted_formula_source_texts(args, sidecar)
+            with patch.object(adapter, "_default_cn_route_b_dirs", return_value=[]):
+                texts, sources = adapter._cn_accepted_formula_source_texts(args, sidecar)
 
-        self.assertEqual(len(texts), 24)
-        self.assertEqual(sources[2], "guarded_fallback_full")
-        self.assertIn(sources[3], {"formula_second_pass", "guarded_fallback_full"})
-        self.assertIn(sources[5], {"formula_second_pass", "guarded_fallback_full"})
-        self.assertIn(sources[13], {"formula_second_pass", "guarded_fallback_full"})
-        self.assertEqual(adapter._compact_formula_numbers(texts[1]), [1])
+        self.assertEqual({}, texts)
+        self.assertEqual({}, sources)
+
+    def test_cn_formula_sources_reject_wrong_body_and_foreign_equation_tag(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            guarded = root / "guarded"
+            sidecar = root / "sidecar"
+            guarded.mkdir()
+            sidecar.mkdir()
+            (guarded / "document.json").write_text(
+                adapter.json.dumps({
+                    "texts": [{
+                        "label": "formula",
+                        "text": r"WRONG_BODY \\quad ( 2 )",
+                    }],
+                }),
+                encoding="utf-8",
+            )
+            args = Namespace(
+                formula_second_pass_guarded_fallback_dir=[
+                    f"route-a-full={guarded}"
+                ]
+            )
+
+            with patch.object(adapter, "_default_cn_route_b_dirs", return_value=[]):
+                texts, sources = adapter._cn_accepted_formula_source_texts(
+                    args,
+                    sidecar,
+                )
+
+        self.assertNotIn(1, texts)
+        self.assertNotIn(1, sources)
+
+    def test_cn_formula_sources_accept_reviewed_clean_formula_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            guarded = root / "guarded"
+            sidecar = root / "sidecar"
+            guarded.mkdir()
+            sidecar.mkdir()
+            (guarded / "document.json").write_text(
+                adapter.json.dumps({
+                    "texts": [{
+                        "label": "formula",
+                        "text": (
+                            r"c ^ { \prime } _ { p } = O ( c _ { p } ) "
+                            r"\times W _ { c }"
+                        ),
+                    }],
+                }),
+                encoding="utf-8",
+            )
+            args = Namespace(
+                formula_second_pass_guarded_fallback_dir=[
+                    f"route-a-full={guarded}"
+                ]
+            )
+
+            with patch.object(adapter, "_default_cn_route_b_dirs", return_value=[]):
+                texts, sources = adapter._cn_accepted_formula_source_texts(
+                    args,
+                    sidecar,
+                )
+
+        self.assertEqual([1], sorted(texts))
+        self.assertEqual("guarded_fallback_full", sources[1])
+        self.assertEqual([1], adapter._compact_formula_numbers(texts[1]))
+
+    def test_cn_final_polish_missing_identity_does_not_partially_mutate_outputs(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            output_dir = root / "output"
+            guarded = root / "guarded"
+            sidecar = root / "sidecar"
+            output_dir.mkdir()
+            guarded.mkdir()
+            sidecar.mkdir()
+            originals = {
+                "document.json": adapter.json.dumps({
+                    "texts": [{
+                        "label": "formula",
+                        "text": r"WRONG_BODY \quad ( 2 )",
+                    }],
+                }),
+                "document.md": "original markdown",
+                "document.html": "<html><body>original html</body></html>",
+            }
+            for name, value in originals.items():
+                (output_dir / name).write_text(value, encoding="utf-8")
+            (guarded / "document.json").write_text(
+                originals["document.json"],
+                encoding="utf-8",
+            )
+            args = Namespace(
+                input_file=Path("CN.pdf"),
+                expected_input_sha256=adapter.CN_ACCEPTED_BASELINE[
+                    "source_pdf_sha256"
+                ],
+                cn_ocr_parity=True,
+                legacy_cn_accepted_baseline=True,
+                formula_second_pass_guarded_fallback_dir=[
+                    f"route-a-full={guarded}"
+                ],
+            )
+
+            with patch.object(adapter, "_default_cn_route_b_dirs", return_value=[]):
+                result = adapter.apply_cn_final_document_polish(
+                    output_dir,
+                    sidecar,
+                    args,
+                )
+
+            self.assertFalse(result["ok"])
+            self.assertFalse(result["applied"])
+            self.assertIn(1, result["missing_source_formulas"])
+            for name, value in originals.items():
+                self.assertEqual(
+                    value,
+                    (output_dir / name).read_text(encoding="utf-8"),
+                )
 
     def test_cn_default_sources_keep_first_formulas_clean(self) -> None:
         if not adapter._default_cn_route_b_dirs() or not adapter._default_cn_guarded_fallback_dirs():
@@ -10545,6 +10860,933 @@ class EnglishReviewPolishTests(unittest.TestCase):
         self.assertEqual(count, 1)
         self.assertIn("kind=visual_annotation", html_text)
         self.assertNotIn("Classification Error %</p>", html_text)
+
+
+class SourceCropRecoveryAndDisclosureTests(unittest.TestCase):
+    def test_table_crop_clamp_separates_side_by_side_tables_and_picture(self) -> None:
+        def node(label: str, left: float, right: float) -> dict[str, object]:
+            return {
+                "label": label,
+                "prov": [{
+                    "page_no": 2,
+                    "bbox": {
+                        "l": left,
+                        "r": right,
+                        "t": 100,
+                        "b": 60,
+                        "coord_origin": "BOTTOMLEFT",
+                    },
+                }],
+            }
+
+        first = node("table", 10, 30)
+        second = node("table", 40, 60)
+        picture = node("picture", 70, 90)
+        first_clamp = adapter._table_crop_clamp(first, [first, second], [picture])
+        second_clamp = adapter._table_crop_clamp(second, [first, second], [picture])
+        self.assertIsNotNone(first_clamp)
+        self.assertIsNotNone(second_clamp)
+        self.assertEqual(35, first_clamp["r"])
+        self.assertEqual(35, second_clamp["l"])
+        self.assertEqual(65, second_clamp["r"])
+
+    def test_table_crop_clamp_topleft_uses_opposing_vertical_edges(self) -> None:
+        current = {
+            "label": "table",
+            "prov": [{
+                "page_no": 1,
+                "bbox": {
+                    "l": 20,
+                    "r": 80,
+                    "t": 60,
+                    "b": 100,
+                    "coord_origin": "TOPLEFT",
+                },
+            }],
+        }
+        above = {
+            "label": "table",
+            "prov": [{
+                "page_no": 1,
+                "bbox": {
+                    "l": 20,
+                    "r": 80,
+                    "t": 20,
+                    "b": 50,
+                    "coord_origin": "TOPLEFT",
+                },
+            }],
+        }
+        below = {
+            "label": "picture",
+            "prov": [{
+                "page_no": 1,
+                "bbox": {
+                    "l": 20,
+                    "r": 80,
+                    "t": 110,
+                    "b": 140,
+                    "coord_origin": "TOPLEFT",
+                },
+            }],
+        }
+        clamp = adapter._table_crop_clamp(current, [current, above], [below])
+        self.assertIsNotNone(clamp)
+        self.assertEqual(55.0, clamp["t"])
+        self.assertEqual(105.0, clamp["b"])
+
+    def test_formula_context_bounds_stay_inside_page_column(self) -> None:
+        left_formula = {
+            "label": "formula",
+            "prov": [{
+                "page_no": 1,
+                "bbox": {"l": 20, "r": 30, "t": 200, "b": 180, "coord_origin": "BOTTOMLEFT"},
+            }],
+        }
+        right_formula = {
+            "label": "formula",
+            "prov": [{
+                "page_no": 1,
+                "bbox": {"l": 70, "r": 80, "t": 200, "b": 180, "coord_origin": "BOTTOMLEFT"},
+            }],
+        }
+        self.assertEqual(50, adapter._formula_context_crop_bounds(left_formula, (100, 300))["r"])
+        self.assertEqual(50, adapter._formula_context_crop_bounds(right_formula, (100, 300))["l"])
+
+    def test_formula_context_bounds_preserve_topleft_page_orientation(self) -> None:
+        formula = {
+            "label": "formula",
+            "prov": [{
+                "page_no": 1,
+                "bbox": {
+                    "l": 20,
+                    "r": 30,
+                    "t": 80,
+                    "b": 100,
+                    "coord_origin": "TOPLEFT",
+                },
+            }],
+        }
+        bounds = adapter._formula_context_crop_bounds(formula, (100, 300))
+        self.assertIsNotNone(bounds)
+        self.assertEqual((0.0, 300), (bounds["t"], bounds["b"]))
+
+    def test_formula_context_bounds_do_not_cut_cross_midpoint_display_formula(self) -> None:
+        cross_mid_formula = {
+            "label": "formula",
+            "prov": [{
+                "page_no": 1,
+                "bbox": {"l": 42, "r": 58, "t": 200, "b": 180, "coord_origin": "BOTTOMLEFT"},
+            }],
+        }
+        near_mid_formula = {
+            "label": "formula",
+            "prov": [{
+                "page_no": 1,
+                "bbox": {"l": 47, "r": 49, "t": 200, "b": 180, "coord_origin": "BOTTOMLEFT"},
+            }],
+        }
+        self.assertIsNone(adapter._formula_context_crop_bounds(cross_mid_formula, (100, 300)))
+        self.assertIsNone(adapter._formula_context_crop_bounds(near_mid_formula, (100, 300)))
+
+    def test_image_table_recovery_accepts_dense_grid_and_records_payload(self) -> None:
+        empty = {
+            "self_ref": "#/tables/0",
+            "label": "table",
+            "data": {"table_cells": [], "num_rows": 0, "num_cols": 0},
+        }
+        recovered = {
+            "label": "table",
+            "data": {
+                "num_rows": 2,
+                "num_cols": 2,
+                "table_cells": [
+                    {"start_row_offset_idx": row, "end_row_offset_idx": row + 1,
+                     "start_col_offset_idx": col, "end_col_offset_idx": col + 1,
+                     "text": f"{row},{col}", "bbox": {"l": 1, "r": 2, "t": 3, "b": 4}}
+                    for row in range(2) for col in range(2)
+                ],
+            },
+        }
+        response = {"status": "success", "document": {"json_content": {"tables": [empty]}}}
+        retry_response = {"status": "success", "document": {"json_content": {"tables": [recovered]}}}
+        args = Namespace(serve_url="http://127.0.0.1:5001", timeout_seconds=120)
+        metadata: dict[str, object] = {}
+        status: dict[str, object] = {"ok": True, "success_class": "success", "warnings": [], "quality_signals": {}}
+        with patch.object(adapter, "_render_table_recovery_crop_png", return_value=b"png"), patch.object(
+            adapter, "post_json", return_value=retry_response
+        ) as request:
+            result = adapter.recover_image_only_tables_from_serve(
+                response, Path("source.pdf"), args, metadata, status
+            )
+        self.assertEqual(1, result["accepted_count"])
+        self.assertEqual(2, empty["data"]["num_rows"])
+        self.assertNotIn("bbox", empty["data"]["table_cells"][0])
+        payload = request.call_args.args[1]
+        self.assertEqual(["image"], payload["options"]["from_formats"])
+        self.assertTrue(payload["options"]["do_table_structure"])
+        self.assertEqual([], status["warnings"])
+
+    def test_image_table_recovery_rejects_sparse_grid_and_remote_endpoint(self) -> None:
+        empty = {
+            "self_ref": "#/tables/0",
+            "label": "table",
+            "data": {"table_cells": [], "num_rows": 0, "num_cols": 0},
+        }
+        response = {"status": "success", "document": {"json_content": {"tables": [empty]}}}
+        args = Namespace(serve_url="https://example.invalid", timeout_seconds=120)
+        status: dict[str, object] = {"ok": True, "success_class": "success", "warnings": [], "quality_signals": {}}
+        result = adapter.recover_image_only_tables_from_serve(
+            response, Path("source.pdf"), args, {}, status
+        )
+        self.assertEqual(1, result["attempted_count"])
+        self.assertIn("image_table_recovery_remote_endpoint_disallowed", status["warnings"][0])
+
+    def test_image_table_recovery_malformed_endpoint_fails_closed(self) -> None:
+        empty = {
+            "self_ref": "#/tables/0",
+            "label": "table",
+            "data": {"table_cells": [], "num_rows": 0, "num_cols": 0},
+        }
+        response = {"status": "success", "document": {"json_content": {"tables": [empty]}}}
+        args = Namespace(serve_url="http://[bad", timeout_seconds=120)
+        status: dict[str, object] = {
+            "ok": True,
+            "success_class": "success",
+            "warnings": [],
+            "quality_signals": {},
+        }
+        with patch.object(adapter, "post_json") as post:
+            result = adapter.recover_image_only_tables_from_serve(
+                response, Path("source.pdf"), args, {}, status
+            )
+        self.assertEqual(1, result["attempted_count"])
+        self.assertFalse(status["ok"])
+        self.assertTrue(
+            any(
+                "image_table_recovery_remote_endpoint_disallowed" in warning
+                for warning in status["warnings"]
+            )
+        )
+        post.assert_not_called()
+
+    def test_image_table_recovery_preserves_valid_one_cell_semantics(self) -> None:
+        table = {
+            "self_ref": "#/tables/0",
+            "label": "table",
+            "data": {
+                "num_rows": 1,
+                "num_cols": 1,
+                "table_cells": [{
+                    "start_row_offset_idx": 0,
+                    "end_row_offset_idx": 1,
+                    "start_col_offset_idx": 0,
+                    "end_col_offset_idx": 1,
+                    "text": "Total = 12",
+                }],
+            },
+        }
+        response = {"status": "success", "document": {"json_content": {"tables": [table]}}}
+        args = Namespace(serve_url="https://example.invalid", timeout_seconds=120)
+        status: dict[str, object] = {
+            "ok": True,
+            "success_class": "success",
+            "warnings": [],
+            "quality_signals": {},
+        }
+        with patch.object(adapter, "_render_table_recovery_crop_png") as render, patch.object(
+            adapter, "post_json"
+        ) as post:
+            result = adapter.recover_image_only_tables_from_serve(
+                response, Path("source.pdf"), args, {}, status
+            )
+        self.assertEqual(0, result["attempted_count"])
+        self.assertEqual(0, result["accepted_count"])
+        self.assertEqual([], result["rejected"])
+        self.assertTrue(status["ok"])
+        self.assertEqual("success", status["success_class"])
+        render.assert_not_called()
+        post.assert_not_called()
+
+    def test_table_semantic_hint_requires_caption_form_not_plain_chinese_text(self) -> None:
+        table = {
+            "label": "table",
+            "prov": [{
+                "page_no": 1,
+                "bbox": {
+                    "l": 20,
+                    "r": 80,
+                    "t": 60,
+                    "b": 100,
+                    "coord_origin": "TOPLEFT",
+                },
+            }],
+        }
+        plain = {
+            "texts": [{
+                "label": "text",
+                "text": "结果表示如下",
+                "prov": [{
+                    "page_no": 1,
+                    "bbox": {
+                        "l": 20,
+                        "r": 80,
+                        "t": 10,
+                        "b": 45,
+                        "coord_origin": "TOPLEFT",
+                    },
+                }],
+            }],
+        }
+        self.assertFalse(adapter._table_has_semantic_hint(table, plain))
+        captioned = {
+            "texts": [{
+                "self_ref": "#/texts/1",
+                "label": "caption",
+                "text": "表 1：结果",
+                "prov": [{
+                    "page_no": 1,
+                    "bbox": {
+                        "l": 20,
+                        "r": 80,
+                        "t": 10,
+                        "b": 45,
+                        "coord_origin": "TOPLEFT",
+                    },
+                }],
+            }],
+        }
+        table_with_caption = dict(table, captions=[{"$ref": "#/texts/1"}])
+        self.assertTrue(adapter._table_has_semantic_hint(table_with_caption, captioned))
+
+    def test_image_table_recovery_rejects_oversized_dimensions(self) -> None:
+        oversized = {
+            "status": "success",
+            "document": {"json_content": {"tables": [{
+                "label": "table",
+                "data": {
+                    "num_rows": 257,
+                    "num_cols": 2,
+                    "table_cells": [
+                        {"start_row_offset_idx": row, "end_row_offset_idx": row + 1,
+                         "start_col_offset_idx": col, "end_col_offset_idx": col + 1,
+                         "text": "x"}
+                        for row, col in ((0, 0), (0, 1), (1, 0), (1, 1))
+                    ],
+                },
+            }]}}
+        }
+        data, diagnostics = adapter._recovered_table_data_from_response(oversized)
+        self.assertIsNone(data)
+        self.assertEqual("table_grid_limits_exceeded", diagnostics["reason"])
+
+    def test_image_table_recovery_rejects_hostile_cell_offsets_before_grid_alloc(self) -> None:
+        hostile = {
+            "status": "success",
+            "document": {
+                "json_content": {
+                    "tables": [{
+                        "label": "table",
+                        "data": {
+                            "num_rows": 2,
+                            "num_cols": 2,
+                            "table_cells": [{
+                                "start_row_offset_idx": 0,
+                                "end_row_offset_idx": 1_000_000_000,
+                                "start_col_offset_idx": 0,
+                                "end_col_offset_idx": 1,
+                                "text": "x",
+                            }],
+                        },
+                    }],
+                }
+            },
+        }
+        with patch.object(adapter, "table_grid", side_effect=AssertionError("grid allocation")):
+            data, diagnostics = adapter._recovered_table_data_from_response(hostile)
+        self.assertIsNone(data)
+        self.assertEqual("table_cell_offsets_out_of_bounds", diagnostics["reason"])
+
+    def test_ruled_grid_ocr_fallback_recovers_nested_5x5_spans_and_positions(self) -> None:
+        crop_bytes, response = _ruled_grid_nested_fixture()
+        data, diagnostics = adapter._recovered_table_data_from_response(
+            response,
+            crop_bytes=crop_bytes,
+            table_semantic_hint=True,
+        )
+        self.assertIsNotNone(data)
+        self.assertTrue(diagnostics["accepted"])
+        self.assertEqual("ruled_grid_ocr_fallback", diagnostics["recovery_mode"])
+        self.assertEqual("validated_ruled_grid_ocr", diagnostics["validation_mode"])
+        self.assertEqual(2, diagnostics["dash_marker_count"])
+        self.assertGreater(diagnostics["merged_component_count"], 0)
+        self.assertEqual((5, 5), (data["num_rows"], data["num_cols"]))
+        cells = {cell["text"]: cell for cell in data["table_cells"] if cell.get("text")}
+        self.assertEqual((0, 1, 2, 5), (
+            cells["To"]["start_row_offset_idx"],
+            cells["To"]["end_row_offset_idx"],
+            cells["To"]["start_col_offset_idx"],
+            cells["To"]["end_col_offset_idx"],
+        ))
+        self.assertEqual((2, 5, 0, 1), (
+            cells["From"]["start_row_offset_idx"],
+            cells["From"]["end_row_offset_idx"],
+            cells["From"]["start_col_offset_idx"],
+            cells["From"]["end_col_offset_idx"],
+        ))
+        expected_positions = {
+            "Solid trans": (2, 2),
+            "Melting": (2, 3),
+            "Sublimation": (2, 4),
+            "Freezing": (3, 2),
+            "Boiling": (3, 4),
+            "Condensation": (4, 3),
+        }
+        for text, (row, col) in expected_positions.items():
+            self.assertEqual(
+                (row, row + 1, col, col + 1),
+                (
+                    cells[text]["start_row_offset_idx"],
+                    cells[text]["end_row_offset_idx"],
+                    cells[text]["start_col_offset_idx"],
+                    cells[text]["end_col_offset_idx"],
+                ),
+            )
+        dash_cells = [cell for cell in data["table_cells"] if cell.get("text") == "-"]
+        self.assertEqual(
+            {(3, 3), (4, 4)},
+            {
+                (cell["start_row_offset_idx"], cell["start_col_offset_idx"])
+                for cell in dash_cells
+            },
+        )
+        self.assertTrue(all("bbox" not in cell for cell in data["table_cells"]))
+
+    def test_unique_empty_table_candidate_uses_ruled_grid_retry(self) -> None:
+        crop_bytes, response = _ruled_grid_nested_fixture()
+        empty_candidate = {
+            "label": "table",
+            "data": {"table_cells": [], "num_rows": 0, "num_cols": 0},
+        }
+        retry_json = dict(response["document"]["json_content"])
+        retry_json["tables"] = [empty_candidate]
+        retry_response = {
+            "status": "success",
+            "document": {"json_content": retry_json},
+        }
+        data, diagnostics = adapter._recovered_table_data_from_response(
+            retry_response,
+            crop_bytes=crop_bytes,
+            table_semantic_hint=True,
+        )
+        self.assertIsNotNone(data)
+        self.assertEqual("validated_ruled_grid_ocr", diagnostics["validation_mode"])
+        self.assertEqual("table_grid_not_dense_enough", diagnostics["structured_rejection_reason"])
+
+    def test_ruled_grid_rejects_chart_like_sparse_labels(self) -> None:
+        crop_bytes, response = _ruled_grid_sparse_chart_fixture()
+        data, diagnostics = adapter._recovered_table_data_from_response(
+            response,
+            crop_bytes=crop_bytes,
+            table_semantic_hint=False,
+        )
+        self.assertIsNone(data)
+        self.assertEqual("ruled_grid_table_semantic_hint_missing", diagnostics["reason"])
+
+    def test_ruled_grid_rejects_fully_labelled_non_nested_chart(self) -> None:
+        crop_bytes, response = _ruled_grid_full_chart_fixture()
+        data, diagnostics = adapter._recovered_table_data_from_response(
+            response,
+            crop_bytes=crop_bytes,
+            table_semantic_hint=False,
+        )
+        self.assertIsNone(data)
+        self.assertEqual("ruled_grid_table_semantic_hint_missing", diagnostics["reason"])
+        hinted_data, hinted_diagnostics = adapter._recovered_table_data_from_response(
+            response,
+            crop_bytes=crop_bytes,
+            table_semantic_hint=True,
+        )
+        self.assertIsNotNone(hinted_data)
+        self.assertEqual((3, 3), (hinted_data["num_rows"], hinted_data["num_cols"]))
+        self.assertEqual(0, hinted_diagnostics["merged_component_count"])
+
+    def test_ruled_grid_ocr_fallback_rejects_no_line_and_ambiguous_ocr(self) -> None:
+        crop_bytes, response = _ruled_grid_nested_fixture()
+        from PIL import Image
+
+        with Image.open(io.BytesIO(crop_bytes)).convert("L") as fixture_image:
+            self.assertFalse(
+                adapter._ruled_grid_dash_marker(
+                    fixture_image,
+                    left=10,
+                    top=10,
+                    right=110,
+                    bottom=110,
+                )
+            )
+            self.assertFalse(
+                adapter._ruled_grid_dash_marker(
+                    fixture_image,
+                    left=210,
+                    top=210,
+                    right=310,
+                    bottom=310,
+                )
+            )
+
+        blank = io.BytesIO()
+        Image.new("RGB", (500, 500), "white").save(blank, format="PNG")
+        no_line_data, no_line_diagnostics = adapter._recovered_table_data_from_response(
+            response,
+            crop_bytes=blank.getvalue(),
+            table_semantic_hint=True,
+        )
+        self.assertIsNone(no_line_data)
+        self.assertEqual("ruled_grid_geometry_not_strong", no_line_diagnostics["reason"])
+
+        ambiguous_response = {
+            "status": "success",
+            "document": {
+                "json_content": {
+                    "pages": {"1": {"size": {"width": 500, "height": 500}}},
+                    "texts": [
+                        {
+                            "label": "text",
+                            "text": f"label-{index}",
+                            "prov": [{
+                                "page_no": 1,
+                                "bbox": {
+                                    "l": 120 + index,
+                                    "r": 140 + index,
+                                    "t": 230 + index,
+                                    "b": 240 + index,
+                                    "coord_origin": "TOPLEFT",
+                                },
+                            }],
+                        }
+                        for index in range(4)
+                    ],
+                }
+            },
+        }
+        ambiguous_data, ambiguous_diagnostics = adapter._recovered_table_data_from_response(
+            ambiguous_response,
+            crop_bytes=crop_bytes,
+            table_semantic_hint=True,
+        )
+        self.assertIsNone(ambiguous_data)
+        self.assertEqual(
+            "ruled_grid_cell_coverage_insufficient",
+            ambiguous_diagnostics["reason"],
+        )
+
+    def test_image_table_recovery_passes_crop_bytes_to_ruled_grid_verifier(self) -> None:
+        crop_bytes, retry_response = _ruled_grid_nested_fixture()
+        empty = {
+            "self_ref": "#/tables/0",
+            "label": "table",
+            "captions": [{"$ref": "#/texts/0"}],
+            "data": {"table_cells": [], "num_rows": 0, "num_cols": 0},
+        }
+        source_response = {
+            "status": "success",
+            "document": {
+                "json_content": {
+                    "tables": [empty],
+                    "texts": [{
+                        "self_ref": "#/texts/0",
+                        "label": "caption",
+                        "text": "Nested table",
+                        "prov": [{"page_no": 1}],
+                    }],
+                }
+            },
+        }
+        args = Namespace(serve_url="http://127.0.0.1:5001", timeout_seconds=120)
+        status: dict[str, object] = {
+            "ok": True,
+            "success_class": "success",
+            "warnings": [],
+            "quality_signals": {},
+        }
+        with patch.object(adapter, "_render_table_recovery_crop_png", return_value=crop_bytes), patch.object(
+            adapter, "post_json", return_value=retry_response
+        ):
+            result = adapter.recover_image_only_tables_from_serve(
+                source_response,
+                Path("source.pdf"),
+                args,
+                {},
+                status,
+            )
+        self.assertEqual(1, result["accepted_count"])
+        self.assertEqual(
+            "ruled_grid_ocr_fallback",
+            empty["local_ai_lab_qc"]["image_table_semantic_recovery"]["recovery_mode"],
+        )
+        self.assertEqual(5, empty["data"]["num_rows"])
+        self.assertEqual(5, empty["data"]["num_cols"])
+
+    def test_image_table_recovery_uses_local_ruled_grid_before_backend_endpoint(self) -> None:
+        crop_bytes, ocr_response = _ruled_grid_nested_fixture()
+        empty = {
+            "self_ref": "#/tables/0",
+            "label": "table",
+            "captions": [{"$ref": "#/texts/99"}],
+            "data": {"table_cells": [], "num_rows": 0, "num_cols": 0},
+            "prov": [{
+                "page_no": 1,
+                "bbox": {
+                    "l": 0,
+                    "r": 500,
+                    "t": 0,
+                    "b": 500,
+                    "coord_origin": "TOPLEFT",
+                },
+            }],
+        }
+        source_json = copy.deepcopy(ocr_response["document"]["json_content"])
+        # Keep an unrelated semantic table in the source response.  The
+        # local-first ruled verifier must consume only mapped OCR for the
+        # target crop rather than reject this response as non-unique.
+        source_json["tables"] = [
+            empty,
+            {
+                "self_ref": "#/tables/other",
+                "label": "table",
+                "data": {
+                    "num_rows": 1,
+                    "num_cols": 1,
+                    "table_cells": [{
+                        "start_row_offset_idx": 0,
+                        "end_row_offset_idx": 1,
+                        "start_col_offset_idx": 0,
+                        "end_col_offset_idx": 1,
+                        "text": "unrelated",
+                    }],
+                },
+            },
+        ]
+        # Same-coordinate OCR from another page must not be allowed to fill
+        # the crop or inflate its recovered evidence count.
+        other_page_texts = copy.deepcopy(source_json.get("texts", []))
+        for node in other_page_texts:
+            for prov in node.get("prov") or []:
+                if isinstance(prov, dict):
+                    prov["page_no"] = 2
+            node["text"] = f"other-{node.get('text', '')}"
+        source_json.setdefault("texts", []).extend(other_page_texts)
+        source_json.setdefault("texts", []).append({
+            "self_ref": "#/texts/99",
+            "label": "caption",
+            "text": "Nested table",
+            "prov": [{"page_no": 1}],
+        })
+        source_response = {
+            "status": "success",
+            "document": {"json_content": source_json},
+        }
+        geometry = {
+            "page_no": 1,
+            "page_size": {"width": 500, "height": 500},
+            "page_image_size": {"width": 500, "height": 500},
+            "origin": "TOPLEFT",
+            "pixel_box": [0, 0, 500, 500],
+            "render_scale": 1.0,
+        }
+        args = Namespace(serve_url="http://backend:5001", timeout_seconds=120)
+        status: dict[str, object] = {
+            "ok": True,
+            "success_class": "success",
+            "warnings": [],
+            "quality_signals": {},
+        }
+        with patch.object(
+            adapter,
+            "_render_table_recovery_crop_png_with_geometry",
+            return_value=(crop_bytes, geometry),
+        ), patch.object(adapter, "post_json") as post:
+            result = adapter.recover_image_only_tables_from_serve(
+                source_response,
+                Path("source.pdf"),
+                args,
+                {},
+                status,
+            )
+        self.assertEqual(1, result["accepted_count"])
+        self.assertEqual(5, empty["data"]["num_rows"])
+        self.assertEqual(
+            "local_crop",
+            empty["local_ai_lab_qc"]["image_table_semantic_recovery"]["recovery_origin"],
+        )
+        self.assertEqual(
+            15,
+            empty["local_ai_lab_qc"]["image_table_semantic_recovery"]
+            ["local_recovery"]["ocr_nonempty_count"],
+        )
+        self.assertTrue(status["ok"])
+        post.assert_not_called()
+
+    def test_image_table_recovery_rejects_same_page_overlapping_table_ocr(self) -> None:
+        crop_bytes, ocr_response = _ruled_grid_nested_fixture()
+        empty = {
+            "self_ref": "#/tables/0",
+            "label": "table",
+            "captions": [{"$ref": "#/texts/99"}],
+            "data": {"table_cells": [], "num_rows": 0, "num_cols": 0},
+            "prov": [{
+                "page_no": 1,
+                "bbox": {
+                    "l": 0,
+                    "r": 500,
+                    "t": 0,
+                    "b": 500,
+                    "coord_origin": "TOPLEFT",
+                },
+            }],
+        }
+        overlapping_table = {
+            "self_ref": "#/tables/other",
+            "label": "table",
+            "data": {
+                "num_rows": 1,
+                "num_cols": 1,
+                "table_cells": [{
+                    "start_row_offset_idx": 0,
+                    "end_row_offset_idx": 1,
+                    "start_col_offset_idx": 0,
+                    "end_col_offset_idx": 1,
+                    "text": "OTHER_TABLE",
+                }],
+            },
+            "prov": [{
+                "page_no": 1,
+                "bbox": {
+                    "l": 230,
+                    "r": 290,
+                    "t": 230,
+                    "b": 290,
+                    "coord_origin": "TOPLEFT",
+                },
+            }],
+        }
+        source_json = copy.deepcopy(ocr_response["document"]["json_content"])
+        source_json["tables"] = [empty, overlapping_table]
+        source_json.setdefault("texts", []).extend([
+            {
+                "self_ref": "#/texts/99",
+                "label": "caption",
+                "text": "Nested table",
+                "prov": [{"page_no": 1}],
+            },
+            {
+                "self_ref": "#/texts/other",
+                "label": "text",
+                "text": "OTHER_TABLE",
+                "prov": [{
+                    "page_no": 1,
+                    "bbox": {
+                        "l": 245,
+                        "r": 280,
+                        "t": 250,
+                        "b": 270,
+                        "coord_origin": "TOPLEFT",
+                    },
+                }],
+            },
+        ])
+        source_response = {
+            "status": "success",
+            "document": {"json_content": source_json},
+        }
+        geometry = {
+            "page_no": 1,
+            "page_size": {"width": 500, "height": 500},
+            "page_image_size": {"width": 500, "height": 500},
+            "origin": "TOPLEFT",
+            "pixel_box": [0, 0, 500, 500],
+            "render_scale": 1.0,
+        }
+        args = Namespace(serve_url="http://backend:5001", timeout_seconds=120)
+        status: dict[str, object] = {
+            "ok": True,
+            "success_class": "success",
+            "warnings": [],
+            "quality_signals": {},
+        }
+        with patch.object(
+            adapter,
+            "_render_table_recovery_crop_png_with_geometry",
+            return_value=(crop_bytes, geometry),
+        ), patch.object(adapter, "post_json") as post:
+            result = adapter.recover_image_only_tables_from_serve(
+                source_response,
+                Path("source.pdf"),
+                args,
+                {},
+                status,
+            )
+
+        self.assertEqual(0, result["accepted_count"])
+        self.assertEqual(1, len(result["rejected"]))
+        self.assertEqual(
+            "local_crop_overlaps_non_target_table",
+            result["rejected"][0]["reason"],
+        )
+        self.assertEqual(
+            "local_crop_overlaps_non_target_table",
+            result["rejected"][0]["local_recovery"]["reason"],
+        )
+        self.assertEqual(0, empty["data"]["num_rows"])
+        self.assertFalse(status["ok"])
+        post.assert_not_called()
+
+    def test_source_disclosures_are_closed_styled_and_idempotent(self) -> None:
+        document = {
+            "tables": [{
+                "self_ref": "#/tables/0",
+                "label": "table",
+                "data": {
+                    "num_rows": 2,
+                    "num_cols": 2,
+                    "table_cells": [
+                        {"start_row_offset_idx": row, "end_row_offset_idx": row + 1,
+                         "start_col_offset_idx": col, "end_col_offset_idx": col + 1,
+                         "text": f"{row},{col}"}
+                        for row in range(2) for col in range(2)
+                    ],
+                },
+                "prov": [{"page_no": 1, "bbox": {"l": 10, "r": 50, "t": 80, "b": 40, "coord_origin": "BOTTOMLEFT"}}],
+            }]
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir)
+            (output_dir / "tables").mkdir()
+            (output_dir / "tables" / "table_1.png").write_bytes(b"png")
+            (output_dir / "document.html").write_text(
+                '<html><head></head><body><figure class="semantic-table"><table data-source-ref="#/tables/0"><tr><td>0,0</td></tr></table></figure></body></html>',
+                encoding="utf-8",
+            )
+            (output_dir / "document.md").write_text("<!-- source-table-ref:#/tables/0 -->\n", encoding="utf-8")
+            adapter.append_structured_table_source_renderings(output_dir, document, document["tables"])
+            adapter.append_structured_table_source_renderings(output_dir, document, document["tables"])
+            html_text = (output_dir / "document.html").read_text(encoding="utf-8")
+            markdown_text = (output_dir / "document.md").read_text(encoding="utf-8")
+        self.assertEqual(1, html_text.count("docling-table-source-disclosure"))
+        self.assertEqual(1, html_text.count("docling-table-source-evidence"))
+        self.assertEqual(1, html_text.count("tables/table_1.png"))
+        self.assertEqual(1, markdown_text.count("docling-table-source-disclosure"))
+        self.assertEqual(1, markdown_text.count("tables/table_1.png"))
+        self.assertNotIn("<details open", html_text)
+        styled, _ = adapter._inject_english_review_style(html_text)
+        self.assertIn("@media print", styled)
+        self.assertIn("docling-source-disclosure", styled)
+
+    def test_empty_table_visual_fallback_is_idempotent_on_html_and_markdown(self) -> None:
+        table = {
+            "self_ref": "#/tables/0",
+            "label": "table",
+            "data": {"table_cells": [], "num_rows": 0, "num_cols": 0},
+            "prov": [{
+                "page_no": 1,
+                "bbox": {"l": 10, "r": 50, "t": 80, "b": 40, "coord_origin": "BOTTOMLEFT"},
+            }],
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir)
+            (output_dir / "tables").mkdir()
+            _write_visible_test_png(output_dir / "tables" / "table_1.png")
+            (output_dir / "document.html").write_text(
+                '<html><body><figure class="semantic-table">'
+                '<table data-source-ref="#/tables/0"></table>'
+                "</figure></body></html>",
+                encoding="utf-8",
+            )
+            (output_dir / "document.md").write_text(
+                "<!-- source-table-ref:#/tables/0 -->\n\n"
+                "| |\n|---|\n",
+                encoding="utf-8",
+            )
+            adapter.inject_empty_table_visual_fallbacks(
+                output_dir,
+                {"tables": [table]},
+                [table],
+            )
+            adapter.inject_empty_table_visual_fallbacks(
+                output_dir,
+                {"tables": [table]},
+                [table],
+            )
+            html_text = (output_dir / "document.html").read_text(encoding="utf-8")
+            markdown = (output_dir / "document.md").read_text(encoding="utf-8")
+        self.assertEqual(1, html_text.count("docling-table-visual-fallback"))
+        self.assertEqual(1, html_text.count("tables/table_1.png"))
+        self.assertEqual(1, markdown.count("source-empty-table-ref:#/tables/0"))
+        self.assertEqual(1, markdown.count("tables/table_1.png"))
+
+    def test_markdown_source_image_escapes_caption_and_rejects_remote_path(self) -> None:
+        rendered = adapter._markdown_image(
+            "x](https://evil.example/evil.png)\n# forged heading",
+            "tables/table_1.png",
+        )
+        self.assertIn(r"x\]\(https://evil.example/evil.png\)", rendered)
+        self.assertNotIn("](https://evil.example/evil.png)", rendered)
+        self.assertNotIn("\n# forged heading", rendered)
+        self.assertEqual(
+            "![caption](#)",
+            adapter._markdown_image("caption", "https://evil.example/crop.png"),
+        )
+
+    def test_final_restore_reinjects_disclosure_style_after_evidence_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir)
+            (output_dir / "document.html").write_text(
+                '<html><head></head><body><details class="docling-source-disclosure"><summary>Source</summary><p>crop</p></details></body></html>',
+                encoding="utf-8",
+            )
+            (output_dir / "document.md").write_text("Source\n", encoding="utf-8")
+            metadata: dict[str, object] = {}
+            status: dict[str, object] = {
+                "ok": True,
+                "success_class": "success",
+                "warnings": [],
+                "quality_signals": {"primary_surface": {"counts": {}}},
+            }
+            adapter.restore_final_delivery_visuals(
+                output_dir,
+                {},
+                Path("missing.pdf"),
+                metadata,
+                status,
+                visual_pdf_path=Path("missing.pdf"),
+            )
+            html_text = (output_dir / "document.html").read_text(encoding="utf-8")
+        self.assertIn("docling-english-review-polish-style", html_text)
+        self.assertIn("@media print", html_text)
+        self.assertNotIn("<details open", html_text)
+
+    def test_stale_review_style_is_replaced_without_duplicate_style_ids(self) -> None:
+        stale = (
+            '<html><head><style id="docling-english-review-polish-style">'
+            ".old-style { color: red; }"
+            "</style></head><body>Body</body></html>"
+        )
+        updated, changed = adapter._inject_english_review_style(stale)
+        self.assertTrue(changed)
+        self.assertEqual(1, updated.count('id="docling-english-review-polish-style"'))
+        self.assertIn("docling-source-disclosure", updated)
+        self.assertNotIn("old-style", updated)
+
+    def test_formula_number_diagnostics_share_ocr_spaced_number(self) -> None:
+        self.assertEqual(12, adapter._formula_number_match_value(adapter.FORMULA_NUMBER_RE.search("( 1 2 )")))
+        self.assertTrue(adapter._is_formula_number_only("( 1 2 )"))
+        diagnostics = adapter.formula_number_qc_diagnostics(
+            [{"text": "x+y ( 1 2 )", "prov": {}}],
+            "<html><body></body></html>",
+        )
+        self.assertEqual(12, diagnostics[0]["recovered_number"])
+        self.assertTrue(diagnostics[0]["safe_to_recover"])
 
 
 if __name__ == "__main__":

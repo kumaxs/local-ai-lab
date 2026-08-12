@@ -19,6 +19,7 @@ import hashlib
 import html
 import io
 import json
+import math
 import os
 import re
 import secrets
@@ -52,8 +53,11 @@ from semantic_reflow import (
 GXX_RE = re.compile(r"/G[0-9A-Fa-f]{2}")
 DATA_IMAGE_RE = re.compile(r"data:image/[^\"')\s]+")
 PLAIN_URL_RE = re.compile(r"(?<![\"'=])(https?://[^\s<]+)")
-FORMULA_NUMBER_RE = re.compile(r"\(\s*(\d+)\s*\)")
-SPACED_FORMULA_NUMBER_RE = re.compile(r"\(\s*((?:\d\s+)+\d)\s*\)")
+# OCR engines may emit an equation number with spaces between its digits,
+# e.g. ``( 1 2 )``.  Keep one shared matcher so the diagnostics and recovery
+# paths cannot disagree about whether the number is present.
+FORMULA_NUMBER_RE = re.compile(r"\(\s*(\d+(?:\s+\d+)*)\s*\)")
+SPACED_FORMULA_NUMBER_RE = FORMULA_NUMBER_RE
 CN_CHAR_RE = re.compile(r"[\u3400-\u9fff]")
 CN_OCR_LANG = ["zh-Hans", "zh-Hant", "en-US"]
 V1_GXX_FAILURE_MIN_COUNT = 10
@@ -61,6 +65,23 @@ V1_GXX_FAILURE_MIN_DENSITY = 0.002
 FORMULA_SOURCE_PADDING_PX = 2
 FORMULA_CONTEXT_PADDING_PX = 96
 DEFAULT_REVIEW_PADDING_PX = 18
+TABLE_RECOVERY_MAX_CROPS = 8
+TABLE_RECOVERY_MAX_CROP_BYTES = 4 * 1024 * 1024
+TABLE_RECOVERY_TIMEOUT_SECONDS = 30
+TABLE_RECOVERY_RENDER_MAX_DIMENSION = 4096
+TABLE_RECOVERY_RENDER_MAX_PIXELS = 16 * 1024 * 1024
+TABLE_RECOVERY_MAX_ROWS = 256
+TABLE_RECOVERY_MAX_COLS = 256
+TABLE_RECOVERY_MAX_CELLS = 65536
+RULED_GRID_MAX_PIXELS = 4 * 1024 * 1024
+RULED_GRID_MAX_DIMENSION = 4096
+RULED_GRID_MAX_LINES = 64
+RULED_GRID_DARK_THRESHOLD = 160
+RULED_GRID_INTERSECTION_MIN_RATIO = 0.12
+RULED_GRID_DASH_THRESHOLD = 200
+RULED_GRID_DASH_MIN_RUN_PX = 2
+RULED_GRID_DASH_MAX_RUN_RATIO = 0.35
+RULED_GRID_DASH_MAX_THICKNESS_RATIO = 0.25
 FORMULA_SOURCE_MIN_WIDTH_PX = 18
 FORMULA_SOURCE_MIN_HEIGHT_PX = 18
 FORMULA_SOURCE_CONTEXT_MIN_WIDTH_PX = 24
@@ -90,11 +111,51 @@ CN_ACCEPTED_BASELINE = {
     "name": "accepted_cn_0854aa1",
     "commit": "0854aa1",
     "output": ".runtime/review/docling-adapter-html-polish-live-fullfallback-2026-06-04/CN",
+    "source_pdf_sha256": "f55df935c50bb6d9a2d0e8194983b999d3e55fd1822ed145ff65d07fcbec906e",
     "document_html_sha256": "6911693bd781c628da70ae2494471f2f4cfd28448000aa599290353cd6af97db",
     "formula_count": 24,
     "equation_numbers": list(range(1, 25)),
     "minimum_cn_character_count": 9900,
     "minimum_final_output_cn_character_count": 9000,
+}
+# Formula replacement on the legacy CN compatibility path is an explicit,
+# occurrence-bound contract, not a free-form OCR preference.  These hashes are
+# the strict presentation-insensitive identities of the previously accepted
+# 24-formula surface after bounded canonicalization.  Formulae 1 and 2 also
+# admit the independently reviewed, cleaner Route-B renderings.  A candidate
+# outside this inventory must never rewrite document.json and then certify
+# itself through the final surface gate.
+CN_ACCEPTED_FORMULA_CONTENT_SHA256: dict[int, tuple[str, ...]] = {
+    1: (
+        "63b8190b4fb026fc719a22bdffbb95fbf15d950323f72d63949e5971913f7e86",
+        "3e2a4ad2889ff93bbeb880e31267821a4c7895a741c59e06d962452b7b35746d",
+    ),
+    2: (
+        "ded02767f81fe6e466b193e920f13e018ddf8b5767407cb68f303e4d46df45c4",
+        "6c7a74dc63c01508585b2d150ff6a69b3ab044131fe5b476f367c57086a0fe4f",
+    ),
+    3: ("5e62378d23c9280ff31a377e6fdb45844fcbc36d0bd09cb81c9e094933b753d7",),
+    4: ("ff55c076cb76fc0b8cee2177e8081a7ec9e1422eea3097613ae9646da729d905",),
+    5: ("651405d8e45329687a32f7bc30918299a00a847d257dd6f9548b6620c69453d6",),
+    6: ("955b3413726b9ade8bd581676f9d44ffdcaab655604769669bba0df1a805d50e",),
+    7: ("e19c681a96619d53b52bdd90dca6842ddf87d4024eb7cfee11ebd9409ad013dc",),
+    8: ("dbe4b5f9529faa79be138fb03ea5c6f5f5f05c076ab9a89345d463bd79e3bf6b",),
+    9: ("e05523821b7173da17bae891504e602b0eacb2f09a3937320ff7a51904a304ac",),
+    10: ("bc3e29906a6e30bf025e84a69b6f07140a27cece76e73671a25660997bdaff16",),
+    11: ("135ce38b7174d1dfc2b094474132ebf0d39e72a18213a63eee7d02cb1fb6b13d",),
+    12: ("e9263d326d0209792e6ab1a6a779382f74625cf4f9d78edb2ad31c3b5024f934",),
+    13: ("fa849c30c18324ce8f894217ee01cac8ebf783b9e1441fedba79b619a21179ec",),
+    14: ("bb463008bba7577f7734093ecc231f43eeafcf261dd51c0bc4b796dd9791ecc0",),
+    15: ("5d54634509cd38f5cafe9d15eae6b349e9d2e753e8ffe89aeab2b8d9336d1f43",),
+    16: ("3ba8230edf4be2890a47d1fe009bd80ab50f86635aa41ecd8f7d94eb5ec9cf66",),
+    17: ("be6cfcaa3bcc415133a29351bb4b2e2fa9f7c638213becaf2164109d487705bb",),
+    18: ("d4765967d1b321931f96a2582d1b521d77f2eb0e69090ac33a6f8d5327e6a2ea",),
+    19: ("06765f13f4fbe9c1ab005d4fe0b942a25e83f7fb4d431bc9f8f741e257bfc77e",),
+    20: ("549e1b827a6dc083167705cfe6275e5c5ed9c8fb166caa3a0dedb3522b3a8250",),
+    21: ("acd568ed192269dfc274be32565843bb36e672ff39d04908f24c668881b4c9ba",),
+    22: ("9febd92b92bc539b3cdaa1fae8b20de802b1553b185bd87cd9fa9722c8fee3db",),
+    23: ("d8383a8e7991511d1c003808ea14a5652a0ab32ea2eaa770b6735f82057ceb2e",),
+    24: ("a801c27f26edcc3a6176372f2771422b70f1511df067fd58b6b7fd48c5c71a07",),
 }
 PAGE_EDGE_LABELS = {"page_header", "page_footer"}
 HEADER_FOOTER_NOISE_RE = re.compile(
@@ -787,6 +848,40 @@ def _markdown_source_formula_anchor_spans(
     return spans
 
 
+def _markdown_tagged_formula_spans(
+    markdown: str,
+) -> tuple[list[tuple[int, int, int | None, bool]], bool]:
+    """Return display blocks carrying a numeric ``\\tag{N}`` identity.
+
+    The boolean indicates that a tag marker was present even when malformed or
+    non-numeric.  Callers use it to disable positional fallback in that case;
+    a malformed/duplicate tag must fail closed rather than silently binding a
+    crop by display order.
+    """
+
+    tag_marker_re = re.compile(r"\\tag\*?\s*\{")
+    numeric_tag_re = re.compile(
+        r"\\tag\*?\s*\{\s*\(?\s*(?P<index>\d+)\s*\)?\s*\}"
+    )
+    tagged: list[tuple[int, int, int | None, bool]] = []
+    marker_seen = False
+    for start, end in _markdown_display_math_spans(markdown):
+        block = markdown[start:end]
+        raw_tags = list(tag_marker_re.finditer(block))
+        if not raw_tags:
+            continue
+        marker_seen = True
+        numeric_tags = list(numeric_tag_re.finditer(block))
+        valid = len(raw_tags) == 1 and len(numeric_tags) == 1
+        index = (
+            int(numeric_tags[0].group("index"))
+            if numeric_tags
+            else None
+        )
+        tagged.append((start, end, index, valid))
+    return tagged, marker_seen
+
+
 def _markdown_adjacent_text_fence_end(markdown: str, end: int) -> int:
     """Include an immediately following generated ``text`` evidence fence."""
 
@@ -1467,10 +1562,21 @@ def _bbox_pixel_crop_box(
     else:
         scale_x = image_width / page_width
         scale_y = image_height / page_height
-    left = float(bbox.get("l") or 0.0) * scale_x
-    right = float(bbox.get("r") or 0.0) * scale_x
-    top_value = float(bbox.get("t") or 0.0)
-    bottom_value = float(bbox.get("b") or 0.0)
+    try:
+        left_value = float(bbox["l"])
+        right_value = float(bbox["r"])
+        top_value = float(bbox["t"])
+        bottom_value = float(bbox["b"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if (
+        not all(math.isfinite(value) for value in (left_value, right_value, top_value, bottom_value))
+        or right_value <= left_value
+        or top_value == bottom_value
+    ):
+        return None
+    left = left_value * scale_x
+    right = right_value * scale_x
     origin = _bbox_explicit_coord_origin(bbox)
     if origin is None:
         return None
@@ -1489,6 +1595,167 @@ def _bbox_pixel_crop_box(
     if crop_box[2] <= crop_box[0] or crop_box[3] <= crop_box[1]:
         return None
     return crop_box
+
+
+def _table_crop_clamp(
+    table: dict[str, Any],
+    tables: list[dict[str, Any]],
+    pictures: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    """Return a source crop box that cannot bleed into a neighbouring visual.
+
+    Docling's table bbox is the only authoritative region we need to preserve.
+    Older code expanded every table by a fixed 100pt, which is unsafe for
+    multi-table figures and two-column pages.  This helper leaves the node bbox
+    intact and places each optional edge at the midpoint of the nearest
+    same-page table/picture.  The pixel crop later clamps its padding to these
+    edges, so a requested review margin never crosses a neighbouring visual.
+    """
+
+    current_prov = first_prov(table)
+    current_bbox = current_prov.get("bbox") if current_prov else None
+    if not isinstance(current_bbox, dict):
+        return None
+    origin = _bbox_explicit_coord_origin(current_bbox)
+    if origin is None:
+        return None
+    try:
+        left = float(current_bbox["l"])
+        right = float(current_bbox["r"])
+        top = float(current_bbox["t"])
+        bottom = float(current_bbox["b"])
+        page_no = int(current_prov.get("page_no") or 0)
+    except (KeyError, TypeError, ValueError):
+        return None
+    if (
+        page_no <= 0
+        or not all(math.isfinite(value) for value in (left, right, top, bottom))
+        or right <= left
+        or top == bottom
+    ):
+        return None
+
+    blockers: list[dict[str, float]] = []
+    for node in [*tables, *pictures]:
+        if node is table:
+            continue
+        prov = first_prov(node)
+        bbox = prov.get("bbox") if prov else None
+        if not isinstance(prov, dict) or not isinstance(bbox, dict):
+            continue
+        try:
+            if int(prov.get("page_no") or 0) != page_no:
+                continue
+            if _bbox_explicit_coord_origin(bbox) != origin:
+                continue
+            candidate = {
+                "l": float(bbox["l"]),
+                "r": float(bbox["r"]),
+                "t": float(bbox["t"]),
+                "b": float(bbox["b"]),
+            }
+        except (KeyError, TypeError, ValueError):
+            continue
+        if candidate["r"] <= candidate["l"] or candidate["t"] == candidate["b"]:
+            continue
+        blockers.append(candidate)
+
+    # These are crop *bounds*, not a replacement for the node bbox.  They may
+    # extend beyond the node to provide review margin, but are kept inside the
+    # nearest midpoint when a blocker exists.
+    clamp_left = float("-inf")
+    clamp_right = float("inf")
+    clamp_top = float("inf") if origin == "BOTTOMLEFT" else float("-inf")
+    clamp_bottom = float("-inf") if origin == "BOTTOMLEFT" else float("inf")
+    for blocker in blockers:
+        # Horizontal midpoint clamps handle the common side-by-side layout and
+        # the table/picture pairing in table-heavy-ai-table-transformer.
+        if blocker["r"] <= left:
+            clamp_left = max(clamp_left, (blocker["r"] + left) / 2.0)
+        elif blocker["l"] >= right:
+            clamp_right = min(clamp_right, (right + blocker["l"]) / 2.0)
+        else:
+            # For overlapping x ranges, only clamp a blocker that is wholly
+            # above/below the table; overlapping content is not safely
+            # separable and must remain visible rather than cutting the node.
+            horizontal_overlap = min(right, blocker["r"]) - max(left, blocker["l"])
+            if horizontal_overlap <= 0:
+                continue
+            if origin == "BOTTOMLEFT":
+                if blocker["b"] >= top:
+                    clamp_top = min(clamp_top, (top + blocker["b"]) / 2.0)
+                elif blocker["t"] <= bottom:
+                    clamp_bottom = max(clamp_bottom, (bottom + blocker["t"]) / 2.0)
+            else:
+                if blocker["t"] <= top:
+                    # TOPLEFT t grows downward: for a blocker above the node,
+                    # use its opposing (bottom) edge, not its outer top edge.
+                    clamp_top = max(clamp_top, (top + blocker["b"]) / 2.0)
+                elif blocker["b"] >= bottom:
+                    # For a blocker below the node, use its opposing (top)
+                    # edge to place the midpoint at the nearest gap.
+                    clamp_bottom = min(clamp_bottom, (bottom + blocker["t"]) / 2.0)
+
+    # A midpoint must never remove pixels belonging to the current node.  If a
+    # malformed/overlapping bbox would do that, fall back to the node bbox.
+    if clamp_left > left or clamp_right < right or (
+        origin == "BOTTOMLEFT" and (clamp_top < top or clamp_bottom > bottom)
+    ) or (
+        origin == "TOPLEFT" and (clamp_top > top or clamp_bottom < bottom)
+    ):
+        return None
+    result = dict(current_bbox)
+    result.update({"l": clamp_left, "r": clamp_right, "t": clamp_top, "b": clamp_bottom})
+    return result
+
+
+def _formula_context_crop_bounds(
+    formula: dict[str, Any],
+    page_size: tuple[float, float] | None,
+) -> dict[str, Any] | None:
+    """Keep an expanded formula context crop inside a clearly identified column.
+
+    A display formula may legitimately span the page midpoint (for example a
+    full-width equation in a two-column paper).  Only clamp when the formula
+    bbox is safely inside one side of the midpoint; near/cross-midpoint bboxes
+    deliberately return ``None`` so the normal padded crop cannot be cut by a
+    guessed column boundary.
+    """
+
+    prov = first_prov(formula)
+    bbox = prov.get("bbox") if prov else None
+    if not isinstance(bbox, dict) or not page_size:
+        return None
+    try:
+        left = float(bbox["l"])
+        right = float(bbox["r"])
+        page_width = float(page_size[0])
+        midpoint = page_width / 2.0
+    except (KeyError, TypeError, ValueError):
+        return None
+    if right <= left or page_width <= 0:
+        return None
+    # Keep a conservative gutter around the midpoint.  This avoids clipping a
+    # formula whose bbox merely brushes the column gap or has noisy OCR edges.
+    midpoint_gutter = max(4.0, page_width * 0.03)
+    if right <= midpoint - midpoint_gutter:
+        column_left, column_right = 0.0, midpoint
+    elif left >= midpoint + midpoint_gutter:
+        column_left, column_right = midpoint, page_width
+    else:
+        return None
+    context_top, context_bottom = (
+        (page_size[1], 0.0)
+        if _bbox_explicit_coord_origin(bbox) == "BOTTOMLEFT"
+        else (0.0, page_size[1])
+    )
+    return {
+        "l": column_left,
+        "r": column_right,
+        "t": context_top,
+        "b": context_bottom,
+        "coord_origin": _bbox_explicit_coord_origin(bbox),
+    }
 
 
 def _bbox_union(boxes: list[dict[str, Any]]) -> dict[str, Any] | None:
@@ -1869,7 +2136,11 @@ def render_page_images_and_crops(
             counts["page_image_count"] += 1
 
         def crop_node(
-            node: dict[str, Any], dest: Path, crop_padding: int
+            node: dict[str, Any],
+            dest: Path,
+            crop_padding: int,
+            *,
+            crop_bounds: dict[str, Any] | None = None,
         ) -> tuple[bool, dict[str, Any] | None]:
             prov = first_prov(node)
             if not prov or not isinstance(prov.get("bbox"), dict):
@@ -1898,6 +2169,65 @@ def render_page_images_and_crops(
             )
             if box is None:
                 return False, None
+            normalized_clip_bounds: dict[str, Any] | None = None
+            if crop_bounds:
+                # Midpoint bounds are optional review margins.  Replace
+                # unbounded sides with the physical page edge before converting
+                # to pixels, then clamp the padded crop without ever clipping
+                # the node bbox itself.
+                bounded = dict(crop_bounds)
+                bounded.setdefault("coord_origin", origin)
+                bounded["l"] = (
+                    0.0
+                    if not math.isfinite(float(bounded.get("l", 0.0)))
+                    else float(bounded["l"])
+                )
+                bounded["r"] = (
+                    page_size[0]
+                    if not math.isfinite(float(bounded.get("r", page_size[0])))
+                    else float(bounded["r"])
+                )
+                if origin == "BOTTOMLEFT":
+                    bounded["t"] = (
+                        page_size[1]
+                        if not math.isfinite(float(bounded.get("t", page_size[1])))
+                        else float(bounded["t"])
+                    )
+                    bounded["b"] = (
+                        0.0
+                        if not math.isfinite(float(bounded.get("b", 0.0)))
+                        else float(bounded["b"])
+                    )
+                else:
+                    bounded["t"] = (
+                        0.0
+                        if not math.isfinite(float(bounded.get("t", 0.0)))
+                        else float(bounded["t"])
+                    )
+                    bounded["b"] = (
+                        page_size[1]
+                        if not math.isfinite(float(bounded.get("b", page_size[1])))
+                        else float(bounded["b"])
+                    )
+                bounds_box = _bbox_pixel_crop_box(
+                    bounded,
+                    page_width=page_size[0],
+                    page_height=page_size[1],
+                    image_width=image.width,
+                    image_height=image.height,
+                    padding=0,
+                    render_scale=scale,
+                )
+                if bounds_box is not None:
+                    normalized_clip_bounds = bounded
+                    box = (
+                        max(box[0], bounds_box[0]),
+                        max(box[1], bounds_box[1]),
+                        min(box[2], bounds_box[2]),
+                        min(box[3], bounds_box[3]),
+                    )
+                    if box[2] <= box[0] or box[3] <= box[1]:
+                        return False, None
             dest.parent.mkdir(exist_ok=True)
             image.crop(box).save(dest)
             metric = {
@@ -1928,6 +2258,9 @@ def render_page_images_and_crops(
                 "page_size": {"width": page_size[0], "height": page_size[1]},
                 "page_image_size": {"width": image.width, "height": image.height},
             }
+            if normalized_clip_bounds is not None:
+                metric["crop_clamp_applied"] = True
+                metric["crop_clip_bounds"] = normalized_clip_bounds
             return True, metric
 
         for index, table in enumerate(tables, start=1):
@@ -1937,18 +2270,12 @@ def render_page_images_and_crops(
                 for prov in (table.get("prov") or [])
                 if isinstance(prov, dict)
             ]
-            if table_prov and isinstance(table_prov[0].get("bbox"), dict):
-                expanded_bbox = dict(table_prov[0]["bbox"])
-                expanded_bbox["l"] = float(expanded_bbox.get("l", 0.0)) - 100.0
-                expanded_bbox["r"] = float(expanded_bbox.get("r", 0.0)) + 100.0
-                expanded_bbox["t"] = float(expanded_bbox.get("t", 0.0)) + 16.0
-                expanded_bbox["b"] = float(expanded_bbox.get("b", 0.0)) - 16.0
-                table_prov[0]["bbox"] = expanded_bbox
-                table_crop_node["prov"] = table_prov
+            table_crop_bounds = _table_crop_clamp(table, tables, pictures)
             wrote_table, table_metric = crop_node(
                 table_crop_node,
                 tables_dir / f"table_{index}.png",
                 max(padding, 48),
+                crop_bounds=table_crop_bounds,
             )
             if wrote_table:
                 counts["table_image_count"] += 1
@@ -2001,10 +2328,18 @@ def render_page_images_and_crops(
                 formulas_dir / f"formula_{index}.png",
                 FORMULA_SOURCE_PADDING_PX,
             )
+            formula_prov = first_prov(formula)
+            formula_page_no = int((formula_prov or {}).get("page_no") or 0)
+            formula_page_size = page_sizes.get(formula_page_no)
+            formula_context_bounds = _formula_context_crop_bounds(
+                formula,
+                formula_page_size,
+            )
             wrote_context, context_metric = crop_node(
                 formula,
                 formulas_dir / f"formula_{index}_context.png",
                 FORMULA_CONTEXT_PADDING_PX,
+                crop_bounds=formula_context_bounds,
             )
             formula_metric: dict[str, Any] = {
                 "index": index,
@@ -2045,6 +2380,1515 @@ def render_page_images_and_crops(
         counts["formula_asset_count"], counts["formula_context_asset_count"]
     )
     return counts, warnings, crop_metrics, structural_manifest
+
+
+def _bounded_table_recovery_render_scale(
+    page_width: float,
+    page_height: float,
+    requested_scale: float = 2.0,
+) -> float | None:
+    """Bound full-page rasterization before asking PDFium for a bitmap."""
+
+    if page_width <= 0.0 or page_height <= 0.0 or requested_scale <= 0.0:
+        return None
+    max_scale = min(
+        TABLE_RECOVERY_RENDER_MAX_DIMENSION / page_width,
+        TABLE_RECOVERY_RENDER_MAX_DIMENSION / page_height,
+        math.sqrt(
+            TABLE_RECOVERY_RENDER_MAX_PIXELS / (page_width * page_height)
+        ),
+    )
+    bounded = min(requested_scale, max_scale)
+    return bounded if bounded > 0.0 else None
+
+
+def _render_table_recovery_crop_png_with_geometry(
+    input_file: Path,
+    table: dict[str, Any],
+    tables: list[dict[str, Any]],
+    pictures: list[dict[str, Any]],
+) -> tuple[bytes, dict[str, Any]] | None:
+    """Render one image-only table crop in memory for the guarded retry."""
+
+    try:
+        import pypdfium2 as pdfium
+    except ImportError:
+        return None
+    prov = first_prov(table)
+    bbox = prov.get("bbox") if prov else None
+    if not isinstance(prov, dict) or not isinstance(bbox, dict):
+        return None
+    try:
+        page_no = int(prov.get("page_no") or 0)
+    except (TypeError, ValueError):
+        return None
+    if page_no < 1:
+        return None
+    pdf = None
+    try:
+        pdf = pdfium.PdfDocument(str(input_file))
+        if page_no > len(pdf):
+            return None
+        page = pdf[page_no - 1]
+        page_width, page_height = (float(value) for value in page.get_size())
+        render_scale = _bounded_table_recovery_render_scale(page_width, page_height)
+        if render_scale is None:
+            return None
+        image = page.render(scale=render_scale).to_pil()
+        box = _bbox_pixel_crop_box(
+            bbox,
+            page_width=page_width,
+            page_height=page_height,
+            image_width=image.width,
+            image_height=image.height,
+            padding=8,
+            render_scale=render_scale,
+        )
+        clamp = _table_crop_clamp(table, tables, pictures)
+        if clamp and box is not None:
+            bounded = dict(clamp)
+            origin = _bbox_explicit_coord_origin(bbox)
+            bounded["coord_origin"] = origin
+            for key, default in (("l", 0.0), ("r", page_width)):
+                value = float(bounded.get(key, default))
+                bounded[key] = default if not math.isfinite(value) else value
+            vertical_defaults = (
+                (("t", page_height), ("b", 0.0))
+                if origin == "BOTTOMLEFT"
+                else (("t", 0.0), ("b", page_height))
+            )
+            for key, default in vertical_defaults:
+                value = float(bounded.get(key, default))
+                bounded[key] = default if not math.isfinite(value) else value
+            bounds_box = _bbox_pixel_crop_box(
+                bounded,
+                page_width=page_width,
+                page_height=page_height,
+                image_width=image.width,
+                image_height=image.height,
+                padding=0,
+                render_scale=render_scale,
+            )
+            if bounds_box:
+                box = (
+                    max(box[0], bounds_box[0]),
+                    max(box[1], bounds_box[1]),
+                    min(box[2], bounds_box[2]),
+                    min(box[3], bounds_box[3]),
+                )
+        if box is None or box[2] <= box[0] or box[3] <= box[1]:
+            return None
+        buffer = io.BytesIO()
+        image.crop(box).save(buffer, format="PNG", optimize=True)
+        return (
+            buffer.getvalue(),
+            {
+                "page_no": page_no,
+                "page_size": {"width": page_width, "height": page_height},
+                "page_image_size": {
+                    "width": image.width,
+                    "height": image.height,
+                },
+                "origin": _bbox_explicit_coord_origin(bbox),
+                "pixel_box": list(box),
+                "render_scale": render_scale,
+            },
+        )
+    except Exception:
+        return None
+    finally:
+        if pdf is not None:
+            try:
+                pdf.close()
+            except Exception:
+                pass
+
+
+def _render_table_recovery_crop_png(
+    input_file: Path,
+    table: dict[str, Any],
+    tables: list[dict[str, Any]],
+    pictures: list[dict[str, Any]],
+) -> bytes | None:
+    """Backward-compatible bytes-only wrapper around crop geometry rendering."""
+
+    rendered = _render_table_recovery_crop_png_with_geometry(
+        input_file,
+        table,
+        tables,
+        pictures,
+    )
+    if isinstance(rendered, tuple):
+        return rendered[0]
+    # Keep injected legacy/new renderers that return raw bytes usable while
+    # the geometry-aware implementation is adopted incrementally.
+    return rendered if isinstance(rendered, (bytes, bytearray)) else None
+
+
+def _map_table_response_ocr_to_crop(
+    response: dict[str, Any],
+    geometry: dict[str, Any],
+    crop_size: tuple[int, int],
+) -> dict[str, Any] | None:
+    """Map source-page OCR into a crop; local fallback consumes only this page.
+
+    The returned response may retain provenance from other source pages for
+    auditability, but the ruled-grid verifier is explicitly scoped to the
+    mapped target page.  This prevents same-coordinate OCR from another page
+    from being mistaken for text inside the crop.
+    """
+
+    try:
+        page_no = int(geometry["page_no"])
+        page_width = float(geometry["page_size"]["width"])
+        page_height = float(geometry["page_size"]["height"])
+        image_width = int(geometry["page_image_size"]["width"])
+        image_height = int(geometry["page_image_size"]["height"])
+        crop_box = tuple(int(value) for value in geometry["pixel_box"])
+        origin = str(geometry["origin"] or "").upper()
+        if origin not in {"TOPLEFT", "BOTTOMLEFT"}:
+            return None
+        if len(crop_box) != 4 or crop_box[2] <= crop_box[0] or crop_box[3] <= crop_box[1]:
+            return None
+    except (KeyError, TypeError, ValueError):
+        return None
+    if (
+        page_width <= 0.0
+        or page_height <= 0.0
+        or not math.isfinite(page_width)
+        or not math.isfinite(page_height)
+        or image_width <= 0
+        or image_height <= 0
+        or crop_box[0] < 0
+        or crop_box[1] < 0
+        or crop_box[2] > image_width
+        or crop_box[3] > image_height
+        or crop_size != (crop_box[2] - crop_box[0], crop_box[3] - crop_box[1])
+    ):
+        return None
+    mapped = copy.deepcopy(response)
+    document = mapped.get("document") if isinstance(mapped, dict) else None
+    document_json = document.get("json_content") if isinstance(document, dict) else None
+    if not isinstance(document, dict) or document_json is None:
+        return None
+    scale_x = image_width / page_width
+    scale_y = image_height / page_height
+
+    def map_bbox(value: Any) -> dict[str, Any] | None:
+        if not isinstance(value, dict):
+            return None
+        try:
+            left = float(value["l"])
+            right = float(value["r"])
+            top_value = float(value["t"])
+            bottom_value = float(value["b"])
+        except (KeyError, TypeError, ValueError):
+            return None
+        if not all(math.isfinite(item) for item in (left, right, top_value, bottom_value)):
+            return None
+        x0, x1 = sorted((left * scale_x, right * scale_x))
+        if origin == "BOTTOMLEFT":
+            y0, y1 = sorted(
+                ((page_height - top_value) * scale_y, (page_height - bottom_value) * scale_y)
+            )
+        else:
+            y0, y1 = sorted((top_value * scale_y, bottom_value * scale_y))
+        return {
+            "l": x0 - crop_box[0],
+            "r": x1 - crop_box[0],
+            "t": y0 - crop_box[1],
+            "b": y1 - crop_box[1],
+            "coord_origin": "TOPLEFT",
+        }
+
+    crop_width, crop_height = crop_size
+    for node in iter_nodes(document_json):
+        if not isinstance(node, dict):
+            continue
+        provs = node.get("prov")
+        if isinstance(provs, list):
+            mapped_provs: list[dict[str, Any]] = []
+            for prov in provs:
+                if not isinstance(prov, dict):
+                    continue
+                try:
+                    prov_page_no = int(prov.get("page_no") or 0)
+                except (TypeError, ValueError):
+                    # Preserve malformed/other-page records only for audit;
+                    # the expected-page filter below will ignore them.
+                    mapped_provs.append(prov)
+                    continue
+                if prov_page_no != page_no:
+                    mapped_provs.append(prov)
+                    continue
+                mapped_bbox = map_bbox(prov.get("bbox"))
+                if mapped_bbox is None:
+                    continue
+                # Drop target-page OCR that lies wholly outside the crop;
+                # retaining it would make the fallback's page-local geometry
+                # ambiguous even though it is not useful evidence.
+                if (
+                    mapped_bbox["r"] <= 0.0
+                    or mapped_bbox["l"] >= crop_width
+                    or mapped_bbox["b"] <= 0.0
+                    or mapped_bbox["t"] >= crop_height
+                ):
+                    continue
+                prov["bbox"] = mapped_bbox
+                prov["page_no"] = 1
+                mapped_provs.append(prov)
+            node["prov"] = mapped_provs
+        elif isinstance(node.get("bbox"), dict):
+            mapped_bbox = map_bbox(node.get("bbox"))
+            if mapped_bbox is not None and not (
+                mapped_bbox["r"] <= 0.0
+                or mapped_bbox["l"] >= crop_width
+                or mapped_bbox["b"] <= 0.0
+                or mapped_bbox["t"] >= crop_height
+            ):
+                node["bbox"] = mapped_bbox
+    document["json_content"] = document_json
+    document["json_content"] = {
+        **(document_json if isinstance(document_json, dict) else {}),
+        "pages": {"1": {"size": {"width": crop_size[0], "height": crop_size[1]}}},
+    }
+    return mapped
+
+
+def _table_recovery_non_target_overlap_reason(
+    table: dict[str, Any],
+    tables: list[dict[str, Any]],
+    geometry: dict[str, Any],
+) -> str | None:
+    """Reject a recovery crop that still contains another table node.
+
+    Source OCR text is not occurrence-bound to a specific table.  If a
+    second same-page table intersects the rendered crop, consuming all OCR in
+    that crop can silently merge the neighbour into the target grid.  The
+    midpoint crop clamp normally keeps distinct visuals disjoint; overlap at
+    this stage therefore means the target cannot be recovered safely and must
+    remain an explicit visual-only fallback.
+    """
+
+    try:
+        page_no = int(geometry["page_no"])
+        page_width = float(geometry["page_size"]["width"])
+        page_height = float(geometry["page_size"]["height"])
+        image_width = int(geometry["page_image_size"]["width"])
+        image_height = int(geometry["page_image_size"]["height"])
+        crop_box = tuple(int(value) for value in geometry["pixel_box"])
+        render_scale = float(geometry["render_scale"])
+    except (KeyError, TypeError, ValueError):
+        return "local_crop_geometry_invalid"
+    if (
+        page_no <= 0
+        or not all(
+            math.isfinite(value)
+            for value in (page_width, page_height, render_scale)
+        )
+        or page_width <= 0.0
+        or page_height <= 0.0
+        or image_width <= 0
+        or image_height <= 0
+        or render_scale <= 0.0
+        or len(crop_box) != 4
+        or crop_box[2] <= crop_box[0]
+        or crop_box[3] <= crop_box[1]
+    ):
+        return "local_crop_geometry_invalid"
+
+    target_ref = str(table.get("self_ref") or "").strip()
+    for candidate in tables:
+        if candidate is table:
+            continue
+        candidate_ref = str(candidate.get("self_ref") or "").strip()
+        if target_ref and candidate_ref == target_ref:
+            continue
+        prov = first_prov(candidate)
+        bbox = prov.get("bbox") if isinstance(prov, dict) else None
+        if not isinstance(prov, dict) or not isinstance(bbox, dict):
+            continue
+        try:
+            if int(prov.get("page_no") or 0) != page_no:
+                continue
+        except (TypeError, ValueError):
+            continue
+        candidate_box = _bbox_pixel_crop_box(
+            bbox,
+            page_width=page_width,
+            page_height=page_height,
+            image_width=image_width,
+            image_height=image_height,
+            padding=0,
+            render_scale=render_scale,
+        )
+        if candidate_box is None:
+            continue
+        intersection_width = min(crop_box[2], candidate_box[2]) - max(
+            crop_box[0], candidate_box[0]
+        )
+        intersection_height = min(crop_box[3], candidate_box[3]) - max(
+            crop_box[1], candidate_box[1]
+        )
+        if intersection_width > 0 and intersection_height > 0:
+            return "local_crop_overlaps_non_target_table"
+    return None
+
+
+def _ruled_grid_group_runs(values: list[int], *, max_gap: int = 1) -> list[list[int]]:
+    groups: list[list[int]] = []
+    for value in values:
+        if not groups or value - groups[-1][-1] > max_gap:
+            groups.append([value])
+        else:
+            groups[-1].append(value)
+    return groups
+
+
+def _ruled_grid_dark_metrics(
+    image: Any,
+) -> tuple[list[int], list[int], list[int], list[int]]:
+    width, height = image.size
+    pixels = image.load()
+    row_counts: list[int] = []
+    row_runs: list[int] = []
+    for y in range(height):
+        count = 0
+        longest = 0
+        current = 0
+        for x in range(width):
+            if int(pixels[x, y]) <= RULED_GRID_DARK_THRESHOLD:
+                count += 1
+                current += 1
+                longest = max(longest, current)
+            else:
+                current = 0
+        row_counts.append(count)
+        row_runs.append(longest)
+    col_counts: list[int] = []
+    col_runs: list[int] = []
+    for x in range(width):
+        count = 0
+        longest = 0
+        current = 0
+        for y in range(height):
+            if int(pixels[x, y]) <= RULED_GRID_DARK_THRESHOLD:
+                count += 1
+                current += 1
+                longest = max(longest, current)
+            else:
+                current = 0
+        col_counts.append(count)
+        col_runs.append(longest)
+    return row_counts, row_runs, col_counts, col_runs
+
+
+def _ruled_grid_line_positions(
+    counts: list[int],
+    runs: list[int],
+    *,
+    orthogonal_size: int,
+) -> list[int]:
+    count_threshold = max(8, int(orthogonal_size * 0.12))
+    # Text glyphs can produce short dark runs in a projection.  A real ruled
+    # edge remains continuous through a substantial fraction of its orthogonal
+    # span, including partial edges around a rowspan/colspan.  The 25% floor
+    # keeps those partial edges while rejecting glyph strokes.
+    run_threshold = max(12, int(orthogonal_size * 0.25))
+    candidate_indexes = [
+        index
+        for index, (count, longest) in enumerate(zip(counts, runs))
+        if count >= count_threshold and longest >= run_threshold
+    ]
+    groups = _ruled_grid_group_runs(candidate_indexes, max_gap=2)
+    return [int(round(sum(group) / len(group))) for group in groups]
+
+
+def _ruled_grid_segment_support(
+    image: Any,
+    *,
+    orientation: str,
+    coordinate: int,
+    start: int,
+    end: int,
+) -> float:
+    """Measure dark-line support along one candidate cell edge."""
+
+    width, height = image.size
+    pixels = image.load()
+    if end <= start:
+        return 0.0
+    supported = 0
+    total = end - start
+    if orientation == "horizontal":
+        for x in range(max(0, start), min(width, end)):
+            if any(
+                int(pixels[x, y]) <= RULED_GRID_DARK_THRESHOLD
+                for y in range(max(0, coordinate - 2), min(height, coordinate + 3))
+            ):
+                supported += 1
+    else:
+        for y in range(max(0, start), min(height, end)):
+            if any(
+                int(pixels[x, y]) <= RULED_GRID_DARK_THRESHOLD
+                for x in range(max(0, coordinate - 2), min(width, coordinate + 3))
+            ):
+                supported += 1
+    return supported / max(total, 1)
+
+
+def _ruled_grid_intersection_support(image: Any, x: int, y: int) -> float:
+    """Return dark-pixel support in a small candidate line intersection."""
+
+    width, height = image.size
+    pixels = image.load()
+    dark = 0
+    total = 0
+    for xx in range(max(0, x - 2), min(width, x + 3)):
+        for yy in range(max(0, y - 2), min(height, y + 3)):
+            total += 1
+            if int(pixels[xx, yy]) <= RULED_GRID_DARK_THRESHOLD:
+                dark += 1
+    return dark / max(total, 1)
+
+
+def _ruled_grid_dash_marker(
+    image: Any,
+    *,
+    left: int,
+    top: int,
+    right: int,
+    bottom: int,
+) -> bool:
+    """Recognize only a tiny horizontal dash in an otherwise empty cell.
+
+    The source PDF's dash glyphs can be left-aligned within a narrow cell, so
+    horizontal centering is not assumed.  We do require a vertically centered,
+    short, thin run away from the ruled edge and reject any additional ink in
+    the interior.  This keeps ordinary glyphs and accidental border bleed from
+    becoming fabricated table text.
+    """
+
+    width = right - left
+    height = bottom - top
+    if width < 8 or height < 6:
+        return False
+    pixels = image.load()
+    edge_margin_x = max(2, min(8, int(width * 0.03)))
+    edge_margin_y = max(2, min(6, int(height * 0.15)))
+    x_start = max(0, left + edge_margin_x)
+    x_end = min(image.width, right - edge_margin_x)
+    y_start = max(0, top + edge_margin_y)
+    y_end = min(image.height, bottom - edge_margin_y)
+    if x_end - x_start < RULED_GRID_DASH_MIN_RUN_PX or y_end <= y_start:
+        return False
+    max_run = max(
+        RULED_GRID_DASH_MIN_RUN_PX,
+        int(width * RULED_GRID_DASH_MAX_RUN_RATIO),
+    )
+    # A dash glyph is only a couple of raster rows thick.  Cap the allowance
+    # so a centered text line in a large cell cannot pass as a dash merely
+    # because the cell itself is tall.
+    max_thickness = max(
+        2,
+        min(3, int(height * RULED_GRID_DASH_MAX_THICKNESS_RATIO)),
+    )
+    center_y = (top + bottom - 1) / 2.0
+    candidate_rows: list[tuple[int, int, int]] = []
+    interior_dark = 0
+    for y in range(y_start, y_end):
+        row_dark = 0
+        longest = 0
+        current = 0
+        for x in range(x_start, x_end):
+            if int(pixels[x, y]) <= RULED_GRID_DASH_THRESHOLD:
+                interior_dark += 1
+                row_dark += 1
+                current += 1
+                longest = max(longest, current)
+            else:
+                current = 0
+        if (
+            abs(y - center_y) <= max(2.0, height * 0.25)
+            and RULED_GRID_DASH_MIN_RUN_PX <= longest <= max_run
+            and row_dark <= max_run * 2
+        ):
+            candidate_rows.append((y, longest, row_dark))
+    if not candidate_rows:
+        return False
+    first_row = candidate_rows[0][0]
+    last_row = candidate_rows[-1][0]
+    if last_row - first_row + 1 > max_thickness:
+        return False
+    # A dash must account for essentially all interior ink.  Text glyphs have
+    # multiple disconnected strokes and exceed this compactness bound.
+    candidate_dark = sum(row_dark for _, _, row_dark in candidate_rows)
+    if candidate_dark < RULED_GRID_DASH_MIN_RUN_PX or interior_dark > candidate_dark + 2:
+        return False
+    return True
+
+
+def _ruled_grid_find(parent: list[int], value: int) -> int:
+    while parent[value] != value:
+        parent[value] = parent[parent[value]]
+        value = parent[value]
+    return value
+
+
+def _ruled_grid_union(parent: list[int], first: int, second: int) -> None:
+    first_root = _ruled_grid_find(parent, first)
+    second_root = _ruled_grid_find(parent, second)
+    if first_root != second_root:
+        parent[second_root] = first_root
+
+
+def _ruled_grid_ocr_records(
+    response: dict[str, Any],
+    image: Any,
+    *,
+    expected_page_no: int | None = None,
+) -> list[dict[str, Any]]:
+    document = response.get("document") if isinstance(response, dict) else None
+    document_json = document.get("json_content") if isinstance(document, dict) else None
+    inventory = _document_page_size_inventory(document_json)
+    page_records = inventory.get("page_records") or {}
+    default_page_size = next(iter(page_records.values()), {}).get("size") or {}
+    records: list[dict[str, Any]] = []
+    seen: set[tuple[str, int, int, int, int]] = set()
+    for node in iter_nodes(document_json):
+        if not isinstance(node, dict):
+            continue
+        text = node.get("text")
+        if not isinstance(text, str) or not text.strip():
+            continue
+        raw_prov = node.get("prov")
+        provs = [item for item in raw_prov if isinstance(item, dict)] if isinstance(raw_prov, list) else []
+        if not provs and isinstance(node.get("bbox"), dict):
+            provs = [{"bbox": node["bbox"]}]
+        for prov in provs:
+            bbox = prov.get("bbox") if isinstance(prov, dict) else None
+            if not isinstance(bbox, dict):
+                continue
+            if expected_page_no is not None:
+                try:
+                    if int(prov.get("page_no") or 0) != expected_page_no:
+                        continue
+                except (TypeError, ValueError):
+                    continue
+            try:
+                left = float(bbox["l"])
+                right = float(bbox["r"])
+                top = float(bbox["t"])
+                bottom = float(bbox["b"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            segment = text
+            charspan = prov.get("charspan")
+            if (
+                isinstance(charspan, (list, tuple))
+                and len(charspan) == 2
+            ):
+                try:
+                    start, end = int(charspan[0]), int(charspan[1])
+                except (TypeError, ValueError):
+                    start, end = 0, 0
+                if 0 <= start < end <= len(text):
+                    segment = text[start:end]
+            if not isinstance(segment, str) or not segment.strip():
+                continue
+            page_no = _positive_page_number(prov.get("page_no"))
+            page_size = (
+                (page_records.get(page_no) or {}).get("size")
+                if page_no is not None
+                else None
+            ) or default_page_size
+            try:
+                page_width = float(page_size.get("width") or image.width)
+                page_height = float(page_size.get("height") or image.height)
+            except (AttributeError, TypeError, ValueError):
+                page_width, page_height = float(image.width), float(image.height)
+            origin = _bbox_explicit_coord_origin(bbox) or _bbox_coord_origin(bbox) or "TOPLEFT"
+            scale_x = image.width / max(page_width, 1.0)
+            scale_y = image.height / max(page_height, 1.0)
+            center_x = ((left + right) / 2.0) * scale_x
+            center_y_source = ((top + bottom) / 2.0) * scale_y
+            center_y = (
+                image.height - center_y_source
+                if origin == "BOTTOMLEFT"
+                else center_y_source
+            )
+            key = (
+                segment.strip(),
+                int(round(left * scale_x)),
+                int(round(right * scale_x)),
+                int(round(top * scale_y)),
+                int(round(bottom * scale_y)),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            records.append({"text": segment.strip(), "cx": center_x, "cy": center_y})
+    return records
+
+
+def _ruled_grid_ocr_fallback(
+    response: dict[str, Any],
+    crop_bytes: bytes,
+    *,
+    table_semantic_hint: bool = False,
+) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    """Recover a conservative table grid from OCR bboxes and ruled pixels."""
+
+    diagnostics: dict[str, Any] = {
+        "recovery_mode": "ruled_grid_ocr_fallback",
+        "table_semantic_hint": bool(table_semantic_hint),
+    }
+    if not table_semantic_hint:
+        diagnostics["reason"] = "ruled_grid_table_semantic_hint_missing"
+        return None, diagnostics
+    try:
+        from PIL import Image
+
+        with Image.open(io.BytesIO(crop_bytes)) as loaded:
+            image = loaded.convert("L")
+            width, height = image.size
+            if (
+                width < 32
+                or height < 32
+                or width > RULED_GRID_MAX_DIMENSION
+                or height > RULED_GRID_MAX_DIMENSION
+                or width * height > RULED_GRID_MAX_PIXELS
+            ):
+                diagnostics["reason"] = "ruled_grid_dimensions_out_of_bounds"
+                return None, diagnostics
+            row_counts, row_runs, col_counts, col_runs = _ruled_grid_dark_metrics(image)
+            horizontal = _ruled_grid_line_positions(row_counts, row_runs, orthogonal_size=width)
+            vertical = _ruled_grid_line_positions(col_counts, col_runs, orthogonal_size=height)
+            diagnostics.update({"horizontal_line_count": len(horizontal), "vertical_line_count": len(vertical)})
+            grid_span_width = vertical[-1] - vertical[0] if vertical else 0
+            grid_span_height = horizontal[-1] - horizontal[0] if horizontal else 0
+            diagnostics.update(
+                {
+                    "grid_span_width": grid_span_width,
+                    "grid_span_height": grid_span_height,
+                }
+            )
+            if (
+                len(horizontal) < 3
+                or len(vertical) < 3
+                or len(horizontal) > RULED_GRID_MAX_LINES
+                or len(vertical) > RULED_GRID_MAX_LINES
+                or grid_span_width < max(24, int(width * 0.15))
+                or grid_span_height < max(24, int(height * 0.15))
+            ):
+                diagnostics["reason"] = "ruled_grid_geometry_not_strong"
+                return None, diagnostics
+
+            intersection_matrix = [
+                [
+                    _ruled_grid_intersection_support(image, x, y)
+                    >= RULED_GRID_INTERSECTION_MIN_RATIO
+                    for x in vertical
+                ]
+                for y in horizontal
+            ]
+            outer_intersections = sum(
+                intersection_matrix[row][col]
+                for row, col in ((0, 0), (0, len(vertical) - 1),
+                                 (len(horizontal) - 1, 0),
+                                 (len(horizontal) - 1, len(vertical) - 1))
+            )
+            outer_supports = [
+                _ruled_grid_intersection_support(image, x, y)
+                for x, y in (
+                    (vertical[0], horizontal[0]),
+                    (vertical[-1], horizontal[0]),
+                    (vertical[0], horizontal[-1]),
+                    (vertical[-1], horizontal[-1]),
+                )
+            ]
+            diagnostics["outer_intersection_support"] = outer_supports
+            horizontal_with_intersection = [
+                any(row_values) for row_values in intersection_matrix
+            ]
+            vertical_with_intersection = [
+                any(intersection_matrix[row][col] for row in range(len(horizontal)))
+                for col in range(len(vertical))
+            ]
+            if (
+                outer_intersections < 3
+                or sum(support >= RULED_GRID_INTERSECTION_MIN_RATIO for support in outer_supports) < 3
+                or not all(horizontal_with_intersection)
+                or not all(vertical_with_intersection)
+            ):
+                diagnostics["reason"] = "ruled_grid_intersections_not_strong"
+                return None, diagnostics
+
+            rows = len(horizontal) - 1
+            cols = len(vertical) - 1
+            if rows < 2 or cols < 2 or rows > TABLE_RECOVERY_MAX_ROWS or cols > TABLE_RECOVERY_MAX_COLS:
+                diagnostics["reason"] = "ruled_grid_dimensions_not_supported"
+                return None, diagnostics
+            # A crop-local response is always normalized to page 1.  Keeping
+            # this explicit avoids same-coordinate OCR from another source
+            # page contaminating the recovered grid.
+            records = _ruled_grid_ocr_records(response, image, expected_page_no=1)
+            inside_records = [
+                record
+                for record in records
+                if vertical[0] <= record["cx"] <= vertical[-1]
+                and horizontal[0] <= record["cy"] <= horizontal[-1]
+            ]
+            if len(inside_records) < 4:
+                diagnostics["reason"] = "ruled_grid_ocr_text_insufficient"
+                return None, diagnostics
+
+            total_cells = rows * cols
+            if total_cells > TABLE_RECOVERY_MAX_CELLS:
+                diagnostics["reason"] = "ruled_grid_cell_limit_exceeded"
+                return None, diagnostics
+            parent = list(range(total_cells))
+            def cell_index(row: int, col: int) -> int:
+                return row * cols + col
+
+            def centered_text_in_rect(left: float, top: float, right: float, bottom: float) -> bool:
+                for record in inside_records:
+                    if not (left <= record["cx"] <= right and top <= record["cy"] <= bottom):
+                        continue
+                    x_ratio = (record["cx"] - left) / max(right - left, 1.0)
+                    y_ratio = (record["cy"] - top) / max(bottom - top, 1.0)
+                    if 0.2 <= x_ratio <= 0.8 and 0.2 <= y_ratio <= 0.8:
+                        return True
+                return False
+
+            # Missing internal lines are treated as merges only when OCR places
+            # text centrally in the combined rectangle.  Blank regions remain
+            # explicit empty cells instead of being guessed as spans.
+            for row in range(rows):
+                for col in range(cols - 1):
+                    support = _ruled_grid_segment_support(
+                        image,
+                        orientation="vertical",
+                        coordinate=vertical[col + 1],
+                        start=horizontal[row] + 2,
+                        end=horizontal[row + 1] - 2,
+                    )
+                    if support < 0.35 and centered_text_in_rect(
+                        vertical[col], horizontal[row], vertical[col + 2], horizontal[row + 1]
+                    ):
+                        _ruled_grid_union(parent, cell_index(row, col), cell_index(row, col + 1))
+            for row in range(rows - 1):
+                for col in range(cols):
+                    support = _ruled_grid_segment_support(
+                        image,
+                        orientation="horizontal",
+                        coordinate=horizontal[row + 1],
+                        start=vertical[col] + 2,
+                        end=vertical[col + 1] - 2,
+                    )
+                    if support < 0.35 and centered_text_in_rect(
+                        vertical[col], horizontal[row], vertical[col + 1], horizontal[row + 2]
+                    ):
+                        _ruled_grid_union(parent, cell_index(row, col), cell_index(row + 1, col))
+
+            components: dict[int, list[tuple[int, int]]] = {}
+            for row in range(rows):
+                for col in range(cols):
+                    components.setdefault(_ruled_grid_find(parent, cell_index(row, col)), []).append((row, col))
+            component_bounds: list[dict[str, Any]] = []
+            for coordinates in components.values():
+                min_row = min(row for row, _ in coordinates)
+                max_row = max(row for row, _ in coordinates)
+                min_col = min(col for _, col in coordinates)
+                max_col = max(col for _, col in coordinates)
+                if len(coordinates) != (max_row - min_row + 1) * (max_col - min_col + 1):
+                    diagnostics["reason"] = "ruled_grid_non_rectangular_component"
+                    return None, diagnostics
+                component_bounds.append(
+                    {
+                        "rows": set(range(min_row, max_row + 1)),
+                        "cols": set(range(min_col, max_col + 1)),
+                        "min_row": min_row,
+                        "max_row": max_row,
+                        "min_col": min_col,
+                        "max_col": max_col,
+                        "text": [],
+                    }
+                )
+            merged_component_count = sum(
+                len(component["rows"]) > 1 or len(component["cols"]) > 1
+                for component in component_bounds
+            )
+            for record in inside_records:
+                component = next(
+                    (
+                        item
+                        for item in component_bounds
+                        if vertical[item["min_col"]] <= record["cx"] <= vertical[item["max_col"] + 1]
+                        and horizontal[item["min_row"]] <= record["cy"] <= horizontal[item["max_row"] + 1]
+                    ),
+                    None,
+                )
+                if component is not None:
+                    component["text"].append(record)
+            # A fully labelled 2x2 ruled box is indistinguishable from a tiny
+            # chart/legend (four labels and no table-specific structure).  The
+            # fallback is intentionally conservative: dense semantic tables
+            # are accepted by the structured path, while visual-only retries
+            # require more than four independent components before we infer a
+            # table from pixels and OCR alone.
+            if len(component_bounds) <= 4:
+                diagnostics.update(
+                    {
+                        "reason": "ruled_grid_semantics_insufficient",
+                        "nonempty_components": sum(
+                            bool(item["text"]) for item in component_bounds
+                        ),
+                        "component_count": len(component_bounds),
+                    }
+                )
+                return None, diagnostics
+            dash_marker_count = 0
+            for component in component_bounds:
+                if component["text"] or len(component["rows"]) != 1 or len(component["cols"]) != 1:
+                    continue
+                row = component["min_row"]
+                col = component["min_col"]
+                if _ruled_grid_dash_marker(
+                    image,
+                    left=vertical[col],
+                    top=horizontal[row],
+                    right=vertical[col + 1],
+                    bottom=horizontal[row + 1],
+                ):
+                    component["text"].append({"text": "-", "cx": 0.0, "cy": 0.0})
+                    dash_marker_count += 1
+            nonempty_components = sum(bool(item["text"]) for item in component_bounds)
+            nonempty_rows = {
+                item["min_row"]
+                for item in component_bounds
+                if item["text"]
+            }
+            nonempty_cols = {
+                item["min_col"]
+                for item in component_bounds
+                if item["text"]
+            }
+            component_coverage = nonempty_components / max(len(component_bounds), 1)
+            plain_grid = merged_component_count == 0
+            minimum_nonempty_components = (
+                max(6, int(math.ceil(len(component_bounds) * 0.8)))
+                if plain_grid
+                else max(4, int(math.ceil(len(component_bounds) * 0.5)))
+            )
+            if (
+                len(inside_records) < 4
+                or (plain_grid and len(inside_records) < 6)
+                or (plain_grid and len(component_bounds) < 6)
+                or nonempty_components < minimum_nonempty_components
+                or len(nonempty_rows) < (rows if plain_grid else 2)
+                or len(nonempty_cols) < (cols if plain_grid else 2)
+            ):
+                diagnostics.update(
+                    {
+                        "reason": (
+                            "ruled_grid_nested_semantics_required"
+                            if plain_grid and not table_semantic_hint
+                            else "ruled_grid_cell_coverage_insufficient"
+                        ),
+                        "nonempty_components": nonempty_components,
+                        "component_count": len(component_bounds),
+                        "component_coverage": round(component_coverage, 3),
+                        "merged_component_count": merged_component_count,
+                    }
+                )
+                return None, diagnostics
+            if plain_grid and not table_semantic_hint:
+                diagnostics.update(
+                    {
+                        "reason": "ruled_grid_nested_semantics_required",
+                        "merged_component_count": merged_component_count,
+                    }
+                )
+                return None, diagnostics
+            table_cells: list[dict[str, Any]] = []
+            for component in sorted(component_bounds, key=lambda item: (item["min_row"], item["min_col"])):
+                texts = sorted(component["text"], key=lambda item: (item["cy"], item["cx"]))
+                table_cells.append(
+                    {
+                        "start_row_offset_idx": component["min_row"],
+                        "end_row_offset_idx": component["max_row"] + 1,
+                        "start_col_offset_idx": component["min_col"],
+                        "end_col_offset_idx": component["max_col"] + 1,
+                        "text": " ".join(item["text"] for item in texts),
+                    }
+                )
+            diagnostics.update(
+                {
+                    "accepted": True,
+                    "rows": rows,
+                    "cols": cols,
+                    "cell_count": len(table_cells),
+                    "ocr_nonempty_count": len(inside_records),
+                    "dash_marker_count": dash_marker_count,
+                    "nonempty_components": nonempty_components,
+                    "component_count": len(component_bounds),
+                    "component_coverage": round(component_coverage, 3),
+                    "merged_component_count": merged_component_count,
+                    "rectangular_components": True,
+                    "confidence": "high",
+                    "validation_mode": "validated_ruled_grid_ocr",
+                }
+            )
+            return {"num_rows": rows, "num_cols": cols, "table_cells": table_cells}, diagnostics
+    except Exception as exc:
+        diagnostics.update({"reason": "ruled_grid_decode_failed", "error": f"{type(exc).__name__}:{exc}"})
+        return None, diagnostics
+
+
+def _table_recovery_raw_limits(table: dict[str, Any]) -> str | None:
+    """Validate untrusted dimensions/offsets before any grid allocation."""
+
+    data = table.get("data") if isinstance(table, dict) else None
+    if not isinstance(data, dict):
+        return "table_data_missing"
+    cells = data.get("table_cells")
+    if not isinstance(cells, list):
+        return "table_cells_missing"
+    raw_rows = data.get("num_rows")
+    raw_cols = data.get("num_cols")
+    if isinstance(raw_rows, bool) or isinstance(raw_cols, bool):
+        return "table_grid_dimensions_invalid"
+    try:
+        rows = int(raw_rows or 0)
+        cols = int(raw_cols or 0)
+    except (TypeError, ValueError):
+        return "table_grid_dimensions_invalid"
+    if rows < 0 or cols < 0:
+        return "table_grid_dimensions_invalid"
+    if rows > TABLE_RECOVERY_MAX_ROWS or cols > TABLE_RECOVERY_MAX_COLS:
+        return "table_grid_limits_exceeded"
+    if len(cells) > TABLE_RECOVERY_MAX_CELLS:
+        return "table_grid_limits_exceeded"
+    offset_keys = (
+        "start_row_offset_idx",
+        "end_row_offset_idx",
+        "start_col_offset_idx",
+        "end_col_offset_idx",
+    )
+    for cell in cells:
+        if not isinstance(cell, dict):
+            return "table_cell_invalid"
+        present = [key in cell for key in offset_keys]
+        if not any(present):
+            # Legacy/minimal payloads may omit all offsets; table_grid() will
+            # place those cells deterministically into declared slots.
+            continue
+        if not all(present):
+            return "table_cell_offsets_invalid"
+        values = [cell[key] for key in offset_keys]
+        if any(isinstance(value, bool) or not isinstance(value, int) for value in values):
+            return "table_cell_offsets_invalid"
+        start_row, end_row, start_col, end_col = values
+        if (
+            start_row < 0
+            or start_col < 0
+            or end_row <= start_row
+            or end_col <= start_col
+            or end_row > rows
+            or end_col > cols
+        ):
+            return "table_cell_offsets_out_of_bounds"
+    return None
+
+
+def _table_recovery_candidate_needs_retry(table: dict[str, Any]) -> bool:
+    """Identify only image-only/empty tables for a retry.
+
+    A bounded but sparse table can still be a legitimate semantic result (for
+    example a one-cell ``Total = 12`` table).  Retrying those tables and then
+    marking the whole conversion degraded would discard valid semantics.  The
+    retry path is therefore reserved for nodes with no non-empty cell text;
+    raw dimensions are checked only after that semantic guard so even hostile
+    dimensions on a valid table are never sent back to the service.
+    """
+
+    data = table.get("data") if isinstance(table, dict) else None
+    cells = data.get("table_cells") if isinstance(data, dict) else None
+    if not isinstance(cells, list) or not cells:
+        return True
+    if any(
+        isinstance(cell, dict)
+        and isinstance(cell.get("text"), str)
+        and cell.get("text", "").strip()
+        for cell in cells
+    ):
+        return False
+    # Every cell is empty (or malformed) -- this is the explicit image-only
+    # recovery case, including a declared 1x1/2x2 grid with no text.
+    return True
+
+
+_TABLE_SEMANTIC_HINT_RE = re.compile(
+    r"(?i)(?<![A-Za-z])table(?![A-Za-z])|"
+    r"(?:^|[\s:：。．,，;；(\[【])表(?:\s*(?:\d+|[A-Za-z]?\d+)|格)"
+)
+
+
+def _table_has_semantic_hint(table: dict[str, Any], document_json: Any) -> bool:
+    """Require explicit nearby table wording before OCR grid inference."""
+
+    table_prov = first_prov(table) or {}
+    table_bbox = table_prov.get("bbox") if isinstance(table_prov, dict) else None
+    try:
+        table_page = int(table_prov.get("page_no") or 0)
+        table_left = float(table_bbox["l"])
+        table_right = float(table_bbox["r"])
+        table_top = float(table_bbox["t"])
+        table_bottom = float(table_bbox["b"])
+    except (KeyError, TypeError, ValueError):
+        table_page = 0
+        table_left = table_right = table_top = table_bottom = 0.0
+    valid_table_geometry = not (
+        table_page <= 0
+        or not all(math.isfinite(value) for value in (
+            table_left, table_right, table_top, table_bottom
+        ))
+        or table_right <= table_left
+        or table_bottom == table_top
+    )
+
+    def has_hint(value: Any) -> bool:
+        return bool(_TABLE_SEMANTIC_HINT_RE.search(str(value or "")))
+
+    # Captions are the strongest source-side signal.  Resolve both direct
+    # strings and Docling ``$ref`` caption nodes without trusting label names.
+    caption_refs = table.get("captions") if isinstance(table, dict) else None
+    for caption in caption_refs or []:
+        if isinstance(caption, str) and has_hint(caption):
+            return True
+        if isinstance(caption, dict):
+            if has_hint(caption.get("text")):
+                return True
+            ref = str(caption.get("$ref") or "")
+            if ref:
+                for node in iter_nodes(document_json):
+                    if isinstance(node, dict) and str(node.get("self_ref") or "") == ref:
+                        if has_hint(node.get("text")):
+                            return True
+
+    # Fall back to a same-page, nearby text/caption node.  The horizontal
+    # relation prevents an unrelated column heading from authorizing a crop.
+    if not valid_table_geometry or not isinstance(table_bbox, dict):
+        return False
+    for node in iter_nodes(document_json):
+        if not isinstance(node, dict) or str(node.get("label") or "").lower() == "table":
+            continue
+        text = node.get("text")
+        if not has_hint(text):
+            continue
+        for prov in node.get("prov") or []:
+            if not isinstance(prov, dict):
+                continue
+            try:
+                if int(prov.get("page_no") or 0) != table_page:
+                    continue
+            except (TypeError, ValueError):
+                continue
+            bbox = prov.get("bbox")
+            if not isinstance(bbox, dict):
+                continue
+            try:
+                left = float(bbox["l"])
+                right = float(bbox["r"])
+                top = float(bbox["t"])
+                bottom = float(bbox["b"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if not all(math.isfinite(value) for value in (left, right, top, bottom)):
+                continue
+            vertical_gap = max(
+                0.0,
+                min(table_top, table_bottom) - max(top, bottom),
+                min(top, bottom) - max(table_top, table_bottom),
+            )
+            horizontal_overlap = min(table_right, right) - max(table_left, left)
+            caption_center = (left + right) / 2.0
+            center_in_table = table_left <= caption_center <= table_right
+            if vertical_gap <= 48.0 and (horizontal_overlap > 0.0 or center_in_table):
+                return True
+    return False
+
+
+def _recovered_table_data_from_response(
+    response: dict[str, Any],
+    *,
+    crop_bytes: bytes | None = None,
+    table_semantic_hint: bool = False,
+) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    """Accept one dense, two-dimensional table from a crop retry."""
+
+    document = response.get("document") if isinstance(response, dict) else None
+    candidates = extract_table_nodes(
+        document.get("json_content") if isinstance(document, dict) else None
+    )
+    diagnostics: dict[str, Any] = {
+        "response_status": response.get("status") if isinstance(response, dict) else None,
+        "candidate_count": len(candidates),
+        "accepted": False,
+        "reason": None,
+    }
+    if not isinstance(response, dict) or response.get("status") not in {"success", "partial_success"}:
+        diagnostics["reason"] = "response_not_success"
+        return None, diagnostics
+    if len(candidates) == 0 and crop_bytes:
+        ruled_data, ruled_diagnostics = _ruled_grid_ocr_fallback(
+            response,
+            crop_bytes,
+            table_semantic_hint=table_semantic_hint,
+        )
+        diagnostics.update(ruled_diagnostics)
+        if ruled_data is not None:
+            diagnostics.update(
+                {
+                    "accepted": True,
+                    "confidence": "high",
+                    "validation_mode": "validated_ruled_grid_ocr",
+                }
+            )
+            return ruled_data, diagnostics
+        # Preserve the conservative ruled-grid rejection reason for callers and
+        # diagnostics; do not hide it behind the generic non-unique candidate
+        # message when the retry returned OCR but no semantic table.
+        return None, diagnostics
+    if len(candidates) != 1:
+        diagnostics["reason"] = "table_candidate_not_unique"
+        return None, diagnostics
+    candidate = candidates[0]
+    raw_limit_reason = _table_recovery_raw_limits(candidate)
+    if raw_limit_reason is not None:
+        diagnostics["reason"] = raw_limit_reason
+        return None, diagnostics
+    confidence = str(candidate.get("confidence") or "").strip().lower()
+    if confidence in {"low", "medium"}:
+        structured_reason = "table_confidence_not_high"
+        diagnostics.update(
+            {"structured_rejection_reason": structured_reason, "confidence": confidence}
+        )
+        if crop_bytes:
+            ruled_data, ruled_diagnostics = _ruled_grid_ocr_fallback(
+                response,
+                crop_bytes,
+                table_semantic_hint=table_semantic_hint,
+            )
+            diagnostics.update(ruled_diagnostics)
+            if ruled_data is not None:
+                diagnostics.update(
+                    {
+                        "accepted": True,
+                        "confidence": "high",
+                        "validation_mode": "validated_ruled_grid_ocr",
+                    }
+                )
+                return ruled_data, diagnostics
+            return None, diagnostics
+        diagnostics["reason"] = structured_reason
+        return None, diagnostics
+    data = candidate.get("data")
+    grid = table_grid(candidate)
+    rows = len(grid)
+    cols = max((len(row) for row in grid), default=0)
+    nonempty = sum(bool(str(cell).strip()) for row in grid for cell in row)
+    total = rows * cols
+    cells = [cell for cell in (data or {}).get("table_cells", []) if isinstance(cell, dict)]
+    fill = nonempty / total if total else 0.0
+    diagnostics.update({"rows": rows, "cols": cols, "cell_count": len(cells), "fill_ratio": round(fill, 3)})
+    if (
+        rows < 2
+        or cols < 2
+        or rows > TABLE_RECOVERY_MAX_ROWS
+        or cols > TABLE_RECOVERY_MAX_COLS
+        or len(cells) > TABLE_RECOVERY_MAX_CELLS
+        or total < 4
+        or len(cells) < 4
+        or fill < 0.6
+    ):
+        structured_reason = "table_grid_not_dense_enough"
+        diagnostics["structured_rejection_reason"] = structured_reason
+        if crop_bytes:
+            ruled_data, ruled_diagnostics = _ruled_grid_ocr_fallback(
+                response,
+                crop_bytes,
+                table_semantic_hint=table_semantic_hint,
+            )
+            diagnostics.update(ruled_diagnostics)
+            if ruled_data is not None:
+                diagnostics.update(
+                    {
+                        "accepted": True,
+                        "confidence": "high",
+                        "validation_mode": "validated_ruled_grid_ocr",
+                    }
+                )
+                return ruled_data, diagnostics
+            return None, diagnostics
+        diagnostics["reason"] = structured_reason
+        return None, diagnostics
+    if not isinstance(data, dict) or not isinstance(data.get("table_cells"), list):
+        diagnostics["reason"] = "table_data_missing_cells"
+        return None, diagnostics
+    sanitized_data = copy.deepcopy(data)
+    for cell in sanitized_data.get("table_cells") or []:
+        if isinstance(cell, dict):
+            # Retry coordinates are local to the PNG crop, not the submitted
+            # PDF page.  Keeping them would falsely claim PDF provenance.
+            cell.pop("bbox", None)
+    diagnostics.update(
+        {
+            "accepted": True,
+            "confidence": "high",
+            "validation_mode": "validated_dense_table",
+        }
+    )
+    return sanitized_data, diagnostics
+
+
+def recover_image_only_tables_from_serve(
+    response: dict[str, Any],
+    input_file: Path,
+    args: argparse.Namespace,
+    metadata: dict[str, Any],
+    status: dict[str, Any],
+) -> dict[str, Any]:
+    """Recover empty image tables locally, then optionally retry via Serve.
+
+    The local path uses only source-page OCR already present in the conversion
+    response plus bounded crop pixels.  A remote retry is attempted only for a
+    trusted loopback endpoint; derived crops are never sent elsewhere.
+    Failures leave the original 0x0 table for the explicit visual-only fallback.
+    """
+
+    endpoint_parse_error: str | None = None
+    try:
+        endpoint = urllib.parse.urlparse(str(getattr(args, "serve_url", "")))
+        trusted_host = endpoint.hostname in {"127.0.0.1", "localhost", "::1"}
+        trusted_endpoint = bool(
+            endpoint.scheme in {"http", "https"}
+            and trusted_host
+            and not endpoint.username
+            and not endpoint.password
+        )
+    except ValueError as exc:
+        # urlparse raises on malformed bracketed hosts.  Treat that exactly as
+        # any other untrusted endpoint: record a rejection and never issue a
+        # crop upload request.
+        endpoint = None
+        endpoint_parse_error = f"{type(exc).__name__}:{exc}"
+        trusted_endpoint = False
+    document = response.get("document") if isinstance(response, dict) else None
+    document_json = document.get("json_content") if isinstance(document, dict) else None
+    tables = extract_table_nodes(document_json)
+    pictures = extract_label_nodes(document_json, "picture")
+    # Check raw dimensions before table_grid() so hostile payloads cannot force
+    # a giant allocation during candidate discovery.  Sparse but bounded grids
+    # are still sent through the guarded retry path.
+    candidates = [table for table in tables if _table_recovery_candidate_needs_retry(table)]
+    diagnostics: dict[str, Any] = {
+        "attempted_count": 0,
+        "accepted_count": 0,
+        "accepted_source_refs": [],
+        "rejected": [],
+        "limits": {
+            "max_crops": TABLE_RECOVERY_MAX_CROPS,
+            "max_crop_bytes": TABLE_RECOVERY_MAX_CROP_BYTES,
+            "timeout_seconds": TABLE_RECOVERY_TIMEOUT_SECONDS,
+        },
+        "endpoint_trusted": trusted_endpoint,
+    }
+    if endpoint_parse_error:
+        diagnostics["endpoint_parse_error"] = endpoint_parse_error
+    for table_index, table in enumerate(candidates[:TABLE_RECOVERY_MAX_CROPS], start=1):
+        source_ref = _structural_node_source_ref(
+            table,
+            kind="table",
+            fallback_index=table_index - 1,
+            part_index=_structural_node_part_index(table),
+        )
+        record: dict[str, Any] = {"source_ref": source_ref, "table_index": table_index}
+        table_semantic_hint = _table_has_semantic_hint(table, document_json)
+        record["table_semantic_hint"] = table_semantic_hint
+        raw_limit_reason = _table_recovery_raw_limits(table)
+        if raw_limit_reason is not None:
+            record["reason"] = raw_limit_reason
+            diagnostics["rejected"].append(record)
+            continue
+        rendered = _render_table_recovery_crop_png_with_geometry(
+            input_file,
+            table,
+            tables,
+            pictures,
+        )
+        geometry = rendered[1] if isinstance(rendered, tuple) else None
+        crop_bytes = rendered[0] if isinstance(rendered, tuple) else None
+        # Preserve injected/test renderers and legacy environments where only
+        # the bytes-only helper is available.
+        if crop_bytes is None:
+            crop_bytes = _render_table_recovery_crop_png(
+                input_file,
+                table,
+                tables,
+                pictures,
+            )
+        diagnostics["attempted_count"] += 1
+        if not crop_bytes:
+            # A failed local render is still a failed recovery attempt.  When
+            # the configured endpoint is untrusted, retain that trust-boundary
+            # outcome as the public reason (while preserving the concrete
+            # render failure for diagnostics); do not ever send an absent crop.
+            if not trusted_endpoint:
+                record["reason"] = "image_table_recovery_remote_endpoint_disallowed"
+                record["render_failure_reason"] = "table_crop_render_failed"
+                if endpoint_parse_error:
+                    record["endpoint_parse_error"] = endpoint_parse_error
+            else:
+                record["reason"] = "table_crop_render_failed"
+            diagnostics["rejected"].append(record)
+            continue
+        record["crop_bytes"] = len(crop_bytes)
+        if len(crop_bytes) > TABLE_RECOVERY_MAX_CROP_BYTES:
+            record["reason"] = "table_crop_bytes_exceeded_limit"
+            diagnostics["rejected"].append(record)
+            continue
+        if geometry is not None:
+            record["crop_geometry"] = copy.deepcopy(geometry)
+            overlap_reason = _table_recovery_non_target_overlap_reason(
+                table,
+                tables,
+                geometry,
+            )
+            if overlap_reason is not None:
+                record["reason"] = overlap_reason
+                record["local_recovery"] = {
+                    "accepted": False,
+                    "reason": overlap_reason,
+                }
+                diagnostics["rejected"].append(record)
+                continue
+            try:
+                from PIL import Image
+
+                with Image.open(io.BytesIO(crop_bytes)) as crop_image:
+                    crop_size = (crop_image.width, crop_image.height)
+                local_response = _map_table_response_ocr_to_crop(
+                    response,
+                    geometry,
+                    crop_size,
+                )
+            except Exception:
+                local_response = None
+            if local_response is not None:
+                # The source response can contain the empty table being
+                # recovered plus unrelated semantic tables.  Calling the
+                # general verifier would treat those nodes as retry
+                # candidates and reject the local path as non-unique.  The
+                # local-first path intentionally consumes only mapped OCR and
+                # crop pixels; structured retry responses are handled below.
+                local_data, local_diagnostics = _ruled_grid_ocr_fallback(
+                    local_response,
+                    crop_bytes,
+                    table_semantic_hint=table_semantic_hint,
+                )
+                record["local_recovery"] = local_diagnostics
+                if local_data is not None:
+                    record.update(local_diagnostics)
+                    record["recovery_origin"] = "local_crop"
+                    table["data"] = local_data
+                    table.setdefault("local_ai_lab_qc", {})[
+                        "image_table_semantic_recovery"
+                    ] = record
+                    diagnostics["accepted_count"] += 1
+                    diagnostics["accepted_source_refs"].append(source_ref)
+                    continue
+        if not trusted_endpoint:
+            record["reason"] = "image_table_recovery_remote_endpoint_disallowed"
+            diagnostics["rejected"].append(record)
+            continue
+        payload = {
+            "sources": [{
+                "kind": "file",
+                "filename": f"table-recovery-{table_index}.png",
+                "base64_string": base64.b64encode(crop_bytes).decode("ascii"),
+            }],
+            "target": {"kind": "inbody"},
+            "options": {
+                "from_formats": ["image"],
+                "to_formats": ["json"],
+                "do_ocr": True,
+                "force_ocr": True,
+                "ocr_preset": "auto",
+                "do_table_structure": True,
+                "table_mode": "accurate",
+                "table_cell_matching": True,
+                "include_images": False,
+                "document_timeout": TABLE_RECOVERY_TIMEOUT_SECONDS,
+            },
+        }
+        try:
+            retry_response = post_json(
+                f"{args.serve_url.rstrip('/')}/v1/convert/source",
+                payload,
+                timeout=min(
+                    int(getattr(args, "timeout_seconds", TABLE_RECOVERY_TIMEOUT_SECONDS)),
+                    TABLE_RECOVERY_TIMEOUT_SECONDS,
+                ),
+                retries=0,
+                retry_sleep_seconds=0.0,
+            )
+        except Exception as exc:
+            record.update({"reason": "table_recovery_request_failed", "error": f"{type(exc).__name__}:{exc}"})
+            diagnostics["rejected"].append(record)
+            continue
+        recovered_data, retry_diagnostics = _recovered_table_data_from_response(
+            retry_response,
+            crop_bytes=crop_bytes,
+            table_semantic_hint=table_semantic_hint,
+        )
+        record.update(retry_diagnostics)
+        if recovered_data is None:
+            diagnostics["rejected"].append(record)
+            continue
+        table["data"] = recovered_data
+        table.setdefault("local_ai_lab_qc", {})["image_table_semantic_recovery"] = record
+        diagnostics["accepted_count"] += 1
+        diagnostics["accepted_source_refs"].append(source_ref)
+    if len(candidates) > TABLE_RECOVERY_MAX_CROPS:
+        diagnostics["rejected"].append(
+            {
+                "reason": "table_recovery_max_crops_exceeded",
+                "count": len(candidates) - TABLE_RECOVERY_MAX_CROPS,
+            }
+        )
+    if diagnostics["rejected"]:
+        status["ok"] = False
+        status["success_class"] = "degraded_failure"
+        for item in diagnostics["rejected"]:
+            reason = str(item.get("reason") or "unknown")
+            ref = str(item.get("source_ref") or "")
+            # The aggregate remote-endpoint record is explanatory metadata;
+            # emit one warning per affected source ref below, not an extra
+            # ``unknown`` warning that hides the actual table identities.
+            if not ref and reason == "image_table_recovery_remote_endpoint_disallowed":
+                continue
+            warning = (
+                f"image_table_semantic_recovery_unavailable:{ref}:{reason}"
+                if ref
+                else f"image_table_semantic_recovery_unavailable:{reason}"
+            )
+            if warning not in status.setdefault("warnings", []):
+                status["warnings"].append(warning)
+    metadata["image_table_semantic_recovery"] = diagnostics
+    status.setdefault("quality_signals", {})["image_table_semantic_recovery"] = diagnostics
+    return diagnostics
 
 
 def inject_empty_table_visual_fallbacks(
@@ -2140,8 +3984,10 @@ def inject_empty_table_visual_fallbacks(
         def fallback_figure(candidate: dict[str, Any], *, exact: bool = True) -> str:
             suffix = " — exact source rendering from the original PDF" if exact else ""
             return (
-                '<figure class="docling-table-visual-fallback" '
+                '<figure class="docling-table-visual-fallback docling-source-visual-only" '
                 f'data-source-ref="{html.escape(str(candidate["source_ref"]), quote=True)}">'
+                '<div class="docling-visual-only-label">Visual-only source crop; '
+                "semantic table recovery unavailable</div>"
                 f'<img src="{candidate["image"]}" '
                 f'alt="{html.escape(candidate["caption"], quote=True)}">'
                 f'<figcaption>{html.escape(candidate["caption"])}{suffix}</figcaption>'
@@ -2257,12 +4103,30 @@ def inject_empty_table_visual_fallbacks(
             source_ref = str(candidate["source_ref"])
             source_marker = f"<!-- source-table-ref:{source_ref} -->"
             fallback_marker = f"<!-- source-empty-table-ref:{source_ref} -->"
+            # Remove only the prior fallback evidence, retaining the source
+            # marker and semantic Markdown table/caption for a fresh bind.
+            cleanup_pattern = re.compile(
+                r"<!--\s*source-empty-table-ref:\s*"
+                + re.escape(source_ref)
+                + r"\s*-->\s*"
+                r"\*\*Visual-only source crop; semantic table recovery unavailable\.\*\*\s*"
+                r"!\[[^\n]*\]\("
+                + re.escape(str(candidate["image"]))
+                + r"\)\s*",
+                flags=re.I,
+            )
+            document_markdown, _ = _markdown_sub_outside_code(
+                document_markdown,
+                cleanup_pattern,
+                "",
+            )
             source_evidence = (
                 source_marker
                 + "\n"
                 + fallback_marker
                 + "\n\n"
-                + f'![{candidate["caption"]}]({candidate["image"]})'
+                + "**Visual-only source crop; semantic table recovery unavailable.**\n\n"
+                + _markdown_image(candidate["caption"], candidate["image"])
             )
             if document_markdown.count(source_marker) == 1:
                 document_markdown = document_markdown.replace(
@@ -2280,7 +4144,8 @@ def inject_empty_table_visual_fallbacks(
             replacement = (
                 fallback_marker
                 + "\n\n"
-                + f'![{candidate["caption"]}]({candidate["image"]})\n\n'
+                + "**Visual-only source crop; semantic table recovery unavailable.**\n\n"
+                + _markdown_image(candidate["caption"], candidate["image"]) + "\n\n"
                 r"\g<caption>"
             )
             document_markdown, changed = caption_pattern.subn(
@@ -2430,6 +4295,93 @@ def _structural_visible_body_text(value: str, *, html_markup: bool = False) -> s
     return visible.replace("\r\n", "\n").replace("\r", "\n")
 
 
+def _source_disclosure_html(
+    body: str,
+    *,
+    summary: str,
+    extra_class: str = "",
+    attrs: str = "",
+) -> str:
+    """Wrap source evidence in an accessible, closed-by-default disclosure."""
+
+    classes = "docling-source-disclosure"
+    if extra_class:
+        classes += " " + extra_class
+    return (
+        f'<details class="{classes}"{attrs}>'
+        f"<summary>{html.escape(summary)}</summary>"
+        f"{body}</details>"
+    )
+
+
+def _source_disclosure_markdown(
+    body: str,
+    *,
+    summary: str,
+    extra_class: str = "",
+) -> str:
+    classes = "docling-source-disclosure" + (
+        f" {extra_class}" if extra_class else ""
+    )
+    return (
+        f'<details class="{classes}"><summary>{html.escape(summary)}</summary>\n\n'
+        f"{body}\n\n</details>"
+    )
+
+
+_SAFE_MARKDOWN_IMAGE_PATH_RE = re.compile(
+    r"(?:[A-Za-z0-9._-]+/)*[A-Za-z0-9._-]+"
+)
+
+
+def _markdown_image(caption: Any, path: Any) -> str:
+    """Render a local image reference without allowing caption/path injection."""
+
+    # Markdown image alt text is bracket-delimited; escape delimiters and
+    # collapse line breaks so PDF-derived captions cannot create a new link,
+    # heading, or raw block.  Backslashes are escaped first to avoid creating a
+    # second escape sequence during rendering.
+    safe_caption = " ".join(str(caption or "").replace("\r", "\n").splitlines())
+    safe_caption = (
+        safe_caption.replace("\\", "\\\\")
+        .replace("[", "\\[")
+        .replace("]", "\\]")
+        .replace("(", "\\(")
+        .replace(")", "\\)")
+        .replace("`", "\\`")
+    )
+    safe_path = str(path or "").replace("\\", "/")
+    path_parts = safe_path.split("/")
+    if (
+        not _SAFE_MARKDOWN_IMAGE_PATH_RE.fullmatch(safe_path)
+        or any(part in {"", ".", ".."} for part in path_parts)
+        or safe_path.startswith("/")
+    ):
+        # Keep the evidence body renderable while refusing arbitrary URLs or
+        # traversal paths supplied by a malformed source record.
+        safe_path = "#"
+    return f"![{safe_caption}]({safe_path})"
+
+
+def _strip_source_disclosure_blocks(value: str, *, extra_class: str) -> str:
+    """Remove prior evidence wrappers and their bodies before rebinding.
+
+    Source figures are regenerated from the current candidate inventory.  Keeping
+    an old wrapper body would leave a raw figure behind when the caller inserts a
+    fresh disclosure on a subsequent pass.
+    """
+
+    pattern = re.compile(
+        r'<details\b[^>]*class\s*=\s*(?P<quote>["\'])'
+        r'(?=[^"\']*\bdocling-source-disclosure\b)'
+        r'(?=[^"\']*\b' + re.escape(extra_class) + r'\b)'
+        r'[^"\']*(?P=quote)[^>]*>'
+        r'.*?</details>',
+        flags=re.I | re.S,
+    )
+    return pattern.sub("", value)
+
+
 def _structural_body_identity(value: str, *, html_markup: bool = False) -> str:
     """Normalize presentation while retaining token order, variables, and operators."""
 
@@ -2511,6 +4463,12 @@ def _structural_bbox_snapshot(value: Any) -> dict[str, Any] | None:
             for key in ("l", "r", "t", "b")
         }
     except (KeyError, TypeError, ValueError):
+        return None
+    if (
+        not all(math.isfinite(result[key]) for key in ("l", "r", "t", "b"))
+        or result["r"] <= result["l"]
+        or result["t"] == result["b"]
+    ):
         return None
     result["coord_origin"] = origin
     return result
@@ -2609,6 +4567,8 @@ def _structural_visual_provenance_entry(
         "page_no": page_no,
         "node_bbox": _structural_bbox_snapshot(node_bbox),
         "crop_bbox": _structural_bbox_snapshot(metric.get("bbox")),
+        "crop_clamp_applied": bool(metric.get("crop_clamp_applied")),
+        "crop_clip_bounds": _structural_bbox_snapshot(metric.get("crop_clip_bounds")),
         "padding_px": metric.get("padding_px"),
         "render_scale": metric.get("render_scale"),
         "pixel_box": list(metric.get("pixel_box") or []),
@@ -2799,6 +4759,10 @@ def _structural_provenance_verify(
             reasons.append("asset_hash_failed")
 
     crop_bbox = _structural_bbox_snapshot(entry.get("crop_bbox"))
+    crop_clamp_applied = bool(entry.get("crop_clamp_applied"))
+    crop_clip_bounds = _structural_bbox_snapshot(entry.get("crop_clip_bounds"))
+    if crop_clamp_applied and crop_clip_bounds is None:
+        reasons.append("missing_crop_clip_bounds")
     coordinate_page_size = _structural_page_size_snapshot(
         entry.get("crop_coordinate_page_size")
     )
@@ -2811,6 +4775,61 @@ def _structural_provenance_verify(
         image_width = image_height = 0
         padding = -1
     declared_pixel_box = entry.get("pixel_box")
+    clip_valid = crop_clip_bounds is None
+    if crop_clip_bounds is not None:
+        clip_values = [
+            crop_clip_bounds[key] for key in ("l", "r", "t", "b")
+        ]
+        clip_origin = crop_clip_bounds.get("coord_origin")
+        bbox_origin = (entry_bbox or {}).get("coord_origin")
+        crop_origin = (crop_bbox or {}).get("coord_origin")
+        if (
+            any(not math.isfinite(float(value)) for value in clip_values)
+            or clip_origin not in {"TOPLEFT", "BOTTOMLEFT"}
+            or (bbox_origin and clip_origin != bbox_origin)
+            or (crop_origin and clip_origin != crop_origin)
+        ):
+            reasons.append("crop_clip_bounds_invalid")
+        elif coordinate_page_size is None:
+            reasons.append("crop_clip_bounds_missing_page_size")
+        else:
+            clip_left = float(crop_clip_bounds["l"])
+            clip_right = float(crop_clip_bounds["r"])
+            clip_top = float(crop_clip_bounds["t"])
+            clip_bottom = float(crop_clip_bounds["b"])
+            page_width = coordinate_page_size["width"]
+            page_height = coordinate_page_size["height"]
+            clip_low_y = min(clip_top, clip_bottom)
+            clip_high_y = max(clip_top, clip_bottom)
+            node_low_y = (
+                min(entry_bbox["t"], entry_bbox["b"])
+                if entry_bbox is not None
+                else float("inf")
+            )
+            node_high_y = (
+                max(entry_bbox["t"], entry_bbox["b"])
+                if entry_bbox is not None
+                else float("-inf")
+            )
+            if (
+                clip_right <= clip_left
+                or clip_high_y <= clip_low_y
+                or clip_left < 0.0
+                or clip_right > page_width
+                or clip_low_y < 0.0
+                or clip_high_y > page_height
+            ):
+                reasons.append("crop_clip_bounds_out_of_page_bounds")
+            elif (
+                entry_bbox is None
+                or clip_left > entry_bbox["l"]
+                or clip_right < entry_bbox["r"]
+                or clip_low_y > node_low_y
+                or clip_high_y < node_high_y
+            ):
+                reasons.append("crop_clip_bounds_excludes_node")
+            else:
+                clip_valid = True
     render_scale: float | None = None
     if entry.get("render_scale") is not None:
         try:
@@ -2842,6 +4861,27 @@ def _structural_provenance_verify(
             padding=padding,
             render_scale=render_scale,
         )
+        if recomputed is not None and crop_clip_bounds is not None and clip_valid:
+            clip_box = _bbox_pixel_crop_box(
+                crop_clip_bounds,
+                page_width=coordinate_page_size["width"],
+                page_height=coordinate_page_size["height"],
+                image_width=image_width,
+                image_height=image_height,
+                padding=0,
+                render_scale=render_scale,
+            )
+            if clip_box is None:
+                recomputed = None
+            else:
+                recomputed = (
+                    max(recomputed[0], clip_box[0]),
+                    max(recomputed[1], clip_box[1]),
+                    min(recomputed[2], clip_box[2]),
+                    min(recomputed[3], clip_box[3]),
+                )
+                if recomputed[2] <= recomputed[0] or recomputed[3] <= recomputed[1]:
+                    recomputed = None
         if recomputed is None or list(recomputed) != declared_pixel_box:
             reasons.append("pixel_box_mismatch")
     return not reasons, sorted(set(reasons))
@@ -3431,8 +5471,18 @@ def append_structured_table_source_renderings(
     html_path = output_dir / "document.html"
     if candidates and html_path.exists():
         document_html = html_path.read_text(encoding="utf-8")
+        document_html = _strip_source_disclosure_blocks(
+            document_html,
+            extra_class="docling-table-source-disclosure",
+        )
+        document_html = re.sub(
+            r'<section\b[^>]*class="[^"]*\bdocling-table-source-evidence-appendix\b[^"]*"[^>]*>.*?</section>',
+            "",
+            document_html,
+            flags=re.I | re.S,
+        )
         def evidence_figure(candidate: dict[str, Any]) -> str:
-            return (
+            figure = (
                 '<figure class="docling-table-source-evidence">'
                 f'<span hidden data-source-ref="{html.escape(str(candidate["source_ref"]), quote=True)}"></span>'
                 f'<img src="{candidate["image"]}" '
@@ -3440,6 +5490,14 @@ def append_structured_table_source_renderings(
                 f'<figcaption>{html.escape(candidate["caption"])} — '
                 "exact source rendering from the original PDF</figcaption>"
                 "</figure>"
+            )
+            return _source_disclosure_html(
+                figure,
+                summary="查看表格原始裁剪",
+                extra_class="docling-table-source-disclosure",
+                attrs=(
+                    f' data-source-ref="{html.escape(str(candidate["source_ref"]), quote=True)}"'
+                ),
             )
         html_bound_refs: list[str] = []
         unmatched_candidates: list[dict[str, Any]] = []
@@ -3490,6 +5548,12 @@ def append_structured_table_source_renderings(
     md_path = output_dir / "document.md"
     if candidates and md_path.exists():
         document_markdown = md_path.read_text(encoding="utf-8").rstrip()
+        document_markdown = re.sub(
+            r'<details\b[^>]*class="[^"]*\bdocling-table-source-disclosure\b[^"]*"[^>]*>.*?</details>',
+            "",
+            document_markdown,
+            flags=re.I | re.S,
+        )
         markdown_bound_refs: list[str] = []
         unmatched_markdown_candidates: list[dict[str, Any]] = []
         for candidate in candidates:
@@ -3498,8 +5562,14 @@ def append_structured_table_source_renderings(
             evidence = (
                 marker
                 + "\n\n"
-                + f'![{candidate["caption"]} — source rendering]'
-                f'({candidate["image"]})'
+                + _source_disclosure_markdown(
+                    _markdown_image(
+                        f'{candidate["caption"]} — source rendering',
+                        candidate["image"],
+                    ),
+                    summary="查看表格原始裁剪",
+                    extra_class="docling-table-source-disclosure",
+                )
             )
             if document_markdown.count(marker) == 1:
                 document_markdown = document_markdown.replace(marker, evidence, 1)
@@ -3520,8 +5590,14 @@ def append_structured_table_source_renderings(
                 parts.extend(
                     [
                         "",
-                        f'![{candidate["caption"]} — source rendering]'
-                        f'({candidate["image"]})',
+                        _source_disclosure_markdown(
+                            _markdown_image(
+                                f'{candidate["caption"]} — source rendering',
+                                candidate["image"],
+                            ),
+                            summary="查看表格原始裁剪",
+                            extra_class="docling-table-source-disclosure",
+                        ),
                     ]
                 )
             document_markdown = document_markdown + "\n".join(parts)
@@ -3818,6 +5894,93 @@ def _formula_crop_provenance_is_verified(
         > page_height
     ):
         return False
+    # New crop metrics carry the exact raster box.  Legacy hand-built
+    # diagnostics may omit it, so keep those compatible while fail-closing any
+    # entry that claims a clamp or declares a pixel box.
+    declared_pixel_box = metric.get("pixel_box")
+    if (
+        declared_pixel_box is not None
+        or metric.get("crop_clamp_applied")
+        or metric.get("crop_clip_bounds") is not None
+    ):
+        try:
+            image_size = metric.get("page_image_size") or {}
+            image_width = int(image_size.get("width") or 0)
+            image_height = int(image_size.get("height") or 0)
+            padding = int(metric.get("padding_px"))
+            render_scale = (
+                float(metric.get("render_scale"))
+                if metric.get("render_scale") is not None
+                else None
+            )
+        except (AttributeError, TypeError, ValueError):
+            return False
+        if (
+            image_width <= 0
+            or image_height <= 0
+            or padding < 0
+            or not isinstance(declared_pixel_box, (list, tuple))
+            or len(declared_pixel_box) != 4
+            or (render_scale is not None and render_scale <= 0.0)
+        ):
+            return False
+        clip_bounds = metric.get("crop_clip_bounds")
+        clip_valid = clip_bounds is None
+        if metric.get("crop_clamp_applied") and not isinstance(clip_bounds, dict):
+            return False
+        if isinstance(clip_bounds, dict):
+            clip_snapshot = _structural_bbox_snapshot(clip_bounds)
+            if clip_snapshot is None:
+                return False
+            clip_values = [clip_snapshot[key] for key in ("l", "r", "t", "b")]
+            if (
+                any(not math.isfinite(float(value)) for value in clip_values)
+                or clip_snapshot.get("coord_origin") != metric_origin
+                or clip_snapshot["r"] <= clip_snapshot["l"]
+                or max(clip_snapshot["t"], clip_snapshot["b"]) > page_height
+                or min(clip_snapshot["t"], clip_snapshot["b"]) < 0.0
+                or clip_snapshot["l"] < 0.0
+                or clip_snapshot["r"] > page_width
+                or clip_snapshot["l"] > metric_geometry["l"]
+                or clip_snapshot["r"] < metric_geometry["r"]
+                or min(clip_snapshot["t"], clip_snapshot["b"])
+                > min(metric_geometry["t"], metric_geometry["b"])
+                or max(clip_snapshot["t"], clip_snapshot["b"])
+                < max(metric_geometry["t"], metric_geometry["b"])
+            ):
+                return False
+            clip_valid = True
+        recomputed = _bbox_pixel_crop_box(
+            metric_bbox,
+            page_width=page_width,
+            page_height=page_height,
+            image_width=image_width,
+            image_height=image_height,
+            padding=padding,
+            render_scale=render_scale,
+        )
+        if recomputed is not None and isinstance(clip_bounds, dict) and clip_valid:
+            clip_box = _bbox_pixel_crop_box(
+                clip_bounds,
+                page_width=page_width,
+                page_height=page_height,
+                image_width=image_width,
+                image_height=image_height,
+                padding=0,
+                render_scale=render_scale,
+            )
+            if clip_box is None:
+                return False
+            recomputed = (
+                max(recomputed[0], clip_box[0]),
+                max(recomputed[1], clip_box[1]),
+                min(recomputed[2], clip_box[2]),
+                min(recomputed[3], clip_box[3]),
+            )
+            if recomputed[2] <= recomputed[0] or recomputed[3] <= recomputed[1]:
+                return False
+        if recomputed is None or list(recomputed) != list(declared_pixel_box):
+            return False
     declared_asset_sha256 = str(metric.get("asset_sha256") or "").lower()
     if not re.fullmatch(r"[0-9a-f]{64}", declared_asset_sha256):
         return False
@@ -4310,14 +6473,25 @@ def _html_formula_occurrence_identities(document_html: str) -> dict[int, list[st
         plain = re.sub(r"<[^>]+>", "", block)
         return _formula_content_identity(plain)
 
+    def add_identity(index: int, identity: str) -> None:
+        identities.setdefault(index, []).append(
+            identity or "__invalid_formula_occurrence__"
+        )
+
+    # Both the normal `data-formula-index` surface and the CJK semantic
+    # surface's `data-equation` attribute identify an occurrence.  Keep the
+    # block body as the identity source so a matching number alone can never
+    # bind the wrong crop.
     for match in re.finditer(
-        r"(?P<block><div\b[^>]*\bdata-formula-index=[\"'](?P<index>\d+)[\"']"
+        r"(?P<block><div\b[^>]*\b(?:data-formula-index|data-equation)="
+        r"[\"'](?P<index>\d+)[\"']"
         r"[^>]*>.*?</div>)",
         document_html,
         flags=re.S | re.I,
     ):
-        identities.setdefault(int(match.group("index")), []).append(
-            identity_from_block(match.group("block"))
+        add_identity(
+            int(match.group("index")),
+            identity_from_block(match.group("block")),
         )
     for match in re.finditer(
         r"(?P<block><div\b[^>]*class=[\"'][^\"']*\bformula\b[^\"']*[\"']"
@@ -4329,12 +6503,14 @@ def _html_formula_occurrence_identities(document_html: str) -> dict[int, list[st
         index = int(match.group("index"))
         identity = identity_from_block(match.group("block"))
         if identity not in identities.setdefault(index, []):
-            identities[index].append(identity)
+            identities[index].append(identity or "__invalid_formula_occurrence__")
     return identities
 
 
 def _markdown_formula_occurrence_identities(document_markdown: str) -> dict[int, list[str]]:
     identities: dict[int, list[str]] = {}
+    tagged_spans, _tag_marker_seen = _markdown_tagged_formula_spans(document_markdown)
+    tagged_by_span = {(start, end): (index, valid) for start, end, index, valid in tagged_spans}
     for start, end in _markdown_display_math_spans(document_markdown):
         anchor = re.match(
             r"\s*<!--\s*source-formula-anchor:(?P<index>\d+)\s*-->",
@@ -4342,9 +6518,20 @@ def _markdown_formula_occurrence_identities(document_markdown: str) -> dict[int,
             flags=re.S,
         )
         if anchor:
-            identities.setdefault(int(anchor.group("index")), []).append(
+            index = int(anchor.group("index"))
+            identities.setdefault(index, []).append(
                 _formula_content_identity(document_markdown[start:end])
             )
+            continue
+        tagged = tagged_by_span.get((start, end))
+        if tagged is None or tagged[0] is None:
+            continue
+        index, valid = tagged
+        identities.setdefault(index, []).append(
+            _formula_content_identity(document_markdown[start:end])
+            if valid
+            else "__invalid_formula_tag__"
+        )
     return identities
 
 
@@ -4391,6 +6578,12 @@ def append_formula_source_renderings(
         flags=re.S,
     )
     document_html = re.sub(
+        r'<details\b[^>]*class="[^"]*\bdocling-formula-source-disclosure\b[^"]*"[^>]*>.*?</details>',
+        "",
+        document_html,
+        flags=re.S | re.I,
+    )
+    document_html = re.sub(
         r'<figure\b[^>]*class="[^"]*\bdocling-formula-inline-source\b[^"]*"[^>]*>.*?</figure>',
         "",
         document_html,
@@ -4412,6 +6605,13 @@ def append_formula_source_renderings(
     document_markdown, _ = _markdown_sub_outside_code(
         document_markdown,
         r"\n?<!--\s*source-formula-visual:\d+\s*-->\s*\n"
+        r"<details\b[^>]*class=[\"'][^\"']*\bdocling-formula-source-disclosure\b[^\"']*[\"'][^>]*>.*?</details>\s*",
+        "\n",
+        flags=re.I | re.S,
+    )
+    document_markdown, _ = _markdown_sub_outside_code(
+        document_markdown,
+        r"\n?<!--\s*source-formula-visual:\d+\s*-->\s*\n"
         r"!?\[[^\n]*Formula[^\n]*\]\(formulas/formula_\d+(?:_context)?\.png\)\s*",
         "\n",
         flags=re.I,
@@ -4429,22 +6629,47 @@ def append_formula_source_renderings(
             flags=re.I,
         )
     ]
+    html_data_equation_occurrences = [
+        int(value)
+        for value in re.findall(
+            r"<div\b[^>]*\bdata-equation=[\"'](\d+)[\"']",
+            document_html,
+            flags=re.I,
+        )
+    ]
     markdown_anchor_spans = _markdown_source_formula_anchor_spans(
+        document_markdown
+    )
+    markdown_tagged_spans, markdown_tag_marker_seen = _markdown_tagged_formula_spans(
         document_markdown
     )
     markdown_anchor_occurrences = [index for _start, _end, index in markdown_anchor_spans]
     html_anchor_indexes = set(html_anchor_occurrences)
     markdown_anchor_indexes = set(markdown_anchor_occurrences)
     html_occurrence_counts = {
-        index: (
-            html_data_index_occurrences.count(index)
-            if index in html_data_index_occurrences
-            else html_anchor_occurrences.count(index)
+        index: max(
+            html_data_index_occurrences.count(index),
+            html_data_equation_occurrences.count(index),
+            html_anchor_occurrences.count(index),
         )
-        for index in set(html_data_index_occurrences) | html_anchor_indexes
+        for index in (
+            set(html_data_index_occurrences)
+            | set(html_data_equation_occurrences)
+            | html_anchor_indexes
+        )
     }
     if expected_indexes is None:
-        anchored = html_anchor_indexes | markdown_anchor_indexes
+        anchored = (
+            html_anchor_indexes
+            | set(html_data_index_occurrences)
+            | set(html_data_equation_occurrences)
+            | markdown_anchor_indexes
+            | {
+                int(index)
+                for _start, _end, index, valid in markdown_tagged_spans
+                if valid and index is not None
+            }
+        )
         expected_indexes = anchored or set(range(1, len(formulas) + 1))
     expected_indexes = {int(index) for index in expected_indexes if int(index) > 0}
     candidates = _formula_indexed_candidates(
@@ -4495,6 +6720,20 @@ def append_formula_source_renderings(
     markdown_identity_by_index = _markdown_formula_occurrence_identities(
         document_markdown
     )
+    # Prefer identity-derived counts so a block carrying both attributes (or
+    # an anchor comment) is not double-counted, while duplicate blocks remain
+    # visible and fail the exact-one occurrence check.
+    html_occurrence_counts = {
+        index: max(
+            len(html_identity_by_index.get(index, [])),
+            html_anchor_occurrences.count(index),
+        )
+        for index in (
+            set(html_data_index_occurrences)
+            | set(html_data_equation_occurrences)
+            | html_anchor_indexes
+        )
+    }
     html_identity_mismatch_indexes: set[int] = set()
     markdown_identity_mismatch_indexes: set[int] = set()
 
@@ -4523,12 +6762,12 @@ def append_formula_source_renderings(
             if occurrence
             else "formula review evidence"
         )
-        return (
+        figure = (
             '<figure class="docling-formula-inline-source" '
             f'data-formula-index="{index}" data-formula-evidence="'
             f'{html.escape(str(candidate.get("selected") or "diagnostic-only"), quote=True)}" '
             'style="margin:.35rem auto 1rem;text-align:center">'
-            f'<img loading="lazy" src="{image_path}" '
+            f'<img src="{image_path}" '
             'style="max-width:100%;height:auto" '
             f'alt="Formula {index} {label}">'
             f'<figcaption>Formula {index} — exact rendering from the original PDF'
@@ -4538,6 +6777,12 @@ def append_formula_source_renderings(
                 else ""
             )
             + "</figcaption></figure>"
+        )
+        return _source_disclosure_html(
+            figure,
+            summary="查看公式原始裁剪",
+            extra_class="docling-formula-source-disclosure",
+            attrs=f' data-formula-index="{index}"',
         )
 
     html_covered_indexes: set[int] = set()
@@ -4574,7 +6819,8 @@ def append_formula_source_renderings(
                 html_identity_mismatch_indexes.add(formula_index)
                 continue
             block_re = re.compile(
-                rf"(<div\b[^>]*data-formula-index=[\"']{formula_index}[\"'][^>]*>)",
+                rf"(<div\b[^>]*\b(?:data-formula-index|data-equation)="
+                rf"[\"']{formula_index}[\"'][^>]*>)",
                 flags=re.I,
             )
             document_html, replacement_count = block_re.subn(
@@ -4645,8 +6891,14 @@ def append_formula_source_renderings(
                     document_markdown[start:end]
                     + "\n\n"
                     + f"<!-- source-formula-visual:{formula_index} -->\n"
-                    + f"![Formula {formula_index} — exact PDF rendering]"
-                    + f"({candidate['selected_image']})",
+                    + _source_disclosure_markdown(
+                        _markdown_image(
+                            f"Formula {formula_index} — exact PDF rendering",
+                            candidate["selected_image"],
+                        ),
+                        summary="查看公式原始裁剪",
+                        extra_class="docling-formula-source-disclosure",
+                    ),
                 )
             )
         for start, end, replacement in reversed(markdown_anchor_edits):
@@ -4656,9 +6908,57 @@ def append_formula_source_renderings(
                 + document_markdown[end:]
             )
 
-        # The CJK legacy surface has display blocks but no semantic anchor.  Its
-        # order is stable, so bind indexes sequentially and expose any mismatch.
-        if expected_indexes and not markdown_anchor_indexes:
+        # The CJK semantic surface may carry an explicit ``\tag{N}`` instead
+        # of generated anchor comments.  Bind by that identity first; never
+        # fall back to display order when a tag marker is malformed or
+        # duplicated.
+        if expected_indexes and not markdown_anchor_indexes and markdown_tag_marker_seen:
+            tagged_edits: list[tuple[int, int, str]] = []
+            for start, end, formula_index, valid in markdown_tagged_spans:
+                if formula_index is None or formula_index not in expected_indexes:
+                    continue
+                candidate = candidate_by_index.get(formula_index)
+                if candidate is None or not candidate.get("selected_image"):
+                    continue
+                if (
+                    not valid
+                    or not occurrence_identity_matches(
+                        formula_index, markdown_identity_by_index
+                    )
+                ):
+                    markdown_identity_mismatch_indexes.add(formula_index)
+                    continue
+                # A duplicate tag produces multiple entries in the inventory;
+                # occurrence_identity_matches() above then fails closed.
+                markdown_covered_indexes.add(formula_index)
+                block = document_markdown[start:end]
+                tagged_edits.append(
+                    (
+                        start,
+                        end,
+                        block
+                        + f"\n<!-- source-formula-visual:{formula_index} -->\n\n"
+                        + _source_disclosure_markdown(
+                            _markdown_image(
+                                f"Formula {formula_index} — exact PDF rendering",
+                                candidate["selected_image"],
+                            ),
+                            summary="查看公式原始裁剪",
+                            extra_class="docling-formula-source-disclosure",
+                        ),
+                    )
+                )
+            for start, end, replacement in reversed(tagged_edits):
+                document_markdown = (
+                    document_markdown[:start]
+                    + replacement
+                    + document_markdown[end:]
+                )
+
+        # Legacy CJK output without either anchors or explicit tags keeps its
+        # stable positional fallback.  Presence of a malformed tag marker
+        # intentionally bypasses this branch so it cannot silently bind wrong.
+        elif expected_indexes and not markdown_anchor_indexes and not markdown_tag_marker_seen:
             display_spans = _markdown_display_math_spans(document_markdown)
             display_edits: list[tuple[int, int, str]] = []
             for formula_index, (start, end) in zip(
@@ -4683,8 +6983,14 @@ def append_formula_source_renderings(
                         end,
                         block
                         + f"\n<!-- source-formula-visual:{formula_index} -->\n\n"
-                        + f"![Formula {formula_index} — exact PDF rendering]"
-                        + f"({candidate['selected_image']})",
+                        + _source_disclosure_markdown(
+                            _markdown_image(
+                                f"Formula {formula_index} — exact PDF rendering",
+                                candidate["selected_image"],
+                            ),
+                            summary="查看公式原始裁剪",
+                            extra_class="docling-formula-source-disclosure",
+                        ),
                     )
                 )
             for start, end, replacement in reversed(display_edits):
@@ -4723,8 +7029,15 @@ def append_formula_source_renderings(
                     [
                         "",
                         f'<!-- source-formula-appendix:{candidate["formula_index"]} -->',
-                        f'![Formula {candidate["formula_index"]} — source rendering]'
-                        f'({candidate.get("selected_image") or candidate.get("diagnostic_image")})',
+                        _source_disclosure_markdown(
+                            _markdown_image(
+                                f'Formula {candidate["formula_index"]} — source rendering',
+                                candidate.get("selected_image")
+                                or candidate.get("diagnostic_image"),
+                            ),
+                            summary="查看公式原始裁剪",
+                            extra_class="docling-formula-source-disclosure",
+                        ),
                     ]
                 )
             parts.append("<!-- local-ai-lab-formula-evidence:end -->")
@@ -4760,6 +7073,13 @@ def append_formula_source_renderings(
             markdown_identity_mismatch_indexes
         ),
         "duplicate_html_anchor_indexes": sorted(
+            {
+                index
+                for index in html_anchor_occurrences
+                if html_anchor_occurrences.count(index) > 1
+            }
+        ),
+        "duplicate_html_occurrence_indexes": sorted(
             index for index, count in html_occurrence_counts.items() if count > 1
         ),
         "duplicate_markdown_anchor_indexes": sorted(
@@ -4767,6 +7087,19 @@ def append_formula_source_renderings(
                 index
                 for index in markdown_anchor_occurrences
                 if markdown_anchor_occurrences.count(index) > 1
+            }
+        ),
+        "duplicate_markdown_tag_indexes": sorted(
+            {
+                int(index)
+                for _start, _end, index, _valid in markdown_tagged_spans
+                if index is not None
+                and sum(
+                    1
+                    for _tag_start, _tag_end, tag_index, _tag_valid in markdown_tagged_spans
+                    if tag_index == index
+                )
+                > 1
             }
         ),
         "html_formula_occurrence_counts": {
@@ -5052,6 +7385,72 @@ def _document_with_resolved_page_provenance(document_json: Any) -> Any:
     return normalized
 
 
+def _inline_source_clip_geometry(
+    clip: Any,
+    bbox: Any,
+    *,
+    page_width: float,
+    page_height: float,
+    image_width: int,
+    image_height: int,
+) -> tuple[dict[str, Any] | None, tuple[int, int, int, int] | None, str | None]:
+    """Validate an inline paragraph clip before intersecting its raster crop."""
+
+    if clip is None:
+        return None, None, None
+    if not isinstance(clip, dict) or not isinstance(bbox, dict):
+        return None, None, "inline_crop_clip_invalid"
+    origin = _bbox_explicit_coord_origin(bbox)
+    clip_origin = _bbox_explicit_coord_origin(clip)
+    if origin is None or clip_origin != origin:
+        return None, None, "inline_crop_clip_origin_mismatch"
+    try:
+        values = {
+            key: float(clip[key])
+            for key in ("l", "r", "t", "b")
+        }
+        node_values = {
+            key: float(bbox[key])
+            for key in ("l", "r", "t", "b")
+        }
+    except (KeyError, TypeError, ValueError):
+        return None, None, "inline_crop_clip_invalid"
+    if any(not math.isfinite(value) for value in values.values()) or any(
+        not math.isfinite(value) for value in node_values.values()
+    ):
+        return None, None, "inline_crop_clip_invalid"
+    if (
+        values["r"] <= values["l"]
+        or max(values["t"], values["b"]) <= min(values["t"], values["b"])
+        or values["l"] < 0.0
+        or values["r"] > page_width
+        or min(values["t"], values["b"]) < 0.0
+        or max(values["t"], values["b"]) > page_height
+    ):
+        return None, None, "inline_crop_clip_out_of_page_bounds"
+    if (
+        values["l"] > node_values["l"]
+        or values["r"] < node_values["r"]
+        or min(values["t"], values["b"])
+        > min(node_values["t"], node_values["b"])
+        or max(values["t"], values["b"])
+        < max(node_values["t"], node_values["b"])
+    ):
+        return None, None, "inline_crop_clip_excludes_bbox"
+    normalized = {**values, "coord_origin": origin}
+    clip_box = _bbox_pixel_crop_box(
+        normalized,
+        page_width=page_width,
+        page_height=page_height,
+        image_width=image_width,
+        image_height=image_height,
+        padding=0,
+    )
+    if clip_box is None:
+        return None, None, "inline_crop_clip_invalid"
+    return normalized, clip_box, None
+
+
 def append_inline_math_source_renderings(
     output_dir: Path,
     document_json: dict[str, Any],
@@ -5077,6 +7476,7 @@ def append_inline_math_source_renderings(
                 if region.get("anchor")
             ),
             "source_images": [],
+            "missing_crop_diagnostics": [],
             "error": f"Pillow unavailable: {exc}",
         }
 
@@ -5085,6 +7485,7 @@ def append_inline_math_source_renderings(
     inline_dir = output_dir / "inline_math"
     candidates: list[dict[str, Any]] = []
     missing_crop_anchors: set[str] = set()
+    missing_crop_diagnostics: list[dict[str, Any]] = []
     expected_anchors = {
         str(region.get("anchor")) for region in regions if region.get("anchor")
     }
@@ -5131,6 +7532,36 @@ def append_inline_math_source_renderings(
                 if crop_box is None:
                     missing_crop_anchors.add(anchor)
                     continue
+                clip_bounds, clip_box, clip_reason = _inline_source_clip_geometry(
+                    region.get("crop_clip_bounds"),
+                    bbox,
+                    page_width=page_width,
+                    page_height=page_height,
+                    image_width=image.width,
+                    image_height=image.height,
+                )
+                if clip_reason:
+                    missing_crop_anchors.add(anchor)
+                    missing_crop_diagnostics.append(
+                        {"anchor": anchor, "reason": clip_reason}
+                    )
+                    continue
+                if clip_box is not None:
+                    crop_box = (
+                        max(crop_box[0], clip_box[0]),
+                        max(crop_box[1], clip_box[1]),
+                        min(crop_box[2], clip_box[2]),
+                        min(crop_box[3], clip_box[3]),
+                    )
+                    if crop_box[2] <= crop_box[0] or crop_box[3] <= crop_box[1]:
+                        missing_crop_anchors.add(anchor)
+                        missing_crop_diagnostics.append(
+                            {
+                                "anchor": anchor,
+                                "reason": "inline_crop_clip_no_overlap",
+                            }
+                        )
+                        continue
                 inline_dir.mkdir(exist_ok=True)
                 image.crop(crop_box).save(output_dir / relative_path)
         except Exception:
@@ -5154,6 +7585,15 @@ def append_inline_math_source_renderings(
                 "bbox": bbox,
                 "source_text": str(region.get("source_text") or "")[:1000],
                 "unresolved": bool(region.get("unresolved")),
+                "crop_clip_bounds": clip_bounds,
+                "pixel_box": list(crop_box),
+                "page_size": {"width": page_width, "height": page_height},
+                "page_image_size": {
+                    "width": image.width,
+                    "height": image.height,
+                },
+                "page_image_sha256": file_sha256(page_image),
+                "asset_sha256": file_sha256(crop_path),
             }
         )
 
@@ -5176,7 +7616,10 @@ def append_inline_math_source_renderings(
             rf"<!--\s*source-inline-math-anchor:{re.escape(anchor)}\s*-->"
         )
         unresolved = bool(candidate.get("unresolved"))
-        disclosure = " open" if unresolved else ""
+        # Source evidence is deliberately quiet by default, including when the
+        # machine transcription is incomplete.  The warning remains inside the
+        # disclosure so reviewers can expand it on demand.
+        disclosure = ""
         warning = (
             '<p><strong>Machine transcription incomplete.</strong> '
             "Use this exact PDF notation as the authoritative reading.</p>"
@@ -5184,12 +7627,12 @@ def append_inline_math_source_renderings(
             else ""
         )
         figure = (
-            f'<details{disclosure} class="docling-inline-math-source" '
+            f'<details{disclosure} class="docling-source-disclosure docling-inline-math-source" '
             f'data-inline-math-anchor="{html.escape(anchor, quote=True)}" '
             'style="margin:.25rem 0 .75rem">'
             "<summary>Compare inline notation with the original PDF</summary>"
             f"{warning}"
-            f'<img loading="lazy" src="{image_path}" '
+            f'<img src="{image_path}" '
             'style="max-width:100%;height:auto" '
             'alt="Exact inline mathematical notation from the original PDF">'
             "</details>"
@@ -5206,10 +7649,10 @@ def append_inline_math_source_renderings(
 
     md_path = output_dir / "document.md"
     markdown_text = md_path.read_text(encoding="utf-8") if md_path.exists() else ""
-    markdown_text = re.sub(
+    markdown_text, _ = _markdown_sub_outside_code(
+        markdown_text,
         r"\n?<!--\s*source-inline-math-visual:[^\s>]+\s*-->.*?</details>\s*",
         "\n",
-        markdown_text,
         flags=re.S | re.I,
     )
     markdown_marker_occurrences = re.findall(
@@ -5222,7 +7665,7 @@ def append_inline_math_source_renderings(
             rf"<!--\s*source-inline-math-anchor:{re.escape(anchor)}\s*-->"
         )
         unresolved = bool(candidate.get("unresolved"))
-        disclosure = " open" if unresolved else ""
+        disclosure = ""
         warning = (
             "\n\n**Machine transcription incomplete. Use the exact PDF notation below.**"
             if unresolved
@@ -5230,9 +7673,13 @@ def append_inline_math_source_renderings(
         )
         evidence = (
             f"<!-- source-inline-math-visual:{anchor} -->\n\n"
-            f'<details{disclosure} class="docling-inline-math-source"><summary>'
+            f'<details{disclosure} class="docling-source-disclosure docling-inline-math-source"><summary>'
             f"Compare inline notation with the original PDF</summary>{warning}\n\n"
-            f"![Inline notation — exact PDF rendering]({candidate['image']})\n\n"
+            + _markdown_image(
+                "Inline notation — exact PDF rendering",
+                candidate["image"],
+            )
+            + "\n\n"
             "</details>"
         )
         markdown_text, count = marker_re.subn(
@@ -5251,6 +7698,7 @@ def append_inline_math_source_renderings(
         "html_covered_anchors": sorted(html_covered),
         "markdown_covered_anchors": sorted(markdown_covered),
         "missing_crop_anchors": sorted(missing_crop_anchors),
+        "missing_crop_diagnostics": missing_crop_diagnostics,
         "missing_html_anchors": sorted(expected_anchors - html_covered),
         "missing_markdown_anchors": sorted(expected_anchors - markdown_covered),
         "duplicate_html_anchor_ids": sorted(
@@ -5523,6 +7971,16 @@ def append_code_source_renderings(
     html_path = output_dir / "document.html"
     if candidates and html_path.exists():
         document_html = html_path.read_text(encoding="utf-8")
+        document_html = _strip_source_disclosure_blocks(
+            document_html,
+            extra_class="docling-code-source-disclosure",
+        )
+        document_html = re.sub(
+            r'<section\b[^>]*class="[^"]*\bdocling-code-source-evidence-appendix\b[^"]*"[^>]*>.*?</section>',
+            "",
+            document_html,
+            flags=re.I | re.S,
+        )
         for candidate in candidates:
             source_ref = str(candidate["source_ref"])
             escaped_ref = re.escape(html.escape(source_ref, quote=True))
@@ -5541,6 +7999,12 @@ def append_code_source_renderings(
                 f'<figcaption>Code block {candidate["code_index"]} — exact source '
                 "rendering from the original PDF</figcaption></figure>"
             )
+            figure = _source_disclosure_html(
+                figure,
+                summary="查看代码原始裁剪",
+                extra_class="docling-code-source-disclosure",
+                attrs=f' data-source-ref="{html.escape(source_ref, quote=True)}"',
+            )
             document_html, applied = block_re.subn(
                 lambda match, figure=figure: match.group("block") + figure,
                 document_html,
@@ -5552,12 +8016,17 @@ def append_code_source_renderings(
                 unmatched_html_candidates.append(candidate)
         if unmatched_html_candidates and "</body>" in document_html.lower():
             figures = "".join(
-                '<figure class="docling-code-source-evidence">'
+                _source_disclosure_html(
+                    '<figure class="docling-code-source-evidence">'
                 f'<span hidden data-source-ref="{html.escape(str(candidate["source_ref"]), quote=True)}"></span>'
                 f'<img src="{candidate["image"]}" '
                 f'alt="Code block {candidate["code_index"]} source rendering">'
                 f'<figcaption>Code block {candidate["code_index"]} — exact source '
-                "rendering from the original PDF</figcaption></figure>"
+                "rendering from the original PDF</figcaption></figure>",
+                    summary="查看代码原始裁剪",
+                    extra_class="docling-code-source-disclosure",
+                    attrs=f' data-source-ref="{html.escape(str(candidate["source_ref"]), quote=True)}"',
+                )
                 for candidate in unmatched_html_candidates
             )
             appendix = (
@@ -5586,14 +8055,26 @@ def append_code_source_renderings(
     md_path = output_dir / "document.md"
     if candidates and md_path.exists():
         document_markdown = md_path.read_text(encoding="utf-8").rstrip()
+        document_markdown, _ = _markdown_sub_outside_code(
+            document_markdown,
+            r'<details\b[^>]*class="[^"]*\bdocling-code-source-disclosure\b[^"]*"[^>]*>.*?</details>',
+            "",
+            flags=re.I | re.S,
+        )
         for candidate in candidates:
             source_ref = str(candidate["source_ref"])
             marker = f"<!-- source-code-ref:{source_ref} -->"
             evidence = (
                 marker
                 + "\n\n"
-                + f'![Code block {candidate["code_index"]} — source rendering]'
-                f'({candidate["image"]})'
+                + _source_disclosure_markdown(
+                    _markdown_image(
+                        f'Code block {candidate["code_index"]} — source rendering',
+                        candidate["image"],
+                    ),
+                    summary="查看代码原始裁剪",
+                    extra_class="docling-code-source-disclosure",
+                )
             )
             if document_markdown.count(marker) == 1:
                 document_markdown = document_markdown.replace(marker, evidence, 1)
@@ -5614,8 +8095,14 @@ def append_code_source_renderings(
                 parts.extend(
                     [
                         "",
-                        f'![Code block {candidate["code_index"]} — source rendering]'
-                        f'({candidate["image"]})',
+                        _source_disclosure_markdown(
+                            _markdown_image(
+                                f'Code block {candidate["code_index"]} — source rendering',
+                                candidate["image"],
+                            ),
+                            summary="查看代码原始裁剪",
+                            extra_class="docling-code-source-disclosure",
+                        ),
                     ]
                 )
             document_markdown = document_markdown + "\n".join(parts)
@@ -5799,7 +8286,11 @@ def formula_review_diagnostics(
         context_metric = crop_metric.get("context") or {}
         match = FORMULA_NUMBER_RE.search(text)
         if match:
-            formula_numbers[match.group(1)] = {"index": index, "text": text, "prov": prov}
+            formula_numbers[str(_formula_number_match_value(match))] = {
+                "index": index,
+                "text": text,
+                "prov": prov,
+            }
         reasons: list[str] = []
         if CN_CHAR_RE.search(text):
             reasons.append("contains_cjk_text")
@@ -5828,7 +8319,7 @@ def formula_review_diagnostics(
                 reasons.append("source_crop_likely_too_thin")
             if source_height < 32 and len(text) > 180:
                 reasons.append("source_crop_likely_useless_for_review")
-        if FORMULA_NUMBER_RE.fullmatch(text.strip()):
+        if _is_formula_number_only(text):
             reasons.append("formula_number_only")
             missing.append({"index": index, "text": text, "prov": prov})
         if reasons:
@@ -5856,7 +8347,7 @@ def formula_review_diagnostics(
     if formula_4:
         formula_4_status = (
             "present_number_only_missing_body"
-            if FORMULA_NUMBER_RE.fullmatch(str(formula_4["text"]).strip())
+            if _is_formula_number_only(str(formula_4["text"]).strip())
             else "present"
         )
     # Do not synthesize a missing-formula finding from a filename substring.
@@ -6187,12 +8678,96 @@ sup.docling-footnote-ref {
 .docling-algorithm-bullet {
   font-weight: 700;
 }
+.docling-source-disclosure {
+  border: 1px solid #cbd5e1;
+  border-radius: .35rem;
+  background: #f8fafc;
+  margin: .5rem 0 .85rem;
+  padding: .2rem .55rem;
+  max-width: 100%;
+}
+.docling-source-disclosure > summary {
+  color: #334155;
+  cursor: pointer;
+  font: .85rem system-ui, sans-serif;
+  list-style-position: outside;
+  padding: .2rem 0;
+}
+.docling-source-disclosure > summary:focus-visible {
+  border-radius: .2rem;
+  outline: 2px solid #2563eb;
+  outline-offset: 2px;
+}
+.docling-source-disclosure > figure {
+  border: 1px solid #94a3b8;
+  border-radius: .25rem;
+  background: #fff;
+  margin: .45rem 0 .25rem;
+  max-width: 100%;
+  overflow: auto;
+  padding: .35rem;
+}
+.docling-source-disclosure > figure img {
+  display: block;
+  height: auto;
+  max-width: 100%;
+}
+.docling-source-disclosure .docling-visual-only-label,
+.docling-visual-only-label {
+  border-left: 3px solid #b45309;
+  color: #92400e;
+  font: .8rem system-ui, sans-serif;
+  margin: .2rem 0 .45rem;
+  padding: .2rem .45rem;
+}
+.docling-table-visual-fallback {
+  border: 2px solid #b45309;
+  border-radius: .3rem;
+  background: #fffbeb;
+  margin: .65rem 0;
+  overflow: auto;
+  padding: .45rem;
+}
+@media print {
+  .docling-source-disclosure {
+    border-color: #64748b;
+    background: #fff;
+  }
+  .docling-source-disclosure:not([open]) > :not(summary) {
+    display: block !important;
+  }
+  .docling-source-disclosure > summary {
+    color: #000;
+  }
+}
 </style>
 """
 
 
 def _inject_english_review_style(document_html: str) -> tuple[str, bool]:
+    style_pattern = re.compile(
+        r'<style\b[^>]*\bid=["\']docling-english-review-polish-style["\'][^>]*>.*?</style\s*>',
+        flags=re.I | re.S,
+    )
+    if style_pattern.search(document_html):
+        # Replace the complete existing block so retained/CJK artifacts pick up
+        # disclosure CSS added in later restores.  If a malformed or duplicate
+        # block is present, keep only one canonical style rather than creating
+        # competing IDs.
+        seen = False
+
+        def replace_style(_match: re.Match[str]) -> str:
+            nonlocal seen
+            if seen:
+                return ""
+            seen = True
+            return ENGLISH_REVIEW_STYLE
+
+        updated = style_pattern.sub(replace_style, document_html)
+        return updated, updated != document_html
     if "docling-english-review-polish-style" in document_html:
+        # A marker without a complete style element is not safe to duplicate;
+        # leave the retained artifact unchanged for conservative recovery.
         return document_html, False
     if "</head>" in document_html:
         return document_html.replace("</head>", ENGLISH_REVIEW_STYLE + "\n</head>", 1), True
@@ -9530,15 +12105,24 @@ def _algorithm_record_html(record: dict[str, Any]) -> str:
         if source_ref
         else ""
     )
-    source_figure = (
-        '<figure class="docling-algorithm-source-evidence">'
-        f'<img src="{html.escape(source_image, quote=True)}" '
-        f'alt="{html.escape(str(record.get("label") or "Algorithm block"), quote=True)} source rendering">'
-        '<figcaption>Algorithm source rendering from the original PDF.</figcaption>'
-        "</figure>"
-        if source_image
-        else ""
-    )
+    source_figure = ""
+    if source_image:
+        source_figure = _source_disclosure_html(
+            (
+                '<figure class="docling-algorithm-source-evidence">'
+                f'<img src="{html.escape(source_image, quote=True)}" '
+                f'alt="{html.escape(str(record.get("label") or "Algorithm block"), quote=True)} source rendering">'
+                '<figcaption>Algorithm source rendering from the original PDF.</figcaption>'
+                "</figure>"
+            ),
+            summary="查看算法原始裁剪",
+            extra_class="docling-algorithm-source-disclosure",
+            attrs=(
+                f' data-source-ref="{html.escape(source_ref, quote=True)}"'
+                if source_ref
+                else ""
+            ),
+        )
     return (
         '<div class="docling-algorithm-recovered" '
         f'data-algorithm-source="{source}"{source_ref_attr}>'
@@ -9561,7 +12145,13 @@ def _algorithm_record_markdown(record: dict[str, Any]) -> str:
         f"<!-- source-algorithm-ref:{source_ref} -->\n" if source_ref else ""
     )
     source_figure = (
-        f"\n\n![{label} source rendering]({source_image})\n"
+        "\n\n"
+        + _source_disclosure_markdown(
+            _markdown_image(f"{label} source rendering", source_image),
+            summary="查看算法原始裁剪",
+            extra_class="docling-algorithm-source-disclosure",
+        )
+        + "\n"
         if source_image
         else ""
     )
@@ -11223,12 +13813,17 @@ def _bind_algorithm_source_evidence_html(
     if closing < 0:
         return document_html, False
     label = str(record.get("label") or "Algorithm block")
-    figure = (
-        '<figure class="docling-algorithm-source-evidence">'
-        f'<img src="{html.escape(source_image, quote=True)}" '
-        f'alt="{html.escape(label, quote=True)} source rendering">'
-        f'<figcaption>{html.escape(label)} — exact source rendering from the '
-        "original PDF</figcaption></figure>"
+    figure = _source_disclosure_html(
+        (
+            '<figure class="docling-algorithm-source-evidence">'
+            f'<img src="{html.escape(source_image, quote=True)}" '
+            f'alt="{html.escape(label, quote=True)} source rendering">'
+            f'<figcaption>{html.escape(label)} — exact source rendering from the '
+            "original PDF</figcaption></figure>"
+        ),
+        summary="查看算法原始裁剪",
+        extra_class="docling-algorithm-source-disclosure",
+        attrs=f' data-source-ref="{html.escape(source_ref, quote=True)}"',
     )
     insertion = start + closing
     return document_html[:insertion] + figure + document_html[insertion:], True
@@ -11254,7 +13849,15 @@ def _bind_algorithm_source_evidence_markdown(
     if source_image in window:
         return document_markdown, False
     label = str(record.get("label") or "Algorithm block")
-    figure = f"\n\n![{label} — source rendering]({source_image})\n"
+    figure = (
+        "\n\n"
+        + _source_disclosure_markdown(
+            _markdown_image(f"{label} — source rendering", source_image),
+            summary="查看算法原始裁剪",
+            extra_class="docling-algorithm-source-disclosure",
+        )
+        + "\n"
+    )
     closing_pre = window.rfind("</pre>")
     insertion = start + closing_pre + len("</pre>") if closing_pre >= 0 else end
     return (
@@ -11321,8 +13924,18 @@ def recover_algorithm_blocks_in_outputs(
     missing_md_records: list[dict[str, Any]] = []
     html_path = output_dir / "document.html"
     if records and html_path.exists():
-        html_text, html_changed = _replace_algorithm_records_in_html(
+        existing_html = _strip_source_disclosure_blocks(
             html_path.read_text(encoding="utf-8"),
+            extra_class="docling-algorithm-source-disclosure",
+        )
+        existing_html = re.sub(
+            r'<section\b[^>]*class="[^"]*\bdocling-algorithm-source-evidence-appendix\b[^"]*"[^>]*>.*?</section>',
+            "",
+            existing_html,
+            flags=re.I | re.S,
+        )
+        html_text, html_changed = _replace_algorithm_records_in_html(
+            existing_html,
             records,
         )
         html_text, html_deduplicated = _dedupe_algorithm_recovered_html(
@@ -11343,13 +13956,22 @@ def recover_algorithm_blocks_in_outputs(
         ]
         if missing_html_records:
             figures = "".join(
-                (
-                    '<figure class="docling-algorithm-source-evidence">'
-                    f'<img src="{html.escape(str(record["source_image"]), quote=True)}" '
-                    f'alt="{html.escape(str(record.get("label") or "Algorithm block"), quote=True)} '
-                    'source rendering">'
-                    f'<figcaption>{html.escape(str(record.get("label") or "Algorithm block"))}'
-                    " — exact source rendering from the original PDF</figcaption></figure>"
+                _source_disclosure_html(
+                    (
+                        '<figure class="docling-algorithm-source-evidence">'
+                        f'<img src="{html.escape(str(record["source_image"]), quote=True)}" '
+                        f'alt="{html.escape(str(record.get("label") or "Algorithm block"), quote=True)} '
+                        'source rendering">'
+                        f'<figcaption>{html.escape(str(record.get("label") or "Algorithm block"))}'
+                        " — exact source rendering from the original PDF</figcaption></figure>"
+                    ),
+                    summary="查看算法原始裁剪",
+                    extra_class="docling-algorithm-source-disclosure",
+                    attrs=(
+                        f' data-source-ref="{html.escape(str(record.get("source_ref") or ""), quote=True)}"'
+                        if record.get("source_ref")
+                        else ""
+                    ),
                 )
                 for record in missing_html_records
             )
@@ -11386,8 +14008,14 @@ def recover_algorithm_blocks_in_outputs(
             html_path.write_text(html_text, encoding="utf-8")
     md_path = output_dir / "document.md"
     if records and md_path.exists():
-        md_text, md_changed = _replace_algorithm_records_in_markdown(
+        existing_markdown, _ = _markdown_sub_outside_code(
             md_path.read_text(encoding="utf-8"),
+            r'<details\b[^>]*class="[^"]*\bdocling-algorithm-source-disclosure\b[^"]*"[^>]*>.*?</details>',
+            "",
+            flags=re.I | re.S,
+        )
+        md_text, md_changed = _replace_algorithm_records_in_markdown(
+            existing_markdown,
             records,
         )
         for record in records:
@@ -11410,10 +14038,14 @@ def recover_algorithm_blocks_in_outputs(
             )
             for record in missing_md_records:
                 label = str(record.get("label") or "Algorithm block")
-                md_text += (
-                    f"\n![{label} — source rendering]"
-                    f"({record['source_image']})\n"
-                )
+                md_text += "\n" + _source_disclosure_markdown(
+                    _markdown_image(
+                        f"{label} — source rendering",
+                        record["source_image"],
+                    ),
+                    summary="查看算法原始裁剪",
+                    extra_class="docling-algorithm-source-disclosure",
+                ) + "\n"
         if md_changed or missing_md_records:
             md_path.write_text(md_text, encoding="utf-8")
     final_html_text = (
@@ -15013,11 +17645,12 @@ def formula_number_qc_diagnostics(
         text = str(formula.get("text") or "")
         prov = first_prov(formula) or {}
         compact_numbers = _compact_formula_numbers(text)
-        normal_numbers = [int(value) for value in FORMULA_NUMBER_RE.findall(text)]
+        normal_numbers = _formula_number_values(text)
+        spaced_number_surface = bool(re.search(r"\(\s*\d(?:\s+\d)+\s*\)", text))
         reasons: list[str] = []
         safe_recovered_number: int | None = None
         source_number = _pdf_formula_number_for_bbox(pdf_path, prov)
-        if compact_numbers and not normal_numbers:
+        if compact_numbers and (not normal_numbers or spaced_number_surface):
             safe_recovered_number = compact_numbers[-1]
             reasons.append("equation_number_recoverable_from_formula_text")
         if source_number is not None and source_number not in compact_numbers:
@@ -15901,7 +18534,7 @@ def formula_second_pass_alignment_diagnostics(
                 )
                 if downstream_offset_risk_after is None:
                     downstream_offset_risk_after = formula_no
-        if FORMULA_NUMBER_RE.fullmatch(route_a_text.strip()) or re.fullmatch(
+        if _is_formula_number_only(route_a_text.strip()) or re.fullmatch(
             r"\s*\(\s*(?:\d\s*){1,3}\s*\)\s*",
             route_a_text,
         ):
@@ -15937,7 +18570,7 @@ def formula_second_pass_alignment_diagnostics(
             )
             if not candidate_text.strip() and (
                 "number_only_missing_body" in (entry.get("reasons") or [])
-                or FORMULA_NUMBER_RE.fullmatch(route_a_text.strip())
+                or _is_formula_number_only(route_a_text.strip())
             ):
                 image_formula_not_converted.append(
                     {
@@ -16569,9 +19202,21 @@ def run_unified_review_qc(
 
 
 def is_cn_accepted_path(args: argparse.Namespace) -> bool:
+    input_file = getattr(args, "input_file", None)
+    submitted_name = str(
+        getattr(args, "_submitted_input_name", None)
+        or getattr(input_file, "name", "")
+    )
+    snapshot = getattr(args, "_input_snapshot", None)
+    submitted_sha256 = str(
+        getattr(snapshot, "sha256", None)
+        or getattr(args, "expected_input_sha256", None)
+        or ""
+    ).strip().lower()
     return bool(
         getattr(args, "legacy_cn_accepted_baseline", False)
-        and args.input_file.name == "CN.pdf"
+        and submitted_name == "CN.pdf"
+        and submitted_sha256 == CN_ACCEPTED_BASELINE["source_pdf_sha256"]
         and effective_cn_ocr_parity(args)
     )
 
@@ -17976,6 +20621,13 @@ def restore_review_artifact_layer(
     )
     write_review_index(output_dir, metadata, status)
     add_document_review_banner(output_dir)
+    # Source disclosures are part of the artifact layer, including the
+    # accepted-CN path that intentionally skips the broader unified QC pass.
+    html_path = output_dir / "document.html"
+    if html_path.exists():
+        html_text = html_path.read_text(encoding="utf-8")
+        html_text, _ = _inject_english_review_style(html_text)
+        html_path.write_text(html_text, encoding="utf-8")
     formula_source_link_count = inject_formula_source_links(output_dir, formulas)
     metadata["formula_source_link_count"] = formula_source_link_count
     status["quality_signals"]["formula_source_link_count"] = formula_source_link_count
@@ -19200,6 +21852,21 @@ def _compact_formula_numbers(text: str) -> list[int]:
     return deduped
 
 
+def _formula_number_match_value(match: re.Match[str]) -> int:
+    """Normalize a FORMULA_NUMBER_RE match, including OCR-spaced digits."""
+
+    return int(re.sub(r"\s+", "", match.group(1)))
+
+
+def _formula_number_values(text: str) -> list[int]:
+    values: list[int] = []
+    for match in FORMULA_NUMBER_RE.finditer(str(text or "")):
+        value = _formula_number_match_value(match)
+        if value not in values:
+            values.append(value)
+    return values
+
+
 def _formula_number_for_node(formula_no: int, node: dict[str, Any]) -> int | None:
     numbers = _compact_formula_numbers(str(node.get("text") or ""))
     if numbers:
@@ -19256,6 +21923,40 @@ def _formula_text_with_number(text: str, formula_no: int) -> str:
     if formula_no in _compact_formula_numbers(body):
         return body
     return f"{body} \\quad ( {formula_no} )"
+
+
+def _cn_formula_candidate_is_accepted(
+    candidate: str,
+    normalized: str,
+    formula_no: int,
+) -> bool:
+    """Bind a CN compatibility candidate to one reviewed body and number.
+
+    The canonicalizer is allowed to remove duplicate copies of the *expected*
+    trailing label (the accepted formula 17 needs that bounded repair), but it
+    must not relabel a candidate that already contains another equation
+    number.  The normalized body must also match the immutable accepted
+    occurrence inventory for this formula index.
+    """
+
+    raw_numbers = [
+        _formula_number_match_value(match)
+        for match in FORMULA_NUMBER_RE.finditer(str(candidate or ""))
+    ]
+    if raw_numbers and any(number != formula_no for number in raw_numbers):
+        return False
+    normalized_numbers = [
+        _formula_number_match_value(match)
+        for match in FORMULA_NUMBER_RE.finditer(str(normalized or ""))
+    ]
+    if normalized_numbers != [formula_no]:
+        return False
+    content_sha256 = _formula_content_identity_sha256(normalized)
+    return bool(
+        content_sha256
+        and content_sha256
+        in CN_ACCEPTED_FORMULA_CONTENT_SHA256.get(formula_no, ())
+    )
 
 
 def _cn_accepted_formula_source_texts(
@@ -19321,7 +22022,11 @@ def _cn_accepted_formula_source_texts(
         ranked: list[tuple[tuple[int, int, int, int], str, str]] = []
         for source, candidate in candidates:
             normalized, _repairs = canonicalize_formula_output(candidate, formula_no)
-            if not normalized:
+            if not normalized or not _cn_formula_candidate_is_accepted(
+                candidate,
+                normalized,
+                formula_no,
+            ):
                 continue
             base_rank = _formula_candidate_rank(normalized, formula_no)
             ranked.append(
@@ -19922,10 +22627,33 @@ def apply_cn_final_document_polish(
         for formula_no in CN_ACCEPTED_BASELINE["equation_numbers"]
         if formula_no not in formula_texts
     ]
-    json_patched = _patch_formula_json_nodes(output_dir, formula_texts)
+    if missing_sources:
+        # The compatibility rewrite is one occurrence-bound 24-formula
+        # contract.  Never leave a partially rewritten degraded artifact: an
+        # early formula carrying another equation label could otherwise make a
+        # later accepted candidate land in the wrong JSON node.
+        return {
+            "ok": False,
+            "applied": False,
+            "formula_texts": sorted(formula_texts),
+            "candidate_sources": source_map,
+            "missing_source_formulas": missing_sources,
+            "document_json_patched": [],
+            "document_md_patched": [],
+            "document_html_patch": {
+                "ok": False,
+                "applied": False,
+                "reason": "cn_formula_identity_inventory_incomplete",
+            },
+        }
+    json_patched = _patch_formula_json_nodes(
+        output_dir,
+        formula_texts,
+        prefer_index_anchor=True,
+    )
     markdown_patched = _patch_markdown_formula_blocks(output_dir, formula_texts)
     html_patch = _patch_html_formula_blocks(output_dir, sidecar_dir, formula_texts)
-    ok = not missing_sources and bool(html_patch.get("ok"))
+    ok = bool(html_patch.get("ok"))
     return {
         "ok": ok,
         "applied": True,
@@ -19980,8 +22708,10 @@ def _replace_unsafe_markdown_formula_blocks_with_source_images(
             "$$\n"
             r"\text{Exact formula preserved in the source rendering below.}"
             "\n$$\n\n"
-            f"![Formula {formula_no} source rendering]"
-            f"(formulas/formula_{formula_no}.png)"
+            + _markdown_image(
+                f"Formula {formula_no} source rendering",
+                f"formulas/formula_{formula_no}.png",
+            )
         )
         edits.append((block[0], block[1], replacement))
     for start, end, replacement in reversed(edits):
@@ -22090,6 +24820,17 @@ def restore_final_delivery_visuals(
     for relative_path in code_sources.get("source_images") or []:
         if relative_path not in metadata.setdefault("generated_outputs", []):
             metadata["generated_outputs"].append(relative_path)
+
+    # Semantic rebuilds and the evidence appenders may replace the initial
+    # HTML document.  Re-inject the scoped disclosure stylesheet after every
+    # final evidence mutation so the delivered artifact always has closed
+    # details, borders, focus treatment, and print expansion rules.
+    final_html_path = output_dir / "document.html"
+    if final_html_path.exists():
+        final_html, _ = _inject_english_review_style(
+            final_html_path.read_text(encoding="utf-8")
+        )
+        _atomic_write_output_text(final_html_path, final_html)
 
     html_text = (output_dir / "document.html").read_text(encoding="utf-8")
     markdown_text = (output_dir / "document.md").read_text(encoding="utf-8")
@@ -24881,6 +27622,18 @@ def _run_snapshot_job(
         submitted_path=submitted_input_file,
         expected_sha256=getattr(args, "expected_input_sha256", None),
     )
+
+    # Recover empty image-only tables before writing the contract so accepted
+    # grid data is visible to semantic reflow and provenance validation.
+    image_table_recovery = recover_image_only_tables_from_serve(
+        response,
+        source_pdf_path,
+        conversion_args,
+        metadata,
+        status,
+    )
+    metadata["image_table_semantic_recovery"] = image_table_recovery
+    status.setdefault("quality_signals", {})["image_table_semantic_recovery"] = image_table_recovery
 
     visual_args = conversion_args
     write_contract_outputs(

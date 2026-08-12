@@ -53,5 +53,5 @@ if [[ ! -f "${MODEL_MARKER}" ]]; then
   touch "${MODEL_MARKER}"
 fi
 
-print "Installed docling-service 1.1.0 into ${VENV_DIR}"
+print "Installed docling-service 1.1.1 into ${VENV_DIR}"
 print "Start it with: ${SCRIPT_DIR}/start.sh"

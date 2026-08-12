@@ -119,7 +119,7 @@ n8n -> local-ai-python-worker -> services/n8n-paper-pipeline
 
 ## Current Docling state
 
-`services/docling-service` is the canonical v1.1.0 product line and is now shipped
+`services/docling-service` is the canonical v1.1.1 product line and is now shipped
 as an official asynchronous HTTP API (`POST /v1/jobs`) with release workflow and
 official package distribution.
 

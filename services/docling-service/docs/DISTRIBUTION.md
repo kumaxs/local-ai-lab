@@ -1,6 +1,6 @@
 # Cross-machine distribution
 
-Docling Service 1.1.0 is distributed from the Git tag `v1.1.0`. The tag starts
+Docling Service 1.1.1 is distributed from the Git tag `v1.1.1`. The tag starts
 the release workflow, which validates the service, builds deterministic source
 bundles, checks the bundle on a clean macOS runner, publishes multi-platform
 Docker images, and creates the GitHub Release.
@@ -9,14 +9,14 @@ Docker images, and creates the GitHub Release.
 
 Download these files from the same GitHub Release:
 
-- `docling-service-1.1.0.tar.gz` or `docling-service-1.1.0.zip`;
+- `docling-service-1.1.1.tar.gz` or `docling-service-1.1.1.zip`;
 - the archive's matching `.sha256` file, or the combined `SHA256SUMS` when both
   archive formats are downloaded.
 
 Verify before extracting:
 
 ```bash
-shasum -a 256 -c docling-service-1.1.0.tar.gz.sha256
+shasum -a 256 -c docling-service-1.1.1.tar.gz.sha256
 ```
 
 Each archive also contains `RELEASE_MANIFEST.json`, which records the Git commit,
@@ -27,7 +27,7 @@ without extracting them:
 ```bash
 python3 services/docling-service/release/verify_release_bundle.py \
   --checksums SHA256SUMS \
-  docling-service-1.1.0.tar.gz
+  docling-service-1.1.1.tar.gz
 ```
 
 The bundle excludes PDFs, reports, runtime state, logs, model caches, virtual
@@ -42,7 +42,7 @@ Extract the bundle and run:
 ```
 
 The wrapper first copies the complete release to the stable path
-`~/Library/Application Support/Local AI Lab/docling-service/1.1.0`. The Python
+`~/Library/Application Support/Local AI Lab/docling-service/1.1.1`. The Python
 environment, scripts, quality adapter, model references, and runtime data then
 remain independent of the Downloads directory or extracted archive. The
 installer prints persistent start, status, and stop commands.
@@ -57,9 +57,9 @@ The release workflow publishes these OCI images for `linux/amd64` and
 `linux/arm64`:
 
 ```text
-ghcr.io/kumaxs/local-ai-lab-docling-api:1.1.0
-ghcr.io/kumaxs/local-ai-lab-docling-backend:1.1.0
-ghcr.io/kumaxs/local-ai-lab-docling-formula:1.1.0
+ghcr.io/kumaxs/local-ai-lab-docling-api:1.1.1
+ghcr.io/kumaxs/local-ai-lab-docling-backend:1.1.1
+ghcr.io/kumaxs/local-ai-lab-docling-formula:1.1.1
 ```
 
 From the extracted bundle:

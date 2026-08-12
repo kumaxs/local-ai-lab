@@ -31,7 +31,7 @@ except ModuleNotFoundError:  # Keep pure helper tests importable in minimal Pyth
         return default
 
 
-FORMULA_SERVICE_VERSION = "1.1.0"
+FORMULA_SERVICE_VERSION = "1.1.1"
 DEFAULT_MODEL_REPO = "wanderkid/unimernet_small"
 DEFAULT_FALLBACK_MODEL = "PP-FormulaNet-L"
 
