@@ -6737,6 +6737,147 @@ def _formula_raw_content_sha256(value: str) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest() if raw else ""
 
 
+_FORMULA_CROP_CONTENT_IDENTITY_MANIFEST = "formula_crop_content_identity_manifest"
+
+
+def _formula_crop_identity_manifest_for_indexed_formulas(
+    formula_by_index: dict[int, dict[str, Any]] | None,
+) -> dict[int, dict[str, str]]:
+    """Build the trusted formula identities used to refresh crop diagnostics.
+
+    Crop metrics are generated before a guarded OCR/second-pass may replace a
+    placeholder formula.  The resulting identity manifest is deliberately
+    derived only from the accepted final formula nodes and is retained as an
+    audit record for the in-process refresh that follows acceptance.
+    """
+
+    manifest: dict[int, dict[str, str]] = {}
+    for raw_index, formula in (formula_by_index or {}).items():
+        if (
+            not isinstance(raw_index, int)
+            or isinstance(raw_index, bool)
+            or raw_index <= 0
+            or not isinstance(formula, dict)
+        ):
+            continue
+        text = str(formula.get("text") or "").strip()
+        semantic_identity = _formula_content_identity_sha256(text)
+        raw_identity = _formula_raw_content_sha256(text)
+        if not semantic_identity or not raw_identity:
+            continue
+        manifest[raw_index] = {
+            "formula_content_identity_sha256": semantic_identity,
+            "formula_raw_content_sha256": raw_identity,
+        }
+    return manifest
+
+
+def _set_formula_crop_identity_manifest(
+    metadata: dict[str, Any],
+    status: dict[str, Any],
+    formula_by_index: dict[int, dict[str, Any]] | None,
+) -> dict[int, dict[str, str]]:
+    """Persist accepted formula identities as an audit record."""
+
+    manifest = _formula_crop_identity_manifest_for_indexed_formulas(
+        formula_by_index
+    )
+    persisted = {str(index): value for index, value in sorted(manifest.items())}
+    metadata[_FORMULA_CROP_CONTENT_IDENTITY_MANIFEST] = persisted
+    status.setdefault("quality_signals", {})[
+        _FORMULA_CROP_CONTENT_IDENTITY_MANIFEST
+    ] = copy.deepcopy(persisted)
+    return manifest
+
+
+def _refresh_formula_crop_diagnostics_after_accepted_formula_update(
+    metadata: dict[str, Any],
+    status: dict[str, Any],
+    formula_by_index: dict[int, dict[str, Any]] | None,
+) -> dict[int, dict[str, str]]:
+    """Refresh crop identities immediately after a trusted formula update.
+
+    This helper is called only from the in-process OCR/second-pass acceptance
+    points.  Final restoration intentionally never reads the persisted
+    identity manifest: an operator (or a later file edit) cannot rewrite the
+    manifest and then use it to bless a tampered final formula.
+    """
+
+    trusted_manifest = _set_formula_crop_identity_manifest(
+        metadata,
+        status,
+        formula_by_index,
+    )
+    for diagnostic_key in (
+        "formula_crop_diagnostics",
+        "suspicious_formula_diagnostics",
+    ):
+        diagnostics = metadata.get(diagnostic_key)
+        if not isinstance(diagnostics, list):
+            continue
+        metadata[diagnostic_key] = _refresh_formula_crop_content_identities(
+            diagnostics,
+            formula_by_index,
+            trusted_identity_manifest=trusted_manifest,
+        )
+        status.setdefault("quality_signals", {})[diagnostic_key] = copy.deepcopy(
+            metadata[diagnostic_key]
+        )
+    return trusted_manifest
+
+
+def _refresh_formula_crop_content_identities(
+    formula_crop_diagnostics: list[dict[str, Any]] | None,
+    formula_by_index: dict[int, dict[str, Any]] | None,
+    *,
+    trusted_identity_manifest: dict[int, dict[str, str]] | None,
+) -> list[dict[str, Any]]:
+    """Refresh only identities backed by an accepted final formula manifest.
+
+    Every non-identity provenance field is retained byte-for-byte.  A formula
+    whose final text no longer matches the trusted manifest is intentionally
+    left stale, so the existing provenance check rejects it instead of letting
+    final output tampering repair its own evidence.
+    """
+
+    refreshed = copy.deepcopy(formula_crop_diagnostics or [])
+    if not formula_by_index or not trusted_identity_manifest:
+        return refreshed
+    for item in refreshed:
+        if not isinstance(item, dict):
+            continue
+        raw_index = item.get("index")
+        if (
+            not isinstance(raw_index, int)
+            or isinstance(raw_index, bool)
+            or raw_index <= 0
+        ):
+            continue
+        formula = formula_by_index.get(raw_index)
+        trusted = trusted_identity_manifest.get(raw_index)
+        if not isinstance(formula, dict) or not isinstance(trusted, dict):
+            continue
+        text = str(formula.get("text") or "").strip()
+        semantic_identity = _formula_content_identity_sha256(text)
+        raw_identity = _formula_raw_content_sha256(text)
+        if (
+            not semantic_identity
+            or not raw_identity
+            or semantic_identity != trusted.get("formula_content_identity_sha256")
+            or raw_identity != trusted.get("formula_raw_content_sha256")
+        ):
+            continue
+        item["formula_content_identity_sha256"] = semantic_identity
+        item["formula_raw_content_sha256"] = raw_identity
+        for metric_name in ("source", "context", "source_crop", "context_crop"):
+            metric = item.get(metric_name)
+            if not isinstance(metric, dict):
+                continue
+            metric["formula_content_identity_sha256"] = semantic_identity
+            metric["formula_raw_content_sha256"] = raw_identity
+    return refreshed
+
+
 def _html_formula_occurrence_identities(document_html: str) -> dict[int, list[str]]:
     identities: dict[int, list[str]] = {}
 
@@ -23582,6 +23723,23 @@ def run_portable_formula_ocr(
         if isinstance(patched_document, dict)
         else []
     )
+    # ``render_page_images_and_crops`` runs before OCR and therefore records
+    # empty identities for placeholder formula nodes.  Only formulas that
+    # were actually accepted and verified in the patched JSON may authorize a
+    # diagnostic refresh; missing/unsafe results remain fail-closed.
+    accepted_formula_by_index = {
+        index: formula
+        for index, formula in enumerate(patched_nodes, start=1)
+        if index in formula_texts
+        and str(formula.get("text") or "") == formula_texts[index]
+    }
+    trusted_formula_manifest = (
+        _refresh_formula_crop_diagnostics_after_accepted_formula_update(
+            metadata,
+            status,
+            accepted_formula_by_index,
+        )
+    )
     verified = [
         index
         for index, formula in enumerate(patched_nodes, start=1)
@@ -23624,6 +23782,9 @@ def run_portable_formula_ocr(
         "post_validation_fallback_error": post_validation_fallback_error,
         "patched_count": len(patched),
         "patched_indexes": patched,
+        "formula_crop_identity_refreshed_indexes": sorted(
+            trusted_formula_manifest
+        ),
         "verified_count": len(verified),
         "verified_indexes": verified,
         "missing_crop_indexes": missing_crops,
@@ -23841,6 +24002,18 @@ def run_optional_formula_second_pass(
             if not cn_final_polish.get("ok"):
                 status["ok"] = False
                 status["success_class"] = "degraded_failure"
+            elif cn_final_polish.get("applied"):
+                final_document = _load_json_file(output_dir / "document.json")
+                if isinstance(final_document, dict):
+                    final_formulas = extract_label_nodes(final_document, "formula")
+                    _refresh_formula_crop_diagnostics_after_accepted_formula_update(
+                        metadata,
+                        status,
+                        {
+                            index: formula
+                            for index, formula in enumerate(final_formulas, start=1)
+                        },
+                    )
             write_updated_contract_state()
             return
         fallback_result = apply_current_formula_display_fallback(
@@ -24175,6 +24348,22 @@ def run_optional_formula_second_pass(
         metadata["formula_second_pass_applied"] = primary_apply_ok
         status["quality_signals"]["formula_second_pass_applied"] = primary_apply_ok
         formula_summary["primary_apply_ok"] = primary_apply_ok
+        if primary_apply_ok:
+            # Route-B/guarded second-pass output is now the authoritative final
+            # formula surface.  Record its indexed identities before final
+            # visual restoration so placeholder crop hashes can be refreshed
+            # without allowing later document tampering to self-authorise.
+            final_document = _load_json_file(output_dir / "document.json")
+            if isinstance(final_document, dict):
+                final_formulas = extract_label_nodes(final_document, "formula")
+                _refresh_formula_crop_diagnostics_after_accepted_formula_update(
+                    metadata,
+                    status,
+                    {
+                        index: formula
+                        for index, formula in enumerate(final_formulas, start=1)
+                    },
+                )
     else:
         metadata["formula_second_pass_applied"] = False
         status["quality_signals"]["formula_second_pass_applied"] = False

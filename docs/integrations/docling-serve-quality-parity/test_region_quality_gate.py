@@ -531,6 +531,222 @@ class RegionQualityGateTests(unittest.TestCase):
             self.assertIn("quarantine_duplicate_evidence_conflict", record["reasons"])
             self.assertFalse(result["ok"])
 
+    def test_quarantine_without_source_ref_keeps_distinct_geometry_separate(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            document, metadata, status = _fixture(root)
+            base = dict(status["quality_signals"]["structural_quarantine_qc"]["candidates"][0])
+            base.pop("source_ref", None)
+            first = dict(base)
+            second = dict(
+                base,
+                bbox={
+                    "l": 220,
+                    "r": 320,
+                    "t": 120,
+                    "b": 180,
+                    "coord_origin": "TOPLEFT",
+                },
+            )
+            status["quality_signals"]["structural_quarantine_qc"]["candidates"] = [
+                first,
+                second,
+            ]
+
+            result = evaluate_regions(
+                root, document, metadata, status, write_sidecars=False
+            )
+
+            picture_records = [
+                item for item in result["records"] if item["kind"] == "picture_ocr"
+            ]
+            self.assertEqual(2, len(picture_records))
+            self.assertTrue(
+                all(
+                    "quarantine_duplicate_evidence_conflict" not in item["reasons"]
+                    for item in picture_records
+                )
+            )
+
+    def test_quarantine_without_source_ref_merges_same_geometry_duplicates(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            document, metadata, status = _fixture(root)
+            base = dict(status["quality_signals"]["structural_quarantine_qc"]["candidates"][0])
+            base.pop("source_ref", None)
+            first = dict(base)
+            second = dict(base, final_output_residual_surfaces=["document.md"])
+            status["quality_signals"]["structural_quarantine_qc"]["candidates"] = [
+                first,
+                second,
+            ]
+
+            result = evaluate_regions(
+                root, document, metadata, status, write_sidecars=False
+            )
+
+            picture_records = [
+                item for item in result["records"] if item["kind"] == "picture_ocr"
+            ]
+            self.assertEqual(1, len(picture_records))
+            self.assertIn("document.md", picture_records[0]["signals"]["residual_surfaces"])
+            self.assertNotIn(
+                "quarantine_duplicate_evidence_conflict",
+                picture_records[0]["reasons"],
+            )
+
+    def test_quarantine_invalid_explicit_source_ref_does_not_collide_with_legal_ref(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            document, metadata, status = _fixture(root)
+            base = dict(status["quality_signals"]["structural_quarantine_qc"]["candidates"][0])
+            first = dict(base, source_ref="picture:foo bar")
+            second = dict(base, source_ref="picture:foo_bar")
+            status["quality_signals"]["structural_quarantine_qc"]["candidates"] = [
+                first,
+                second,
+            ]
+
+            result = evaluate_regions(
+                root, document, metadata, status, write_sidecars=False
+            )
+
+            picture_records = [
+                item for item in result["records"] if item["kind"] == "picture_ocr"
+            ]
+            self.assertEqual(2, len(picture_records))
+            invalid = [
+                item
+                for item in picture_records
+                if "quarantine_source_ref_invalid" in item["reasons"]
+            ]
+            valid = [
+                item for item in picture_records if item["source_ref"] == "picture:foo_bar"
+            ]
+            self.assertEqual(1, len(invalid))
+            self.assertEqual(1, len(valid))
+            self.assertFalse(result["ok"])
+
+    def test_quarantine_overlong_explicit_source_refs_do_not_collide(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            document, metadata, status = _fixture(root)
+            base = dict(status["quality_signals"]["structural_quarantine_qc"]["candidates"][0])
+            long_prefix = "picture:" + ("a" * 172)
+            first = dict(base, source_ref=long_prefix + "X")
+            second = dict(base, source_ref=long_prefix + "Y")
+            status["quality_signals"]["structural_quarantine_qc"]["candidates"] = [
+                first,
+                second,
+            ]
+
+            result = evaluate_regions(
+                root, document, metadata, status, write_sidecars=False
+            )
+
+            picture_records = [
+                item for item in result["records"] if item["kind"] == "picture_ocr"
+            ]
+            self.assertEqual(2, len(picture_records))
+            self.assertTrue(
+                all(
+                    "quarantine_source_ref_invalid" in item["reasons"]
+                    and item["status"] == "unresolved"
+                    for item in picture_records
+                )
+            )
+            self.assertFalse(result["ok"])
+
+    def test_quarantine_normalized_explicit_source_refs_do_not_collide_with_legal_ref(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            document, metadata, status = _fixture(root)
+            base = dict(status["quality_signals"]["structural_quarantine_qc"]["candidates"][0])
+            first = dict(base, source_ref="picture:trim ")
+            second = dict(base, source_ref="picture:trim")
+            third = dict(base, source_ref="picture:null\x00")
+            status["quality_signals"]["structural_quarantine_qc"]["candidates"] = [
+                first,
+                second,
+                third,
+            ]
+
+            result = evaluate_regions(
+                root, document, metadata, status, write_sidecars=False
+            )
+
+            picture_records = [
+                item for item in result["records"] if item["kind"] == "picture_ocr"
+            ]
+            self.assertEqual(3, len(picture_records))
+            invalid = [
+                item
+                for item in picture_records
+                if "quarantine_source_ref_invalid" in item["reasons"]
+            ]
+            valid = [
+                item for item in picture_records if item["source_ref"] == "picture:trim"
+            ]
+            self.assertEqual(2, len(invalid))
+            self.assertEqual(1, len(valid))
+            self.assertFalse(result["ok"])
+
+    def test_quarantine_without_source_ref_missing_bbox_stays_separate_and_unresolved(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            document, metadata, status = _fixture(root)
+            base = dict(status["quality_signals"]["structural_quarantine_qc"]["candidates"][0])
+            base.pop("source_ref", None)
+            base.pop("bbox", None)
+            first = dict(base)
+            second = dict(base)
+            status["quality_signals"]["structural_quarantine_qc"]["candidates"] = [
+                first,
+                second,
+            ]
+
+            result = evaluate_regions(
+                root, document, metadata, status, write_sidecars=False
+            )
+
+            picture_records = [
+                item for item in result["records"] if item["kind"] == "picture_ocr"
+            ]
+            self.assertEqual(2, len(picture_records))
+            self.assertTrue(
+                all(
+                    "quarantine_bbox_missing_or_invalid" in item["reasons"]
+                    and item["status"] == "unresolved"
+                    for item in picture_records
+                )
+            )
+            self.assertFalse(result["ok"])
+
+    def test_non_quarantine_candidate_is_ignored_without_crash(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            document, metadata, status = _fixture(root)
+            status["quality_signals"]["structural_quarantine_qc"]["candidates"] = [
+                {
+                    "kind": "text",
+                    "label": "text",
+                    "page_no": 1,
+                    "text": "ordinary body paragraph",
+                }
+            ]
+
+            result = evaluate_regions(
+                root, document, metadata, status, write_sidecars=False
+            )
+
+            quarantine_records = [
+                item
+                for item in result["records"]
+                if item["kind"] in {"picture_ocr", "header_footer"}
+            ]
+            self.assertEqual([], quarantine_records)
+            self.assertTrue(result["ok"])
+
     def test_quarantine_non_object_candidate_is_critical(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -1547,6 +1763,132 @@ class RegionQualityGateTests(unittest.TestCase):
             inline = next(record for record in result["records"] if record["kind"] == "inline_math")
             self.assertEqual("verified_semantic", inline["status"])
             self.assertTrue(result["ok"])
+
+    def test_inline_long_paragraph_binding_uses_full_text_not_preview(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            document, metadata, status = _fixture(root)
+            node = document["texts"][3]
+            node["self_ref"] = "#/texts/321"
+            long_prefix = "leading context " * 30
+            source_text = "alpha_{s_j} <= beta_{t_k}"
+            node["text"] = long_prefix + source_text + " trailing explanation"
+            region = status["quality_signals"]["primary_surface"]["inline_math_source_regions"][0]
+            region.update(
+                {
+                    "source_text": source_text,
+                    "collection_index": 321,
+                    "part_index": 0,
+                    "unresolved": False,
+                }
+            )
+            candidate = status["quality_signals"]["final_source_visuals"][
+                "inline_math_source_renderings"
+            ]["candidates"][0]
+            candidate.update({"source_text": source_text, "part_index": 0})
+
+            result = evaluate_regions(
+                root, document, metadata, status, write_sidecars=False
+            )
+
+            inline = next(item for item in result["records"] if item["kind"] == "inline_math")
+            self.assertEqual("verified_semantic", inline["status"])
+            self.assertTrue(result["ok"])
+
+            document, metadata, status = _fixture(root)
+            node = document["texts"][3]
+            node["self_ref"] = "#/texts/321"
+            node["text"] = long_prefix + "alpha_{s_j} >= beta_{t_k}" + " trailing explanation"
+            region = status["quality_signals"]["primary_surface"]["inline_math_source_regions"][0]
+            region.update(
+                {
+                    "source_text": source_text,
+                    "collection_index": 321,
+                    "part_index": 0,
+                    "unresolved": False,
+                }
+            )
+            candidate = status["quality_signals"]["final_source_visuals"][
+                "inline_math_source_renderings"
+            ]["candidates"][0]
+            candidate.update({"source_text": source_text, "part_index": 0})
+
+            result = evaluate_regions(
+                root, document, metadata, status, write_sidecars=False
+            )
+
+            inline = next(item for item in result["records"] if item["kind"] == "inline_math")
+            self.assertIn(
+                "inline_math_final_node_binding_missing_or_ambiguous",
+                inline["reasons"],
+            )
+            self.assertFalse(result["ok"])
+
+    def test_inline_binding_text_at_limit_fails_closed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            document, metadata, status = _fixture(root)
+            limit_text = "a" * gate.MAX_BINDING_TEXT_CHARS
+            node = document["texts"][3]
+            node["self_ref"] = "#/texts/654"
+            node["text"] = limit_text
+            region = status["quality_signals"]["primary_surface"]["inline_math_source_regions"][0]
+            region.update(
+                {
+                    "source_text": limit_text,
+                    "collection_index": 654,
+                    "part_index": 0,
+                    "unresolved": False,
+                }
+            )
+            candidate = status["quality_signals"]["final_source_visuals"][
+                "inline_math_source_renderings"
+            ]["candidates"][0]
+            candidate.update({"source_text": limit_text, "part_index": 0})
+
+            result = evaluate_regions(
+                root, document, metadata, status, write_sidecars=False
+            )
+
+            inline = next(item for item in result["records"] if item["kind"] == "inline_math")
+            self.assertIn("inline_math_binding_text_truncated", inline["reasons"])
+            self.assertTrue(inline["signals"]["binding_text_truncated"])
+            self.assertFalse(result["ok"])
+
+    def test_inline_binding_tail_difference_past_limit_fails_closed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            document, metadata, status = _fixture(root)
+            prefix = "a" * gate.MAX_BINDING_TEXT_CHARS
+            source_text = prefix + "DIFF"
+            node = document["texts"][3]
+            node["self_ref"] = "#/texts/655"
+            node["text"] = prefix
+            region = status["quality_signals"]["primary_surface"]["inline_math_source_regions"][0]
+            region.update(
+                {
+                    "source_text": source_text,
+                    "collection_index": 655,
+                    "part_index": 0,
+                    "unresolved": False,
+                }
+            )
+            candidate = status["quality_signals"]["final_source_visuals"][
+                "inline_math_source_renderings"
+            ]["candidates"][0]
+            candidate.update({"source_text": source_text, "part_index": 0})
+
+            result = evaluate_regions(
+                root, document, metadata, status, write_sidecars=False
+            )
+
+            inline = next(item for item in result["records"] if item["kind"] == "inline_math")
+            self.assertIn("inline_math_binding_text_truncated", inline["reasons"])
+            self.assertTrue(inline["signals"]["region_source_text_truncated"])
+            self.assertTrue(inline["signals"]["candidate_source_text_truncated"])
+            self.assertTrue(inline["signals"]["node_text_truncated"])
+            self.assertTrue(inline["signals"]["binding_text_truncated"])
+            self.assertFalse(result["ok"])
 
     def test_inline_candidate_must_match_region_occurrence(self):
         with tempfile.TemporaryDirectory() as temporary:

@@ -44,6 +44,7 @@ MAX_DOCUMENT_NODES = 100_000
 MAX_TABLE_CELLS = 65_536
 MAX_RESIDUAL_SURFACES = 32
 MAX_LIST_ITEMS = DEFAULT_MAX_RECORDS + 1
+MAX_BINDING_TEXT_CHARS = 100_000
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _SAFE_SOURCE_REF_RE = re.compile(r"[^A-Za-z0-9_.:/#@+\-]+")
@@ -110,14 +111,32 @@ def _root_path_matches_context(root: Path, context: tuple[str, int, int, int]) -
     )
 
 
-def _text(value: Any, limit: int = 240) -> str:
-    """Return bounded, single-line diagnostic text."""
-
+def _normalized_text(value: Any) -> str:
     if value is None:
         return ""
     value = str(value).replace("\x00", "").replace("\r", " ").replace("\n", " ")
-    value = re.sub(r"\s+", " ", value).strip()
-    return value[:limit]
+    return re.sub(r"\s+", " ", value).strip()
+
+
+def _bounded_normalized_text(value: Any, limit: int) -> tuple[str, bool]:
+    normalized = _normalized_text(value)
+    return normalized[:limit], len(normalized) >= limit
+
+
+def _text(value: Any, limit: int = 240) -> str:
+    """Return bounded, single-line diagnostic text."""
+
+    return _bounded_normalized_text(value, limit)[0]
+
+
+def _full_text(value: Any, limit: int = MAX_BINDING_TEXT_CHARS) -> str:
+    """Return normalized text for identity/binding checks without preview truncation."""
+
+    return _bounded_normalized_text(value, limit)[0]
+
+
+def _full_text_truncated(value: Any, limit: int = MAX_BINDING_TEXT_CHARS) -> bool:
+    return _bounded_normalized_text(value, limit)[1]
 
 
 def _source_ref(value: Any, limit: int = 180) -> str | None:
@@ -127,6 +146,29 @@ def _source_ref(value: Any, limit: int = 180) -> str | None:
     # Keep refs readable while preventing them from becoming paths, comments,
     # or unbounded IDs in the sidecar.
     return _SAFE_SOURCE_REF_RE.sub("_", value)
+
+
+def _strict_quarantine_source_ref(value: Any) -> tuple[str | None, bool]:
+    """Keep explicit quarantine refs exact; invalid producer refs fail closed."""
+
+    if value is None:
+        return None, False
+    if not isinstance(value, str):
+        return None, True
+    raw = value
+    if not raw or len(raw) > 180:
+        return None, True
+    if _SAFE_SOURCE_REF_RE.search(raw):
+        return None, True
+    if (
+        raw.startswith(("/", "\\"))
+        or raw == ".."
+        or raw.startswith(("../", "..\\"))
+        or "/../" in raw
+        or "\\..\\" in raw
+    ):
+        return None, True
+    return raw, False
 
 
 def _sha256_text(value: Any) -> str:
@@ -338,6 +380,8 @@ def _document_nodes(document_json: Any, labels: set[str] | None = None) -> list[
             {
                 "label": label,
                 "text": _text(node.get("text")),
+                "full_text": _full_text(node.get("text")),
+                "full_text_truncated": _full_text_truncated(node.get("text")),
                 "page_no": _first_page(node),
                 "raw_page_no": raw_page_no,
                 "bbox": _first_bbox(node),
@@ -3028,9 +3072,19 @@ def _inline_math_records(
         region = by_anchor.get(anchor) or {}
         candidate = candidate_by_anchor.get(anchor) or {}
         reasons: list[str] = list(global_reasons)
+        node_text_truncated = False
+        region_source_text = region.get("source_text")
+        candidate_source_text = candidate.get("source_text")
+        region_source_truncated = _full_text_truncated(region_source_text)
+        candidate_source_truncated = _full_text_truncated(candidate_source_text)
+        binding_text_truncated = bool(
+            region_source_truncated or candidate_source_truncated
+        )
         binding_mode = _text(region.get("binding_mode"), 40) or "inline"
         if binding_mode != "inline":
             reasons.append("inline_math_occurrence_not_bound")
+        if binding_text_truncated:
+            reasons.append("inline_math_binding_text_truncated")
         if bool(region.get("unresolved")):
             reasons.append("inline_math_source_unresolved")
         if anchor not in html or anchor in missing_html or anchor in duplicate_html:
@@ -3062,12 +3116,17 @@ def _inline_math_records(
             and _safe_page(candidate_source_page) != region_page
         ):
             reasons.append("inline_math_candidate_source_page_mismatch")
-        region_source_identity = _inline_binding_identity(region.get("source_text"))
-        candidate_source_text = candidate.get("source_text")
+        region_source_identity = (
+            "" if binding_text_truncated else _inline_binding_identity(region_source_text)
+        )
         if candidate_source_text is None:
             reasons.append("inline_math_candidate_body_missing")
         else:
-            candidate_source_identity = _inline_binding_identity(candidate_source_text)
+            candidate_source_identity = (
+                ""
+                if binding_text_truncated
+                else _inline_binding_identity(candidate_source_text)
+            )
             if (
                 not region_source_identity
                 or not candidate_source_identity
@@ -3089,6 +3148,11 @@ def _inline_math_records(
                 reasons.append("inline_math_final_node_binding_missing")
             else:
                 body_node_item = body_nodes[0]
+                node_text_truncated = bool(body_node_item.get("full_text_truncated"))
+                if node_text_truncated:
+                    binding_text_truncated = True
+                    if "inline_math_binding_text_truncated" not in reasons:
+                        reasons.append("inline_math_binding_text_truncated")
                 declared_page = _safe_page(
                     region.get("page_no") or candidate.get("page_no")
                 )
@@ -3111,14 +3175,16 @@ def _inline_math_records(
                     if isinstance(body_node_item.get("node"), dict)
                     else {}
                 )
-                if expected_body_sha is not None:
+                if expected_body_sha is not None and not node_text_truncated and not binding_text_truncated:
                     if _body_identity_sha("inline_math", _structural_body_identity(node.get("text"))) != expected_body_sha:
                         reasons.append("inline_math_final_node_body_mismatch")
-                else:
+                elif not node_text_truncated and not binding_text_truncated:
                     source_text = _inline_binding_identity(
-                        region.get("source_text") or candidate.get("source_text")
+                        region_source_text or candidate_source_text
                     )
-                    node_text = _inline_binding_identity(node.get("text"))
+                    node_text = _inline_binding_identity(
+                        body_node_item.get("full_text", node.get("text"))
+                    )
                     if not source_text or not node_text or source_text not in node_text:
                         reasons.append("inline_math_final_node_body_unverified")
         else:
@@ -3150,7 +3216,7 @@ def _inline_math_records(
                     for collection_ref in collection_refs
                     for node_item in document_nodes_by_ref.get(collection_ref, [])
                 ]
-            if region_page is not None and safe_region_bbox is not None and source_text:
+            if region_page is not None and safe_region_bbox is not None:
                 for node_item in candidate_nodes:
                     if node_item.get("label") not in {"text", "paragraph", "list_item"}:
                         continue
@@ -3170,7 +3236,17 @@ def _inline_math_records(
                     )
                     if not bbox_bound:
                         continue
-                    node_text = _inline_binding_identity(node_item.get("text"))
+                    if node_item.get("full_text_truncated"):
+                        node_text_truncated = True
+                        binding_text_truncated = True
+                        if "inline_math_binding_text_truncated" not in reasons:
+                            reasons.append("inline_math_binding_text_truncated")
+                        continue
+                    if binding_text_truncated or not source_text:
+                        continue
+                    node_text = _inline_binding_identity(
+                        node_item.get("full_text", node_item.get("text"))
+                    )
                     body_bound = bool(
                         node_text
                         and source_text in node_text
@@ -3193,6 +3269,10 @@ def _inline_math_records(
             "html_bound": anchor in html and anchor not in duplicate_html,
             "markdown_bound": anchor in markdown and anchor not in duplicate_markdown,
             "crop_present": anchor not in missing_crop and bool(candidate),
+            "region_source_text_truncated": region_source_truncated,
+            "candidate_source_text_truncated": candidate_source_truncated,
+            "node_text_truncated": node_text_truncated,
+            "binding_text_truncated": binding_text_truncated,
             "source_unresolved": bool(region.get("unresolved")),
         }
         records.append(
@@ -3248,9 +3328,9 @@ def _quarantine_records(output_dir: Path, quality: dict[str, Any]) -> list[dict[
     )
     records: list[dict[str, Any]] = []
     by_identity: dict[tuple[str, str], dict[str, Any]] = {}
-    by_fingerprint: dict[tuple[str, int | None, str, str], dict[str, Any]] = {}
+    by_fingerprint: dict[tuple[Any, ...], dict[str, Any]] = {}
 
-    def classify(candidate: dict[str, Any]) -> tuple[str | None, bool, bool, int | None, str, str | None, tuple[Any, ...]]:
+    def classify(candidate: dict[str, Any], ordinal: int) -> tuple[str | None, bool, bool, int | None, str, str | None, bool, bool, tuple[Any, ...]]:
         picture_overlap = _truthy(candidate.get("picture_overlap"))
         label = _text(candidate.get("label"), 64).casefold().removeprefix("quarantined_")
         kind_hint = _text(candidate.get("kind"), 80).casefold()
@@ -3262,22 +3342,65 @@ def _quarantine_records(output_dir: Path, quality: dict[str, Any]) -> list[dict[
             or "picture_ocr" in kind_hint
         )
         if not picture_overlap and not header_footer and not picture_annotation:
-            return None, picture_overlap, picture_annotation, None, "", None, ()
+            return (
+                None,
+                picture_overlap,
+                picture_annotation,
+                None,
+                "",
+                None,
+                False,
+                False,
+                (),
+            )
         kind = "picture_ocr" if picture_overlap or picture_annotation else "header_footer"
         page = _safe_page(candidate.get("page_no"))
         preview = _text(candidate.get("text") or candidate.get("text_preview"))
         action = _text(candidate.get("action"), 80)
-        source_ref = _source_ref(candidate.get("source_ref"))
-        fingerprint = (kind, page, preview, action)
+        source_ref, invalid_source_ref = _strict_quarantine_source_ref(
+            candidate.get("source_ref")
+        )
+        safe_bbox = _safe_bbox(candidate.get("bbox"))
+        safe_bbox_key = json.dumps(
+            safe_bbox,
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        bbox_missing_or_invalid = safe_bbox is None
+        fingerprint = (
+            kind,
+            page,
+            preview,
+            action,
+            (
+                safe_bbox_key
+                if source_ref is None
+                and not invalid_source_ref
+                and not bbox_missing_or_invalid
+                else f"ordinal:{ordinal}"
+            )
+            if source_ref is None
+            else "source-ref-bound",
+        )
         evidence_key = (
             page,
-            json.dumps(_safe_bbox(candidate.get("bbox")), ensure_ascii=False, sort_keys=True),
+            safe_bbox_key,
             _text(candidate.get("source_asset") or candidate.get("image") or candidate.get("evidence"), 300),
             _text(candidate.get("picture_overlap"), 40),
             action,
             preview,
         )
-        return kind, picture_overlap, picture_annotation, page, preview, source_ref, (fingerprint, evidence_key)
+        return (
+            kind,
+            picture_overlap,
+            picture_annotation,
+            page,
+            preview,
+            source_ref,
+            invalid_source_ref,
+            bbox_missing_or_invalid,
+            (fingerprint, evidence_key),
+        )
 
     def residual_evidence(candidate: dict[str, Any]) -> tuple[list[str], bool]:
         residual = candidate.get("final_output_residual_surfaces")
@@ -3296,8 +3419,18 @@ def _quarantine_records(output_dir: Path, quality: dict[str, Any]) -> list[dict[
         return sorted(values), malformed
 
     for ordinal, candidate in enumerate(candidates, start=1):
-        classified = classify(candidate)
-        kind, picture_overlap, picture_annotation, page, preview, source_ref, keys = classified
+        classified = classify(candidate, ordinal)
+        (
+            kind,
+            picture_overlap,
+            picture_annotation,
+            page,
+            preview,
+            source_ref,
+            invalid_source_ref,
+            bbox_missing_or_invalid,
+            keys,
+        ) = classified
         if kind is None:
             continue
         fingerprint, evidence_key = keys
@@ -3318,13 +3451,20 @@ def _quarantine_records(output_dir: Path, quality: dict[str, Any]) -> list[dict[
             reasons.append("picture_overlap_schema_invalid")
         if picture_annotation and not picture_overlap:
             reasons.append("picture_overlap_unproven")
+        if invalid_source_ref:
+            reasons.append("quarantine_source_ref_invalid")
+        if source_ref is None and bbox_missing_or_invalid:
+            reasons.append("quarantine_bbox_missing_or_invalid")
         if residuals:
             reasons.append("main_flow_residual")
         if action != "quarantine_from_main_text_flow":
             reasons.append("isolation_not_proven")
-        identity = (kind, source_ref) if source_ref else ("fingerprint", repr(fingerprint))
+        if invalid_source_ref:
+            identity = ("invalid-source-ref", f"{kind}:{ordinal}")
+        else:
+            identity = (kind, source_ref) if source_ref else ("fingerprint", repr(fingerprint))
         existing = by_identity.get(identity)
-        if existing is None and not source_ref:
+        if existing is None and not source_ref and not invalid_source_ref:
             existing = by_fingerprint.get(fingerprint)
         if existing is not None:
             merged = existing.setdefault("signals", {}).setdefault("residual_surfaces", [])
@@ -3357,6 +3497,8 @@ def _quarantine_records(output_dir: Path, quality: dict[str, Any]) -> list[dict[
                 "picture_overlap": picture_overlap,
                 "residual_surfaces": residuals,
                 "quarantine_action": action or None,
+                "source_ref_valid": not invalid_source_ref,
+                "bbox_present": not bbox_missing_or_invalid,
             },
             status="verified_semantic" if not reasons else "unresolved",
             critical=True,
@@ -3365,7 +3507,9 @@ def _quarantine_records(output_dir: Path, quality: dict[str, Any]) -> list[dict[
         )
         record["_quarantine_core"] = evidence_key
         records.append(record)
-        if source_ref:
+        if invalid_source_ref:
+            by_identity[identity] = record
+        elif source_ref:
             by_identity[identity] = record
         else:
             by_fingerprint[fingerprint] = record

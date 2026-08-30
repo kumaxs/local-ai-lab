@@ -2552,6 +2552,481 @@ class PortableFormulaOcrTests(unittest.TestCase):
         self.assertIsNone(request_payload["items"][0]["source_text"])
         self.assertTrue(status["ok"])
 
+    def test_private_formula_service_refreshes_trusted_crop_identity_after_ocr(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            (output_dir / "formulas").mkdir()
+            _write_formula_text_test_png(output_dir / "formulas" / "formula_1.png")
+            _write_visible_test_png(
+                output_dir / "formulas" / "formula_1_context.png",
+                (160, 80),
+            )
+            initial_formula = _formula_test_node("")
+            (output_dir / "document.json").write_text(
+                json.dumps({"texts": [initial_formula]}),
+                encoding="utf-8",
+            )
+            (output_dir / "document.html").write_text(
+                "<html><head></head><body>Formula follows.</body></html>",
+                encoding="utf-8",
+            )
+            (output_dir / "document.md").write_text(
+                "Formula follows.\n\n<!-- formula-not-decoded -->\n",
+                encoding="utf-8",
+            )
+            metadata: dict[str, object] = {
+                "ocr_fallback_reason": "gxx_quality_failure",
+                "formula_crop_diagnostics": [
+                    _formula_test_crop_diagnostic(output_dir, 1, initial_formula)
+                ],
+                "suspicious_formula_diagnostics": [],
+            }
+            status: dict[str, object] = {
+                "ok": True,
+                "success_class": "success",
+                "warnings": [],
+                "quality_signals": {},
+            }
+            args = Namespace(
+                formula_policy="formula_service",
+                enable_formula_mlx=False,
+                formula_ocr_url="http://formula:8001",
+                input_file=output_dir / "source.pdf",
+                timeout_seconds=60,
+                http_retries=0,
+                http_retry_sleep_seconds=0,
+            )
+            response = {
+                "ok": True,
+                "model": "test/guarded-ensemble",
+                "results": [
+                    {
+                        "id": "1",
+                        "latex": "x = y",
+                        "ok": True,
+                        "safety_reasons": [],
+                        "variant": "source_crop",
+                    }
+                ],
+            }
+            with patch.object(
+                adapter, "post_json", return_value=response
+            ), patch.object(adapter, "_formula_output_safety_reasons", return_value=[]):
+                result = adapter.run_portable_formula_ocr(
+                    output_dir, metadata, status, args
+                )
+
+            final_formula = _formula_test_node("x = y")
+            diagnostics = metadata["formula_crop_diagnostics"]
+            self.assertTrue(result["ok"], result)
+            self.assertEqual(
+                result["formula_crop_identity_refreshed_indexes"], [1]
+            )
+            self.assertEqual(
+                metadata["formula_crop_content_identity_manifest"]["1"][
+                    "formula_content_identity_sha256"
+                ],
+                adapter._formula_content_identity_sha256("x = y"),
+            )
+            self.assertEqual(
+                diagnostics[0]["formula_content_identity_sha256"],
+                adapter._formula_content_identity_sha256("x = y"),
+            )
+            self.assertEqual(
+                diagnostics[0]["formula_raw_content_sha256"],
+                adapter._formula_raw_content_sha256("x = y"),
+            )
+            self.assertEqual(
+                diagnostics[0]["source"]["formula_content_identity_sha256"],
+                adapter._formula_content_identity_sha256("x = y"),
+            )
+            self.assertEqual(
+                diagnostics[0]["context"]["formula_raw_content_sha256"],
+                adapter._formula_raw_content_sha256("x = y"),
+            )
+            parsed = adapter._parse_formula_source_crop_diagnostics(diagnostics)
+            self.assertTrue(
+                adapter._formula_crop_provenance_is_verified(
+                    output_dir / "formulas" / "formula_1.png",
+                    parsed,
+                    1,
+                    formula=final_formula,
+                    for_context=False,
+                )
+            )
+            self.assertEqual(
+                adapter._formula_indexed_candidates(
+                    output_dir,
+                    [final_formula],
+                    formula_crop_diagnostics=diagnostics,
+                    formula_by_index={1: final_formula},
+                )[0]["selected"],
+                "source",
+            )
+
+    def test_trusted_formula_crop_refresh_fails_closed_for_evidence_and_final_tampering(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            (output_dir / "formulas").mkdir()
+            source_path = output_dir / "formulas" / "formula_1.png"
+            context_path = output_dir / "formulas" / "formula_1_context.png"
+            _write_formula_text_test_png(source_path)
+            _write_visible_test_png(context_path, (160, 80))
+            accepted_formula = _formula_test_node("x = y")
+            diagnostics = [
+                _formula_test_crop_diagnostic(output_dir, 1, _formula_test_node(""))
+            ]
+            manifest = adapter._formula_crop_identity_manifest_for_indexed_formulas(
+                {1: accepted_formula}
+            )
+            refreshed = adapter._refresh_formula_crop_content_identities(
+                diagnostics,
+                {1: accepted_formula},
+                trusted_identity_manifest=manifest,
+            )
+            parsed = adapter._parse_formula_source_crop_diagnostics(refreshed)
+            self.assertTrue(
+                adapter._formula_crop_provenance_is_verified(
+                    source_path,
+                    parsed,
+                    1,
+                    formula=accepted_formula,
+                    for_context=False,
+                )
+            )
+
+            # A final JSON edit does not get to refresh the stale diagnostic:
+            # the accepted manifest remains authoritative.
+            tampered_formula = _formula_test_node("x = z")
+            tampered_refresh = adapter._refresh_formula_crop_content_identities(
+                diagnostics,
+                {1: tampered_formula},
+                trusted_identity_manifest=manifest,
+            )
+            tampered_parsed = adapter._parse_formula_source_crop_diagnostics(
+                tampered_refresh
+            )
+            self.assertFalse(
+                adapter._formula_crop_provenance_is_verified(
+                    source_path,
+                    tampered_parsed,
+                    1,
+                    formula=tampered_formula,
+                    for_context=False,
+                )
+            )
+
+            # All source evidence mutations remain fail-closed independently
+            # of the formula identity refresh.
+            tampered_crop = copy.deepcopy(refreshed)
+            tampered_crop[0]["source"]["asset_sha256"] = "b" * 64
+            self.assertFalse(
+                adapter._formula_crop_provenance_is_verified(
+                    source_path,
+                    adapter._parse_formula_source_crop_diagnostics(tampered_crop),
+                    1,
+                    formula=accepted_formula,
+                    for_context=False,
+                )
+            )
+            tampered_pdf = copy.deepcopy(refreshed)
+            tampered_pdf[0]["source_pdf_sha256"] = "b" * 64
+            self.assertFalse(
+                adapter._formula_crop_provenance_is_verified(
+                    source_path,
+                    adapter._parse_formula_source_crop_diagnostics(tampered_pdf),
+                    1,
+                    formula=accepted_formula,
+                    for_context=False,
+                )
+            )
+            tampered_bbox = copy.deepcopy(refreshed)
+            tampered_bbox[0]["bbox"]["l"] = 6.0
+            self.assertFalse(
+                adapter._formula_crop_provenance_is_verified(
+                    source_path,
+                    adapter._parse_formula_source_crop_diagnostics(tampered_bbox),
+                    1,
+                    formula=accepted_formula,
+                    for_context=False,
+                )
+            )
+            self.assertFalse(
+                adapter._formula_crop_provenance_is_verified(
+                    source_path,
+                    parsed,
+                    2,
+                    formula=accepted_formula,
+                    for_context=False,
+                )
+            )
+            source_path.write_bytes(b"tampered crop")
+            self.assertFalse(
+                adapter._formula_crop_provenance_is_verified(
+                    source_path,
+                    parsed,
+                    1,
+                    formula=accepted_formula,
+                    for_context=False,
+                )
+            )
+
+    def test_trusted_second_pass_update_refreshes_crop_identity_immediately(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            (output_dir / "formulas").mkdir()
+            _write_formula_text_test_png(output_dir / "formulas" / "formula_1.png")
+            _write_visible_test_png(
+                output_dir / "formulas" / "formula_1_context.png",
+                (160, 80),
+            )
+            initial_formula = _formula_test_node("")
+            final_formula = _formula_test_node("x = y")
+            metadata: dict[str, object] = {
+                "formula_crop_diagnostics": [
+                    _formula_test_crop_diagnostic(output_dir, 1, initial_formula)
+                ],
+                "suspicious_formula_diagnostics": [],
+            }
+            status: dict[str, object] = {
+                "ok": True,
+                "success_class": "success",
+                "warnings": [],
+                "quality_signals": {},
+            }
+
+            # This is the same in-process acceptance point used after a
+            # successful Route-B/second-pass primary apply.
+            adapter._refresh_formula_crop_diagnostics_after_accepted_formula_update(
+                metadata,
+                status,
+                {1: final_formula},
+            )
+
+            diagnostic = metadata["formula_crop_diagnostics"][0]
+            self.assertEqual(
+                diagnostic["formula_content_identity_sha256"],
+                adapter._formula_content_identity_sha256("x = y"),
+            )
+            self.assertEqual(
+                diagnostic["formula_raw_content_sha256"],
+                adapter._formula_raw_content_sha256("x = y"),
+            )
+            self.assertEqual(
+                status["quality_signals"]["formula_crop_diagnostics"][0][
+                    "formula_raw_content_sha256"
+                ],
+                adapter._formula_raw_content_sha256("x = y"),
+            )
+
+    def test_second_pass_apply_point_refreshes_crop_identity_from_final_json(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            (output_dir / "formulas").mkdir()
+            _write_formula_text_test_png(output_dir / "formulas" / "formula_1.png")
+            _write_visible_test_png(
+                output_dir / "formulas" / "formula_1_context.png",
+                (160, 80),
+            )
+            initial_formula = _formula_test_node("")
+            final_formula = _formula_test_node("x = y")
+            (output_dir / "document.json").write_text(
+                json.dumps({"texts": [initial_formula]}),
+                encoding="utf-8",
+            )
+            (output_dir / "document.html").write_text(
+                "<html><head></head><body>Formula</body></html>",
+                encoding="utf-8",
+            )
+            (output_dir / "document.md").write_text("Formula\n", encoding="utf-8")
+            sidecar_dir = output_dir / "formula_second_pass"
+            sidecar_dir.mkdir()
+            (sidecar_dir / "document.json").write_text(
+                json.dumps({"texts": [final_formula]}),
+                encoding="utf-8",
+            )
+            (sidecar_dir / "document.md").write_text(
+                "$$x = y$$\n", encoding="utf-8"
+            )
+            route_b_dir = output_dir / "route-b"
+            route_b_dir.mkdir()
+            metadata: dict[str, object] = {
+                "formula_crop_diagnostics": [
+                    _formula_test_crop_diagnostic(output_dir, 1, initial_formula)
+                ],
+                "suspicious_formula_diagnostics": [],
+            }
+            status: dict[str, object] = {
+                "ok": True,
+                "success_class": "success",
+                "warnings": [],
+                "quality_signals": {},
+            }
+            args = Namespace(
+                formula_second_pass_policy="apply",
+                formula_second_pass_route_b_dir=route_b_dir,
+                formula_second_pass_output_dir=sidecar_dir,
+                formula_second_pass_review_candidate_dir=None,
+                formula_second_pass_guarded_fallback_dir=[],
+                formula_second_pass_guarded_fallback_eq=[],
+                formula_policy="off",
+                enable_formula_mlx=False,
+                input_file=output_dir / "paper.pdf",
+            )
+            second_pass_result = {
+                "ok": True,
+                "route_a_formula_count": 1,
+                "route_b_formula_count": 1,
+                "suspicious_formula_count": 1,
+                "second_pass_attempted_count": 1,
+                "replaced_count": 1,
+                "no_match_count": 0,
+                "fallback_count": 0,
+                "crop_only_without_formula_count": 0,
+                "render_failed_latex_count": 0,
+                "replacement_log": [
+                    {
+                        "formula_no": 1,
+                        "status": "replaced",
+                        "display_override": "x = y",
+                        "route_a_text": "",
+                    }
+                ],
+                "route_job_identity_check": {},
+                "route_b_source_identity_check": {},
+                "evidence_gaps": [],
+            }
+            with patch.object(
+                adapter, "run_formula_second_pass", return_value=second_pass_result
+            ), patch.object(
+                adapter,
+                "patch_document_html_for_formula_second_pass",
+                return_value={"ok": True},
+            ), patch.object(
+                adapter,
+                "synchronize_formula_contract_outputs",
+                return_value={"ok": True},
+            ), patch.object(
+                adapter,
+                "apply_cn_final_document_polish",
+                return_value={"ok": True, "applied": False},
+            ), patch.object(
+                adapter,
+                "validate_formula_second_pass_html",
+                return_value={"ok": True},
+            ), patch.object(
+                adapter,
+                "apply_markdown_main_flow_supplement",
+                return_value={"ok": True},
+            ):
+                adapter.run_optional_formula_second_pass(
+                    output_dir, metadata, status, args
+                )
+
+            self.assertTrue(metadata["formula_second_pass_applied"])
+            diagnostic = metadata["formula_crop_diagnostics"][0]
+            self.assertEqual(
+                diagnostic["formula_content_identity_sha256"],
+                adapter._formula_content_identity_sha256("x = y"),
+            )
+            self.assertEqual(
+                diagnostic["source"]["formula_raw_content_sha256"],
+                adapter._formula_raw_content_sha256("x = y"),
+            )
+
+    def test_final_restore_does_not_self_authorize_tampered_formula(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            (output_dir / "formulas").mkdir()
+            source_path = output_dir / "formulas" / "formula_1.png"
+            context_path = output_dir / "formulas" / "formula_1_context.png"
+            _write_formula_text_test_png(source_path)
+            _write_visible_test_png(context_path, (160, 80))
+            accepted_formula = _formula_test_node("x = y")
+            tampered_formula = _formula_test_node("x = z")
+            (output_dir / "document.json").write_text(
+                json.dumps({"texts": [tampered_formula]}),
+                encoding="utf-8",
+            )
+            (output_dir / "document.html").write_text(
+                '<html><body><div data-formula-index="1">x = z</div>'
+                "<!-- source-formula-anchor:1 --></body></html>",
+                encoding="utf-8",
+            )
+            (output_dir / "document.md").write_text(
+                "$$x = z$$\n<!-- source-formula-anchor:1 -->\n",
+                encoding="utf-8",
+            )
+            initial_formula = _formula_test_node("")
+            metadata: dict[str, object] = {
+                "formula_crop_diagnostics": [
+                    _formula_test_crop_diagnostic(output_dir, 1, initial_formula)
+                ],
+                "suspicious_formula_diagnostics": [],
+            }
+            status: dict[str, object] = {
+                "ok": True,
+                "success_class": "success",
+                "warnings": [],
+                "quality_signals": {"primary_surface": {"counts": {}}},
+            }
+            adapter._set_formula_crop_identity_manifest(
+                metadata,
+                status,
+                {1: accepted_formula},
+            )
+            tampered_identity = adapter._formula_crop_identity_manifest_for_indexed_formulas(
+                {1: tampered_formula}
+            )[1]
+            metadata["formula_crop_content_identity_manifest"]["1"] = tampered_identity
+            status["quality_signals"]["formula_crop_content_identity_manifest"]["1"] = (
+                copy.deepcopy(tampered_identity)
+            )
+
+            with patch.object(
+                adapter,
+                "inject_empty_table_visual_fallbacks",
+                return_value={},
+            ), patch.object(
+                adapter,
+                "append_structured_table_source_renderings",
+                return_value={},
+            ), patch.object(
+                adapter,
+                "append_inline_math_source_renderings",
+                return_value={},
+            ), patch.object(
+                adapter,
+                "recover_algorithm_blocks_in_outputs",
+                return_value={},
+            ), patch.object(
+                adapter,
+                "append_code_source_renderings",
+                return_value={},
+            ):
+                visuals = adapter.restore_final_delivery_visuals(
+                    output_dir,
+                    {"texts": [tampered_formula]},
+                    Path("missing.pdf"),
+                    metadata,
+                    status,
+                    visual_pdf_path=Path("missing.pdf"),
+                )
+
+            # The accepted OCR identity remains the only authority.  The
+            # final tampered text cannot cause the stale empty crop hash to be
+            # rewritten, so no inline source binding is reported.
+            self.assertEqual(
+                metadata["formula_crop_diagnostics"][0][
+                    "formula_content_identity_sha256"
+                ],
+                "",
+            )
+            self.assertEqual(
+                visuals["formula_source_renderings"]["missing_candidate_indexes"],
+                [1],
+            )
+
 
 class SemanticReflowTests(unittest.TestCase):
     def test_structure_block_source_refs_follow_nodes_when_blocks_reorder(self) -> None:
