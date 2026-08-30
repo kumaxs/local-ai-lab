@@ -113,6 +113,32 @@ function job(jobId, originalName = `${jobId}.pdf`) {
 }
 
 
+function visibleText(node) {
+  if (!node) {
+    return "";
+  }
+  const ownText = typeof node.textContent === "string" ? node.textContent : "";
+  return ownText + (node.children || []).map(visibleText).join("");
+}
+
+
+function hasLoneSurrogate(value) {
+  return Array.from(String(value || "")).some((character) => {
+    const codePoint = character.codePointAt(0);
+    return character.length === 1 && codePoint >= 0xd800 && codePoint <= 0xdfff;
+  });
+}
+
+
+function renderedRow(harness) {
+  const table = harness.element("jobsContainer").children[0];
+  assert.ok(table, "jobs table should be rendered");
+  const row = table.children[1];
+  assert.ok(row, "job row should be rendered");
+  return row;
+}
+
+
 function createHarness() {
   const elements = new Map();
   const document = {
@@ -442,4 +468,201 @@ test("an unauthorized refresh clears protected job config and storage data", asy
   assert.equal(UI_STATE.lastStorageFetch, null);
   assert.equal(harness.element("inputBytes").textContent, "-");
   assert.match(harness.element("serviceHealth").textContent, /需要 Token/);
+});
+
+
+test("long job errors are whitespace-normalized and bounded without hiding the output action", () => {
+  const harness = createHarness();
+  const { UI_STATE, JOB_MESSAGE_MAX_LENGTH, renderJobs } = harness.hook;
+  const frontSentinel = "FRONT_ERROR_SENTINEL";
+  const tailSentinel = "TAIL_ERROR_SENTINEL";
+  const longError = `${frontSentinel}\n${"detail\twith  whitespace\n".repeat(500)}${tailSentinel}`;
+  UI_STATE.jobs = [{
+    ...job("failed-job"),
+    state: "failed",
+    artifact_state: "available",
+    error: longError,
+  }];
+
+  renderJobs();
+
+  const row = renderedRow(harness);
+  const messageCell = row.children[4];
+  const messageNode = messageCell.children[1];
+  const tableText = visibleText(harness.element("jobsContainer"));
+  assert.ok(messageNode.textContent.length <= JOB_MESSAGE_MAX_LENGTH);
+  assert.ok(tableText.length < 1000, "the visible table must stay bounded");
+  assert.match(messageNode.textContent, new RegExp(frontSentinel));
+  assert.doesNotMatch(messageNode.textContent, new RegExp(tailSentinel));
+  assert.doesNotMatch(messageNode.textContent, /[\n\t]/);
+  assert.match(messageNode.textContent, /内容过长/);
+  assert.match(messageNode.textContent, /查看输出/);
+  assert.match(messageNode.textContent, /status\.json/);
+
+  const outputButton = row.children[6].children[0].children[0];
+  assert.equal(outputButton.textContent, "查看输出");
+  assert.equal(outputButton.disabled, false);
+  assert.doesNotMatch(String(outputButton.title || ""), new RegExp(frontSentinel));
+  assert.doesNotMatch(String(outputButton.title || ""), new RegExp(tailSentinel));
+});
+
+
+test("short job errors remain unchanged while progress messages use the same bound", () => {
+  const harness = createHarness();
+  const { UI_STATE, JOB_MESSAGE_MAX_LENGTH, renderJobs } = harness.hook;
+  const shortError = "转换失败：第 3 页无法读取";
+  UI_STATE.jobs = [{
+    ...job("short-failed-job"),
+    state: "failed",
+    artifact_state: "available",
+    error: shortError,
+    progress_message: "this progress message must not replace an error",
+  }];
+
+  renderJobs();
+
+  let row = renderedRow(harness);
+  assert.equal(row.children[4].children[1].textContent, shortError);
+  assert.equal(row.children[6].children[0].children[0].disabled, false);
+
+  const longProgress = `progress-start\n${"phase\tstill running ".repeat(100)}progress-tail`;
+  UI_STATE.jobs = [{
+    ...job("long-progress-job"),
+    state: "running",
+    artifact_state: "pending",
+    error: null,
+    progress_message: longProgress,
+  }];
+  renderJobs();
+  row = renderedRow(harness);
+  const progressMessage = row.children[4].children[1].textContent;
+  assert.ok(progressMessage.length <= JOB_MESSAGE_MAX_LENGTH);
+  assert.match(progressMessage, /progress-start/);
+  assert.doesNotMatch(progressMessage, /progress-tail/);
+  assert.match(progressMessage, /内容过长/);
+  assert.doesNotMatch(progressMessage, /查看输出/);
+  assert.doesNotMatch(progressMessage, /status\.json/);
+});
+
+
+test("message limits include the omission marker and never split an emoji or lone surrogate", () => {
+  const harness = createHarness();
+  const {
+    boundedJobMessage,
+    JOB_MESSAGE_MAX_LENGTH,
+    JOB_MESSAGE_OUTPUT_PROBE_LENGTH,
+    JOB_MESSAGE_OMISSION,
+  } = harness.hook;
+  assert.equal(JOB_MESSAGE_OUTPUT_PROBE_LENGTH, JOB_MESSAGE_MAX_LENGTH + 1);
+
+  const exact = "x".repeat(JOB_MESSAGE_MAX_LENGTH);
+  assert.equal(boundedJobMessage(exact), exact);
+
+  const over = `${"x".repeat(JOB_MESSAGE_MAX_LENGTH)}TAIL_281`;
+  const boundedOver = boundedJobMessage(over);
+  assert.equal(boundedOver.length, JOB_MESSAGE_MAX_LENGTH);
+  assert.match(boundedOver, /内容过长/);
+  assert.doesNotMatch(boundedOver, /TAIL_281/);
+  assert.equal(boundedOver.endsWith(JOB_MESSAGE_OMISSION), true);
+  assert.equal(hasLoneSurrogate(boundedOver), false);
+
+  const codeUnitBudget = JOB_MESSAGE_MAX_LENGTH - JOB_MESSAGE_OMISSION.length;
+  const emojiAtBoundary = `${"x".repeat(codeUnitBudget - 1)}😀${"TAIL_EMOJI".repeat(20)}`;
+  const boundedEmoji = boundedJobMessage(emojiAtBoundary);
+  assert.ok(boundedEmoji.length <= JOB_MESSAGE_MAX_LENGTH);
+  assert.equal(hasLoneSurrogate(boundedEmoji), false);
+  assert.doesNotMatch(boundedEmoji, /TAIL_EMOJI/);
+
+  const emojiThatFits = `${"x".repeat(codeUnitBudget - 2)}😀${"TAIL_FITS".repeat(20)}`;
+  const boundedEmojiThatFits = boundedJobMessage(emojiThatFits);
+  assert.ok(boundedEmojiThatFits.includes("😀"));
+  assert.equal(hasLoneSurrogate(boundedEmojiThatFits), false);
+
+  assert.equal(hasLoneSurrogate(boundedJobMessage("safe\uD800")), false);
+});
+
+
+test("large message previews stop at explicit scan and output limits", () => {
+  const harness = createHarness();
+  const {
+    boundedJobMessage,
+    JOB_MESSAGE_MAX_LENGTH,
+    JOB_MESSAGE_SCAN_LIMIT,
+  } = harness.hook;
+  const tailSentinel = "TAIL_AFTER_SCAN_LIMIT";
+  const millionCharacterError = `${"detail ".repeat(200000)}${tailSentinel}`;
+  assert.ok(millionCharacterError.length > JOB_MESSAGE_SCAN_LIMIT * 10);
+  const bounded = boundedJobMessage(millionCharacterError);
+  assert.ok(bounded.length <= JOB_MESSAGE_MAX_LENGTH);
+  assert.doesNotMatch(bounded, new RegExp(tailSentinel));
+  assert.match(bounded, /内容过长/);
+
+  const whitespaceBeyondScan = `${" \t\n".repeat(Math.ceil(JOB_MESSAGE_SCAN_LIMIT / 3) + 10)}${tailSentinel}`;
+  assert.equal(boundedJobMessage(whitespaceBeyondScan), "");
+});
+
+
+test("whitespace-only errors fall back to visible progress and keep running controls usable", () => {
+  const harness = createHarness();
+  const { UI_STATE, JOB_MESSAGE_SCAN_LIMIT, renderJobs } = harness.hook;
+  const progress = "正在处理 PDF";
+  UI_STATE.jobs = [{
+    ...job("whitespace-error-job"),
+    state: "running",
+    artifact_state: "pending",
+    error: " \n\t ".repeat(Math.ceil(JOB_MESSAGE_SCAN_LIMIT / 4) + 10),
+    progress_message: progress,
+  }];
+
+  renderJobs();
+
+  const row = renderedRow(harness);
+  assert.equal(row.children[4].children[1].textContent, progress);
+  const outputButton = row.children[6].children[0].children[0];
+  assert.equal(outputButton.textContent, "产物待完成");
+  assert.equal(outputButton.disabled, true);
+  assert.doesNotMatch(row.children[4].children[1].textContent, /status\.json/);
+});
+
+
+test("lone-surrogate-only errors fall back to visible progress", () => {
+  const harness = createHarness();
+  const { UI_STATE, JOB_MESSAGE_SCAN_LIMIT, renderJobs } = harness.hook;
+  const progress = "仍在处理";
+  UI_STATE.jobs = [{
+    ...job("surrogate-error-job"),
+    state: "running",
+    artifact_state: "pending",
+    error: "\uD800".repeat(JOB_MESSAGE_SCAN_LIMIT + 100),
+    progress_message: progress,
+  }];
+
+  renderJobs();
+
+  const row = renderedRow(harness);
+  assert.equal(row.children[4].children[1].textContent, progress);
+  assert.equal(row.children[6].children[0].children[0].disabled, true);
+});
+
+
+test("job messages are rendered as text and do not create HTML nodes", () => {
+  const harness = createHarness();
+  const { UI_STATE, renderJobs } = harness.hook;
+  const xssText = '<img src=x onerror="alert(1)">';
+  UI_STATE.jobs = [{
+    ...job("xss-job"),
+    state: "running",
+    artifact_state: "pending",
+    error: xssText,
+  }];
+
+  renderJobs();
+
+  const row = renderedRow(harness);
+  const messageNode = row.children[4].children[1];
+  assert.equal(messageNode.textContent, xssText);
+  assert.equal(messageNode.children.length, 0);
+  const outputButton = row.children[6].children[0].children[0];
+  assert.equal(outputButton.textContent, "产物待完成");
+  assert.equal(outputButton.disabled, true);
 });

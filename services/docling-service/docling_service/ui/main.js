@@ -87,6 +87,14 @@ const CONFIG_ORDER = [
 const TERMINAL_STATES = new Set(["succeeded", "failed", "interrupted"]);
 const AUTHENTICATED_BLOB_LIMIT_BYTES = 256 * 1024 * 1024;
 const JOB_PAGE_SIZE = 100;
+// Job errors can contain a complete status/error JSON document. Keep the queue
+// readable instead of putting an unbounded payload in the table. Only failed
+// jobs with a published artifact point to the canonical status output.
+const JOB_MESSAGE_MAX_LENGTH = 280;
+const JOB_MESSAGE_OUTPUT_PROBE_LENGTH = JOB_MESSAGE_MAX_LENGTH + 1;
+const JOB_MESSAGE_SCAN_LIMIT = 64 * 1024;
+const JOB_MESSAGE_OMISSION = "…（内容过长，已省略）";
+const JOB_ERROR_MESSAGE_OMISSION = "…（内容过长，已省略；请点击“查看输出”查看 status.json）";
 const DEADLINE_FIELDS = [
   ["input_expires_at", "输入截止"],
   ["output_expires_at", "产物截止"],
@@ -386,6 +394,164 @@ function queuePositionText(position) {
   return String(position);
 }
 
+function serializeJobMessage(value) {
+  if (value === null || value === undefined) {
+    return "";
+  }
+  if (typeof value === "string") {
+    return value;
+  }
+  try {
+    const serialized = JSON.stringify(value);
+    return serialized === undefined ? String(value) : serialized;
+  } catch (_error) {
+    return String(value);
+  }
+}
+
+function codePointPrefix(value, maxCodeUnits) {
+  let prefix = "";
+  for (let index = 0; index < value.length && prefix.length < maxCodeUnits;) {
+    const first = value.charCodeAt(index);
+    let width = 1;
+    if (first >= 0xd800 && first <= 0xdbff) {
+      const second = value.charCodeAt(index + 1);
+      if (second >= 0xdc00 && second <= 0xdfff) {
+        width = 2;
+      } else {
+        index += 1;
+        continue;
+      }
+    } else if (first >= 0xdc00 && first <= 0xdfff) {
+      index += 1;
+      continue;
+    }
+    if (prefix.length + width > maxCodeUnits) {
+      break;
+    }
+    prefix += value.slice(index, index + width);
+    index += width;
+  }
+  return prefix;
+}
+
+function sanitizeShortJobMessage(raw) {
+  let sanitized = "";
+  for (let index = 0; index < raw.length;) {
+    const first = raw.charCodeAt(index);
+    let width = 1;
+    if (first >= 0xd800 && first <= 0xdbff) {
+      const second = raw.charCodeAt(index + 1);
+      if (second >= 0xdc00 && second <= 0xdfff) {
+        width = 2;
+      } else {
+        index += 1;
+        continue;
+      }
+    } else if (first >= 0xdc00 && first <= 0xdfff) {
+      index += 1;
+      continue;
+    }
+    sanitized += raw.slice(index, index + width);
+    index += width;
+  }
+  return sanitized;
+}
+
+function previewLongJobMessage(raw, showOutputHint) {
+  let preview = "";
+  let pendingSpace = false;
+  let hasContent = false;
+  let index = 0;
+  let truncated = false;
+  while (index < raw.length && index < JOB_MESSAGE_SCAN_LIMIT) {
+    const first = raw.charCodeAt(index);
+    let width = 1;
+    if (first >= 0xd800 && first <= 0xdbff) {
+      const second = raw.charCodeAt(index + 1);
+      if (second >= 0xdc00 && second <= 0xdfff) {
+        width = 2;
+      } else {
+        index += 1;
+        continue;
+      }
+    } else if (first >= 0xdc00 && first <= 0xdfff) {
+      index += 1;
+      continue;
+    }
+    if (index + width > JOB_MESSAGE_SCAN_LIMIT) {
+      truncated = true;
+      break;
+    }
+    const character = raw.slice(index, index + width);
+    index += width;
+    if (/\s/u.test(character)) {
+      if (hasContent) {
+        pendingSpace = true;
+      }
+      continue;
+    }
+    hasContent = true;
+    const separator = pendingSpace && preview ? " " : "";
+    const needed = separator.length + character.length;
+    if (preview.length + needed > JOB_MESSAGE_OUTPUT_PROBE_LENGTH) {
+      truncated = true;
+      break;
+    }
+    preview += separator + character;
+    pendingSpace = false;
+    if (preview.length >= JOB_MESSAGE_OUTPUT_PROBE_LENGTH) {
+      truncated = true;
+      break;
+    }
+  }
+
+  // A scan cap reached before any displayable character is intentional: treat
+  // the preview as empty so a useful progress message can still win priority
+  // over an all-whitespace or lone-surrogate error payload.
+  if (!hasContent) {
+    return { text: "", truncated: false };
+  }
+  if (index < raw.length) {
+    truncated = true;
+  }
+  if (!truncated && preview.length <= JOB_MESSAGE_MAX_LENGTH) {
+    return { text: preview, truncated: false };
+  }
+  const omission = showOutputHint
+    ? JOB_ERROR_MESSAGE_OMISSION
+    : JOB_MESSAGE_OMISSION;
+  const prefixLength = Math.max(
+    0,
+    JOB_MESSAGE_MAX_LENGTH - omission.length,
+  );
+  return {
+    text: `${codePointPrefix(preview, prefixLength)}${omission}`,
+    truncated: true,
+  };
+}
+
+function previewJobMessage(value, { showOutputHint = false } = {}) {
+  const raw = serializeJobMessage(value);
+  if (!raw) {
+    return { text: "", truncated: false };
+  }
+  // Preserve short messages verbatim (apart from removing malformed lone
+  // surrogates) so ordinary progress/error text is not rewritten.
+  if (raw.length <= JOB_MESSAGE_MAX_LENGTH) {
+    const sanitized = sanitizeShortJobMessage(raw);
+    return {
+      text: sanitized.trim() ? sanitized : "",
+      truncated: false,
+    };
+  }
+  return previewLongJobMessage(raw, showOutputHint);
+}
+
+function boundedJobMessage(value, options = {}) {
+  return previewJobMessage(value, options).text;
+}
+
 function renderJobRow(job) {
   const row = document.createElement("tr");
   const stateCell = document.createElement("td");
@@ -429,6 +595,7 @@ function renderJobRow(job) {
   safeText(fileCell, job.original_name);
   const percent = job.progress_percent;
   const terminal = TERMINAL_STATES.has(job.state);
+  const artifactsAvailable = terminal && job.artifact_state === "available";
   const stage = job.progress_stage || (
     job.state === "queued" ? "等待处理" : terminal ? job.state : "处理中"
   );
@@ -453,7 +620,16 @@ function renderJobRow(job) {
   safeText(queueLabel, `队列位置：${queuePositionText(job.queue_position)}`);
   const messageLabel = document.createElement("div");
   messageLabel.className = "muted";
-  safeText(messageLabel, job.progress_message || "");
+  const errorPreview = previewJobMessage(job.error, {
+    showOutputHint: artifactsAvailable,
+  });
+  const messagePreview = errorPreview.text
+    ? errorPreview
+    : previewJobMessage(job.progress_message);
+  safeText(
+    messageLabel,
+    messagePreview.text,
+  );
   queueCell.appendChild(queueLabel);
   queueCell.appendChild(messageLabel);
   expireCell.appendChild(renderExpiration(job));
@@ -463,7 +639,6 @@ function renderJobRow(job) {
 
   const detailButton = document.createElement("button");
   detailButton.type = "button";
-  const artifactsAvailable = terminal && job.artifact_state === "available";
   safeText(detailButton, artifactsAvailable ? "查看输出" : terminal ? "产物不可用" : "产物待完成");
   detailButton.disabled = !artifactsAvailable;
   detailButton.title = artifactsAvailable
@@ -1440,9 +1615,18 @@ if (
 ) {
   Object.assign(globalThis.__DOCLING_UI_TEST__, {
     UI_STATE,
+    JOB_MESSAGE_MAX_LENGTH,
+    JOB_MESSAGE_OUTPUT_PROBE_LENGTH,
+    JOB_MESSAGE_SCAN_LIMIT,
+    JOB_MESSAGE_OMISSION,
+    JOB_ERROR_MESSAGE_OMISSION,
+    codePointPrefix,
+    previewJobMessage,
+    boundedJobMessage,
     setToken,
     loadConfig,
     loadOutputs,
+    renderJobs,
     refreshDashboardData,
     navigateJobsPage,
   });
