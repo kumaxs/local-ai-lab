@@ -60,10 +60,16 @@ installed release's `.runtime/docling-release/macos/` directory. For a release
 bundle installation this is below the stable versioned installation path; for a
 repository checkout it is below the repository root.
 
-Log output from `run-backend.sh` and `run-api.sh` is now managed by
-`deploy/macos/logging_wrapper.py`, which merges stdout and stderr and performs
-size-based rotation. Defaults are `10MiB` per file and `3` backups.
-Both defaults can be overridden by environment variables (read by the wrapper):
+`start.sh`, `status.sh`, and `stop.sh` call `deploy/macos/lifecycle.py`. Each
+service instance has a supervisor, an independent guard, and one child process.
+Lifecycle metadata records an instance nonce plus PID, session ID, and precise
+Darwin process-birth identity, so a reused PID or unrelated listener is never
+adopted or signalled. The small `pids/*.pid` files are compatibility records for
+the supervisor PID; `logging_wrapper.py` remains only as a pre-1.2 CLI shim.
+
+The supervisor owns merged stdout/stderr logging and bounded, symlink-safe
+size-based rotation. Defaults are `10 MiB` per file and `3` backups. Both can be
+overridden before start:
 
 - `DOCLING_MACOS_LOG_MAX_BYTES` (default `10485760`)
 - `DOCLING_MACOS_LOG_BACKUP_COUNT` (default `3`)
@@ -76,9 +82,32 @@ export DOCLING_MACOS_LOG_BACKUP_COUNT=5
 zsh services/docling-service/deploy/macos/start.sh
 ```
 
-The PIDs written by `start.sh` now point to the wrapper process. `stop.sh`
-retains its existing safety check and still sends termination signals to the
-wrapper.
+The guard recovers a killed supervisor or child and reconciles dual death. A
+bounded `stop.sh` verifies the exact instance, requests orderly shutdown, then
+escalates only that validated process session if needed. Atomic metadata and a
+per-service lock make concurrent starts/stops fail safely. Legacy PID-only
+records are inspected conservatively and migrated only when their script,
+listener, and process identity agree.
+
+When the installed lifecycle helper is available, `status.sh` prints a JSON
+array with one object for `backend` and one for `api`. `running` means the
+supervisor and child identities match and the
+recorded loopback health endpoint responds. `stale` means metadata remains but
+all recorded roles are gone. `unknown` means identity, listener, session, child,
+or health evidence conflicts and requires inspection. An old PID-only record is
+reported as `legacy-running` or `legacy-stale`. For a normal status report, exit
+status is `0` only when both services are healthy `running` and `1` for stopped,
+unknown, legacy, or otherwise nonhealthy state. Installation/invocation failures
+outside that report can exit `2` (or the shell's own command error).
+
+Custom loopback ports can be selected before start and are persisted in instance
+metadata, so a later fresh shell can still inspect and stop the same deployment:
+
+```bash
+export DOCLING_BACKEND_PORT=55001
+export DOCLING_API_PORT=58001
+zsh services/docling-service/deploy/macos/start.sh
+```
 
 ### Web UI
 
@@ -98,6 +127,9 @@ refreshes the visible page. It rejects non-advancing/cyclic cursors; a queued
 timer refresh or bounded takeover prevents navigation from leaving the list
 indefinitely stale. Token replacement/clear and `401` clear protected page
 state and invalidate delayed responses from the prior token.
+Stage/error messages have a 280-Unicode-character preview bound and scan at
+most the first 65,536 UTF-16 code units. For a terminal job with longer
+diagnostics, open its published `status.json` from the output list.
 
 Unauthenticated downloads use the browser's native streaming path. When bearer
 authentication is enabled, page downloads are capped at 256 MiB; use a
@@ -130,8 +162,11 @@ curl -sS -X POST http://127.0.0.1:8000/v1/jobs \
   -F 'file=@/absolute/path/paper.pdf;type=application/pdf'
 ```
 
-Poll the returned `status_url`, then read the `outputs_url`. Omit the
-`Authorization` header when no service token is configured.
+Submit once, save the returned `job_id`, and poll its `status_url` with
+`GET /v1/jobs/{job_id}` until a terminal state; then read `outputs_url` or the
+archive. Do not poll by repeating the multipart `POST`. If submission itself
+must be retried, reuse one `Idempotency-Key`. Omit the `Authorization` header
+when no service token is configured.
 
 ## Configuration
 

@@ -45,6 +45,9 @@ as global totals. Non-advancing/cyclic cursors and stale refresh responses are
 rejected. Replacing or clearing the in-memory token invalidates delayed task,
 configuration, output, and upload responses and clears protected page data;
 `401` has the same fail-closed behavior.
+Stage/error text is a bounded 280-character preview scanned from at most the
+first 65,536 UTF-16 code units; open a terminal job's `status.json` for longer
+diagnostics.
 
 The System configuration panel is backed by SQLite compare-and-swap revisions.
 It edits only lifecycle controls (input, successful/failed output, job,
@@ -53,7 +56,8 @@ The effective value is SQLite override, then environment, then the built-in
 default; `null` clears an override. Deadlines already recorded on a job are
 not recalculated, so a TTL change applies to new deadlines and future cleanup
 only. Paths, token, model/engine settings, and concurrency/capacity limits are
-read-only. A token entered in the page remains in browser memory only and is
+read-only. Webhook delivery-history TTL is also environment/read-only. A token
+entered in the page remains in browser memory only and is
 never persisted by the UI. Unauthenticated downloads use the browser's native
 streaming path. Bearer-protected page downloads are capped at 256 MiB; use a
 streaming API client for larger protected artifacts.

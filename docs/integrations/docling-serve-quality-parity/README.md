@@ -276,9 +276,17 @@ adapter. Docling Server remains the execution backend for Route A.
 adapter output and review artifacts are written.
 Formal release default is `off` for `--formula-second-pass-policy`.
 
+Formula ownership is separate from the rest of the document contract. Route A
+remains the non-formula structural/reading baseline. When the service uses the
+guarded private `formula_service` policy and its occurrence-bound sidecar passes,
+that sidecar is the authoritative final formula surface and the generic second
+pass is deliberately skipped. Otherwise the policy below decides whether a
+Route-B/guarded candidate may replace only the formula surface.
+
 Replacement gating:
 
-- `off`: Route B is ignored; Route A output is authoritative.
+- `off`: Route B is ignored; Route A is the formula surface unless an accepted
+  guarded private formula-service result already owns it.
 - `auto`: route-b candidates are consumed only when a trusted route-b source is
   provided.
 - `apply-all`: route-b candidates are consumed only when the guarded route-b path
@@ -295,11 +303,13 @@ Replacement gating:
   `route_a_markdown_formula_coverage_incomplete`).
 - Legacy CLI values remain accepted as input aliases: `review` resolves to
   `auto`, and `apply` resolves to `apply-all`.
-- Route B is a candidate source only while route A remains the contract baseline.
-  In `apply-all`, sidecar JSON/Markdown coverage gates run before the primary
-  copy. The copy and every later HTML, synchronization, polish, and final-surface
-  gate run inside one rollback-protected transaction; any later failure restores
-  the pre-apply Route-A files and records a failed status.
+- Route B is only a candidate before acceptance, while Route A remains the
+  non-formula contract baseline. In `apply-all`, sidecar JSON/Markdown coverage
+  gates run before the primary copy. The copy and every later HTML,
+  synchronization, polish, and final-surface gate run inside one
+  rollback-protected transaction. Only after all gates pass does the accepted
+  Route-B/guarded result become the authoritative final formula surface; any
+  later failure restores the pre-apply files and records a failed status.
 - In service mode, `--formula-second-pass-route-b-dir` may be a direct
   route-B document directory or a shared route-B root that resolves to
   `<root>/<job-id>` per job.

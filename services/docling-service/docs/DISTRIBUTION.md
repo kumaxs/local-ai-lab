@@ -121,6 +121,8 @@ progress, artifact download/delete, TTL and storage visibility, and lifecycle
 configuration. Job rows use cursor-based pages of at most 100 items and refresh
 the visible page without accumulating stale pages. Token changes and `401`
 responses clear protected UI state and invalidate delayed prior-token results.
+Stage/error text is a bounded 280-character preview; longer terminal diagnostics
+remain available through the published `status.json` output.
 
 The configuration panel sends revisioned SQLite CAS updates to
 `/v1/system/config`. It can change only input/success-output/failed-output/job,
@@ -141,8 +143,10 @@ If GHCR access is unavailable, build locally with:
 docker compose -f services/docling-service/deploy/docker/compose.yaml up -d --build
 ```
 
-This path must build from an intact release bundle or the exact tagged source;
-do not copy only the Docker directory because the API image also needs the
+For the Web UI, this path must build from a complete post-1.1.1 source tree or a
+future intact bundle that contains `docling_service/ui/`. The exact `v1.1.1`
+tag remains reproducible but intentionally builds the legacy no-UI checkpoint.
+Do not copy only the Docker directory because the API image also needs the
 shared quality adapter files under `docs/integrations/`.
 
 ## Release automation

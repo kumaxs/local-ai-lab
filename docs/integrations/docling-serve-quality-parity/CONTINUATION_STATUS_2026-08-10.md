@@ -1,5 +1,10 @@
 # Quality-delivery continuation status — 2026-08-10 (updated 2026-08-11)
 
+> Historical checkpoint. For current implementation, deployment, validation,
+> and quality status, use the repository `HANDOFF.md` and
+> `evaluation/results-2026-08-30.md`. Counts below are intentionally preserved
+> as 2026-08-10 evidence and must not be read as current results.
+
 This is the durable continuation record for the quality-parity delivery work.
 It records the current implementation and verification state, including the
 completed nine-PDF offline delivery replay.

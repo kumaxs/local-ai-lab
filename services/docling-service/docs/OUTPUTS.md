@@ -96,6 +96,14 @@ contributors must agree between the provenance manifest and
 punctuation, and Unicode math symbols, so a correctly linked crop cannot
 certify a truncated expression or malformed semantic grid.
 
+Formula authority is occurrence-bound and independent of the whole-document
+route. Route A is the non-formula structural/reading baseline. If the guarded
+private `formula_service` result passes its source-identity, coverage, and final
+surface gates, it owns the final formula surface and the generic second pass is
+skipped. Otherwise an explicit Route-B/guarded `apply-all` result becomes
+authoritative only after every coverage and rollback-protected final-surface
+gate passes; a rejected candidate cannot partially replace the prior surface.
+
 The second-pass formula repair policy is configured by
 `DOCLING_FORMULA_SECOND_PASS_POLICY` (formal release:
 `off`, `auto`, `apply-all`).

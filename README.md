@@ -36,6 +36,7 @@ API 启动后可直接打开配套管理页面：Docker 为
 同一页面还能通过 SQLite CAS revision 管理输入、成功/失败产物、任务、staging、
 temp、清理、幂等和下载租约 TTL。SQLite 覆盖优先于环境值，环境值优先于默认值，
 提交 `null` 可清除覆盖；已有任务的截止时间不追溯重算。
+Webhook 投递历史 TTL 与路径、Token、模型/引擎、并发/容量一样仍是环境只读项。
 
 UI 静态文件随当前源码构建的 Python 包提供，并将在下一版本 release bundle 中提供，
 不需要 Node.js 或额外 Compose 服务；已发布的 `v1.1.1` 归档与镜像不包含此 UI。
@@ -47,6 +48,9 @@ Bearer Token 时页面下载上限为 256 MiB，更大的受保护产物应使�
 手动刷新都会重新读取可见页。未推进/回环 cursor 会被隔离。Token 保存、替换、清空
 或 API 返回 `401` 时，页面会立即清除受保护的任务、存储、配置和输出信息，并拒绝
 旧 Token 下延迟返回的请求，避免共享浏览器中的跨权限残留。
+任务阶段/错误消息的列表预览最多 280 个 Unicode 字符，并且只扫描开头最多
+65,536 个 UTF-16 代码单元；
+终态任务若有更长诊断，应从输出列表打开 `status.json`，而不是把列表行当成完整日志。
 
 ### 区域级质量门禁
 
@@ -99,6 +103,10 @@ macOS/通用分发包和 GitHub Release；Docker 与 macOS 不再使用两个会
 下载并校验 `docling-service-1.1.1.zip` 或 `.tar.gz`。目标机器只需 Docker
 Engine 和 Compose v2；不需要 Git、Python，也不必执行 `.sh` 文件：
 
+> 已发布的 `v1.1.1` 包和镜像是稳定的无 UI 检查点。需要本页描述的 Web UI 时，
+> 必须使用当前 post-1.1.1 源码构建，或等待下一个正式标签；不要期待下面的
+> `compose.release.yaml` 自动获得尚未发布的 UI。
+
 ```bash
 docker compose \
   -f services/docling-service/deploy/docker/compose.release.yaml \
@@ -116,6 +124,14 @@ Release Compose 拉取以下 GHCR 镜像：
 - `ghcr.io/kumaxs/local-ai-lab-docling-api:1.1.1`
 - `ghcr.io/kumaxs/local-ai-lab-docling-backend:1.1.1`
 - `ghcr.io/kumaxs/local-ai-lab-docling-formula:1.1.1`
+
+在完整的当前源码 checkout 中构建带 Web UI 的版本：
+
+```bash
+docker compose \
+  -f services/docling-service/deploy/docker/compose.yaml \
+  up -d --build
+```
 
 源码版 [`compose.yaml`](services/docling-service/deploy/docker/compose.yaml)
 中的 `../../../..` 是合法的相对 build context：它让 Docker 构建能读取仓库
@@ -171,7 +187,10 @@ curl -sS -X POST http://127.0.0.1:8766/v1/jobs \
   -F 'file=@/absolute/path/paper.pdf;type=application/pdf'
 ```
 
-响应为 `202 Accepted`，包含 `job_id`、状态、文件清单和 ZIP 链接。主要接口：
+响应为 `202 Accepted`，包含 `job_id`、状态、文件清单和 ZIP 链接。每次文献只
+提交一次 `POST`；保存返回的 `job_id`，随后用 `GET /v1/jobs/{job_id}` 轮询到终态，
+再读取 outputs/manifest/archive。不要通过重复 `POST` 轮询；重试提交时必须复用
+同一 `Idempotency-Key`。主要接口：
 
 | 接口 | 作用 |
 | --- | --- |
@@ -305,10 +324,15 @@ Docker 默认只把 API 绑定到 `127.0.0.1:8766`，macOS 默认绑定到
 
 ## 开发验证
 
-最近一次正式记录的验证为：integration discovery **584 OK（5 skipped）**，
-service discovery **165 OK**。九份真实 PDF 的统一离线交付回放为 **9/9
-通过**；每份的公式、结构、独立 PDF inventory 和本地引用门禁均为绿，且已对
-CN 公式/表格、算法和 BERT 表格来源裁剪做原始分辨率视觉抽查。
+2026-08-30 当前工程基线的完整测试为：quality-parity **755 OK（5 skipped）**，
+service/distribution **218 OK**。源码构建 Docker 已完成一篇 Pseudo2CodeQA 的
+上传、队列、转换（发布目录 43 个常规文件）、ZIP CRC 和严格区域门禁端到端验证。
+
+这不等于文献质量已经可以生产放行：同日直接部署的多样化新 6 篇严格评估只有
+**1/6** 通过，旧 10 篇虽然全部完成转换且 inventory 数量无回退，但严格门禁为
+**0/10**。剩余问题集中在公式/行内数学绑定、图片/页眉页脚隔离、表格拓扑和
+跨页算法证据；详见
+[`results-2026-08-30.md`](docs/integrations/docling-serve-quality-parity/evaluation/results-2026-08-30.md)。
 
 ```bash
 cd services/docling-service

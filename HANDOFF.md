@@ -1,12 +1,214 @@
 # Local AI Lab Session Handoff
 
-> Status: active 2026-08-30 handoff snapshot.
+> Status: completed 2026-08-30 implementation/evaluation handoff snapshot.
 >
 > A later session receiving `交接继续` must read `AGENTS.md` and this file
-> completely, validate the recorded state, and continue from the remaining
-> authorized end-to-end smoke rather than repeating the completed offline work.
+> completely, validate the recorded state, and continue from the explicit
+> quality-release blockers below rather than repeating completed implementation,
+> Docker/macOS smoke, or regression work.
 
-## Active 2026-08-30 snapshot
+## Final 2026-08-30 snapshot
+
+### Repository and delivery state
+
+- Writable repository: `/private/tmp/local-ai-lab-aug30-webui`.
+- Branch: `main`; push remote: `github` =
+  `git@github.com:kumaxs/local-ai-lab.git`.
+- Last engineering commit before this documentation closure: `5ad1aa8`.
+- At handoff completion, the documentation/cleanup commit is expected to be the
+  current `HEAD` and `github/main`; always verify both hashes and a clean status.
+- Canonical `/Users/zeyuan/Projects/local-ai-lab` remained a stale read-only
+  source of historical runtime PDFs during this task. It was not pulled,
+  reset, rebased, or overwritten.
+- `/Users/zeyuan/Local-AI-Lab` is a retired tombstone.
+- No tag, GitHub Release, or published container image was created. Public
+  `v1.1.1` remains the legacy no-Web-UI checkpoint; current UI deployment uses
+  the post-1.1.1 source build until a new release is intentionally published.
+
+Relevant pushed commits after the earlier handoff are:
+
+- `ecf7f7f docs(docling): record release integrity audit`
+- `20f5f52 fix(docling): avoid duplicate conversion submissions`
+- `c89d851 fix(webui): bound job messages`
+- `e20010e fix(docling): bind final formula and region evidence`
+- `fa8d9ba fix(docling): seal formula and region evidence`
+- `5ad1aa8 fix(docling): harden macOS process lifecycle`
+
+### User goal outcome
+
+The requested implementation work is complete:
+
+- one same-origin Web UI for direct/macOS and Docker deployment;
+- PDF upload, queue pagination, trusted phase progress, output inventory,
+  individual/ZIP download, terminal deletion, TTL countdowns, and storage view;
+- nine live-editable lifecycle settings backed by SQLite CAS revisions, with
+  `SQLite override > environment > default`, `null` override removal, and
+  explicitly non-retroactive existing deadlines;
+- source-bound region gates for figure/picture OCR, header/footer, table,
+  formula, inline math, algorithm, and code quality;
+- indentation-preserving algorithm/code delivery, cross-page algorithm
+  evidence, operator-preserving inline-math identity, independent table
+  topology/occupancy checks, and fail-closed sidecar publication;
+- source-built Docker and direct macOS deployment validation;
+- diverse fresh and old-corpus evaluation, documentation, and handoff.
+
+The quality objective is **not production-approved**. New and old documents
+complete conversion, but most still fail the stricter evidence gate. This is an
+honest remaining product limitation, not unfinished wiring or a hidden service
+crash.
+
+### Web UI and API boundary
+
+The API serves `/`, `/ui`, and `/ui/` from the packaged Python assets. Default
+addresses are Docker `http://127.0.0.1:8766/ui/` and direct/macOS
+`http://127.0.0.1:8000/ui/`. No Node runtime or extra Compose service is needed.
+
+Operational boundaries that must remain documented and tested:
+
+- cursor pages contain at most 100 jobs and counts describe only the visible
+  page;
+- phase/error text is a 280-Unicode-character preview scanned from at most the
+  first 65,536 UTF-16 code units;
+  full terminal diagnostics are read from `status.json`;
+- browser bearer tokens stay only in memory; token changes and `401` clear
+  protected state and invalidate delayed requests;
+- unauthenticated downloads use native streaming; protected in-page downloads
+  are capped at 256 MiB and larger artifacts require a streaming API client;
+- submit each PDF once, retain `job_id`, and poll `GET /v1/jobs/{job_id}`;
+  repeated multipart submission is not polling, and uncertain retries reuse one
+  `Idempotency-Key`;
+- editable runtime values are input, success-output, failed-output, job,
+  staging, temp, cleanup interval, idempotency, and download-lease TTLs.
+  Paths, token, model/engine, concurrency/capacity, and webhook delivery-history
+  TTL remain deployment/read-only settings.
+
+### Docker end-to-end evidence
+
+An isolated source-built Compose stack processed Pseudo2CodeQA as real job
+`f83a0e65-f9bc-4ec3-b34e-888e2b7333e5` in about 54 seconds. The client submitted
+once and polled by GET. The published job directory contained 43 regular files;
+formula occurrence coverage was `2 / 2`, both inline-math records were bound,
+and the strict region
+gate had 168 records (`165 verified_semantic`, `3 visual_only`, `0 unresolved`).
+Manifest-bound downloads and archive CRC validation passed.
+
+The Web UI state machine has deterministic Node coverage for stale token,
+navigation, refresh, configuration, output, bounded-message, and cyclic cursor
+races, plus server integration coverage. This Docker run was an API/UI-assets
+E2E, not a claim of manual browser visual review.
+
+### macOS lifecycle evidence
+
+`5ad1aa8` replaces the wrapper-only lifecycle with instance-bound
+supervisor/guard/child management. It uses flock, atomic metadata, Darwin birth
+identity, SID/listener/health checks, symlink-safe bounded log rotation,
+conservative legacy-PID migration, bounded exact-instance shutdown, and
+recovery from supervisor, guard, child, or dual death.
+
+Focused process-lifecycle tests pass 26/26 and focused distribution tests pass
+24/24 (50 combined); the complete service/distribution discovery passes
+218/218. Real Darwin smoke covered default ports, custom `55001/58001`
+ports across a fresh shell, normal stop, SIGKILL recovery for each role and dual
+death, and bounded SIGSTOP escalation. The evaluation service was then stopped;
+status reported backend/API `stopped`, and ports `5001`/`8000` had no listeners.
+
+### Document-quality evidence
+
+Formula ownership is intentionally narrow: Route A remains the non-formula
+document baseline. An accepted private `formula_service` sidecar is authoritative
+for formulas and skips generic second pass; an explicit Route-B/guarded
+`apply-all` result becomes final only after full source, occurrence, JSON,
+Markdown, and rollback-protected final-surface gates pass.
+
+Fresh direct set (no service exceptions/timeouts):
+
+```text
+cases: 6
+strict passed / failed: 1 / 5
+region records: 1248
+verified_semantic: 763
+visual_only: 35
+unresolved / critical: 450 / 450
+```
+
+Only Pseudo2CodeQA passed (`168 verified`, `3 visual`, `0 unresolved` in the
+direct run). PP-FormulaNet, LongDocBench, FRCD, CN, and Transformers GNN failed
+closed on formula/inline binding, cross-page algorithm, picture/main-flow, or
+table evidence. See the evaluation report for per-case values.
+
+Fresh old-ten reconversion also had no service exception/timeout and reproduced
+every locked page plus algorithm/code/table/formula high-confidence/ambiguous
+inventory count exactly. Its strict result was:
+
+```text
+cases: 10
+strict passed / failed: 0 / 10
+source region records: 3151
+retained/classified records: 3150
+verified_semantic: 2899
+visual_only: 58
+unresolved / critical: 193 / 193
+truncated cases: 1 (Donut exceeded the 1000-record sidecar cap by one)
+```
+
+The latest read-only stored 23-output compatibility replay was `0 / 23` strict
+passes with `3383 verified_semantic`, `131 visual_only`, `800 unresolved`, and
+`800 critical`, with no replay errors or truncation. Legacy success labels were
+not grandfathered.
+
+The sealed Doc2DB score remains scalar-only: 24 pages, tables `7 / 0`, formulas
+`1 / 6`, algorithms `0 / 0`, and code `0 / 0`. It was not visually inspected or
+used for tuning.
+
+### Validation baseline
+
+```text
+Full quality-parity unittest discovery: 755 tests, OK, 5 skipped
+Docling service/distribution unittest discovery: 218 tests, OK
+Focused macOS process lifecycle: 26 tests, OK
+Focused distribution/release bundle: 24 tests, OK
+Web UI concurrent-state Node suite: 16 tests, OK
+Source-built Docker Pseudo2CodeQA job and archive: passed
+New-six direct conversion completion: 6 / 6; strict quality: 1 / 6
+Old-ten direct conversion completion: 10 / 10; strict quality: 0 / 10
+Old-ten inventory baseline equality: 10 / 10
+```
+
+The durable evaluation record is
+`docs/integrations/docling-serve-quality-parity/evaluation/results-2026-08-30.md`.
+PDFs and generated conversion outputs are not committed.
+
+### Cleanup state
+
+After recording the scalar results, this task removed its three `/private/tmp`
+corpus/input directories, the new-six/old-ten/live-smoke review directories,
+and generated `__pycache__` directories. It also removed the isolated
+`docling-aug30-smoke` containers, network, five named volumes, and three local
+images whose Compose labels identified that project. Those job files and model
+volumes are intentionally not recoverable; their durable non-PDF evidence is
+the evaluation report and this handoff. No task-owned service or Docker resource
+remains running.
+
+### Remaining risks and next action
+
+Do not publish a production-quality claim or unattended high-fidelity release
+from this state. The next quality workstream should make generic, evidence-bound
+improvements for FRCD/CN/PP-FormulaNet/Transformers-GNN formula and inline math,
+LongDocBench picture/table residuals, and Donut record-volume handling. It must
+then rerun all fresh six, old ten, and stored 23 outputs without inventory
+regression or unresolved critical regions.
+
+If a UI-containing public release is desired after that decision, bump every
+version source together, build and verify both archives and all three images,
+run the release workflow, and state explicitly that `v1.1.1` never contained
+the UI. Do not merely retag current source or mix it with old published images.
+
+## Superseded intermediate 2026-08-30 snapshot (historical)
+
+> The section below was written before service authorization, Docker/macOS E2E,
+> lifecycle hardening, and the final new/old evaluations. Its pending-smoke
+> instructions and old counts are preserved only as history and must not be
+> executed or treated as current state.
 
 ### Repository and branch state
 

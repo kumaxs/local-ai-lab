@@ -69,7 +69,7 @@ python3 scripts/process_inbox.py \
 
 ## Future: Docling-Ready
 
-Docling Service v1.1.0 已发布，但尚未自动接入该 pipeline。当前 pipeline 仍沿用现有入口。
+Docling Service v1.1.1 已发布，但尚未自动接入该 pipeline。当前 pipeline 仍沿用现有入口。
 
 项目保留未来 Docling-ready 的演进边界，预期结构包括：
 

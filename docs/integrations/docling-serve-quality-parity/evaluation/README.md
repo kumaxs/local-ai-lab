@@ -45,3 +45,8 @@ cleanup.
 
 Recorded run: [`results-2026-08-30.md`](results-2026-08-30.md), with immutable
 input metadata in [`corpus-lock-2026-08-30.json`](corpus-lock-2026-08-30.json).
+That run includes one source-built Docker API conversion, six diverse fresh
+direct conversions, a fresh reconversion of all ten old inventory baselines,
+and a read-only 23-output compatibility replay. Conversion completion and
+strict region-quality acceptance are reported separately; a completed job is
+not counted as a quality pass when critical evidence remains unresolved.

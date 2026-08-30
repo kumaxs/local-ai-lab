@@ -43,6 +43,11 @@ over a hung transition and reloads the page that is still visible. Invalid,
 non-advancing, or cyclic cursors are quarantined instead of accumulating stale
 rows or looping between pages.
 
+Each row shows at most 280 Unicode characters of its stage/error message and
+the client scans no more than the first 65,536 UTF-16 code units. This is an
+operations preview, not a log contract. For a terminal job with longer
+diagnostics, expand its outputs and read the published `status.json`.
+
 Unauthenticated downloads use the browser's native streaming path. When bearer
 authentication is configured, the page must use an in-memory `Blob` and caps
 downloads at 256 MiB; use a streaming API client for larger protected files or
@@ -83,6 +88,8 @@ SQLite override and immediately falls back to the environment/default value.
 Deadlines already written to existing jobs are historical and are not
 recomputed when a TTL changes; new jobs and future cleanup decisions use the
 new effective policy. The UI labels this non-retroactive behavior explicitly.
+Webhook delivery-history retention remains an environment/read-only runtime
+setting; it is deliberately not a tenth live-editable field.
 
 Paths (input, output, state, staging, and temporary roots), the bearer token,
 model/engine and backend settings, and concurrency/capacity limits are
@@ -142,6 +149,13 @@ The response is `202 Accepted`:
 Reusing a key with the same PDF and request metadata returns the original job;
 reusing it for a different request returns `409`.
 
+The multipart request is a **single submission**, not a polling operation.
+Persist the returned `job_id`; call `GET /v1/jobs/{job_id}` until `state` is
+terminal, then call the returned outputs, manifest, or archive URL. Do not
+repeat `POST /v1/jobs` to ask for progress. If transport uncertainty requires a
+submission retry, send the same `Idempotency-Key` so the server can return the
+original job rather than enqueueing a second conversion.
+
 ## Jobs and lifecycle
 
 States are exactly `queued`, `running`, `succeeded`, `failed`, and
@@ -189,6 +203,15 @@ Markdown are bound. Algorithm contributor lists must agree across the manifest
 and semantic sidecar; tables require complete declared-grid occupancy unless
 the explicit empty-table fallback applies, and inline-math bindings preserve
 operators and Unicode math symbols.
+
+Formula authority is narrower than the whole-document route. Route A remains
+the non-formula structural/reading-contract baseline. In Docker
+`formula_policy=formula_service`, an accepted private formula-service sidecar is
+the final formula surface and the generic second pass is skipped. With an
+explicit `apply-all` second pass, Route-B/guarded formulas become final only
+after source identity, complete JSON/Markdown coverage, occurrence binding,
+and every later rollback-protected final-surface gate pass. If those conditions
+do not hold, the candidate cannot replace the prior formula surface.
 
 Example:
 

@@ -55,16 +55,21 @@ Stop without deleting persisted models, jobs, or outputs with:
 ./docker-down.sh
 ```
 
-## Build from tagged source
+## Build from current source
 
-The source-build fallback remains available from an intact release bundle or
-the exact `v1.1.1` repository checkout:
+The current post-1.1.1 source-build path is the Docker deployment that contains
+the Web UI described below. Run it from a complete checkout (or a future bundle
+that actually contains `docling_service/ui/`):
 
 ```bash
 docker compose \
   -f services/docling-service/deploy/docker/compose.yaml \
   up -d --build
 ```
+
+An exact `v1.1.1` checkout can still reproduce the legacy release service, but
+that tag does not contain the Web UI. Do not mix current API source with
+published `1.1.1` images and describe the result as a UI-enabled release.
 
 On the first start, the parser initializes the portable layout, table, and
 RapidOCR models in `docling_models`. A separate private formula container
@@ -104,6 +109,9 @@ terminal-job deletion, TTL countdowns, and managed-storage usage.
 The queue uses cursor-based previous/next pages of at most 100 jobs. Counts are
 for the visible page; refresh re-reads that page, rejects stale/cyclic cursors,
 and has a bounded takeover path when navigation hangs.
+Stage/error messages are bounded to a 280-Unicode-character preview after
+scanning at most the first 65,536 UTF-16 code units. Open a terminal job's
+published `status.json` for longer diagnostics.
 
 Enter the configured bearer token in the page when prompted. The value stays in
 the current page's memory only and is not written to browser storage, SQLite,
@@ -153,6 +161,10 @@ curl -sS -X POST http://127.0.0.1:8766/v1/jobs \
 
 For bearer authentication, set `DOCLING_SERVICE_API_TOKEN` in the shell before
 `docker compose up`, then send `Authorization: Bearer <token>`.
+Submit the multipart request once, save its `job_id`, and poll
+`GET /v1/jobs/{job_id}` until terminal before fetching outputs or the archive.
+Do not repeat the `POST` to poll; reuse one `Idempotency-Key` only when retrying
+an uncertain submission.
 
 ## Resource and portability controls
 
@@ -210,6 +222,10 @@ column-bounded crop rendered at six times the source PDF resolution is used only
 when the preview crop is visibly clipped at an edge. The primary model is
 released before the fallback loads, the batch size is one, and the two model
 peaks therefore do not accumulate.
+When the private sidecar passes the source-identity, coverage, and final-surface
+gates, it is the authoritative formula surface for that job; Route A remains
+the non-formula document baseline. A rejected or incomplete sidecar cannot
+silently replace formulas.
 After every parser response the API also calls Docling Serve's converter-cache
 release endpoint before formula recognition. This prevents completed layout/OCR
 pipelines from retaining model memory while the isolated formula model loads.

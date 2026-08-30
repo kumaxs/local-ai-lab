@@ -80,7 +80,7 @@ This is useful for compatibility, smoke tests, and fallback behavior. It should 
 
 ## Future Docling-Ready Boundary
 
-Docling Service v1.1.0 is released, but this pipeline is not yet auto-integrated with it.
+Docling Service v1.1.1 is released, but this pipeline is not yet auto-integrated with it.
 
 The future path should separate intake orchestration from document parsing:
 
