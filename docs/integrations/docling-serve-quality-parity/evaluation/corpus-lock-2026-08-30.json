@@ -22,7 +22,9 @@
       "resolved_url": "https://arxiv.org/pdf/2608.15064",
       "size_bytes": 7653005,
       "sha256": "0946cf4036545e9edf6b718fbf65ae06ffadc39ec4a84b6444a970833cfc74d6",
-      "content_inspected": false
+      "content_inspected": true,
+      "first_inspected_at": "2026-08-30T03:25:00Z",
+      "inspection_scope": "PDF metadata, text inventory, and rendered page 4; calibration only"
     },
     {
       "id": "calibration-pseudo2codeqa-2608.09068",
@@ -37,7 +39,9 @@
       "resolved_url": "https://arxiv.org/pdf/2608.09068",
       "size_bytes": 3508902,
       "sha256": "8591c6c7630ec49e8abb5609000d49548def66c6b6202aa7d123e4b6e3e2a02a",
-      "content_inspected": false
+      "content_inspected": true,
+      "first_inspected_at": "2026-08-30T03:25:00Z",
+      "inspection_scope": "PDF metadata, text inventory, and rendered page 5; calibration only"
     },
     {
       "id": "calibration-ppformulanet-2503.18382",
@@ -52,7 +56,9 @@
       "resolved_url": "https://arxiv.org/pdf/2503.18382",
       "size_bytes": 2760150,
       "sha256": "81dac9aef0f0e21878d5f81291a0c8839bfb315ccef605771041de27436a0399",
-      "content_inspected": false
+      "content_inspected": true,
+      "first_inspected_at": "2026-08-30T03:25:00Z",
+      "inspection_scope": "PDF metadata, text inventory, and rendered page 6; calibration only"
     },
     {
       "id": "sealed-doc2db-2608.08459",
