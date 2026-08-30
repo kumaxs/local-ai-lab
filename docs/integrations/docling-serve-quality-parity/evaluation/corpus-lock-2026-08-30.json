@@ -71,10 +71,10 @@
       "abstract_url": "https://arxiv.org/abs/2608.27211v1",
       "pdf_url": "https://arxiv.org/pdf/2608.27211v1",
       "focus": ["algorithm", "pseudocode", "indentation", "display_formula", "inline_math"],
-      "downloaded_at": null,
-      "resolved_url": null,
-      "size_bytes": null,
-      "sha256": null,
+      "downloaded_at": "2026-08-30T03:31:06Z",
+      "resolved_url": "https://arxiv.org/pdf/2608.27211v1",
+      "size_bytes": 408389,
+      "sha256": "33e71eefee575b48b6958da940e866bbee525635e2ddf781ed825ec5d49d9f24",
       "content_inspected": false
     },
     {
