@@ -1038,55 +1038,365 @@ class DoclingHttpRetryTests(unittest.TestCase):
 
         self.assertTrue(adapter.is_transient_http_error(wrapped))
 
-    def test_result_visibility_404_is_retried(self) -> None:
-        url = "http://127.0.0.1:5001/v1/convert/source"
-        pending = urllib.error.HTTPError(
+    def test_post_json_retries_503_but_not_result_404(self) -> None:
+        url = "http://127.0.0.1:5001/v1/recognize"
+        unavailable = urllib.error.HTTPError(
+            url, 503, "Unavailable", {}, io.BytesIO(b'{"detail":"busy"}')
+        )
+        with (
+            patch.object(
+                adapter.urllib.request,
+                "urlopen",
+                side_effect=[unavailable, _JsonResponse({"ok": True})],
+            ) as urlopen,
+            patch.object(adapter.time, "sleep") as sleep,
+        ):
+            result = adapter.post_json(
+                url,
+                {"items": []},
+                timeout=10,
+                retries=1,
+                retry_sleep_seconds=0.01,
+            )
+        self.assertEqual(result, {"ok": True})
+        self.assertEqual(urlopen.call_count, 2)
+        sleep.assert_called_once_with(0.01)
+
+        result_missing = urllib.error.HTTPError(
             url,
             404,
             "Not Found",
             {},
             io.BytesIO(b'{"detail":"Task result not found. Please wait."}'),
         )
+        with patch.object(
+            adapter.urllib.request, "urlopen", side_effect=result_missing
+        ) as urlopen:
+            with self.assertRaisesRegex(RuntimeError, "Task result not found"):
+                adapter.post_json(
+                    url,
+                    {"items": []},
+                    timeout=10,
+                    retries=3,
+                    retry_sleep_seconds=0.01,
+                )
+        self.assertEqual(urlopen.call_count, 1)
+
+    @staticmethod
+    def _run_async() -> dict[str, object]:
+        return adapter._run_docling_async_request(
+            "http://127.0.0.1:5001",
+            {"sources": []},
+            timeout_seconds=120,
+            retries=3,
+            retry_sleep_seconds=0.01,
+        )
+
+    def test_async_submit_poll_result_success_uses_real_contract_fields(self) -> None:
+        result_payload = {"status": "success", "document": {"json_content": {}}}
         with (
             patch.object(
                 adapter.urllib.request,
                 "urlopen",
-                side_effect=[pending, _JsonResponse({"status": "success"})],
+                side_effect=[
+                    _JsonResponse({"task_id": "task-abc", "task_status": "pending"}),
+                    _JsonResponse({"task_id": "task-abc", "task_status": "pending"}),
+                    _JsonResponse({"task_id": "task-abc", "task_status": "started"}),
+                    _JsonResponse({"task_id": "task-abc", "task_status": "success"}),
+                    _JsonResponse(result_payload),
+                ],
+            ) as urlopen,
+            patch.object(adapter.time, "sleep"),
+        ):
+            result = self._run_async()
+
+        self.assertEqual(result, result_payload)
+        requests = [call[0][0] for call in urlopen.call_args_list]
+        request_methods = [
+            request.get_method() if isinstance(request, urllib.request.Request) else "GET"
+            for request in requests
+        ]
+        request_urls = [
+            request.full_url if isinstance(request, urllib.request.Request) else request
+            for request in requests
+        ]
+        self.assertEqual(request_methods[0], "POST")
+        self.assertEqual(
+            request_urls[0],
+            "http://127.0.0.1:5001/v1/convert/source/async",
+        )
+        self.assertTrue(all(method == "GET" for method in request_methods[1:]))
+        self.assertIn("/v1/status/poll/task-abc?wait=", request_urls[1])
+        self.assertEqual(
+            request_urls[-1],
+            "http://127.0.0.1:5001/v1/result/task-abc",
+        )
+
+    def test_async_result_visibility_404_retries_only_same_result_get(self) -> None:
+        result_url = "http://127.0.0.1:5001/v1/result/task-abc"
+        not_ready = urllib.error.HTTPError(
+            result_url,
+            404,
+            "Not Found",
+            {},
+            io.BytesIO(
+                b'{"detail":"Task result not found. Please wait for a completion status."}'
+            ),
+        )
+        result_payload = {"status": "success", "document": {}}
+        with (
+            patch.object(
+                adapter.urllib.request,
+                "urlopen",
+                side_effect=[
+                    _JsonResponse({"task_id": "task-abc"}),
+                    _JsonResponse({"task_id": "task-abc", "task_status": "success"}),
+                    not_ready,
+                    _JsonResponse(result_payload),
+                ],
             ) as urlopen,
             patch.object(adapter.time, "sleep") as sleep,
         ):
-            result = adapter.post_json(
-                url,
-                {"sources": []},
-                timeout=10,
-                retries=1,
-                retry_sleep_seconds=0.01,
-            )
+            result = self._run_async()
 
-        self.assertEqual(result, {"status": "success"})
+        self.assertEqual(result, result_payload)
+        requests = [call[0][0] for call in urlopen.call_args_list]
+        request_methods = [
+            request.get_method() if isinstance(request, urllib.request.Request) else "GET"
+            for request in requests
+        ]
+        request_urls = [
+            request.full_url if isinstance(request, urllib.request.Request) else request
+            for request in requests
+        ]
+        self.assertEqual(request_methods.count("POST"), 1)
+        self.assertEqual(request_urls[-2:], [result_url, result_url])
+        sleep.assert_called_once()
+
+    def test_async_terminal_failure_uses_error_message_and_skips_result(self) -> None:
+        with patch.object(
+            adapter.urllib.request,
+            "urlopen",
+            side_effect=[
+                _JsonResponse({"task_id": "task-abc"}),
+                _JsonResponse(
+                    {
+                        "task_id": "task-abc",
+                        "task_status": "failure",
+                        "error_message": "backend conversion failed",
+                    }
+                ),
+            ],
+        ) as urlopen:
+            with self.assertRaisesRegex(RuntimeError, "backend conversion failed"):
+                self._run_async()
         self.assertEqual(urlopen.call_count, 2)
-        sleep.assert_called_once_with(0.01)
 
-    def test_unrelated_404_is_not_retried(self) -> None:
-        url = "http://127.0.0.1:5001/v1/convert/source"
+    def test_async_result_failure_and_skipped_preserve_backend_response(self) -> None:
+        for result_status in ("failure", "skipped"):
+            result_payload = {
+                "status": result_status,
+                "document": {},
+                "errors": [{"error_message": "document conversion failed"}],
+            }
+            with self.subTest(result_status=result_status), patch.object(
+                adapter.urllib.request,
+                "urlopen",
+                side_effect=[
+                    _JsonResponse({"task_id": "task-abc"}),
+                    _JsonResponse(
+                        {"task_id": "task-abc", "task_status": "success"}
+                    ),
+                    _JsonResponse(result_payload),
+                ],
+            ):
+                self.assertEqual(self._run_async(), result_payload)
+
+    def test_async_poll_and_result_transients_retry_only_gets(self) -> None:
+        poll_url = "http://127.0.0.1:5001/v1/status/poll/task-abc?wait=5"
+        result_url = "http://127.0.0.1:5001/v1/result/task-abc"
+        poll_unavailable = urllib.error.HTTPError(
+            poll_url,
+            503,
+            "Unavailable",
+            {},
+            io.BytesIO(b'{"detail":"poll busy"}'),
+        )
+        result_unavailable = urllib.error.HTTPError(
+            result_url,
+            504,
+            "Gateway Timeout",
+            {},
+            io.BytesIO(b'{"detail":"result busy"}'),
+        )
+        result_payload = {"status": "success", "document": {}}
+        with (
+            patch.object(
+                adapter.urllib.request,
+                "urlopen",
+                side_effect=[
+                    _JsonResponse({"task_id": "task-abc"}),
+                    poll_unavailable,
+                    _JsonResponse(
+                        {"task_id": "task-abc", "task_status": "success"}
+                    ),
+                    result_unavailable,
+                    _JsonResponse(result_payload),
+                ],
+            ) as urlopen,
+            patch.object(adapter.time, "sleep") as sleep,
+        ):
+            self.assertEqual(self._run_async(), result_payload)
+
+        requests = [call.args[0] for call in urlopen.call_args_list]
+        methods = [
+            request.get_method() if isinstance(request, urllib.request.Request) else "GET"
+            for request in requests
+        ]
+        self.assertEqual(methods.count("POST"), 1)
+        self.assertEqual(methods.count("GET"), 4)
+        self.assertEqual(sleep.call_count, 2)
+
+    def test_async_exhausted_poll_transient_cannot_trigger_outer_fallback(self) -> None:
+        poll_url = "http://127.0.0.1:5001/v1/status/poll/task-abc?wait=5"
+        unavailable = [
+            urllib.error.HTTPError(
+                poll_url,
+                503,
+                "Unavailable",
+                {},
+                io.BytesIO(b'{"detail":"poll busy"}'),
+            )
+            for _ in range(adapter._DOCLING_GET_RETRY_MIN_ATTEMPTS)
+        ]
+        with (
+            patch.object(
+                adapter.urllib.request,
+                "urlopen",
+                side_effect=[_JsonResponse({"task_id": "task-abc"}), *unavailable],
+            ) as urlopen,
+            patch.object(adapter.time, "sleep"),
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError, "remained unavailable after 6 GET attempts"
+            ) as raised:
+                self._run_async()
+
+        self.assertFalse(adapter.is_transient_http_error(raised.exception))
+        requests = [call.args[0] for call in urlopen.call_args_list]
+        methods = [
+            request.get_method() if isinstance(request, urllib.request.Request) else "GET"
+            for request in requests
+        ]
+        self.assertEqual(methods.count("POST"), 1)
+        self.assertEqual(methods.count("GET"), 6)
+
+    def test_async_submit_is_never_replayed(self) -> None:
+        unavailable = urllib.error.HTTPError(
+            "http://127.0.0.1:5001/v1/convert/source/async",
+            503,
+            "Unavailable",
+            {},
+            io.BytesIO(b'{"detail":"busy"}'),
+        )
+        with patch.object(
+            adapter.urllib.request, "urlopen", side_effect=unavailable
+        ) as urlopen:
+            with self.assertRaisesRegex(RuntimeError, "HTTP 503") as raised:
+                self._run_async()
+        self.assertEqual(urlopen.call_count, 1)
+        self.assertFalse(adapter.is_transient_http_error(raised.exception))
+
+    def test_async_malformed_or_mismatched_status_fails_closed(self) -> None:
+        cases = (
+            ([[]], "submit payload malformed"),
+            ([{"not_task_id": "x"}], "submit task_id"),
+            (
+                [
+                    {"task_id": "task-good"},
+                    {"task_id": "task-bad", "task_status": "success"},
+                ],
+                "task_id mismatch",
+            ),
+            (
+                [
+                    {"task_id": "task-good"},
+                    {"task_id": "task-good", "task_status": "unknown"},
+                ],
+                "unexpected status",
+            ),
+        )
+        for responses, message in cases:
+            with self.subTest(message=message), patch.object(
+                adapter.urllib.request,
+                "urlopen",
+                side_effect=[_JsonResponse(response) for response in responses],
+            ):
+                with self.assertRaisesRegex(RuntimeError, message):
+                    self._run_async()
+
+    def test_async_malformed_or_mismatched_result_fails_closed(self) -> None:
+        cases = (
+            ([], "result fetch payload malformed"),
+            (
+                {"task_id": "another-task", "status": "success"},
+                "result task_id mismatch",
+            ),
+            ({"document": {}}, "result unexpected status"),
+        )
+        for result_payload, message in cases:
+            with self.subTest(message=message), patch.object(
+                adapter.urllib.request,
+                "urlopen",
+                side_effect=[
+                    _JsonResponse({"task_id": "task-good"}),
+                    _JsonResponse(
+                        {"task_id": "task-good", "task_status": "success"}
+                    ),
+                    _JsonResponse(result_payload),
+                ],
+            ):
+                with self.assertRaisesRegex(RuntimeError, message):
+                    self._run_async()
+
+    def test_async_unrelated_result_404_is_not_retried(self) -> None:
         missing = urllib.error.HTTPError(
-            url,
+            "http://127.0.0.1:5001/v1/result/task-good",
             404,
             "Not Found",
             {},
             io.BytesIO(b'{"detail":"unknown endpoint"}'),
         )
-        with patch.object(adapter.urllib.request, "urlopen", side_effect=missing) as urlopen:
+        with patch.object(
+            adapter.urllib.request,
+            "urlopen",
+            side_effect=[
+                _JsonResponse({"task_id": "task-good"}),
+                _JsonResponse({"task_id": "task-good", "task_status": "success"}),
+                missing,
+            ],
+        ) as urlopen:
             with self.assertRaisesRegex(RuntimeError, "unknown endpoint"):
-                adapter.post_json(
-                    url,
+                self._run_async()
+        self.assertEqual(urlopen.call_count, 3)
+
+    def test_async_deadline_includes_submit(self) -> None:
+        with (
+            patch.object(adapter, "post_json", return_value={"task_id": "task-good"}),
+            patch.object(adapter.time, "monotonic", side_effect=[0.0, 2.0]),
+            patch.object(adapter.urllib.request, "urlopen") as urlopen,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "timed out before terminal status"):
+                adapter._run_docling_async_request(
+                    "http://127.0.0.1:5001",
                     {"sources": []},
-                    timeout=10,
-                    retries=2,
+                    timeout_seconds=1,
+                    retries=3,
                     retry_sleep_seconds=0.01,
                 )
+        urlopen.assert_not_called()
 
-        self.assertEqual(urlopen.call_count, 1)
+
 
 
 class VlmWorkerPreflightTests(unittest.TestCase):
@@ -11068,7 +11378,7 @@ class SourceCropRecoveryAndDisclosureTests(unittest.TestCase):
         metadata: dict[str, object] = {}
         status: dict[str, object] = {"ok": True, "success_class": "success", "warnings": [], "quality_signals": {}}
         with patch.object(adapter, "_render_table_recovery_crop_png", return_value=b"png"), patch.object(
-            adapter, "post_json", return_value=retry_response
+            adapter, "_run_docling_async_request", return_value=retry_response
         ) as request:
             result = adapter.recover_image_only_tables_from_serve(
                 response, Path("source.pdf"), args, metadata, status
@@ -11076,6 +11386,7 @@ class SourceCropRecoveryAndDisclosureTests(unittest.TestCase):
         self.assertEqual(1, result["accepted_count"])
         self.assertEqual(2, empty["data"]["num_rows"])
         self.assertNotIn("bbox", empty["data"]["table_cells"][0])
+        request.assert_called_once()
         payload = request.call_args.args[1]
         self.assertEqual(["image"], payload["options"]["from_formats"])
         self.assertTrue(payload["options"]["do_table_structure"])
@@ -11465,7 +11776,7 @@ class SourceCropRecoveryAndDisclosureTests(unittest.TestCase):
             "quality_signals": {},
         }
         with patch.object(adapter, "_render_table_recovery_crop_png", return_value=crop_bytes), patch.object(
-            adapter, "post_json", return_value=retry_response
+            adapter, "_run_docling_async_request", return_value=retry_response
         ):
             result = adapter.recover_image_only_tables_from_serve(
                 source_response,

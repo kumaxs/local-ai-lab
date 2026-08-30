@@ -467,19 +467,297 @@ def page_range(args: argparse.Namespace) -> list[int] | None:
     return [args.page_start, args.page_end]
 
 
+class _DoclingNonReplayableError(RuntimeError):
+    """Failure after a non-idempotent Docling request was attempted."""
+
+
 def is_transient_http_error(exc: BaseException) -> bool:
     current: BaseException | None = exc
     while current is not None:
+        # Once a non-idempotent async submit has been attempted, falling back by
+        # replaying a conversion could create another task. Safe GET retries are
+        # exhausted inside the async helper instead.
+        if isinstance(current, _DoclingNonReplayableError):
+            return False
         if isinstance(current, urllib.error.HTTPError) and current.code in {503, 504}:
             return True
         current = current.__cause__
     return False
 
 
-def _is_transient_docling_response(code: int, detail: str) -> bool:
-    if code in {503, 504}:
-        return True
-    return code == 404 and "Task result not found" in detail
+def _is_transient_docling_response(code: int, _detail: str) -> bool:
+    # Replaying a conversion POST after Docling Serve's result-visibility 404
+    # creates a second task because the backend has no idempotency key.  Main
+    # conversions use the explicit async task contract below, so generic POST
+    # retries are limited to service-unavailable responses.
+    return code in {503, 504}
+
+
+_DOCLING_TASK_STATUS_PENDING = {
+    "pending",
+    "started",
+}
+_DOCLING_TASK_STATUS_SUCCESS = {"success", "partial_success"}
+_DOCLING_TASK_STATUS_FAILURE = {"failure", "skipped"}
+_DOCLING_TASK_STATUS_RESULT = (
+    _DOCLING_TASK_STATUS_SUCCESS | _DOCLING_TASK_STATUS_FAILURE
+)
+_DOCLING_GET_RETRY_MIN_ATTEMPTS = 6
+_DOCLING_GET_RETRY_MAX_ATTEMPTS = 8
+_DOCLING_GET_RETRY_MAX_SLEEP_SECONDS = 5.0
+
+
+def _bounded_message(message: object, max_length: int = 2000) -> str:
+    text = str(message)
+    if len(text) <= max_length:
+        return text
+    return text[:max_length] + "..."
+
+
+def _http_error_detail(exc: urllib.error.HTTPError, max_length: int = 2000) -> str:
+    try:
+        payload = exc.read().decode("utf-8", errors="replace")
+    except OSError:
+        payload = ""
+    return _bounded_message(payload, max_length=max_length)
+
+
+def _validate_docling_task_id(value: object, *, context: str) -> str:
+    if not isinstance(value, str):
+        raise RuntimeError(f"Docling Serve {context} task_id invalid")
+    task_id = value
+    if not task_id.strip():
+        raise RuntimeError(f"Docling Serve {context} task_id empty")
+    if len(task_id) > 4096 or any(ord(character) < 32 for character in task_id):
+        raise RuntimeError(f"Docling Serve {context} task_id malformed: {task_id!r}")
+    return task_id
+
+
+def _assert_matching_task_id(
+    observed: Any,
+    expected: str,
+    *,
+    context: str,
+) -> None:
+    if observed is None:
+        return
+    observed_task_id = _validate_docling_task_id(observed, context=context)
+    if observed_task_id != expected:
+        raise RuntimeError(
+            f"Docling Serve {context} task_id mismatch: expected={expected} observed={observed_task_id}"
+        )
+
+
+def _quoted_task_id(task_id: str) -> str:
+    return urllib.parse.quote(task_id, safe="")
+
+
+def _parse_docling_task_result_error(payload: dict[str, Any]) -> str:
+    if not isinstance(payload, dict):
+        return "(invalid response payload)"
+    for field in ("error_message", "message", "error", "detail"):
+        if payload.get(field):
+            return _bounded_message(payload.get(field))
+    errors = payload.get("errors")
+    if isinstance(errors, list) and errors:
+        return _bounded_message(errors)
+    return "(no error detail)"
+
+
+def _get_docling_submitted_task_json(
+    url: str,
+    *,
+    phase: str,
+    task_id: str,
+    deadline: float,
+    timeout_limit_seconds: float,
+    retries: int,
+    retry_sleep_seconds: float,
+    allow_result_not_ready: bool = False,
+) -> dict[str, Any]:
+    """Retry only idempotent GETs for one already-submitted Docling task."""
+
+    max_attempts = min(
+        _DOCLING_GET_RETRY_MAX_ATTEMPTS,
+        max(_DOCLING_GET_RETRY_MIN_ATTEMPTS, int(retries) + 3),
+    )
+    retry_base_seconds = max(0.25, min(2.0, float(retry_sleep_seconds)))
+    last_error = "unknown transient error"
+
+    for attempt in range(max_attempts):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise _DoclingNonReplayableError(
+                f"Docling Serve {phase} timed out for submitted task_id={task_id}"
+            )
+        try:
+            payload = get_json(
+                url,
+                timeout=max(0.1, min(remaining, timeout_limit_seconds)),
+            )
+        except urllib.error.HTTPError as exc:
+            detail = _http_error_detail(exc)
+            result_not_ready = (
+                allow_result_not_ready
+                and exc.code == 404
+                and "task result not found" in detail.lower()
+            )
+            if exc.code not in {503, 504} and not result_not_ready:
+                raise _DoclingNonReplayableError(
+                    f"Docling Serve {phase} failed for submitted task_id={task_id}: "
+                    f"HTTP {exc.code}: {detail}"
+                ) from None
+            last_error = f"HTTP {exc.code}: {detail}"
+        except (urllib.error.URLError, TimeoutError) as exc:
+            last_error = f"{type(exc).__name__}: {_bounded_message(exc)}"
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            raise _DoclingNonReplayableError(
+                f"Docling Serve {phase} payload malformed for submitted "
+                f"task_id={task_id}: {type(exc).__name__}"
+            ) from None
+        else:
+            if not isinstance(payload, dict):
+                raise _DoclingNonReplayableError(
+                    f"Docling Serve {phase} payload malformed for submitted task_id={task_id}"
+                )
+            return payload
+
+        if attempt + 1 >= max_attempts:
+            raise _DoclingNonReplayableError(
+                f"Docling Serve {phase} remained unavailable after "
+                f"{max_attempts} GET attempts for submitted task_id={task_id}: "
+                f"{last_error}"
+            )
+        pause = min(
+            _DOCLING_GET_RETRY_MAX_SLEEP_SECONDS,
+            retry_base_seconds * (2**attempt),
+            max(0.0, deadline - time.monotonic()),
+        )
+        if pause <= 0:
+            raise _DoclingNonReplayableError(
+                f"Docling Serve {phase} timed out for submitted task_id={task_id}"
+            )
+        time.sleep(pause)
+
+    raise _DoclingNonReplayableError(
+        f"Docling Serve {phase} unavailable for submitted task_id={task_id}"
+    )
+
+
+def _run_docling_async_request(
+    serve_url: str,
+    payload: dict[str, Any],
+    *,
+    timeout_seconds: int,
+    retries: int,
+    retry_sleep_seconds: float,
+) -> dict[str, Any]:
+    """Run one Docling source conversion without ever replaying its submit."""
+
+    if timeout_seconds <= 0:
+        raise RuntimeError("Docling Serve conversion timeout must be positive")
+    base_url = serve_url.rstrip("/")
+    submit_url = f"{base_url}/v1/convert/source/async"
+    deadline = time.monotonic() + float(timeout_seconds)
+    # A failed/ambiguous submit is intentionally not retried: the async API has
+    # no idempotency key, so retrying could enqueue duplicate conversions.
+    try:
+        submit_response = post_json(
+            submit_url,
+            payload,
+            timeout=timeout_seconds,
+            retries=0,
+            retry_sleep_seconds=retry_sleep_seconds,
+        )
+    except Exception as exc:
+        # An HTTP/network failure cannot prove that the backend did not enqueue
+        # the request.  Mark every submit failure non-replayable so the outer
+        # chunk fallback cannot create duplicate work.
+        raise _DoclingNonReplayableError(
+            "Docling Serve async submit outcome unknown; request was not "
+            f"replayed: {type(exc).__name__}: {_bounded_message(exc)}"
+        ) from exc
+    if not isinstance(submit_response, dict):
+        raise RuntimeError("Docling Serve async submit payload malformed")
+    submitted_task_id = _validate_docling_task_id(
+        submit_response.get("task_id"), context="submit"
+    )
+    quoted_task_id = _quoted_task_id(submitted_task_id)
+
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise RuntimeError(
+                f"Docling Serve conversion timed out before terminal status for task_id={submitted_task_id}"
+            )
+        wait_seconds = max(0.1, min(5.0, remaining))
+        wait_value = f"{wait_seconds:.3f}".rstrip("0").rstrip(".")
+        status_url = (
+            f"{base_url}/v1/status/poll/{quoted_task_id}?wait="
+            f"{urllib.parse.quote(wait_value, safe='')}"
+        )
+        status_payload = _get_docling_submitted_task_json(
+            status_url,
+            phase="status poll",
+            task_id=submitted_task_id,
+            deadline=deadline,
+            timeout_limit_seconds=wait_seconds + 5.0,
+            retries=retries,
+            retry_sleep_seconds=retry_sleep_seconds,
+        )
+
+        status_task_id = _validate_docling_task_id(
+            status_payload.get("task_id"), context="status"
+        )
+        if status_task_id != submitted_task_id:
+            raise RuntimeError(
+                "Docling Serve status task_id mismatch: "
+                f"expected={submitted_task_id} observed={status_task_id}"
+            )
+        status = str(status_payload.get("task_status") or "").strip().lower()
+
+        if status in _DOCLING_TASK_STATUS_SUCCESS:
+            break
+        if status in _DOCLING_TASK_STATUS_PENDING:
+            # A conforming long poll normally blocks.  Bound an unexpectedly
+            # eager backend so a malformed implementation cannot busy-spin.
+            pause = min(0.25, max(0.0, deadline - time.monotonic()))
+            if pause:
+                time.sleep(pause)
+            continue
+        if status in _DOCLING_TASK_STATUS_FAILURE:
+            raise RuntimeError(
+                f"Docling Serve conversion terminally failed for task_id={submitted_task_id}: "
+                f"{_parse_docling_task_result_error(status_payload)}"
+            )
+        raise RuntimeError(
+            f"Docling Serve conversion returned unexpected status for task_id={submitted_task_id}: "
+            f"{status}"
+        )
+
+    result_url = f"{base_url}/v1/result/{quoted_task_id}"
+    result_payload = _get_docling_submitted_task_json(
+        result_url,
+        phase="result fetch",
+        task_id=submitted_task_id,
+        deadline=deadline,
+        timeout_limit_seconds=60.0,
+        retries=retries,
+        retry_sleep_seconds=retry_sleep_seconds,
+        allow_result_not_ready=True,
+    )
+    _assert_matching_task_id(
+        result_payload.get("task_id"),
+        submitted_task_id,
+        context="result",
+    )
+    result_status = str(result_payload.get("status") or "").strip().lower()
+    if result_status not in _DOCLING_TASK_STATUS_RESULT:
+        raise _DoclingNonReplayableError(
+            f"Docling Serve result unexpected status for task_id={submitted_task_id}: "
+            f"{result_status}"
+        )
+    return result_payload
 
 
 def post_json(
@@ -3835,10 +4113,10 @@ def recover_image_only_tables_from_serve(
             },
         }
         try:
-            retry_response = post_json(
-                f"{args.serve_url.rstrip('/')}/v1/convert/source",
+            retry_response = _run_docling_async_request(
+                args.serve_url,
                 payload,
-                timeout=min(
+                timeout_seconds=min(
                     int(getattr(args, "timeout_seconds", TABLE_RECOVERY_TIMEOUT_SECONDS)),
                     TABLE_RECOVERY_TIMEOUT_SECONDS,
                 ),
@@ -24207,10 +24485,10 @@ def run_conversion(
     )
     payload = request_payload(args, options)
     start = time.perf_counter()
-    response = post_json(
-        f"{args.serve_url.rstrip('/')}/v1/convert/source",
+    response = _run_docling_async_request(
+        args.serve_url,
         payload,
-        timeout=args.timeout_seconds,
+        timeout_seconds=args.timeout_seconds,
         retries=args.http_retries,
         retry_sleep_seconds=args.http_retry_sleep_seconds,
     )
