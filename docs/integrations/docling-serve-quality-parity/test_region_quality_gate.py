@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import sys
 import tempfile
 import unittest
@@ -9,10 +10,21 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from region_quality_gate import REGION_STATUSES, evaluate_regions
+from region_quality_gate import (
+    REGION_STATUSES,
+    _body_identity_sha,
+    _document_nodes,
+    _formula_raw_content_sha256,
+    _manifest_entry,
+    _node_body_identity,
+    _table_topology_diagnostics,
+    evaluate_regions,
+)
 
 
-SOURCE_SHA = "a" * 64
+SOURCE_BYTES = b"source"
+SOURCE_SHA = hashlib.sha256(SOURCE_BYTES).hexdigest()
+EVIDENCE_SHA = hashlib.sha256(b"evidence").hexdigest()
 BBOX = {"l": 10, "r": 110, "t": 120, "b": 180, "coord_origin": "TOPLEFT"}
 
 
@@ -107,6 +119,7 @@ def _structural_signals() -> dict[str, object]:
                     "source_provenance_verified": True,
                     "context_provenance_verified": False,
                     "page_no": 1,
+                    "bbox": BBOX,
                     "source_reasons": [],
                 }
             ]
@@ -134,6 +147,7 @@ def _structural_signals() -> dict[str, object]:
 
 
 def _fixture(root: Path) -> tuple[dict[str, object], dict[str, object], dict[str, object]]:
+    (root / "source.pdf").write_bytes(SOURCE_BYTES)
     for path in (
         "pages/page_1.png",
         "tables/table_1.png",
@@ -206,7 +220,27 @@ def _fixture(root: Path) -> tuple[dict[str, object], dict[str, object], dict[str
                 "self_ref": "#/pictures/0",
                 "prov": [{"page_no": 1, "bbox": BBOX}],
             }
-        ]
+        ],
+        "texts": [
+            {
+                "label": "code",
+                "text": "Algorithm 1\n1: initialize\n2: return",
+                "self_ref": "#/texts/algorithm-0",
+                "prov": [{"page_no": 1, "bbox": BBOX}],
+            },
+            {
+                "label": "code",
+                "text": "def solve(x):\n    return x + 1",
+                "self_ref": "#/texts/code-0",
+                "prov": [{"page_no": 1, "bbox": BBOX}],
+            },
+            {
+                "label": "formula",
+                "text": "x_i = y_i + 1",
+                "self_ref": "#/texts/formula-0",
+                "prov": [{"page_no": 1, "bbox": BBOX}],
+            },
+        ],
     }
     quality = {
         "primary_surface": {
@@ -260,9 +294,96 @@ def _fixture(root: Path) -> tuple[dict[str, object], dict[str, object], dict[str
         "quality_signals": quality,
         "warnings": [],
     }
+    table_node = document["tables"][0]
+    algorithm_node, code_node, formula_node = document["texts"]
+
+    def manifest_entry(kind, index, source_ref, path, node):
+        body_identity = _node_body_identity(kind, node)
+        return {
+            "kind": kind,
+            "index": index,
+            "source_ref": source_ref,
+            "self_ref": node["self_ref"],
+            "part_index": None,
+            "page_no": 1,
+            "node_bbox": BBOX,
+            "asset_path": path,
+            "asset_sha256": EVIDENCE_SHA,
+            "visual_pdf_sha256": SOURCE_SHA,
+            "structural_body_identity_sha256": _body_identity_sha(
+                kind, body_identity
+            ),
+            "source_node_bindings": [
+                {
+                    "source_ref": source_ref,
+                    "self_ref": node["self_ref"],
+                    "part_index": None,
+                    "page_no": 1,
+                    "bbox": BBOX,
+                    "body_identity_sha256": _body_identity_sha(
+                        "algorithm-source-node" if kind == "algorithm" else kind,
+                        _node_body_identity(kind, node),
+                    ),
+                }
+            ],
+        }
+
     metadata = {
         "visual_evidence_input_sha256": SOURCE_SHA,
         "generated_outputs": [],
+        "structural_visual_provenance_manifest": {
+            "visual_pdf_sha256": SOURCE_SHA,
+            "tables": [
+                manifest_entry(
+                    "table", 1, "#/tables/0", "tables/table_1.png", table_node
+                )
+            ],
+            "algorithms": [
+                manifest_entry(
+                    "algorithm",
+                    1,
+                    "#/texts/algorithm-0",
+                    "algorithms/algorithm_1.png",
+                    algorithm_node,
+                )
+            ],
+            "code": [
+                manifest_entry(
+                    "code",
+                    1,
+                    "#/texts/code-0",
+                    "code_blocks/code_block_1.png",
+                    code_node,
+                )
+            ],
+        },
+        "formula_crop_diagnostics": [
+            {
+                "index": 1,
+                "page_no": 1,
+                "bbox": BBOX,
+                "source_pdf_sha256": SOURCE_SHA,
+                "formula_content_identity_sha256": hashlib.sha256(
+                    b"formula-content"
+                ).hexdigest(),
+                "formula_raw_content_sha256": _formula_raw_content_sha256(
+                    formula_node["text"]
+                ),
+                "source": {
+                    "path": "formulas/formula_1.png",
+                    "page_no": 1,
+                    "bbox": BBOX,
+                    "asset_sha256": EVIDENCE_SHA,
+                    "source_pdf_sha256": SOURCE_SHA,
+                    "formula_content_identity_sha256": hashlib.sha256(
+                        b"formula-content"
+                    ).hexdigest(),
+                    "formula_raw_content_sha256": _formula_raw_content_sha256(
+                        formula_node["text"]
+                    ),
+                },
+            }
+        ],
     }
     return document, metadata, status
 
@@ -488,6 +609,7 @@ class RegionQualityGateTests(unittest.TestCase):
     def test_missing_bare_picture_asset_is_advisory_unresolved_not_visual_only(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
+            (root / "source.pdf").write_bytes(SOURCE_BYTES)
             document = {
                 "pictures": [
                     {
@@ -551,6 +673,428 @@ class RegionQualityGateTests(unittest.TestCase):
             self.assertEqual(payload["schema_version"], 1)
             self.assertEqual(payload["record_count"], result["record_count"])
             self.assertTrue(all(record["text_preview"] is None or len(record["text_preview"]) <= 180 for record in payload["records"]))
+
+    def test_strict_numeric_page_rejects_float_and_bool(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            document = {
+                "pictures": [
+                    {
+                        "label": "picture",
+                        "self_ref": "#/pictures/0",
+                        "prov": [{"page_no": 1.0, "bbox": BBOX}],
+                    },
+                    {
+                        "label": "picture",
+                        "self_ref": "#/pictures/1",
+                        "prov": [{"page_no": True, "bbox": BBOX}],
+                    },
+                ]
+            }
+            result = evaluate_regions(
+                root,
+                document,
+                {"generated_outputs": []},
+                {"ok": True, "quality_signals": {}, "warnings": []},
+                write_sidecars=False,
+            )
+            self.assertTrue(all(record["page_no"] is None for record in result["records"]))
+            self.assertTrue(all("invalid_page_no" in record["reasons"] for record in result["records"]))
+
+    def test_duplicate_refs_and_count_mismatch_fail_closed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            document, metadata, status = _fixture(root)
+            visuals = status["quality_signals"]["final_source_visuals"]
+            table_ref = "#/tables/0"
+            visuals["table_source_expected_refs"] = [table_ref, table_ref]
+            status["quality_signals"]["primary_surface"]["counts"]["tables"] = 2
+            result = evaluate_regions(root, document, metadata, status, write_sidecars=False)
+            table = next(record for record in result["records"] if record["kind"] == "table")
+            self.assertIn("expected_region_refs_duplicate", table["reasons"])
+            self.assertIn("expected_region_count_mismatch", table["reasons"])
+            self.assertFalse(result["ok"])
+
+    def test_partial_expected_count_without_duplicate_refs_fails_closed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            document, metadata, status = _fixture(root)
+            status["quality_signals"]["primary_surface"]["counts"]["tables"] = 2
+
+            result = evaluate_regions(
+                root, document, metadata, status, write_sidecars=False
+            )
+            table = next(record for record in result["records"] if record["kind"] == "table")
+
+            self.assertIn("expected_region_count_mismatch", table["reasons"])
+            self.assertFalse(result["ok"])
+
+    def test_extra_structural_candidate_fails_closed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            document, metadata, status = _fixture(root)
+            visuals = status["quality_signals"]["final_source_visuals"]
+            visuals["structured_table_source_renderings"]["candidates"].append(
+                _candidate("#/tables/extra", "tables/table_1.png", index=2)
+            )
+
+            result = evaluate_regions(
+                root, document, metadata, status, write_sidecars=False
+            )
+            table = next(record for record in result["records"] if record["kind"] == "table")
+
+            self.assertIn("candidate_source_ref_set_mismatch", table["reasons"])
+            self.assertFalse(result["ok"])
+
+    def test_deleted_final_structural_node_fails_closed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            document, metadata, status = _fixture(root)
+            document["texts"] = [
+                node
+                for node in document["texts"]
+                if node["self_ref"] != "#/texts/algorithm-0"
+            ]
+
+            result = evaluate_regions(
+                root, document, metadata, status, write_sidecars=False
+            )
+            algorithm = next(
+                record for record in result["records"] if record["kind"] == "algorithm"
+            )
+
+            self.assertIn("final_document_node_missing", algorithm["reasons"])
+            self.assertFalse(result["ok"])
+
+    def test_missing_structural_manifest_fails_closed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            document, metadata, status = _fixture(root)
+            metadata.pop("structural_visual_provenance_manifest")
+
+            result = evaluate_regions(
+                root, document, metadata, status, write_sidecars=False
+            )
+            structural = [
+                record
+                for record in result["records"]
+                if record["kind"] in {"table", "algorithm", "code"}
+            ]
+
+            self.assertTrue(
+                all(
+                    "structural_provenance_manifest_missing" in record["reasons"]
+                    for record in structural
+                )
+            )
+            self.assertFalse(result["ok"])
+
+    def test_wrong_kind_asset_path_fails_closed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            document, metadata, status = _fixture(root)
+            (root / "metadata.json").write_bytes(b"evidence")
+            visuals = status["quality_signals"]["final_source_visuals"]
+            visuals["formula_source_renderings"]["candidates"][0][
+                "selected_image"
+            ] = "metadata.json"
+
+            result = evaluate_regions(
+                root, document, metadata, status, write_sidecars=False
+            )
+            formula = next(
+                record for record in result["records"] if record["kind"] == "formula"
+            )
+
+            self.assertIn("source_asset_kind_mismatch", formula["reasons"])
+            self.assertFalse(result["ok"])
+
+    def test_symlinked_evidence_asset_is_not_followed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            document, metadata, status = _fixture(root)
+            outside = root.parent / f"{root.name}-outside-evidence.png"
+            outside.write_bytes(b"outside")
+            link = root / "formulas" / "formula_link.png"
+            link.symlink_to(outside)
+            visuals = status["quality_signals"]["final_source_visuals"]
+            visuals["formula_source_renderings"]["candidates"][0][
+                "selected_image"
+            ] = "formulas/formula_link.png"
+            metadata["formula_crop_diagnostics"][0]["source"][
+                "path"
+            ] = "formulas/formula_link.png"
+            try:
+                result = evaluate_regions(
+                    root, document, metadata, status, write_sidecars=False
+                )
+                formula = next(
+                    record
+                    for record in result["records"]
+                    if record["kind"] == "formula"
+                )
+                self.assertIn("unsafe_or_missing_source_asset", formula["reasons"])
+                self.assertEqual(outside.read_bytes(), b"outside")
+                self.assertFalse(result["ok"])
+            finally:
+                outside.unlink(missing_ok=True)
+
+    def test_visual_annotation_without_overlap_is_not_skipped(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            document, metadata, status = _fixture(root)
+            candidate = status["quality_signals"]["structural_quarantine_qc"][
+                "candidates"
+            ][0]
+            candidate.pop("picture_overlap")
+
+            result = evaluate_regions(
+                root, document, metadata, status, write_sidecars=False
+            )
+            picture_ocr = next(
+                record for record in result["records"] if record["kind"] == "picture_ocr"
+            )
+
+            self.assertIn("picture_overlap_unproven", picture_ocr["reasons"])
+            self.assertFalse(result["ok"])
+
+    def test_oversized_residual_surface_list_fails_closed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            document, metadata, status = _fixture(root)
+            status["quality_signals"]["structural_quarantine_qc"]["candidates"][0][
+                "final_output_residual_surfaces"
+            ] = [f"surface-{index}" for index in range(33)]
+
+            result = evaluate_regions(
+                root, document, metadata, status, write_sidecars=False
+            )
+            picture_ocr = next(
+                record for record in result["records"] if record["kind"] == "picture_ocr"
+            )
+
+            self.assertIn("residual_surface_schema_invalid", picture_ocr["reasons"])
+            self.assertLessEqual(
+                len(picture_ocr["signals"]["residual_surfaces"]), 32
+            )
+            self.assertFalse(result["ok"])
+
+    def test_manifest_algorithm_alias_is_resolved(self):
+        entry = {"source_ref": "#/texts/algorithm-0", "kind": "algorithm"}
+        metadata = {"structural_visual_provenance_manifest": {"algorithms": [entry]}}
+        self.assertEqual(_manifest_entry(metadata, "algorithm", "#/texts/algorithm-0"), entry)
+
+    def test_source_identity_conflict_and_actual_source_mismatch_fail_closed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "source.pdf").write_bytes(b"source")
+            result = evaluate_regions(
+                root,
+                {"pictures": []},
+                {"input_sha256": "b" * 64},
+                {"ok": True, "quality_signals": {}, "warnings": []},
+                write_sidecars=False,
+            )
+            self.assertFalse(result["ok"])
+            self.assertIn("source_pdf_actual_hash_mismatch", result["failure_reasons"])
+
+    def test_missing_source_pdf_fails_closed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            document, metadata, status = _fixture(root)
+            (root / "source.pdf").unlink()
+
+            result = evaluate_regions(
+                root, document, metadata, status, write_sidecars=False
+            )
+
+            self.assertIn("source_pdf_missing_or_unsafe", result["failure_reasons"])
+            self.assertFalse(result["ok"])
+
+    def test_malformed_state_json_is_not_overwritten(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "document.json").write_text("{}", encoding="utf-8")
+            metadata_bytes = b"{not-json"
+            status_bytes = b"[not-an-object]"
+            (root / "metadata.json").write_bytes(metadata_bytes)
+            (root / "status.json").write_bytes(status_bytes)
+            result = evaluate_regions(root, write_sidecars=True)
+            self.assertFalse(result["ok"])
+            self.assertEqual((root / "metadata.json").read_bytes(), metadata_bytes)
+            self.assertEqual((root / "status.json").read_bytes(), status_bytes)
+
+    def test_valid_non_object_state_json_is_not_overwritten(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "document.json").write_text("{}", encoding="utf-8")
+            (root / "source.pdf").write_bytes(SOURCE_BYTES)
+            metadata_bytes = b"[]"
+            status_bytes = b"null"
+            (root / "metadata.json").write_bytes(metadata_bytes)
+            (root / "status.json").write_bytes(status_bytes)
+
+            result = evaluate_regions(root, write_sidecars=True)
+
+            self.assertFalse(result["ok"])
+            self.assertIn("metadata_json_invalid", result["failure_reasons"])
+            self.assertIn("status_json_invalid", result["failure_reasons"])
+            self.assertEqual((root / "metadata.json").read_bytes(), metadata_bytes)
+            self.assertEqual((root / "status.json").read_bytes(), status_bytes)
+
+    def test_empty_document_fails_closed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "source.pdf").write_bytes(SOURCE_BYTES)
+
+            result = evaluate_regions(
+                root,
+                {},
+                {"input_sha256": SOURCE_SHA},
+                {"ok": True, "quality_signals": {}, "warnings": []},
+                write_sidecars=False,
+            )
+
+            self.assertIn("document_json_empty", result["failure_reasons"])
+            self.assertFalse(result["ok"])
+
+    def test_formula_and_inline_extra_candidates_fail_closed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            document, metadata, status = _fixture(root)
+            visuals = status["quality_signals"]["final_source_visuals"]
+            extra_formula = dict(
+                visuals["formula_source_renderings"]["candidates"][0]
+            )
+            extra_formula["formula_index"] = 2
+            visuals["formula_source_renderings"]["candidates"].append(extra_formula)
+            visuals["inline_math_source_renderings"]["candidates"].append(
+                {
+                    "anchor": "inline:extra",
+                    "image": "inline_math/0001-inline-1.png",
+                    "page_no": 1,
+                    "bbox": BBOX,
+                }
+            )
+
+            result = evaluate_regions(
+                root, document, metadata, status, write_sidecars=False
+            )
+            formula = next(
+                record for record in result["records"] if record["kind"] == "formula"
+            )
+            inline = next(
+                record for record in result["records"] if record["kind"] == "inline_math"
+            )
+
+            self.assertIn("formula_candidate_index_set_mismatch", formula["reasons"])
+            self.assertIn("inline_math_candidate_anchor_set_mismatch", inline["reasons"])
+            self.assertFalse(result["ok"])
+
+    def test_table_bounds_span_and_overlap_are_critical(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            document, metadata, status = _fixture(root)
+            cells = document["tables"][0]["data"]["table_cells"]
+            cells[0]["end_col_offset_idx"] = 3
+            cells[0]["col_span"] = 3
+            cells[1]["row_span"] = 2
+            cells[3]["start_row_offset_idx"] = 99
+            cells[3]["end_row_offset_idx"] = 100
+            cells.append(dict(cells[2]))
+            result = evaluate_regions(root, document, metadata, status, write_sidecars=False)
+            table = next(record for record in result["records"] if record["kind"] == "table")
+            self.assertIn("table_cell_bounds_invalid", table["reasons"])
+            self.assertIn("table_cell_span_invalid", table["reasons"])
+            self.assertIn("table_cell_overlap", table["reasons"])
+            self.assertFalse(result["ok"])
+
+    def test_legal_uncertainty_and_range_cells_do_not_trigger_collapsed_rows(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            document, metadata, status = _fixture(root)
+            data = document["tables"][0]["data"]
+            data["num_cols"] = 4
+            data["table_cells"].extend(
+                [
+                    {
+                        "start_row_offset_idx": 1,
+                        "end_row_offset_idx": 2,
+                        "start_col_offset_idx": col,
+                        "end_col_offset_idx": col + 1,
+                        "row_span": 1,
+                        "col_span": 1,
+                        "text": text,
+                        "bbox": {"l": 90 + col * 40, "r": 125 + col * 40, "t": 22, "b": 52},
+                    }
+                    for col, text in ((2, "98.5 ± 0.2"), (3, "[98.2, 99.1]"))
+                ]
+            )
+            result = evaluate_regions(root, document, metadata, status, write_sidecars=False)
+            table = next(record for record in result["records"] if record["kind"] == "table")
+            self.assertNotIn("table_row_likely_collapsed", table["reasons"])
+
+    def test_chunk_part_source_refs_are_deterministic_and_bounded(self):
+        document = {
+            "chunks": [
+                {
+                    "page_range": [2, 2],
+                    "document": {"texts": [{"label": "text", "self_ref": "#/texts/0"}]},
+                },
+                {
+                    "page_range": [1, 1],
+                    "document": {"texts": [{"label": "text", "self_ref": "#/texts/0"}]},
+                },
+            ]
+        }
+        refs = [item["source_ref"] for item in _document_nodes(document, {"text"})]
+        self.assertEqual(sorted(refs), ["chunk:0:#/texts/0", "chunk:1:#/texts/0"])
+
+    def test_chunk_table_topology_uses_canonical_chunk_ref(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            document, _metadata, _status = _fixture(Path(temporary))
+            table = document["tables"][0]
+            table["_local_ai_lab_chunk_part_index"] = 2
+            table["data"]["table_cells"].extend(
+                [
+                    {
+                        "start_row_offset_idx": 1,
+                        "end_row_offset_idx": 2,
+                        "start_col_offset_idx": column,
+                        "end_col_offset_idx": column + 1,
+                        "row_span": 1,
+                        "col_span": 1,
+                        "text": values,
+                        "bbox": {
+                            "l": 90 + column * 40,
+                            "r": 125 + column * 40,
+                            "t": 22,
+                            "b": 52,
+                        },
+                    }
+                    for column, values in (
+                        (2, "98.5 90.5 95.2"),
+                        (3, "98.2 87.7 93.2"),
+                    )
+                ]
+            )
+            table["data"]["num_cols"] = 4
+            chunked = {
+                "chunks": [
+                    {
+                        "page_range": [1, 1],
+                        "document": {"tables": [table]},
+                    }
+                ]
+            }
+
+            diagnostics = _table_topology_diagnostics(chunked)
+
+            self.assertIn("chunk:2:#/tables/0", diagnostics)
+            self.assertIn(
+                "table_row_likely_collapsed",
+                diagnostics["chunk:2:#/tables/0"]["reasons"],
+            )
 
 
 if __name__ == "__main__":  # pragma: no cover
