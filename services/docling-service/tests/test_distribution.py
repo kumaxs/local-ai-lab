@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import json
 import zipfile
 import subprocess
@@ -8,10 +9,13 @@ import sys
 import tarfile
 import os
 import shutil
+import stat
 import tempfile
 import unittest
+import warnings
 from pathlib import Path
 import re
+from typing import Callable
 
 from docling_service.formula_api import FORMULA_SERVICE_VERSION
 from docling_service.release import RELEASE_VERSION
@@ -104,8 +108,70 @@ class DistributionTests(unittest.TestCase):
             RELEASE_ROOT / "RELEASE_NOTES.md",
         ):
             self.assertIn(RELEASE_VERSION, path.read_text(encoding="utf-8"))
+        bundle_readme = (RELEASE_ROOT / "BUNDLE_README.md").read_text(encoding="utf-8")
+        self.assertIn(f"# Docling Service {RELEASE_VERSION} distribution bundle", bundle_readme)
+        self.assertIn(f"docling-service-{RELEASE_VERSION}.tar.gz.sha256", bundle_readme)
+        self.assertIn(f"immutable `{RELEASE_VERSION}` image tags", bundle_readme)
+        installer_text = (SERVICE_ROOT / "deploy/macos/install.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(
+            f'print "Installed docling-service {RELEASE_VERSION} into', installer_text
+        )
         installer = (RELEASE_ROOT / "install-macos.sh").read_text(encoding="utf-8")
         self.assertIn("VERSION=$(<${SCRIPT_DIR}/VERSION)", installer)
+
+    def _rewrite_release_zip(
+        self,
+        source_path: Path,
+        target_path: Path,
+        *,
+        mutate: Callable[[dict[str, bytes]], None],
+        mutate_after_manifest: Callable[[dict[str, bytes]], None] | None = None,
+    ) -> Path:
+        payload: dict[str, bytes] = {}
+        with zipfile.ZipFile(source_path) as source:
+            root = ""
+            for name in source.namelist():
+                if not name or name.endswith("/"):
+                    continue
+                if not root:
+                    root = name.split("/", 1)[0]
+                payload[name] = source.read(name)
+        if not root:
+            raise AssertionError("invalid archive content")
+        mutate(payload)
+        manifest_path = f"{root}/RELEASE_MANIFEST.json"
+        manifest = json.loads(payload[manifest_path].decode("utf-8"))
+        entry_by_path = {
+            str(entry.get("path")): entry
+            for entry in manifest.get("files", [])
+            if isinstance(entry, dict) and entry.get("path") is not None
+        }
+        refreshed_files = []
+        for name, data in sorted(payload.items()):
+            relative = name[len(root) + 1 :]
+            if relative == "RELEASE_MANIFEST.json":
+                continue
+            old_entry = entry_by_path.get(relative, {})
+            refreshed_files.append(
+                {
+                    "path": relative,
+                    "sha256": hashlib.sha256(data).hexdigest(),
+                    "size": len(data),
+                    "executable": bool(old_entry.get("executable", False)),
+                }
+            )
+        manifest["files"] = refreshed_files
+        payload[manifest_path] = (
+            json.dumps(manifest, indent=2, sort_keys=True).encode("utf-8") + b"\n"
+        )
+        if mutate_after_manifest is not None:
+            mutate_after_manifest(payload)
+        with zipfile.ZipFile(target_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as target:
+            for name, data in sorted(payload.items()):
+                target.writestr(name, data)
+        return target_path
 
     def test_release_compose_uses_prebuilt_portable_images(self) -> None:
         compose = (SERVICE_ROOT / "deploy/docker/compose.release.yaml").read_text(encoding="utf-8")
@@ -442,6 +508,607 @@ class DistributionTests(unittest.TestCase):
                         sys.executable,
                         str(RELEASE_ROOT / "verify_release_bundle.py"),
                         str(bad_zip),
+                    ],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+
+    def test_release_verification_rejects_zip_links_and_duplicate_members(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "output"
+            subprocess.run(
+                [
+                    sys.executable,
+                    str(RELEASE_ROOT / "build_release_bundle.py"),
+                    "--source-root",
+                    str(REPO_ROOT),
+                    "--output-dir",
+                    str(output),
+                    "--version",
+                    RELEASE_VERSION,
+                    "--commit",
+                    "0" * 40,
+                    "--epoch",
+                    "1785816000",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            source_zip = output / f"docling-service-{RELEASE_VERSION}.zip"
+            link_zip = output / f"docling-service-{RELEASE_VERSION}-link.zip"
+            target_suffix = (
+                "/services/docling-service/deploy/macos/install.sh"
+            )
+            with zipfile.ZipFile(source_zip) as source, zipfile.ZipFile(
+                link_zip,
+                "w",
+                compression=zipfile.ZIP_DEFLATED,
+                compresslevel=9,
+            ) as target:
+                for item in source.infolist():
+                    if item.filename.endswith(target_suffix):
+                        item.create_system = 3
+                        item.external_attr = (stat.S_IFLNK | 0o777) << 16
+                    target.writestr(item, source.read(item.filename))
+            with self.assertRaises(subprocess.CalledProcessError):
+                subprocess.run(
+                    [
+                        sys.executable,
+                        str(RELEASE_ROOT / "verify_release_bundle.py"),
+                        str(link_zip),
+                    ],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+
+            duplicate_zip = (
+                output / f"docling-service-{RELEASE_VERSION}-duplicate-member.zip"
+            )
+            with zipfile.ZipFile(source_zip) as source, zipfile.ZipFile(
+                duplicate_zip,
+                "w",
+                compression=zipfile.ZIP_DEFLATED,
+                compresslevel=9,
+            ) as target:
+                duplicate_item = None
+                duplicate_data = None
+                for item in source.infolist():
+                    data = source.read(item.filename)
+                    target.writestr(item, data)
+                    if item.filename.endswith(target_suffix):
+                        duplicate_item = item
+                        duplicate_data = data
+                self.assertIsNotNone(duplicate_item)
+                self.assertIsNotNone(duplicate_data)
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", UserWarning)
+                    target.writestr(duplicate_item, duplicate_data)
+            with self.assertRaises(subprocess.CalledProcessError):
+                subprocess.run(
+                    [
+                        sys.executable,
+                        str(RELEASE_ROOT / "verify_release_bundle.py"),
+                        str(duplicate_zip),
+                    ],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+
+    def test_bundle_build_rejects_version_requests_that_disagree_with_sources(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "output"
+            command = [
+                sys.executable,
+                str(RELEASE_ROOT / "build_release_bundle.py"),
+                "--source-root",
+                str(REPO_ROOT),
+                "--output-dir",
+                str(output),
+                "--version",
+                "9.9.9",
+                "--commit",
+                "0" * 40,
+                "--epoch",
+                "1785816000",
+            ]
+            with self.assertRaises(subprocess.CalledProcessError):
+                subprocess.run(command, check=True, capture_output=True, text=True)
+            self.assertFalse(output.exists())
+            self.assertFalse((output / "docling-service-9.9.9.tar.gz").is_file())
+            self.assertFalse((output / "docling-service-9.9.9.zip").is_file())
+            self.assertFalse((output / "SHA256SUMS").is_file())
+
+    def test_bundle_build_rejects_source_version_drift_before_writing_outputs(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            scratch_root = Path(directory) / "source"
+            scratch_services = scratch_root / "services"
+            scratch_services.mkdir(parents=True)
+            shutil.copytree(
+                SERVICE_ROOT,
+                scratch_services / "docling-service",
+                ignore=shutil.ignore_patterns(
+                    ".venv", "__pycache__", "*.pyc", "*.egg-info"
+                ),
+            )
+            compose_path = (
+                scratch_services
+                / "docling-service/deploy/docker/compose.release.yaml"
+            )
+            compose = compose_path.read_text(encoding="utf-8")
+            wrong_version = "9.9.9" if RELEASE_VERSION != "9.9.9" else "9.9.8"
+            marker = f"DOCLING_VERSION:-{RELEASE_VERSION}"
+            self.assertIn(marker, compose)
+            compose_path.write_text(
+                compose.replace(marker, f"DOCLING_VERSION:-{wrong_version}", 1),
+                encoding="utf-8",
+            )
+            output = Path(directory) / "output"
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(RELEASE_ROOT / "build_release_bundle.py"),
+                    "--source-root",
+                    str(scratch_root),
+                    "--output-dir",
+                    str(output),
+                    "--version",
+                    RELEASE_VERSION,
+                    "--commit",
+                    "0" * 40,
+                    "--epoch",
+                    "1785816000",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(0, result.returncode)
+            self.assertIn("inconsistent across services", result.stderr)
+            self.assertFalse(output.exists())
+
+    def test_python39_toml_fallback_rejects_duplicate_or_malformed_project_data(self) -> None:
+        source = (SERVICE_ROOT / "pyproject.toml").read_text(encoding="utf-8")
+        duplicate = source + f'\n[project]\nversion = "{RELEASE_VERSION}"\n'
+        malformed = source + "\nnot valid toml =\n"
+        concatenated = source.replace(
+            f'version = "{RELEASE_VERSION}"',
+            'version = "1.1." "1"',
+            1,
+        )
+        for script_name in ("build_release_bundle.py", "verify_release_bundle.py"):
+            with self.subTest(script=script_name):
+                script_path = RELEASE_ROOT / script_name
+                spec = importlib.util.spec_from_file_location(
+                    f"_test_{script_path.stem}", script_path
+                )
+                self.assertIsNotNone(spec)
+                self.assertIsNotNone(spec.loader)
+                module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(module)
+                module.tomllib = None
+                if script_name == "build_release_bundle.py":
+                    with tempfile.TemporaryDirectory() as directory:
+                        pyproject = Path(directory) / "pyproject.toml"
+                        pyproject.write_text(source, encoding="utf-8")
+                        self.assertEqual(
+                            RELEASE_VERSION, module._extract_toml_version(pyproject)
+                        )
+                        pyproject.write_text(duplicate, encoding="utf-8")
+                        with self.assertRaisesRegex(ValueError, "duplicate TOML section"):
+                            module._extract_toml_version(pyproject)
+                        pyproject.write_text(malformed, encoding="utf-8")
+                        with self.assertRaisesRegex(ValueError, "invalid TOML assignment"):
+                            module._extract_toml_version(pyproject)
+                        pyproject.write_text(concatenated, encoding="utf-8")
+                        with self.assertRaisesRegex(ValueError, "TOML"):
+                            module._extract_toml_version(pyproject)
+                else:
+                    path = "services/docling-service/pyproject.toml"
+                    self.assertEqual(
+                        RELEASE_VERSION,
+                        module._extract_toml_version(
+                            path, content=source.encode("utf-8")
+                        ),
+                    )
+                    with self.assertRaisesRegex(ValueError, "duplicate TOML section"):
+                        module._extract_toml_version(
+                            path, content=duplicate.encode("utf-8")
+                        )
+                    with self.assertRaisesRegex(ValueError, "invalid TOML assignment"):
+                        module._extract_toml_version(
+                            path, content=malformed.encode("utf-8")
+                        )
+                    with self.assertRaisesRegex(ValueError, "TOML"):
+                        module._extract_toml_version(
+                            path, content=concatenated.encode("utf-8")
+                        )
+
+    def test_verifier_rejects_tampered_manifest_images_or_compose_defaults(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "output"
+            command = [
+                sys.executable,
+                str(RELEASE_ROOT / "build_release_bundle.py"),
+                "--source-root",
+                str(REPO_ROOT),
+                "--output-dir",
+                str(output),
+                "--version",
+                RELEASE_VERSION,
+                "--commit",
+                "0" * 40,
+                "--epoch",
+                "1785816000",
+            ]
+            subprocess.run(command, check=True, capture_output=True, text=True)
+            source_zip = output / f"docling-service-{RELEASE_VERSION}.zip"
+            wrong_version = "9.9.9" if RELEASE_VERSION != "9.9.9" else "9.9.8"
+            root_prefix = f"docling-service-{RELEASE_VERSION}"
+
+            bad_duplicate_json_key = (
+                output
+                / f"docling-service-{RELEASE_VERSION}-duplicate-manifest-key.zip"
+            )
+
+            def mutate_duplicate_json_key(payload: dict[str, bytes]) -> None:
+                manifest_path = f"{root_prefix}/RELEASE_MANIFEST.json"
+                manifest = payload[manifest_path].decode("utf-8")
+                marker = (
+                    f'    "api": "ghcr.io/kumaxs/local-ai-lab-docling-api:'
+                    f'{RELEASE_VERSION}",'
+                )
+                self.assertEqual(1, manifest.count(marker))
+                payload[manifest_path] = manifest.replace(
+                    marker, marker + "\n" + marker, 1
+                ).encode("utf-8")
+
+            self._rewrite_release_zip(
+                source_zip,
+                bad_duplicate_json_key,
+                mutate=lambda payload: None,
+                mutate_after_manifest=mutate_duplicate_json_key,
+            )
+            with self.assertRaises(subprocess.CalledProcessError):
+                subprocess.run(
+                    [
+                        sys.executable,
+                        str(RELEASE_ROOT / "verify_release_bundle.py"),
+                        str(bad_duplicate_json_key),
+                    ],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+
+            bad_readme_versions = (
+                output
+                / f"docling-service-{RELEASE_VERSION}-conflicting-readme-version.zip"
+            )
+
+            def mutate_readme_versions(payload: dict[str, bytes]) -> None:
+                readme_path = f"{root_prefix}/README.md"
+                readme = payload[readme_path].decode("utf-8")
+                payload[readme_path] = (
+                    readme
+                    + f"\n# Docling Service {wrong_version} distribution bundle\n"
+                ).encode("utf-8")
+
+            self._rewrite_release_zip(
+                source_zip,
+                bad_readme_versions,
+                mutate=mutate_readme_versions,
+            )
+            with self.assertRaises(subprocess.CalledProcessError):
+                subprocess.run(
+                    [
+                        sys.executable,
+                        str(RELEASE_ROOT / "verify_release_bundle.py"),
+                        str(bad_readme_versions),
+                    ],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+
+            bad_commented_installer_version = (
+                output
+                / f"docling-service-{RELEASE_VERSION}-commented-installer-version.zip"
+            )
+
+            def mutate_commented_installer_version(
+                payload: dict[str, bytes],
+            ) -> None:
+                installer_path = (
+                    f"{root_prefix}/services/docling-service/deploy/macos/install.sh"
+                )
+                installer = payload[installer_path].decode("utf-8")
+                marker = (
+                    f'print "Installed docling-service {RELEASE_VERSION} '
+                    'into ${VENV_DIR}"'
+                )
+                self.assertEqual(1, installer.count(marker))
+                payload[installer_path] = installer.replace(
+                    marker, "# " + marker, 1
+                ).encode("utf-8")
+
+            self._rewrite_release_zip(
+                source_zip,
+                bad_commented_installer_version,
+                mutate=mutate_commented_installer_version,
+            )
+            with self.assertRaises(subprocess.CalledProcessError):
+                subprocess.run(
+                    [
+                        sys.executable,
+                        str(RELEASE_ROOT / "verify_release_bundle.py"),
+                        str(bad_commented_installer_version),
+                    ],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+
+            bad_commented_readme_checksum = (
+                output
+                / f"docling-service-{RELEASE_VERSION}-commented-readme-checksum.zip"
+            )
+
+            def mutate_commented_readme_checksum(
+                payload: dict[str, bytes],
+            ) -> None:
+                readme_path = f"{root_prefix}/README.md"
+                readme = payload[readme_path].decode("utf-8")
+                marker = (
+                    f"shasum -a 256 -c "
+                    f"docling-service-{RELEASE_VERSION}.tar.gz.sha256"
+                )
+                self.assertEqual(1, readme.count(marker))
+                payload[readme_path] = readme.replace(
+                    marker, f"<!-- {marker} -->", 1
+                ).encode("utf-8")
+
+            self._rewrite_release_zip(
+                source_zip,
+                bad_commented_readme_checksum,
+                mutate=mutate_commented_readme_checksum,
+            )
+            with self.assertRaises(subprocess.CalledProcessError):
+                subprocess.run(
+                    [
+                        sys.executable,
+                        str(RELEASE_ROOT / "verify_release_bundle.py"),
+                        str(bad_commented_readme_checksum),
+                    ],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+
+            bad_unclosed_readme_comment = (
+                output
+                / f"docling-service-{RELEASE_VERSION}-unclosed-readme-comment.zip"
+            )
+
+            def mutate_unclosed_readme_comment(
+                payload: dict[str, bytes],
+            ) -> None:
+                readme_path = f"{root_prefix}/README.md"
+                readme = payload[readme_path].decode("utf-8")
+                marker = (
+                    f"shasum -a 256 -c "
+                    f"docling-service-{RELEASE_VERSION}.tar.gz.sha256"
+                )
+                self.assertEqual(1, readme.count(marker))
+                payload[readme_path] = readme.replace(
+                    marker, "<!--\n" + marker, 1
+                ).encode("utf-8")
+
+            self._rewrite_release_zip(
+                source_zip,
+                bad_unclosed_readme_comment,
+                mutate=mutate_unclosed_readme_comment,
+            )
+            with self.assertRaises(subprocess.CalledProcessError):
+                subprocess.run(
+                    [
+                        sys.executable,
+                        str(RELEASE_ROOT / "verify_release_bundle.py"),
+                        str(bad_unclosed_readme_comment),
+                    ],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+
+            bad_manifest = output / f"docling-service-{RELEASE_VERSION}-tampered-images.zip"
+
+            def mutate_images(payload: dict[str, bytes]) -> None:
+                manifest_path = f"{root_prefix}/RELEASE_MANIFEST.json"
+                manifest = json.loads(payload[manifest_path].decode("utf-8"))
+                manifest["docker_images"] = {
+                    service: value.rsplit(":", 1)[0] + f":{wrong_version}"
+                    for service, value in manifest["docker_images"].items()
+                }
+                payload[manifest_path] = (
+                    json.dumps(manifest, indent=2, sort_keys=True).encode("utf-8") + b"\n"
+                )
+
+            self._rewrite_release_zip(
+                source_zip,
+                bad_manifest,
+                mutate=mutate_images,
+            )
+            with self.assertRaises(subprocess.CalledProcessError):
+                subprocess.run(
+                    [
+                        sys.executable,
+                        str(RELEASE_ROOT / "verify_release_bundle.py"),
+                        str(bad_manifest),
+                    ],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+
+            bad_service_map = (
+                output
+                / f"docling-service-{RELEASE_VERSION}-tampered-image-services.zip"
+            )
+
+            def mutate_image_services(payload: dict[str, bytes]) -> None:
+                manifest_path = f"{root_prefix}/RELEASE_MANIFEST.json"
+                manifest = json.loads(payload[manifest_path].decode("utf-8"))
+                images = manifest["docker_images"]
+                images["api"], images["backend"] = images["backend"], images["api"]
+                payload[manifest_path] = (
+                    json.dumps(manifest, indent=2, sort_keys=True).encode("utf-8")
+                    + b"\n"
+                )
+
+            self._rewrite_release_zip(
+                source_zip,
+                bad_service_map,
+                mutate=mutate_image_services,
+            )
+            with self.assertRaises(subprocess.CalledProcessError):
+                subprocess.run(
+                    [
+                        sys.executable,
+                        str(RELEASE_ROOT / "verify_release_bundle.py"),
+                        str(bad_service_map),
+                    ],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+
+            bad_duplicate_service = (
+                output
+                / f"docling-service-{RELEASE_VERSION}-duplicate-compose-service.zip"
+            )
+
+            def mutate_duplicate_service(payload: dict[str, bytes]) -> None:
+                compose_path = f"{root_prefix}/services/docling-service/deploy/docker/compose.release.yaml"
+                compose = payload[compose_path].decode("utf-8")
+                root_volumes = "\nvolumes:\n"
+                self.assertIn(root_volumes, compose)
+                payload[compose_path] = compose.replace(
+                    root_volumes,
+                    "\n  api:\n    environment:\n      FOO: bar\n" + root_volumes,
+                    1,
+                ).encode("utf-8")
+
+            self._rewrite_release_zip(
+                source_zip,
+                bad_duplicate_service,
+                mutate=mutate_duplicate_service,
+            )
+            with self.assertRaises(subprocess.CalledProcessError):
+                subprocess.run(
+                    [
+                        sys.executable,
+                        str(RELEASE_ROOT / "verify_release_bundle.py"),
+                        str(bad_duplicate_service),
+                    ],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+
+            bad_unknown_service = (
+                output
+                / f"docling-service-{RELEASE_VERSION}-unknown-compose-service.zip"
+            )
+
+            def mutate_unknown_service(payload: dict[str, bytes]) -> None:
+                compose_path = f"{root_prefix}/services/docling-service/deploy/docker/compose.release.yaml"
+                compose = payload[compose_path].decode("utf-8")
+                root_volumes = "\nvolumes:\n"
+                self.assertIn(root_volumes, compose)
+                payload[compose_path] = compose.replace(
+                    root_volumes,
+                    (
+                        "\n  evil:\n"
+                        "    image: attacker.example/pwn:latest\n"
+                        + root_volumes
+                    ),
+                    1,
+                ).encode("utf-8")
+
+            self._rewrite_release_zip(
+                source_zip,
+                bad_unknown_service,
+                mutate=mutate_unknown_service,
+            )
+            with self.assertRaises(subprocess.CalledProcessError):
+                subprocess.run(
+                    [
+                        sys.executable,
+                        str(RELEASE_ROOT / "verify_release_bundle.py"),
+                        str(bad_unknown_service),
+                    ],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+
+            bad_services_root = (
+                output
+                / f"docling-service-{RELEASE_VERSION}-missing-services-root.zip"
+            )
+
+            def mutate_services_root(payload: dict[str, bytes]) -> None:
+                compose_path = f"{root_prefix}/services/docling-service/deploy/docker/compose.release.yaml"
+                compose = payload[compose_path].decode("utf-8")
+                self.assertEqual(1, compose.count("\nservices:\n"))
+                payload[compose_path] = compose.replace(
+                    "\nservices:\n", "\nnotservices:\n", 1
+                ).encode("utf-8")
+
+            self._rewrite_release_zip(
+                source_zip,
+                bad_services_root,
+                mutate=mutate_services_root,
+            )
+            with self.assertRaises(subprocess.CalledProcessError):
+                subprocess.run(
+                    [
+                        sys.executable,
+                        str(RELEASE_ROOT / "verify_release_bundle.py"),
+                        str(bad_services_root),
+                    ],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+
+            bad_compose = output / f"docling-service-{RELEASE_VERSION}-tampered-compose.zip"
+
+            def mutate_compose(payload: dict[str, bytes]) -> None:
+                compose_path = f"{root_prefix}/services/docling-service/deploy/docker/compose.release.yaml"
+                compose = payload[compose_path].decode("utf-8")
+                marker = f"DOCLING_VERSION:-{RELEASE_VERSION}"
+                self.assertIn(marker, compose)
+                compose = compose.replace(
+                    marker, f"DOCLING_VERSION:-{wrong_version}", 1
+                )
+                payload[compose_path] = compose.encode("utf-8")
+
+            self._rewrite_release_zip(
+                source_zip,
+                bad_compose,
+                mutate=mutate_compose,
+            )
+            with self.assertRaises(subprocess.CalledProcessError):
+                subprocess.run(
+                    [
+                        sys.executable,
+                        str(RELEASE_ROOT / "verify_release_bundle.py"),
+                        str(bad_compose),
                     ],
                     check=True,
                     capture_output=True,
