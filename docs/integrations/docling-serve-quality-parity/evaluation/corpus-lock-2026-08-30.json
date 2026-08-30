@@ -1,0 +1,73 @@
+{
+  "schema_version": 1,
+  "lock_id": "docling-region-quality-2026-08-30",
+  "selected_at": "2026-08-30T03:18:22Z",
+  "selection_basis": "official arXiv metadata only; no candidate PDF or rendered page inspected before this lock",
+  "deduplication": {
+    "document_level": true,
+    "version_level": true,
+    "sha256_required_after_download": true
+  },
+  "candidates": [
+    {
+      "id": "calibration-longdocbench-2608.15064",
+      "split": "calibration",
+      "title": "LongDocBench: Benchmarking TOC Hierarchy and Contextual Relationship Recovery in Long Documents",
+      "source": "arXiv",
+      "source_id": "2608.15064",
+      "abstract_url": "https://arxiv.org/abs/2608.15064",
+      "pdf_url": "https://arxiv.org/pdf/2608.15064",
+      "focus": ["long_document", "table", "figure", "header_footer", "reading_order"],
+      "downloaded_at": null,
+      "resolved_url": null,
+      "size_bytes": null,
+      "sha256": null,
+      "content_inspected": false
+    },
+    {
+      "id": "calibration-pseudo2codeqa-2608.09068",
+      "split": "calibration",
+      "title": "Pseudo2CodeQA: A Benchmark for LLM-Based Structured Algorithmic Reasoning in Code Generation",
+      "source": "arXiv",
+      "source_id": "2608.09068",
+      "abstract_url": "https://arxiv.org/abs/2608.09068",
+      "pdf_url": "https://arxiv.org/pdf/2608.09068",
+      "focus": ["algorithm", "pseudocode", "code", "indentation", "table"],
+      "downloaded_at": null,
+      "resolved_url": null,
+      "size_bytes": null,
+      "sha256": null,
+      "content_inspected": false
+    },
+    {
+      "id": "calibration-ppformulanet-2503.18382",
+      "split": "calibration",
+      "title": "PP-FormulaNet: Bridging Accuracy and Efficiency in Advanced Formula Recognition",
+      "source": "arXiv",
+      "source_id": "2503.18382",
+      "abstract_url": "https://arxiv.org/abs/2503.18382",
+      "pdf_url": "https://arxiv.org/pdf/2503.18382",
+      "focus": ["display_formula", "inline_math", "math_symbols", "table", "figure"],
+      "downloaded_at": null,
+      "resolved_url": null,
+      "size_bytes": null,
+      "sha256": null,
+      "content_inspected": false
+    },
+    {
+      "id": "sealed-doc2db-2608.08459",
+      "split": "sealed",
+      "title": "Beyond Tables: Doc2DB-Bench for Relationally Faithful Document-to-Database Construction",
+      "source": "arXiv",
+      "source_id": "2608.08459",
+      "abstract_url": "https://arxiv.org/abs/2608.08459",
+      "pdf_url": "https://arxiv.org/pdf/2608.08459",
+      "focus": ["table", "figure", "long_document", "relational_structure"],
+      "downloaded_at": null,
+      "resolved_url": null,
+      "size_bytes": null,
+      "sha256": null,
+      "content_inspected": false
+    }
+  ]
+}
