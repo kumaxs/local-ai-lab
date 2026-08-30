@@ -23,7 +23,8 @@ import os
 import re
 import stat
 import statistics
-import tempfile
+import unicodedata
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -65,6 +66,48 @@ _ASSET_PREFIXES = {
     "formula": ("formulas/",),
     "inline_math": ("inline_math/",),
 }
+
+# A single evaluation pins the output directory to the directory inode opened
+# here.  Every asset read and sidecar write below then uses a dup of this fd;
+# replacing/renaming the path during validation cannot redirect an operation
+# into an attacker-controlled directory.  ContextVar keeps nested/concurrent
+# callers from sharing a mutable process-global handle.
+_ROOT_CONTEXT: ContextVar[tuple[str, int, int, int] | None] = ContextVar(
+    "region_quality_root_context", default=None
+)
+
+
+def _root_context_for(root: Path) -> tuple[str, int, int, int] | None:
+    context = _ROOT_CONTEXT.get()
+    if context is None:
+        return None
+    root_key = os.path.abspath(os.fspath(root))
+    return context if context[0] == root_key else None
+
+
+def _open_root_dir(root: Path) -> tuple[int, os.stat_result]:
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(os.fspath(root), flags)
+    try:
+        stat_result = os.fstat(fd)
+        if not stat.S_ISDIR(stat_result.st_mode):
+            raise OSError("output_root_not_directory")
+        return fd, stat_result
+    except Exception:
+        os.close(fd)
+        raise
+
+
+def _root_path_matches_context(root: Path, context: tuple[str, int, int, int]) -> bool:
+    try:
+        stat_result = os.stat(os.fspath(root), follow_symlinks=False)
+    except OSError:
+        return False
+    return bool(
+        stat.S_ISDIR(stat_result.st_mode)
+        and stat_result.st_dev == context[2]
+        and stat_result.st_ino == context[3]
+    )
 
 
 def _text(value: Any, limit: int = 240) -> str:
@@ -336,7 +379,13 @@ def _open_relative(root: Path, relative: str, *, max_bytes: int) -> int:
         raise ValueError("unsafe_relative_path")
     nofollow = getattr(os, "O_NOFOLLOW", 0)
     directory_flag = getattr(os, "O_DIRECTORY", 0)
-    root_fd = os.open(str(root), os.O_RDONLY | directory_flag | nofollow)
+    context = _root_context_for(root)
+    if context is not None:
+        # Duplicate the pinned descriptor so the caller owns the returned
+        # traversal's root handle while the evaluation context remains open.
+        root_fd = os.dup(context[1])
+    else:
+        root_fd = os.open(str(root), os.O_RDONLY | directory_flag | nofollow)
     current_fd = root_fd
     try:
         for part in rel_path.parts[:-1]:
@@ -426,32 +475,88 @@ def _read_json(path: Path) -> tuple[Any, str | None]:
 
 
 def _atomic_json(path: Path, payload: Any) -> str | None:
-    """Write a sidecar without following a pre-existing symlink."""
+    """Write a sidecar through the evaluation's pinned root directory fd.
 
-    if path.is_symlink():
-        return "sidecar_path_is_symlink"
+    A path-based ``mkstemp``/``replace`` pair is vulnerable when the output
+    directory is renamed and replaced between validation and publication.  The
+    evaluator establishes ``_ROOT_CONTEXT`` once and all writes below use
+    ``*at``-style dirfd operations against that inode.  Calls made outside an
+    evaluation are rejected rather than silently falling back to a path race.
+    """
+
+    context = _root_context_for(path.parent)
+    if context is None:
+        return "sidecar_root_context_missing"
+    if not _root_path_matches_context(path.parent, context):
+        return "output_root_changed"
+    root_fd: int | None = None
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        fd, temporary = tempfile.mkstemp(
-            prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent)
-        )
-        temporary_path = Path(temporary)
+        root_fd = os.dup(context[1])
+    except OSError as exc:
+        return f"sidecar_write_failed:{type(exc).__name__}"
+    target_name = path.name
+    temp_name: str | None = None
+    temp_fd: int | None = None
+    try:
         try:
-            os.fchmod(fd, 0o600)
-            with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                json.dump(payload, handle, indent=2, ensure_ascii=False, sort_keys=True)
-                handle.write("\n")
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(temporary_path, path)
-        except Exception:
+            existing = os.lstat(target_name, dir_fd=root_fd)
+            if stat.S_ISLNK(existing.st_mode):
+                return "sidecar_path_is_symlink"
+        except FileNotFoundError:
+            pass
+        # Create the temporary inode directly below the pinned root.  Bounded
+        # retries avoid unbounded work if a hostile directory is crowded.
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+        for attempt in range(64):
+            candidate_name = f".{target_name}.{os.getpid()}.{attempt}.tmp"
             try:
-                temporary_path.unlink()
-            except OSError:
-                pass
-            raise
+                temp_fd = os.open(candidate_name, flags, 0o600, dir_fd=root_fd)
+                temp_name = candidate_name
+                break
+            except FileExistsError:
+                continue
+        if temp_fd is None or temp_name is None:
+            return "sidecar_temp_name_exhausted"
+        os.fchmod(temp_fd, 0o600)
+        with os.fdopen(temp_fd, "w", encoding="utf-8") as handle:
+            temp_fd = None
+            json.dump(payload, handle, indent=2, ensure_ascii=False, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        # Re-check the destination entry immediately before replacement; a
+        # newly-created symlink is never replaced by this writer.
+        try:
+            existing = os.lstat(target_name, dir_fd=root_fd)
+            if stat.S_ISLNK(existing.st_mode):
+                return "sidecar_path_is_symlink"
+        except FileNotFoundError:
+            pass
+        os.replace(temp_name, target_name, src_dir_fd=root_fd, dst_dir_fd=root_fd)
+        temp_name = None
+        # If the named root was swapped while writing, the fixed inode is still
+        # safe, but the caller must not advertise the sidecar under the new
+        # path.  Report failure so status.ok is forced false.
+        if not _root_path_matches_context(path.parent, context):
+            return "output_root_changed_after_write"
     except (OSError, TypeError, ValueError) as exc:
         return f"sidecar_write_failed:{type(exc).__name__}"
+    finally:
+        if temp_fd is not None:
+            try:
+                os.close(temp_fd)
+            except OSError:
+                pass
+        if temp_name is not None:
+            try:
+                os.unlink(temp_name, dir_fd=root_fd)
+            except OSError:
+                pass
+        if root_fd is not None:
+            try:
+                os.close(root_fd)
+            except OSError:
+                pass
     return None
 
 
@@ -594,15 +699,51 @@ def _candidate_map(source_visuals: dict[str, Any], kind: str) -> dict[str, dict[
     for payload in payloads:
         if not isinstance(payload, dict):
             continue
-        candidates = payload.get("candidates")
-        if not isinstance(candidates, list):
-            continue
-        for item in candidates[:MAX_LIST_ITEMS]:
-            if not isinstance(item, dict):
-                continue
-            ref = _source_ref(item.get("source_ref"))
-            if ref:
-                result[ref] = item
+        candidate_lists: list[list[Any]] = []
+        raw_candidates = payload.get("candidates")
+        if isinstance(raw_candidates, list):
+            candidate_lists.append(raw_candidates)
+        # ``recover_algorithm_blocks_in_outputs`` publishes production records
+        # under ``records`` and calls the crop ``source_image``.  Merge both
+        # compatibility arrays when both exist; an empty ``candidates`` array
+        # must not hide valid production records.
+        raw_records = payload.get("records") if kind == "algorithm" else None
+        if isinstance(raw_records, list):
+            candidate_lists.append(raw_records)
+        for candidates in candidate_lists:
+            for item in candidates[:MAX_LIST_ITEMS]:
+                if not isinstance(item, dict):
+                    continue
+                candidate = dict(item)
+                if not candidate.get("image") and candidate.get("source_image"):
+                    candidate["image"] = candidate.get("source_image")
+                ref = _source_ref(candidate.get("source_ref"))
+                if kind == "table" and ref in _ref_set(
+                    source_visuals, "algorithm_source_expected_refs"
+                ):
+                    continue
+                if kind == "table":
+                    explicit_marker = " ".join(
+                        _text(candidate.get(key), 80)
+                        for key in ("kind", "label", "original_label")
+                    ).casefold()
+                    algorithm_like = bool(
+                        candidate.get("algorithm_like") is True
+                        or candidate.get("is_algorithm") is True
+                        or "algorithm_like_table" in explicit_marker
+                    )
+                    if algorithm_like:
+                        continue
+                if ref:
+                    existing = result.get(ref)
+                    if existing is None:
+                        result[ref] = candidate
+                    else:
+                        # Preserve the first producer's values and fill only
+                        # absent fields from its compatibility twin.
+                        for key, value in candidate.items():
+                            if existing.get(key) in (None, "", [], {}):
+                                existing[key] = value
     return result
 
 
@@ -633,6 +774,17 @@ def _ref_list(source_visuals: dict[str, Any], key: str) -> tuple[list[str], list
     return normalised[:MAX_LIST_ITEMS], duplicates[:32]
 
 
+def _ref_items_invalid(value: Any) -> bool:
+    """Reject non-string/empty reference entries instead of silently dropping them."""
+
+    if not isinstance(value, (list, tuple, set)):
+        return False
+    for item in _bounded_values(value):
+        if not isinstance(item, str) or not _source_ref(item):
+            return True
+    return False
+
+
 def _candidate_duplicate_refs(source_visuals: dict[str, Any], kind: str) -> list[str]:
     payload_keys = [
         "structured_table_source_renderings" if kind == "table" else f"{kind}_source_renderings"
@@ -640,22 +792,84 @@ def _candidate_duplicate_refs(source_visuals: dict[str, Any], kind: str) -> list
     if kind == "table":
         payload_keys.append("empty_table_visual_fallbacks")
     duplicates: list[str] = []
-    seen: set[str] = set()
     for key in payload_keys:
         payload = source_visuals.get(key)
-        candidates = payload.get("candidates") if isinstance(payload, dict) else None
-        if not isinstance(candidates, list):
+        if not isinstance(payload, dict):
             continue
-        for item in candidates[:MAX_LIST_ITEMS]:
+        arrays = [payload.get("candidates")]
+        if kind == "algorithm":
+            arrays.append(payload.get("records"))
+        for candidates in arrays:
+            if not isinstance(candidates, list):
+                continue
+            # The same ref may legitimately appear once in each compatibility
+            # array.  Detect duplicates within an array, not across aliases.
+            seen: set[str] = set()
+            for item in candidates[:MAX_LIST_ITEMS]:
+                if not isinstance(item, dict):
+                    continue
+                ref = _source_ref(item.get("source_ref"))
+                if not ref:
+                    continue
+                if kind == "table" and ref in _ref_set(
+                    source_visuals, "algorithm_source_expected_refs"
+                ):
+                    continue
+                if ref in seen and ref not in duplicates:
+                    duplicates.append(ref)
+                seen.add(ref)
+    return duplicates[:32]
+
+
+def _candidate_alias_conflict_refs(
+    source_visuals: dict[str, Any], kind: str
+) -> list[str]:
+    """Reject contradictory evidence across compatibility arrays."""
+
+    if kind != "algorithm":
+        return []
+    payload = source_visuals.get("algorithm_source_renderings")
+    if not isinstance(payload, dict):
+        return []
+    candidates = payload.get("candidates")
+    records = payload.get("records")
+    if not isinstance(candidates, list) or not isinstance(records, list):
+        return []
+
+    def by_ref(items: list[Any]) -> dict[str, dict[str, Any]]:
+        result: dict[str, dict[str, Any]] = {}
+        for item in items[:MAX_LIST_ITEMS]:
             if not isinstance(item, dict):
                 continue
-            ref = _source_ref(item.get("source_ref"))
-            if not ref:
-                continue
-            if ref in seen and ref not in duplicates:
-                duplicates.append(ref)
-            seen.add(ref)
-    return duplicates[:32]
+            normalized = dict(item)
+            if not normalized.get("image") and normalized.get("source_image"):
+                normalized["image"] = normalized.get("source_image")
+            ref = _source_ref(normalized.get("source_ref"))
+            if ref:
+                result.setdefault(ref, normalized)
+        return result
+
+    left = by_ref(candidates)
+    right = by_ref(records)
+    conflicts: list[str] = []
+    keys = (
+        "image",
+        "page_no",
+        "bbox",
+        "page_span",
+        "page_bboxes",
+        "table_index",
+        "provenance_verified",
+    )
+    for ref in sorted(set(left) & set(right)):
+        if any(
+            left[ref].get(key) not in (None, "", [], {})
+            and right[ref].get(key) not in (None, "", [], {})
+            and left[ref].get(key) != right[ref].get(key)
+            for key in keys
+        ):
+            conflicts.append(ref)
+    return conflicts[:32]
 
 
 def _structural_visible_body_text(value: Any, *, html_markup: bool = False) -> str:
@@ -716,8 +930,132 @@ def _structural_body_identity(value: Any, *, html_markup: bool = False) -> str:
     return "\n".join(identities)
 
 
+def _algorithm_body_identity(value: Any) -> str:
+    """Mirror the adapter's algorithm line-number/soft-wrap identity."""
+
+    visible = _structural_visible_body_text(value)
+    lines = [
+        re.sub(r"^\s*(\d{1,3})\s*:\s*", r"\1 ", line)
+        for line in (visible.splitlines() or [visible])
+    ]
+    return " ".join(_structural_body_identity("\n".join(lines)).splitlines())
+
+
+def _algorithm_layout_visible_lines(lines: list[Any]) -> list[Any]:
+    """Select the same visible layout body used by the publishing adapter."""
+
+    if len(lines) < 3:
+        return lines
+    body_start = re.compile(
+        r"(?i)^\s*(?:Require|Ensure|Input|Output|Parameters?|Initialize|"
+        r"for\b.*\bdo\b|while\b|if\b|else\b|return\b|"
+        r"end(?:\s+(?:for|while|if))?\b|\d+\s*[:.]|"
+        r"[•\-\u2022]\s*(?:Sample|Update|Process|Train|Add|Modify|Set|Compute|Draw)\b|"
+        r"Sample|Update|Process|Train|Add|Modify|Set|Compute|Draw)"
+    )
+    start_index: int | None = None
+    for index, line in enumerate(lines[:MAX_LIST_ITEMS]):
+        if isinstance(line, dict) and body_start.match(
+            re.sub(r"\s+", " ", str(line.get("text") or "")).strip()
+        ):
+            start_index = index
+            break
+    visible = lines[:MAX_LIST_ITEMS] if start_index is None else lines[start_index:MAX_LIST_ITEMS]
+    return [
+        line
+        for line in visible
+        if not (
+            isinstance(line, dict)
+            and re.match(
+                r"(?i)^Algorithm\s+\d+\b",
+                re.sub(r"\s+", " ", str(line.get("text") or "")).strip(),
+            )
+        )
+    ]
+
+
+def _algorithm_layout_fragmented(lines: list[Any]) -> bool:
+    text_lines = [
+        re.sub(r"\s+", " ", str(line.get("text") or "")).strip()
+        for line in lines[:MAX_LIST_ITEMS]
+        if isinstance(line, dict)
+        and re.sub(r"\s+", " ", str(line.get("text") or "")).strip()
+    ]
+    if len(text_lines) < 3:
+        return True
+    short_lines = [line for line in text_lines if len(line) <= 3]
+    readable_lines = [line for line in text_lines if len(line) >= 12]
+    return bool(
+        (len(short_lines) >= 4 and len(short_lines) / max(1, len(text_lines)) > 0.28)
+        or (len(short_lines) >= 6 and len(readable_lines) < 4)
+        or (len({line for line in short_lines}) >= 5 and len(text_lines) >= 10)
+    )
+
+
+def _algorithm_expected_body_identity(record: dict[str, Any]) -> str:
+    layout = record.get("layout")
+    if isinstance(layout, dict):
+        line_count = _strict_nonnegative_int(layout.get("line_count"))
+        raw_lines = layout.get("lines")
+        if line_count is not None and line_count >= 3 and isinstance(raw_lines, list):
+            visible_lines = _algorithm_layout_visible_lines(raw_lines)
+            if not _algorithm_layout_fragmented(visible_lines):
+                body = "\n".join(
+                    str(line.get("text") or "")
+                    for line in visible_lines
+                    if isinstance(line, dict) and str(line.get("text") or "")
+                )
+                if body:
+                    return _algorithm_body_identity(body)
+    return _algorithm_body_identity(record.get("text"))
+
+
+def _inline_binding_identity(value: Any) -> str:
+    """Canonicalize presentation-only math syntax for paragraph binding.
+
+    Docling may render ``s_j`` as ``s j`` and ``α_{s_j}`` as ``α s j`` in the
+    final text node.  Remove only whitespace and TeX subscript/grouping
+    presentation; operators, relation signs, delimiters, punctuation, Unicode
+    math symbols, letters, and digits all remain identity-bearing.
+    """
+
+    visible = unicodedata.normalize(
+        "NFKC", _structural_visible_body_text(value)
+    ).casefold()
+    visible = (
+        visible.replace(r"\(", "")
+        .replace(r"\)", "")
+        .replace(r"\[", "")
+        .replace(r"\]", "")
+    )
+    return "".join(
+        character
+        for character in visible
+        if not character.isspace() and character not in "_{}$"
+    )
+
+
 def _code_body_identity(value: Any) -> str:
-    return " ".join(_structural_body_identity(value).splitlines())
+    raw = str(value or "")
+    matches = list(re.finditer(r"(?<![\w.])(\d{1,3})\s+", raw))
+    selected: list[re.Match[str]] = []
+    expected = 1
+    for match in matches:
+        if int(match.group(1)) == expected:
+            selected.append(match)
+            expected += 1
+    if len(selected) >= 2:
+        contents: list[str] = []
+        for index, match in enumerate(selected):
+            end = selected[index + 1].start() if index + 1 < len(selected) else len(raw)
+            content = raw[match.end() : end].strip().replace("−", "-")
+            content = re.sub(r"\.\s+(?=[A-Za-z_]\w*\s*\()", ".", content)
+            contents.append(content)
+        # The adapter feeds the numbered contents joined by ``\n`` into
+        # ``_code_body_identity``; that contract flattens physical lines with
+        # spaces after structural tokenisation.  Mirror it exactly here.
+        return " ".join(_structural_body_identity("\n".join(contents)).splitlines())
+    return " ".join(_structural_body_identity(raw).splitlines())
 
 
 def _table_body_identity(node: dict[str, Any]) -> str:
@@ -809,6 +1147,62 @@ def _node_body_identity(kind: str, node: dict[str, Any]) -> str:
     return _structural_body_identity(node.get("text"))
 
 
+def _algorithm_page_span_reasons(candidate: dict[str, Any]) -> list[str]:
+    """Keep cross-page algorithm records fail-closed until a join contract exists."""
+
+    reasons: list[str] = []
+    span = candidate.get("page_span")
+    page_numbers: set[int] = set()
+    if span is not None:
+        if not isinstance(span, dict):
+            reasons.append("algorithm_page_span_invalid")
+        else:
+            start = _safe_page(span.get("start_page"))
+            end = _safe_page(span.get("end_page"))
+            if span.get("start_page") is not None and start is None:
+                reasons.append("algorithm_page_span_invalid")
+            if span.get("end_page") is not None and end is None:
+                reasons.append("algorithm_page_span_invalid")
+            if start is not None:
+                page_numbers.add(start)
+            if end is not None:
+                page_numbers.add(end)
+            pages = span.get("pages")
+            if pages is not None:
+                if not isinstance(pages, list):
+                    reasons.append("algorithm_page_span_invalid")
+                else:
+                    if len(pages) > MAX_LIST_ITEMS:
+                        reasons.append("algorithm_page_span_too_many")
+                    for value in pages[:MAX_LIST_ITEMS]:
+                        page = _safe_page(value)
+                        if page is None:
+                            reasons.append("algorithm_page_span_invalid")
+                        else:
+                            page_numbers.add(page)
+            if start is not None and end is not None and start != end:
+                reasons.append("algorithm_cross_page_unsupported")
+    page_bboxes = candidate.get("page_bboxes")
+    if page_bboxes is not None:
+        if not isinstance(page_bboxes, list):
+            reasons.append("algorithm_page_bboxes_invalid")
+        else:
+            if len(page_bboxes) > MAX_LIST_ITEMS:
+                reasons.append("algorithm_page_bboxes_too_many")
+            for item in page_bboxes[:MAX_LIST_ITEMS]:
+                if not isinstance(item, dict):
+                    reasons.append("algorithm_page_bboxes_invalid")
+                    continue
+                page = _safe_page(item.get("page_no"))
+                if page is None:
+                    reasons.append("algorithm_page_bboxes_invalid")
+                else:
+                    page_numbers.add(page)
+    if len(page_numbers) > 1:
+        reasons.append("algorithm_cross_page_unsupported")
+    return _unique(reasons)
+
+
 def _body_identity_sha(kind: str, identity: str) -> str:
     return hashlib.sha256(
         (str(kind).casefold() + "\0" + str(identity)).encode("utf-8")
@@ -830,6 +1224,46 @@ def _bbox_equal(left: Any, right: Any) -> bool:
     if lhs is None or rhs is None:
         return False
     return all(abs(float(lhs[key]) - float(rhs[key])) <= 1e-6 for key in ("l", "r", "t", "b")) and lhs.get("coord_origin") == rhs.get("coord_origin")
+
+
+def _bbox_contains(outer: Any, inner: Any, *, tolerance: float = 1.0) -> bool:
+    outer_box = _safe_bbox(outer)
+    inner_box = _safe_bbox(inner)
+    if outer_box is None or inner_box is None:
+        return False
+    if outer_box.get("coord_origin") != inner_box.get("coord_origin"):
+        return False
+    outer_low, outer_high = sorted((outer_box["t"], outer_box["b"]))
+    inner_low, inner_high = sorted((inner_box["t"], inner_box["b"]))
+    return bool(
+        outer_box["l"] - tolerance <= inner_box["l"]
+        and outer_box["r"] + tolerance >= inner_box["r"]
+        and outer_low - tolerance <= inner_low
+        and outer_high + tolerance >= inner_high
+    )
+
+
+def _bbox_union(values: Iterable[Any]) -> dict[str, Any] | None:
+    boxes = [_safe_bbox(value) for value in values]
+    safe_boxes = [box for box in boxes if box is not None]
+    if not safe_boxes or len(safe_boxes) != len(boxes):
+        return None
+    origins = {str(box.get("coord_origin")) for box in safe_boxes}
+    if len(origins) != 1:
+        return None
+    origin = origins.pop()
+    result = {
+        "l": min(float(box["l"]) for box in safe_boxes),
+        "r": max(float(box["r"]) for box in safe_boxes),
+        "coord_origin": origin,
+    }
+    if origin == "BOTTOMLEFT":
+        result["t"] = max(float(box["t"]) for box in safe_boxes)
+        result["b"] = min(float(box["b"]) for box in safe_boxes)
+    else:
+        result["t"] = min(float(box["t"]) for box in safe_boxes)
+        result["b"] = max(float(box["b"]) for box in safe_boxes)
+    return result
 
 
 def _manifest_entries(metadata: dict[str, Any], kind: str, source_ref: str | None) -> list[dict[str, Any]]:
@@ -863,23 +1297,64 @@ def _manifest_diagnostics(
     node_item: dict[str, Any] | None,
     nodes_by_key: dict[tuple[int | None, str], list[dict[str, Any]]],
     source_sha: str | None,
+    semantic_record: dict[str, Any] | None = None,
 ) -> list[str]:
     """Validate the manifest's immutable path/hash/node binding when present."""
 
-    if not isinstance(metadata.get("structural_visual_provenance_manifest"), dict):
+    manifest = metadata.get("structural_visual_provenance_manifest")
+    if not isinstance(manifest, dict):
         return []
+    aliases = {
+        "table": ("tables", "table"),
+        "algorithm": ("algorithms", "algorithm"),
+        "code": ("code", "codes"),
+        "formula": ("formulas", "formula"),
+        "inline_math": ("inline_math", "inline-math"),
+    }
+    manifest_schema_reasons: list[str] = []
+    for key in aliases.get(kind, (kind,)):
+        raw = manifest.get(key)
+        if raw is None:
+            continue
+        if not isinstance(raw, list):
+            manifest_schema_reasons.append("structural_manifest_entries_invalid")
+            continue
+        if len(raw) > MAX_LIST_ITEMS:
+            manifest_schema_reasons.append("structural_manifest_entries_too_many")
+        if any(not isinstance(item, dict) for item in raw[:MAX_LIST_ITEMS]):
+            manifest_schema_reasons.append("structural_manifest_entry_invalid")
     entries = _manifest_entries(metadata, kind, source_ref)
     if not entries:
-        return ["structural_manifest_entry_missing"]
+        return _unique([*manifest_schema_reasons, "structural_manifest_entry_missing"])
     if len(entries) != 1:
-        return ["structural_manifest_entry_ambiguous"]
+        return _unique([*manifest_schema_reasons, "structural_manifest_entry_ambiguous"])
     entry = entries[0]
-    reasons: list[str] = []
+    reasons: list[str] = list(manifest_schema_reasons)
     declared_kind = _text(entry.get("kind"), 48).casefold()
-    if declared_kind and declared_kind not in {kind, "tables" if kind == "table" else "algorithms" if kind == "algorithm" else "codes" if kind == "code" else kind}:
+    if declared_kind != kind:
         reasons.append("structural_manifest_kind_mismatch")
     if _source_ref(entry.get("source_ref")) != source_ref:
         reasons.append("structural_manifest_source_ref_mismatch")
+    entry_self_ref = entry.get("self_ref")
+    entry_part_index = entry.get("part_index")
+    if "self_ref" not in entry or not isinstance(entry_self_ref, str):
+        reasons.append("structural_manifest_self_ref_invalid")
+    if "part_index" not in entry:
+        reasons.append("structural_manifest_part_index_missing")
+    if kind == "algorithm":
+        # Algorithm records are sidecar semantic blocks, not Docling nodes.
+        # The adapter intentionally binds their entry to the empty self-ref;
+        # source_node_bindings below bind the contributing final nodes.
+        if entry_self_ref != "":
+            reasons.append("structural_manifest_self_ref_mismatch")
+        if entry_part_index is not None:
+            reasons.append("structural_manifest_part_index_mismatch")
+    elif isinstance(node_item, dict):
+        node = node_item.get("node") if isinstance(node_item.get("node"), dict) else {}
+        if entry_self_ref != str(node.get("self_ref") or ""):
+            reasons.append("structural_manifest_self_ref_mismatch")
+        if entry_part_index != node_item.get("part_index"):
+            reasons.append("structural_manifest_part_index_mismatch")
     asset = candidate.get("image") or candidate.get("path") or entry.get("asset_path")
     manifest_asset = _safe_asset(output_dir, entry.get("asset_path"))
     if manifest_asset is None:
@@ -930,13 +1405,22 @@ def _manifest_diagnostics(
     body_hash = _sha256(entry.get("structural_body_identity_sha256"))
     if body_hash is None:
         reasons.append("structural_manifest_body_hash_invalid")
-    if node_item and body_hash:
-        identity = _node_body_identity(kind, node_item.get("node") if isinstance(node_item.get("node"), dict) else {})
-        if body_hash != _body_identity_sha(kind, identity):
-            # Algorithm manifests sometimes hash the final displayed record
-            # rather than the raw node; source-node bindings below remain the
-            # authoritative fallback in that case.
-            if kind != "algorithm":
+    if body_hash:
+        if kind == "algorithm":
+            if not isinstance(semantic_record, dict):
+                reasons.append("algorithm_semantic_record_missing_or_ambiguous")
+            elif body_hash != _body_identity_sha(
+                "algorithm", _algorithm_expected_body_identity(semantic_record)
+            ):
+                reasons.append("structural_manifest_body_hash_mismatch")
+        elif isinstance(node_item, dict):
+            identity = _node_body_identity(
+                kind,
+                node_item.get("node")
+                if isinstance(node_item.get("node"), dict)
+                else {},
+            )
+            if body_hash != _body_identity_sha(kind, identity):
                 reasons.append("structural_manifest_body_hash_mismatch")
     bindings = entry.get("source_node_bindings")
     binding_prefix = "algorithm" if kind == "algorithm" else "structural"
@@ -951,6 +1435,7 @@ def _manifest_diagnostics(
                 reasons.append(f"{binding_prefix}_source_node_binding_invalid")
                 continue
             self_ref = _text(binding.get("self_ref"), 180)
+            binding_source_ref = _source_ref(binding.get("source_ref"))
             part_index_raw = binding.get("part_index")
             part_index = (
                 part_index_raw
@@ -958,7 +1443,12 @@ def _manifest_diagnostics(
                 else None
             )
             key = (part_index, self_ref)
-            if not self_ref or key in seen_binding_keys:
+            if (
+                not self_ref
+                or not binding_source_ref
+                or "part_index" not in binding
+                or key in seen_binding_keys
+            ):
                 reasons.append(f"{binding_prefix}_source_node_binding_not_bijective")
                 continue
             seen_binding_keys.add(key)
@@ -967,6 +1457,8 @@ def _manifest_diagnostics(
                 reasons.append(f"{binding_prefix}_source_node_binding_missing")
                 continue
             bound_item = matching[0]
+            if binding_source_ref != bound_item.get("source_ref"):
+                reasons.append(f"{binding_prefix}_source_node_ref_mismatch")
             page_no = _safe_page(binding.get("page_no"))
             if page_no is None or page_no != bound_item.get("page_no"):
                 reasons.append(f"{binding_prefix}_source_node_page_mismatch")
@@ -974,15 +1466,115 @@ def _manifest_diagnostics(
                 reasons.append(f"{binding_prefix}_source_node_bbox_mismatch")
             bound_hash = _sha256(binding.get("body_identity_sha256"))
             bound_node = bound_item.get("node") if isinstance(bound_item.get("node"), dict) else {}
-            bound_identity_kind = (
-                "table"
-                if kind == "algorithm" and binding.get("body_identity_kind") == "table_grid"
-                else kind
-            )
+            raw_identity_kind = binding.get("body_identity_kind")
+            if kind == "algorithm":
+                if raw_identity_kind not in {"node_text", "table_grid"}:
+                    reasons.append("algorithm_source_node_body_identity_kind_invalid")
+                elif raw_identity_kind == "table_grid" and (
+                    bound_item.get("label") != "table"
+                    or not _table_body_identity(bound_node)
+                ):
+                    reasons.append("algorithm_source_node_body_identity_kind_mismatch")
+                elif raw_identity_kind == "node_text" and (
+                    bound_item.get("label")
+                    not in {"code", "formula", "list_item", "text", "section_header"}
+                    or not _structural_body_identity(bound_node.get("text"))
+                ):
+                    reasons.append("algorithm_source_node_body_identity_kind_mismatch")
+                bound_identity_kind = (
+                    "table" if raw_identity_kind == "table_grid" else "algorithm"
+                )
+            else:
+                if raw_identity_kind not in (None, ""):
+                    reasons.append("structural_source_node_body_identity_kind_invalid")
+                bound_identity_kind = kind
             bound_identity = _node_body_identity(bound_identity_kind, bound_node)
             hash_kind = "algorithm-source-node" if kind == "algorithm" else kind
             if bound_hash is None or bound_hash != _body_identity_sha(hash_kind, bound_identity):
                 reasons.append(f"{binding_prefix}_source_node_body_hash_mismatch")
+        if kind == "algorithm" and isinstance(semantic_record, dict):
+            semantic_bindings = semantic_record.get("source_node_bindings")
+            if not isinstance(semantic_bindings, list) or not semantic_bindings:
+                reasons.append("algorithm_semantic_source_node_bindings_missing")
+            else:
+                if len(semantic_bindings) > MAX_LIST_ITEMS:
+                    reasons.append("algorithm_semantic_source_node_bindings_too_many")
+
+                def contributor_key(value: Any) -> tuple[str, str, int | None] | None:
+                    if not isinstance(value, dict):
+                        return None
+                    contributor_ref = _source_ref(value.get("source_ref"))
+                    contributor_self_ref = _text(value.get("self_ref"), 180)
+                    contributor_part = value.get("part_index")
+                    if (
+                        not contributor_ref
+                        or not contributor_self_ref
+                        or "part_index" not in value
+                        or (
+                            contributor_part is not None
+                            and (
+                                not isinstance(contributor_part, int)
+                                or isinstance(contributor_part, bool)
+                                or contributor_part < 0
+                            )
+                        )
+                    ):
+                        return None
+                    return contributor_ref, contributor_self_ref, contributor_part
+
+                manifest_keys = [
+                    key
+                    for binding in bindings[:MAX_LIST_ITEMS]
+                    if (key := contributor_key(binding)) is not None
+                ]
+                semantic_keys = [
+                    key
+                    for binding in semantic_bindings[:MAX_LIST_ITEMS]
+                    if (key := contributor_key(binding)) is not None
+                ]
+                if (
+                    len(manifest_keys) != len(bindings[:MAX_LIST_ITEMS])
+                    or len(semantic_keys) != len(semantic_bindings[:MAX_LIST_ITEMS])
+                    or len(set(manifest_keys)) != len(manifest_keys)
+                    or len(set(semantic_keys)) != len(semantic_keys)
+                    or set(manifest_keys) != set(semantic_keys)
+                ):
+                    reasons.append("algorithm_source_node_binding_set_mismatch")
+                manifest_by_key = {
+                    key: binding
+                    for binding in bindings[:MAX_LIST_ITEMS]
+                    if (key := contributor_key(binding)) is not None
+                }
+                semantic_by_key = {
+                    key: binding
+                    for binding in semantic_bindings[:MAX_LIST_ITEMS]
+                    if (key := contributor_key(binding)) is not None
+                }
+                if any(
+                    _safe_page(manifest_by_key[key].get("page_no"))
+                    != _safe_page(semantic_by_key[key].get("page_no"))
+                    or not _bbox_equal(
+                        manifest_by_key[key].get("bbox"),
+                        semantic_by_key[key].get("bbox"),
+                    )
+                    or manifest_by_key[key].get("body_identity_kind")
+                    != semantic_by_key[key].get("body_identity_kind")
+                    or _sha256(manifest_by_key[key].get("body_identity_sha256"))
+                    != _sha256(semantic_by_key[key].get("body_identity_sha256"))
+                    for key in set(manifest_by_key) & set(semantic_by_key)
+                ):
+                    reasons.append(
+                        "algorithm_source_node_binding_evidence_mismatch"
+                    )
+                manifest_union = _bbox_union(
+                    binding.get("bbox")
+                    for binding in bindings[:MAX_LIST_ITEMS]
+                    if isinstance(binding, dict)
+                )
+                if manifest_union is None or not _bbox_equal(
+                    manifest_union, semantic_record.get("bbox")
+                ):
+                    reasons.append("algorithm_source_node_union_bbox_mismatch")
     return _unique(reasons, limit=80)
 
 
@@ -1020,11 +1612,12 @@ def _positive_index_set(value: Any) -> set[int]:
     if not isinstance(value, (list, tuple, set)):
         return set()
     bounded = _bounded_values(value)
-    return {
-        item
-        for item in bounded
-        if isinstance(item, int) and not isinstance(item, bool) and item > 0
-    }
+    result: set[int] = set()
+    for item in bounded:
+        parsed = _safe_page(item)
+        if parsed is not None:
+            result.add(parsed)
+    return result
 
 
 def _table_numeric_signal(value: Any) -> int:
@@ -1080,6 +1673,8 @@ def _table_topology_diagnostics(document_json: Any) -> dict[str, dict[str, Any]]
         invalid_span_count = 0
         overlap_count = 0
         occupied: set[tuple[int, int]] = set()
+        occupancy_work_count = 0
+        geometry_work_limited = False
         for raw in raw_cells[:MAX_TABLE_CELLS]:
             if not isinstance(raw, dict):
                 invalid_cell_geometry_count += 1
@@ -1105,12 +1700,20 @@ def _table_topology_diagnostics(document_json: Any) -> dict[str, dict[str, Any]]
                 invalid_span_count += 1
             if col_span is not None and (col_span <= 0 or col_span != end_col - start_col):
                 invalid_span_count += 1
-            for row_index in range(start_row, min(end_row, start_row + 256)):
-                for col_index in range(start_col, min(end_col, start_col + 256)):
-                    cell_key = (row_index, col_index)
-                    if cell_key in occupied:
-                        overlap_count += 1
-                    occupied.add(cell_key)
+            span_area = (end_row - start_row) * (end_col - start_col)
+            if (
+                span_area > MAX_TABLE_CELLS
+                or occupancy_work_count + span_area > MAX_TABLE_CELLS
+            ):
+                geometry_work_limited = True
+            else:
+                occupancy_work_count += span_area
+                for row_index in range(start_row, end_row):
+                    for col_index in range(start_col, end_col):
+                        cell_key = (row_index, col_index)
+                        if cell_key in occupied:
+                            overlap_count += 1
+                        occupied.add(cell_key)
             low, high = sorted((float(bbox["t"]), float(bbox["b"])))
             cells.append(
                 {
@@ -1180,6 +1783,8 @@ def _table_topology_diagnostics(document_json: Any) -> dict[str, dict[str, Any]]
                     collapsed_rows.append(row_index)
 
         reasons: list[str] = []
+        if not raw_cells:
+            reasons.append("table_cell_geometry_missing")
         if raw_cells and (invalid_cell_geometry_count or raw_cell_count > MAX_TABLE_CELLS):
             reasons.append("table_cell_geometry_invalid")
         if invalid_bounds_count:
@@ -1189,10 +1794,25 @@ def _table_topology_diagnostics(document_json: Any) -> dict[str, dict[str, Any]]
         if overlap_count:
             reasons.append("table_cell_overlap")
         if declared_rows is None or declared_cols is None:
-            if raw_cells:
-                reasons.append("table_dimensions_missing")
+            reasons.append("table_dimensions_missing")
         if dimensions_exceed_limit:
             reasons.append("table_dimensions_exceed_limit")
+        if geometry_work_limited:
+            reasons.append("table_geometry_work_limit")
+        if (
+            raw_cells
+            and declared_rows is not None
+            and declared_cols is not None
+            and declared_rows * declared_cols <= MAX_TABLE_CELLS
+        ):
+            in_bounds_occupied = {
+                (row_index, col_index)
+                for row_index, col_index in occupied
+                if 0 <= row_index < declared_rows
+                and 0 <= col_index < declared_cols
+            }
+            if len(in_bounds_occupied) != declared_rows * declared_cols:
+                reasons.append("table_cell_occupancy_incomplete")
         if cross_row_cell_count:
             reasons.append("table_cell_crosses_semantic_row_boundary")
         if collapsed_rows:
@@ -1208,6 +1828,9 @@ def _table_topology_diagnostics(document_json: Any) -> dict[str, dict[str, Any]]
             "declared_num_rows": declared_rows,
             "declared_num_cols": declared_cols,
             "dimensions_exceed_limit": dimensions_exceed_limit,
+            "geometry_work_limited": geometry_work_limited,
+            "occupancy_work_count": occupancy_work_count,
+            "occupied_slot_count": len(occupied),
             "baseline_line_height": (
                 round(baseline_height, 4) if baseline_height is not None else None
             ),
@@ -1232,7 +1855,8 @@ def _structural_region_records(
     _expected_values, expected_duplicates = _ref_list(source_visuals, expected_key)
     expected_refs = _ref_set(source_visuals, expected_key)
     candidates = _candidate_map(source_visuals, kind)
-    if not expected_refs:
+    expected_declared = expected_key in source_visuals
+    if not expected_refs and not expected_declared:
         expected_refs = set(candidates)
 
     count_key = {
@@ -1241,14 +1865,15 @@ def _structural_region_records(
         "code": "code_blocks",
         "formula": "formulas",
     }.get(kind)
-    expected_count_value = primary_counts.get(count_key) if count_key else None
+    count_declared = bool(count_key and count_key in primary_counts)
+    expected_count_value = primary_counts.get(count_key) if count_declared else None
     expected_count = (
         _strict_nonnegative_int(expected_count_value)
-        if expected_count_value is not None
+        if count_declared
         else None
     )
     global_reasons: list[str] = []
-    if expected_count_value is not None and expected_count is None:
+    if count_declared and expected_count is None:
         global_reasons.append("expected_region_count_invalid")
     if expected_duplicates:
         global_reasons.append("expected_region_refs_duplicate")
@@ -1259,9 +1884,15 @@ def _structural_region_records(
     candidate_duplicates = _candidate_duplicate_refs(source_visuals, kind)
     if candidate_duplicates:
         global_reasons.append("candidate_source_refs_duplicate")
-    if source_visuals.get(expected_key) is not None and not isinstance(source_visuals.get(expected_key), (list, tuple, set)):
+    if _candidate_alias_conflict_refs(source_visuals, kind):
+        global_reasons.append("candidate_alias_evidence_conflict")
+    if expected_declared and not isinstance(
+        source_visuals.get(expected_key), (list, tuple, set)
+    ):
         global_reasons.append("expected_region_refs_invalid")
-    if source_visuals.get(expected_key) is None and expected_count:
+    elif _ref_items_invalid(source_visuals.get(expected_key)):
+        global_reasons.append("expected_region_ref_item_invalid")
+    if not expected_declared and (expected_count or candidates):
         global_reasons.append("expected_region_refs_missing_declaration")
     candidate_payload_keys = [
         "structured_table_source_renderings"
@@ -1272,11 +1903,33 @@ def _structural_region_records(
         candidate_payload_keys.append("empty_table_visual_fallbacks")
     for payload_key in candidate_payload_keys:
         raw_payload = source_visuals.get(payload_key)
-        raw_candidates = (
-            raw_payload.get("candidates") if isinstance(raw_payload, dict) else None
-        )
-        if isinstance(raw_candidates, list) and len(raw_candidates) > MAX_LIST_ITEMS:
-            global_reasons.append("structural_candidates_too_many")
+        if raw_payload is not None and not isinstance(raw_payload, dict):
+            global_reasons.append("structural_renderings_invalid")
+        array_keys = ["candidates"]
+        if kind == "algorithm":
+            array_keys.append("records")
+        for array_key in array_keys:
+            raw_candidates = (
+                raw_payload.get(array_key)
+                if isinstance(raw_payload, dict)
+                else None
+            )
+            if isinstance(raw_candidates, list):
+                if len(raw_candidates) > MAX_LIST_ITEMS:
+                    global_reasons.append("structural_candidates_too_many")
+                if any(not isinstance(item, dict) for item in raw_candidates[:MAX_LIST_ITEMS]):
+                    global_reasons.append("structural_candidate_invalid")
+                if any(
+                    isinstance(item, dict)
+                    and (
+                        not isinstance(item.get("source_ref"), str)
+                        or not _source_ref(item.get("source_ref"))
+                    )
+                    for item in raw_candidates[:MAX_LIST_ITEMS]
+                ):
+                    global_reasons.append("structural_candidate_ref_invalid")
+            elif isinstance(raw_payload, dict) and array_key in raw_payload:
+                global_reasons.append("structural_candidates_invalid")
     candidate_refs = set(candidates)
     if candidate_refs != expected_refs:
         global_reasons.append("candidate_source_ref_set_mismatch")
@@ -1291,11 +1944,115 @@ def _structural_region_records(
         self_ref = _text(node.get("self_ref"), 180)
         if self_ref:
             nodes_by_key.setdefault((node_item.get("part_index"), self_ref), []).append(node_item)
-    strict_manifest = isinstance(metadata.get("structural_visual_provenance_manifest"), dict)
+    manifest = metadata.get("structural_visual_provenance_manifest")
+    strict_manifest = isinstance(manifest, dict)
+    manifest_aliases = {
+        "table": ("tables", "table"),
+        "algorithm": ("algorithms", "algorithm"),
+        "code": ("code", "codes"),
+    }
+    manifest_items: list[dict[str, Any]] = []
+    if strict_manifest:
+        for manifest_key in manifest_aliases.get(kind, (kind,)):
+            raw_entries = manifest.get(manifest_key)
+            if raw_entries is None:
+                continue
+            if not isinstance(raw_entries, list):
+                global_reasons.append("structural_manifest_entries_invalid")
+                continue
+            if len(raw_entries) > MAX_LIST_ITEMS:
+                global_reasons.append("structural_manifest_entries_too_many")
+            if any(not isinstance(item, dict) for item in raw_entries[:MAX_LIST_ITEMS]):
+                global_reasons.append("structural_manifest_entry_invalid")
+            manifest_items.extend(
+                item for item in raw_entries[:MAX_LIST_ITEMS] if isinstance(item, dict)
+            )
+    manifest_refs = {
+        ref
+        for item in manifest_items
+        if (ref := _source_ref(item.get("source_ref")))
+    }
+    algorithm_refs = _ref_set(source_visuals, "algorithm_source_expected_refs")
+    if kind == "table":
+        manifest_refs -= algorithm_refs
+    if strict_manifest and manifest_refs != expected_refs:
+        global_reasons.append("structural_manifest_ref_set_mismatch")
+
+    algorithm_records_by_ref: dict[str, list[dict[str, Any]]] = {}
+    if kind == "algorithm":
+        algorithm_sidecar, sidecar_error = _read_json(
+            output_dir / "algorithm_blocks.json"
+        )
+        if sidecar_error:
+            if expected_refs or candidate_refs or manifest_items:
+                global_reasons.append("algorithm_semantic_sidecar_missing_or_unsafe")
+        elif not isinstance(algorithm_sidecar, list):
+            global_reasons.append("algorithm_semantic_sidecar_invalid")
+        else:
+            if len(algorithm_sidecar) > MAX_LIST_ITEMS:
+                global_reasons.append("algorithm_semantic_records_too_many")
+            for record in algorithm_sidecar[:MAX_LIST_ITEMS]:
+                if not isinstance(record, dict):
+                    global_reasons.append("algorithm_semantic_record_invalid")
+                    continue
+                record_ref = _source_ref(record.get("source_ref"))
+                if not record_ref:
+                    global_reasons.append("algorithm_semantic_record_ref_invalid")
+                    continue
+                algorithm_records_by_ref.setdefault(record_ref, []).append(record)
+            if any(
+                len(records_for_ref) != 1
+                for records_for_ref in algorithm_records_by_ref.values()
+            ):
+                global_reasons.append("algorithm_semantic_record_ref_duplicate")
+
+    if kind == "table":
+        relevant_nodes = [
+            item
+            for item in node_items
+            if item.get("label") == "table"
+            and item.get("source_ref") not in algorithm_refs
+        ]
+        current_kind_refs = {
+            ref
+            for item in relevant_nodes
+            if (ref := _source_ref(item.get("source_ref")))
+        }
+    elif kind == "code":
+        relevant_nodes = [
+            item
+            for item in node_items
+            if item.get("label") in {"code", "code_block"}
+            and item.get("source_ref") not in algorithm_refs
+        ]
+        current_kind_refs = {
+            ref
+            for item in relevant_nodes
+            if (ref := _source_ref(item.get("source_ref")))
+        }
+    else:
+        relevant_nodes = []
+        current_kind_refs = set(algorithm_records_by_ref)
+    if len(current_kind_refs) != len(relevant_nodes) and kind != "algorithm":
+        global_reasons.append("final_document_node_ref_invalid_or_duplicate")
+    if current_kind_refs != expected_refs:
+        global_reasons.append("final_document_ref_set_mismatch")
+
     if expected_refs and not strict_manifest:
         global_reasons.append("structural_provenance_manifest_missing")
     records: list[dict[str, Any]] = []
-    if expected_count is not None and expected_count > 0 and not expected_refs:
+    if not expected_refs and (
+        candidate_refs
+        or manifest_refs
+        or current_kind_refs
+        or (expected_count is not None and expected_count > 0)
+        or global_reasons
+    ):
+        declaration_reason = (
+            "expected_region_refs_empty_declaration"
+            if expected_declared
+            else "expected_region_refs_missing"
+        )
         records.append(
             _record(
                 output_dir=output_dir,
@@ -1303,8 +2060,13 @@ def _structural_region_records(
                 index=0,
                 status="unresolved",
                 critical=True,
-                reasons=["expected_region_refs_missing", *global_reasons],
-                signals={"source_ref_present": False},
+                reasons=[declaration_reason, *global_reasons],
+                signals={
+                    "source_ref_present": False,
+                    "candidate_count": len(candidate_refs),
+                    "manifest_count": len(manifest_refs),
+                    "final_ref_count": len(current_kind_refs),
+                },
             )
         )
         return records
@@ -1327,23 +2089,50 @@ def _structural_region_records(
     exact_coverage = source_visuals.get(exact_key)
     if not isinstance(exact_coverage, bool):
         exact_coverage = None
-    for key in (
+    structural_ref_keys = (
         f"{kind}_source_html_bound_refs",
         f"{kind}_source_markdown_bound_refs",
         f"{kind}_source_html_body_identity_verified_refs",
         f"{kind}_source_markdown_body_identity_verified_refs",
+        f"{kind}_source_html_body_identity_mismatch_refs",
+        f"{kind}_source_markdown_body_identity_mismatch_refs",
         f"{kind}_source_provenance_verified_refs",
-    ):
+        f"{kind}_source_provenance_mismatch_refs",
+        f"{kind}_source_body_identity_expected_refs",
+    )
+    if kind == "table":
+        structural_ref_keys = (
+            *structural_ref_keys,
+            "table_empty_fallback_expected_refs",
+        )
+    for key in structural_ref_keys:
         raw_values = source_visuals.get(key)
         if isinstance(raw_values, (list, tuple, set)) and len(raw_values) > MAX_LIST_ITEMS:
             global_reasons.append("structural_binding_refs_too_many")
+        elif key in source_visuals and not isinstance(
+            raw_values, (list, tuple, set)
+        ):
+            global_reasons.append("structural_binding_refs_invalid")
+        elif _ref_items_invalid(raw_values):
+            global_reasons.append("structural_binding_ref_item_invalid")
+        elif _ref_list(source_visuals, key)[1]:
+            global_reasons.append("structural_binding_refs_duplicate")
     expected_semantic_refs = expected_refs - empty_fallback_refs
+    if empty_fallback_refs - expected_refs:
+        global_reasons.append("unexpected_empty_table_fallback_refs")
     if html_bound - expected_refs or markdown_bound - expected_refs:
         global_reasons.append("unexpected_surface_binding_refs")
     if html_verified - expected_semantic_refs or markdown_verified - expected_semantic_refs:
         global_reasons.append("unexpected_body_identity_refs")
     if provenance_verified - expected_refs:
         global_reasons.append("unexpected_provenance_refs")
+    if (
+        html_mismatch
+        | markdown_mismatch
+        | provenance_mismatch
+        | expected_body
+    ) - expected_refs:
+        global_reasons.append("unexpected_structural_diagnostic_refs")
 
     for ordinal, ref in enumerate(sorted(expected_refs), start=1):
         candidate = candidates.get(ref) or {}
@@ -1370,6 +2159,11 @@ def _structural_region_records(
                     node_item,
                     nodes_by_key,
                     source_sha,
+                    (
+                        algorithm_records_by_ref.get(ref, [None])[0]
+                        if len(algorithm_records_by_ref.get(ref, [])) == 1
+                        else None
+                    ),
                 )
             )
         if strict_manifest and node_item is not None:
@@ -1382,7 +2176,7 @@ def _structural_region_records(
         if candidate.get("asset_sha256") is not None:
             if candidate_asset_sha is None:
                 reasons.append("source_candidate_asset_hash_invalid")
-            elif _hash_relative_asset(root, asset) != candidate_asset_sha:
+            elif _hash_relative_asset(output_dir, asset) != candidate_asset_sha:
                 reasons.append("source_candidate_asset_hash_mismatch")
         topology: dict[str, Any] | None = None
         if kind == "table":
@@ -1433,6 +2227,13 @@ def _structural_region_records(
         candidate_reasons = candidate.get("provenance_reasons")
         if isinstance(candidate_reasons, list):
             reasons.extend(candidate_reasons)
+        if kind == "algorithm":
+            reasons.extend(_algorithm_page_span_reasons(candidate))
+            semantic_algorithm_records = algorithm_records_by_ref.get(ref, [])
+            if len(semantic_algorithm_records) == 1:
+                reasons.extend(
+                    _algorithm_page_span_reasons(semantic_algorithm_records[0])
+                )
         signals: dict[str, Any] = {
             "source_candidate_present": bool(candidate),
             "source_asset_present": bool(asset),
@@ -1525,8 +2326,27 @@ def _formula_region_records(
         global_reasons.append("formula_expected_count_invalid")
     if isinstance(raw_expected, (list, tuple, set)) and len(raw_expected) > MAX_LIST_ITEMS:
         global_reasons.append("formula_expected_indexes_too_many")
+    if isinstance(raw_expected, (list, tuple, set)) and any(
+        _safe_page(value) is None for value in _bounded_values(raw_expected)
+    ):
+        global_reasons.append("formula_expected_index_invalid")
+    if (
+        "formula_source_dropped_artifacts" in source_visuals
+        and not isinstance(declared_drops, list)
+    ):
+        global_reasons.append("formula_dropped_artifacts_invalid")
     if isinstance(declared_drops, list) and len(declared_drops) > MAX_LIST_ITEMS:
         global_reasons.append("formula_dropped_artifacts_too_many")
+    if isinstance(declared_drops, list) and any(
+        not isinstance(artifact, dict)
+        or _safe_page(
+            artifact.get("raw_formula_index", artifact.get("index"))
+        )
+        is None
+        or not str(artifact.get("reason") or "")
+        for artifact in declared_drops[:MAX_LIST_ITEMS]
+    ):
+        global_reasons.append("formula_dropped_artifact_invalid")
     records: list[dict[str, Any]] = []
     if expected_count and not expected:
         return [
@@ -1549,6 +2369,10 @@ def _formula_region_records(
 
     payload = source_visuals.get("formula_source_renderings")
     candidates = payload.get("candidates") if isinstance(payload, dict) else []
+    if payload is not None and not isinstance(payload, dict):
+        global_reasons.append("formula_renderings_invalid")
+    elif isinstance(payload, dict) and "candidates" in payload and not isinstance(candidates, list):
+        global_reasons.append("formula_candidates_invalid")
     by_index: dict[int, dict[str, Any]] = {}
     candidate_duplicates: set[int] = set()
     if isinstance(candidates, list):
@@ -1563,6 +2387,12 @@ def _formula_region_records(
             if index in by_index:
                 candidate_duplicates.add(index)
             by_index[index] = candidate
+        if any(
+            not isinstance(candidate, dict)
+            or _safe_page(candidate.get("formula_index")) is None
+            for candidate in candidates[:MAX_LIST_ITEMS]
+        ):
+            global_reasons.append("formula_candidate_invalid")
     if candidate_duplicates:
         global_reasons.append("formula_candidate_indexes_duplicate")
     if set(by_index) != expected:
@@ -1589,6 +2419,57 @@ def _formula_region_records(
     ) | _positive_index_set(
         source_visuals.get("formula_source_markdown_appendix_indexes")
     )
+    formula_surface_index_keys = (
+        "formula_source_html_indexes",
+        "formula_source_markdown_indexes",
+        "formula_source_missing_indexes",
+        "formula_source_unexpected_indexes",
+        "formula_source_duplicate_html_anchor_indexes",
+        "formula_source_duplicate_markdown_anchor_indexes",
+        "formula_source_html_appendix_indexes",
+        "formula_source_markdown_appendix_indexes",
+    )
+    for key in formula_surface_index_keys:
+        if key not in source_visuals:
+            continue
+        raw_indexes = source_visuals.get(key)
+        if not isinstance(raw_indexes, (list, tuple, set)):
+            global_reasons.append("formula_surface_indexes_invalid")
+            continue
+        if len(raw_indexes) > MAX_LIST_ITEMS:
+            global_reasons.append("formula_surface_indexes_too_many")
+        if any(
+            _safe_page(value) is None for value in _bounded_values(raw_indexes)
+        ):
+            global_reasons.append("formula_surface_index_invalid")
+        normalized_indexes = [
+            index
+            for value in _bounded_values(raw_indexes)
+            if (index := _safe_page(value)) is not None
+        ]
+        if len(normalized_indexes) != len(set(normalized_indexes)):
+            global_reasons.append("formula_surface_indexes_duplicate")
+    crop_metrics = metadata.get("formula_crop_diagnostics") if isinstance(metadata, dict) else None
+    bounded_crop_metrics: list[Any] = []
+    diagnostic_indexes: set[int] = set()
+    if crop_metrics is not None and not isinstance(crop_metrics, list):
+        global_reasons.append("formula_crop_diagnostics_invalid")
+    elif isinstance(crop_metrics, list):
+        bounded_crop_metrics = crop_metrics[:MAX_LIST_ITEMS]
+        if len(crop_metrics) > MAX_LIST_ITEMS:
+            global_reasons.append("formula_crop_diagnostics_too_many")
+        for item in crop_metrics[:MAX_LIST_ITEMS]:
+            if not isinstance(item, dict):
+                global_reasons.append("formula_crop_diagnostic_invalid")
+                continue
+            index_value = _safe_page(item.get("index"))
+            if index_value is None:
+                global_reasons.append("formula_crop_diagnostic_index_invalid")
+                continue
+            diagnostic_indexes.add(index_value)
+    extra_diagnostic_indexes = diagnostic_indexes - expected
+    if extra_diagnostic_indexes:
+        global_reasons.append("formula_crop_diagnostic_extra_index")
     formula_nodes = _document_nodes(document_json, {"formula"}) if isinstance(document_json, dict) else []
     nodes_by_formula_index = {
         formula_index: formula_nodes[formula_index - 1]
@@ -1599,7 +2480,35 @@ def _formula_region_records(
         global_reasons.append("formula_final_node_count_mismatch")
     if (html_indexes - semantic_expected) or (markdown_indexes - semantic_expected):
         global_reasons.append("formula_unexpected_surface_indexes")
-
+    diagnostic_surface_indexes = (
+        missing_indexes
+        | unexpected_indexes
+        | duplicate_html
+        | duplicate_markdown
+        | appendix_indexes
+    )
+    if diagnostic_surface_indexes - expected:
+        global_reasons.append("formula_unexpected_diagnostic_indexes")
+    if approved_drops - expected:
+        global_reasons.append("formula_unexpected_dropped_artifact_indexes")
+    if not expected and (
+        by_index or diagnostic_indexes or formula_nodes or expected_count or global_reasons
+    ):
+        # Keep this explicit marker separate from the per-index loop: an empty
+        # declaration with an extra candidate/diagnostic/node must not vanish
+        # as a vacuous successful zero-count run.
+        return [
+            _record(
+                output_dir=output_dir,
+                kind="formula",
+                index=0,
+                source_ref="formula:index:empty-declaration",
+                status="unresolved",
+                critical=True,
+                reasons=["formula_expected_indexes_empty_or_missing", *global_reasons],
+                signals={"candidate_count": len(by_index), "diagnostic_count": len(diagnostic_indexes), "final_node_count": len(formula_nodes)},
+            )
+        ]
     for ordinal, index in enumerate(sorted(expected), start=1):
         candidate = by_index.get(index) or {}
         selected_image = candidate.get("selected_image")
@@ -1646,9 +2555,8 @@ def _formula_region_records(
                     continue
                 reasons.append(source_reason)
         diagnostic = None
-        crop_metrics = metadata.get("formula_crop_diagnostics") if isinstance(metadata, dict) else None
-        if isinstance(crop_metrics, list):
-            matches = [item for item in crop_metrics if isinstance(item, dict) and _safe_page(item.get("index")) == index]
+        if isinstance(bounded_crop_metrics, list):
+            matches = [item for item in bounded_crop_metrics if isinstance(item, dict) and _safe_page(item.get("index")) == index]
             if len(matches) == 1:
                 diagnostic = matches[0]
             elif len(matches) > 1:
@@ -1788,6 +2696,8 @@ def _inline_math_records(
     if not isinstance(primary, dict):
         primary = {}
     regions = primary.get("inline_math_source_regions")
+    regions_declared = "inline_math_source_regions" in primary
+    regions_invalid = regions_declared and not isinstance(regions, list)
     if not isinstance(regions, list):
         regions = []
     by_anchor: dict[str, dict[str, Any]] = {}
@@ -1802,13 +2712,17 @@ def _inline_math_records(
             region_duplicates.add(anchor)
         by_anchor[anchor] = item
     expected = _ref_set(source_visuals, "inline_math_source_expected_anchors")
-    if not expected:
-        expected = set(by_anchor)
+    expected_declared = "inline_math_source_expected_anchors" in source_visuals
     candidates = source_visuals.get("inline_math_source_renderings")
     candidate_by_anchor: dict[str, dict[str, Any]] = {}
     candidate_duplicates: set[str] = set()
     if isinstance(candidates, dict):
-        for item in (candidates.get("candidates") or [])[:MAX_LIST_ITEMS]:
+        candidate_items = candidates.get("candidates")
+        for item in (
+            candidate_items[:MAX_LIST_ITEMS]
+            if isinstance(candidate_items, list)
+            else []
+        ):
             if isinstance(item, dict) and _text(item.get("anchor"), 180):
                 anchor = _text(item.get("anchor"), 180)
                 if anchor in candidate_by_anchor:
@@ -1825,8 +2739,41 @@ def _inline_math_records(
         source_visuals, "inline_math_source_expected_anchors"
     )
     global_reasons: list[str] = []
+    inline_binding_keys = (
+        "inline_math_source_html_anchors",
+        "inline_math_source_markdown_anchors",
+        "inline_math_source_missing_crop_anchors",
+        "inline_math_source_missing_html_anchors",
+        "inline_math_source_missing_markdown_anchors",
+        "inline_math_source_duplicate_html_anchors",
+        "inline_math_source_duplicate_markdown_anchors",
+    )
+    for key in inline_binding_keys:
+        if key not in source_visuals:
+            continue
+        raw_anchors = source_visuals.get(key)
+        if not isinstance(raw_anchors, (list, tuple, set)):
+            global_reasons.append("inline_math_binding_refs_invalid")
+            continue
+        if len(raw_anchors) > MAX_LIST_ITEMS:
+            global_reasons.append("inline_math_binding_refs_too_many")
+        if _ref_items_invalid(raw_anchors):
+            global_reasons.append("inline_math_binding_ref_item_invalid")
+        elif _ref_list(source_visuals, key)[1]:
+            global_reasons.append("inline_math_binding_refs_duplicate")
+    if regions_invalid:
+        global_reasons.append("inline_math_regions_invalid")
+    if any(
+        not isinstance(item, dict)
+        or not isinstance(item.get("anchor"), str)
+        or not _source_ref(item.get("anchor"))
+        for item in regions[:MAX_LIST_ITEMS]
+    ):
+        global_reasons.append("inline_math_region_anchor_invalid")
     if source_visuals.get("inline_math_source_expected_anchors") is not None and not isinstance(source_visuals.get("inline_math_source_expected_anchors"), (list, tuple, set)):
         global_reasons.append("inline_math_expected_anchors_invalid")
+    elif _ref_items_invalid(source_visuals.get("inline_math_source_expected_anchors")):
+        global_reasons.append("inline_math_expected_anchor_item_invalid")
     if expected_duplicates:
         global_reasons.append("inline_math_expected_anchors_duplicate")
     if region_duplicates or candidate_duplicates:
@@ -1839,18 +2786,105 @@ def _inline_math_records(
     raw_inline_candidates = candidates.get("candidates") if isinstance(candidates, dict) else None
     if isinstance(raw_inline_candidates, list) and len(raw_inline_candidates) > MAX_LIST_ITEMS:
         global_reasons.append("inline_math_candidates_too_many")
+    if candidates is not None and not isinstance(candidates, dict):
+        global_reasons.append("inline_math_renderings_invalid")
+    elif isinstance(candidates, dict) and "candidates" in candidates and not isinstance(raw_inline_candidates, list):
+        global_reasons.append("inline_math_candidates_invalid")
+    if isinstance(raw_inline_candidates, list) and any(
+        not isinstance(item, dict) for item in raw_inline_candidates[:MAX_LIST_ITEMS]
+    ):
+        global_reasons.append("inline_math_candidate_invalid")
+    if isinstance(raw_inline_candidates, list) and any(
+        not isinstance(item.get("anchor"), str) or not _source_ref(item.get("anchor"))
+        for item in raw_inline_candidates[:MAX_LIST_ITEMS]
+        if isinstance(item, dict)
+    ):
+        global_reasons.append("inline_math_candidate_anchor_invalid")
     if set(by_anchor) != expected:
         global_reasons.append("inline_math_region_anchor_set_mismatch")
     if set(candidate_by_anchor) != expected:
         global_reasons.append("inline_math_candidate_anchor_set_mismatch")
     if html != expected or markdown != expected:
         global_reasons.append("inline_math_surface_anchor_set_mismatch")
+    if (
+        missing_crop
+        | missing_html
+        | missing_markdown
+        | duplicate_html
+        | duplicate_markdown
+    ) - expected:
+        global_reasons.append("inline_math_unexpected_diagnostic_anchors")
+    counts = primary.get("counts") if isinstance(primary.get("counts"), dict) else {}
+    inline_count_declarations: list[tuple[str, Any]] = []
+    if "inline_math_source_region_count" in primary:
+        inline_count_declarations.append(
+            (
+                "inline_math_source_region_count",
+                primary.get("inline_math_source_region_count"),
+            )
+        )
+    for key in ("inline_math", "inline_math_regions", "inline_math_source_regions"):
+        if key in counts:
+            inline_count_declarations.append((f"counts.{key}", counts.get(key)))
+    parsed_inline_counts = [
+        _strict_nonnegative_int(value)
+        for _name, value in inline_count_declarations
+    ]
+    parsed_inline_count = (
+        parsed_inline_counts[0] if parsed_inline_counts else None
+    )
+    inline_count = parsed_inline_count if parsed_inline_count is not None else 0
+    if inline_count_declarations and any(
+        value is None for value in parsed_inline_counts
+    ):
+        global_reasons.append("inline_math_expected_count_invalid")
+    valid_inline_counts = {
+        value for value in parsed_inline_counts if value is not None
+    }
+    if len(valid_inline_counts) > 1:
+        global_reasons.append("inline_math_expected_count_conflict")
+    if not inline_count_declarations and (regions_declared or expected_declared):
+        global_reasons.append("inline_math_expected_count_missing")
+    if parsed_inline_count is not None and (
+        parsed_inline_count != len(regions) or parsed_inline_count != len(expected)
+    ):
+        global_reasons.append("inline_math_expected_count_mismatch")
     document_nodes = _document_nodes(document_json, None)
     document_nodes_by_ref: dict[str, list[dict[str, Any]]] = {}
     for node_item in document_nodes:
         node_ref = _source_ref(node_item.get("source_ref"))
         if node_ref:
             document_nodes_by_ref.setdefault(node_ref, []).append(node_item)
+    has_extra_occurrences = bool(
+        by_anchor
+        or candidate_by_anchor
+        or regions
+        or html
+        or markdown
+        or missing_crop
+        or (isinstance(raw_inline_candidates, list) and raw_inline_candidates)
+    )
+    if not expected and (has_extra_occurrences or inline_count > 0 or global_reasons):
+        declaration_reason = (
+            "inline_math_expected_anchors_empty"
+            if expected_declared
+            else "inline_math_expected_anchors_missing"
+        )
+        return [
+            _record(
+                output_dir=output_dir,
+                kind="inline_math",
+                index=0,
+                source_ref="inline_math:empty-or-missing-declaration",
+                status="unresolved",
+                critical=True,
+                reasons=[declaration_reason, *global_reasons],
+                signals={
+                    "region_count": len(by_anchor),
+                    "candidate_count": len(candidate_by_anchor),
+                },
+            )
+        ]
     records: list[dict[str, Any]] = []
     for ordinal, anchor in enumerate(sorted(expected), start=1):
         region = by_anchor.get(anchor) or {}
@@ -1870,6 +2904,40 @@ def _inline_math_records(
         asset = candidate.get("image") or candidate.get("path")
         if not asset:
             reasons.append("inline_math_source_asset_missing")
+        region_page = _safe_page(region.get("page_no"))
+        candidate_page = _safe_page(candidate.get("page_no"))
+        if region_page is None or candidate_page is None or candidate_page != region_page:
+            reasons.append("inline_math_candidate_page_mismatch")
+        if not _bbox_equal(region.get("bbox"), candidate.get("bbox")):
+            reasons.append("inline_math_candidate_bbox_mismatch")
+        region_part = region.get("part_index")
+        candidate_part = candidate.get("part_index")
+        if (
+            region_part is not None
+            and candidate_part is not None
+            and region_part != candidate_part
+        ):
+            reasons.append("inline_math_candidate_part_mismatch")
+        candidate_source_page = candidate.get("source_page_no")
+        if (
+            candidate_source_page is not None
+            and _safe_page(candidate_source_page) != region_page
+        ):
+            reasons.append("inline_math_candidate_source_page_mismatch")
+        region_source_identity = _inline_binding_identity(region.get("source_text"))
+        candidate_source_text = candidate.get("source_text")
+        if candidate_source_text is None:
+            reasons.append("inline_math_candidate_body_missing")
+        else:
+            candidate_source_identity = _inline_binding_identity(candidate_source_text)
+            if (
+                not region_source_identity
+                or not candidate_source_identity
+                or region_source_identity not in candidate_source_identity
+            ):
+                reasons.append("inline_math_candidate_body_mismatch")
+        if bool(candidate.get("unresolved")):
+            reasons.append("inline_math_candidate_unresolved")
         candidate_asset_sha = _sha256(candidate.get("asset_sha256"))
         if candidate.get("asset_sha256") is not None:
             if candidate_asset_sha is None:
@@ -1882,12 +2950,104 @@ def _inline_math_records(
             if len(body_nodes) != 1:
                 reasons.append("inline_math_final_node_binding_missing")
             else:
+                body_node_item = body_nodes[0]
+                declared_page = _safe_page(
+                    region.get("page_no") or candidate.get("page_no")
+                )
+                declared_bbox = region.get("bbox") or candidate.get("bbox")
+                if (
+                    declared_page is not None
+                    and body_node_item.get("page_no") != declared_page
+                ):
+                    reasons.append("inline_math_final_node_page_mismatch")
+                if declared_bbox is not None and not _bbox_equal(
+                    declared_bbox, body_node_item.get("bbox")
+                ):
+                    reasons.append("inline_math_final_node_bbox_mismatch")
+                expected_body_sha = _sha256(
+                    region.get("final_body_identity_sha256")
+                    or candidate.get("final_body_identity_sha256")
+                )
+                node = (
+                    body_node_item.get("node")
+                    if isinstance(body_node_item.get("node"), dict)
+                    else {}
+                )
+                if expected_body_sha is not None:
+                    if _body_identity_sha("inline_math", _structural_body_identity(node.get("text"))) != expected_body_sha:
+                        reasons.append("inline_math_final_node_body_mismatch")
+                else:
+                    source_text = _inline_binding_identity(
+                        region.get("source_text") or candidate.get("source_text")
+                    )
+                    node_text = _inline_binding_identity(node.get("text"))
+                    if not source_text or not node_text or source_text not in node_text:
+                        reasons.append("inline_math_final_node_body_unverified")
+        else:
+            # Inline regions emitted by semantic_reflow normally carry a
+            # paragraph anchor rather than a Docling self_ref.  Bind them to
+            # exactly one final text/paragraph node by page, part, bbox, and
+            # visible source text; ambiguous or absent mappings fail closed.
+            source_text = _inline_binding_identity(
+                region.get("source_text") or candidate.get("source_text")
+            )
+            region_page = _safe_page(region.get("page_no") or candidate.get("page_no"))
+            region_bbox = region.get("bbox") or candidate.get("bbox")
+            safe_region_bbox = _safe_bbox(region_bbox)
+            part_index = region.get("part_index")
+            paragraph_matches: list[dict[str, Any]] = []
+            collection_index = _strict_nonnegative_int(
+                region.get("collection_index", candidate.get("collection_index"))
+            )
+            candidate_nodes = document_nodes
+            collection_bound = collection_index is not None
+            if collection_index is not None:
+                collection_refs = [f"#/texts/{collection_index}"]
+                if isinstance(part_index, int) and not isinstance(part_index, bool):
+                    collection_refs.insert(
+                        0, f"chunk:{part_index}:#/texts/{collection_index}"
+                    )
+                candidate_nodes = [
+                    node_item
+                    for collection_ref in collection_refs
+                    for node_item in document_nodes_by_ref.get(collection_ref, [])
+                ]
+            if region_page is not None and safe_region_bbox is not None and source_text:
+                for node_item in candidate_nodes:
+                    if node_item.get("label") not in {"text", "paragraph", "list_item"}:
+                        continue
+                    if node_item.get("page_no") != region_page:
+                        continue
+                    node_part_index = node_item.get("part_index")
+                    if (
+                        part_index is not None
+                        and node_part_index != part_index
+                        and not (part_index == 0 and node_part_index is None)
+                    ):
+                        continue
+                    bbox_bound = (
+                        _bbox_contains(node_item.get("bbox"), safe_region_bbox)
+                        if collection_bound
+                        else _bbox_equal(safe_region_bbox, node_item.get("bbox"))
+                    )
+                    if not bbox_bound:
+                        continue
+                    node_text = _inline_binding_identity(node_item.get("text"))
+                    body_bound = bool(
+                        node_text
+                        and source_text in node_text
+                    )
+                    if body_bound:
+                        paragraph_matches.append(node_item)
+            if len(paragraph_matches) != 1:
+                reasons.append("inline_math_final_node_binding_missing_or_ambiguous")
+            else:
                 expected_body_sha = _sha256(
                     region.get("final_body_identity_sha256")
                     or candidate.get("final_body_identity_sha256")
                 )
                 if expected_body_sha is not None:
-                    node = body_nodes[0].get("node") if isinstance(body_nodes[0].get("node"), dict) else {}
+                    node = paragraph_matches[0].get("node") if isinstance(paragraph_matches[0].get("node"), dict) else {}
                     if _body_identity_sha("inline_math", _structural_body_identity(node.get("text"))) != expected_body_sha:
                         reasons.append("inline_math_final_node_body_mismatch")
         signals = {
@@ -1922,16 +3082,37 @@ def _quarantine_records(output_dir: Path, quality: dict[str, Any]) -> list[dict[
     structural = quality.get("structural_quarantine_qc")
     if not isinstance(structural, dict):
         return []
+    if "candidates" not in structural:
+        return []
+    raw_candidates = structural.get("candidates")
+    if not isinstance(raw_candidates, list):
+        return [
+            _record(
+                output_dir=output_dir,
+                kind="picture_ocr",
+                index="schema",
+                source_ref="picture_ocr:quarantine-schema",
+                status="unresolved",
+                critical=True,
+                reasons=["quarantine_candidates_invalid"],
+            )
+        ]
+    candidates_overflow = len(raw_candidates) > MAX_LIST_ITEMS
+    invalid_count = sum(
+        1 for item in raw_candidates[:MAX_LIST_ITEMS] if not isinstance(item, dict)
+    )
+    # Canonical sorting makes the representative record and merged evidence
+    # independent of producer list order.  Non-dicts are counted separately so
+    # malformed entries cannot disappear behind a valid duplicate.
+    candidates = sorted(
+        (item for item in raw_candidates[:MAX_LIST_ITEMS] if isinstance(item, dict)),
+        key=lambda item: json.dumps(item, ensure_ascii=False, sort_keys=True, default=str)[:4096],
+    )
     records: list[dict[str, Any]] = []
-    candidates = structural.get("candidates")
-    if not isinstance(candidates, list):
-        candidates = []
-    seen_refs: set[tuple[str, str]] = set()
-    seen_fingerprints: set[tuple[str, int | None, str, str]] = set()
-    candidates_overflow = len(candidates) > MAX_LIST_ITEMS
-    for ordinal, candidate in enumerate(candidates[:MAX_LIST_ITEMS], start=1):
-        if not isinstance(candidate, dict):
-            continue
+    by_identity: dict[tuple[str, str], dict[str, Any]] = {}
+    by_fingerprint: dict[tuple[str, int | None, str, str], dict[str, Any]] = {}
+
+    def classify(candidate: dict[str, Any]) -> tuple[str | None, bool, bool, int | None, str, str | None, tuple[Any, ...]]:
         picture_overlap = _truthy(candidate.get("picture_overlap"))
         label = _text(candidate.get("label"), 64).casefold().removeprefix("quarantined_")
         kind_hint = _text(candidate.get("kind"), 80).casefold()
@@ -1943,41 +3124,58 @@ def _quarantine_records(output_dir: Path, quality: dict[str, Any]) -> list[dict[
             or "picture_ocr" in kind_hint
         )
         if not picture_overlap and not header_footer and not picture_annotation:
-            continue
+            return None, picture_overlap, picture_annotation, None, "", None, ()
         kind = "picture_ocr" if picture_overlap or picture_annotation else "header_footer"
         page = _safe_page(candidate.get("page_no"))
         preview = _text(candidate.get("text") or candidate.get("text_preview"))
-        raw_overlap = candidate.get("picture_overlap")
-        overlap_schema_invalid = raw_overlap is not None and not isinstance(raw_overlap, (bool, int, float, dict, list, tuple, set))
+        action = _text(candidate.get("action"), 80)
         source_ref = _source_ref(candidate.get("source_ref"))
-        fingerprint = (kind, page, preview, _text(candidate.get("action"), 80))
-        if source_ref and (kind, source_ref) in seen_refs:
-            # Keep conflicting duplicate source refs visible rather than
-            # allowing a later clean record to hide an earlier residual.
-            if fingerprint in seen_fingerprints:
-                continue
-        elif not source_ref and fingerprint in seen_fingerprints:
-            continue
-        if source_ref:
-            seen_refs.add((kind, source_ref))
-        seen_fingerprints.add(fingerprint)
+        fingerprint = (kind, page, preview, action)
+        evidence_key = (
+            page,
+            json.dumps(_safe_bbox(candidate.get("bbox")), ensure_ascii=False, sort_keys=True),
+            _text(candidate.get("source_asset") or candidate.get("image") or candidate.get("evidence"), 300),
+            _text(candidate.get("picture_overlap"), 40),
+            action,
+            preview,
+        )
+        return kind, picture_overlap, picture_annotation, page, preview, source_ref, (fingerprint, evidence_key)
+
+    def residual_evidence(candidate: dict[str, Any]) -> tuple[list[str], bool]:
         residual = candidate.get("final_output_residual_surfaces")
-        malformed_residuals = residual is None or not isinstance(residual, list)
-        residuals: list[str] = []
+        malformed = residual is None or not isinstance(residual, list)
+        values: list[str] = []
         if isinstance(residual, list):
             if len(residual) > MAX_RESIDUAL_SURFACES:
-                malformed_residuals = True
+                malformed = True
             for value in residual[:MAX_RESIDUAL_SURFACES]:
                 if not isinstance(value, str):
-                    malformed_residuals = True
+                    malformed = True
                     continue
                 normalized = _text(value, 80)
-                if normalized:
-                    residuals.append(normalized)
+                if normalized and normalized not in values:
+                    values.append(normalized)
+        return sorted(values), malformed
+
+    for ordinal, candidate in enumerate(candidates, start=1):
+        classified = classify(candidate)
+        kind, picture_overlap, picture_annotation, page, preview, source_ref, keys = classified
+        if kind is None:
+            continue
+        fingerprint, evidence_key = keys
+        residuals, malformed_residuals = residual_evidence(candidate)
+        raw_overlap = candidate.get("picture_overlap")
+        overlap_schema_invalid = raw_overlap is not None and not isinstance(
+            raw_overlap, (bool, int, float, dict, list, tuple, set)
+        )
         action = _text(candidate.get("action"), 80)
         reasons: list[str] = []
         if malformed_residuals:
-            reasons.append("residual_surface_schema_invalid" if residual is not None else "residual_surface_schema_missing")
+            reasons.append(
+                "residual_surface_schema_invalid"
+                if candidate.get("final_output_residual_surfaces") is not None
+                else "residual_surface_schema_missing"
+            )
         if overlap_schema_invalid:
             reasons.append("picture_overlap_schema_invalid")
         if picture_annotation and not picture_overlap:
@@ -1986,33 +3184,64 @@ def _quarantine_records(output_dir: Path, quality: dict[str, Any]) -> list[dict[
             reasons.append("main_flow_residual")
         if action != "quarantine_from_main_text_flow":
             reasons.append("isolation_not_proven")
-        record_status = "verified_semantic" if not reasons else "unresolved"
-        # Quarantine diagnostics call this field ``evidence`` and point to the
-        # source page crop; retain that path as the bounded asset proof rather
-        # than manufacturing a picture filename that may not exist.
-        asset = (
-            candidate.get("source_asset")
-            or candidate.get("image")
-            or candidate.get("evidence")
+        identity = (kind, source_ref) if source_ref else ("fingerprint", repr(fingerprint))
+        existing = by_identity.get(identity)
+        if existing is None and not source_ref:
+            existing = by_fingerprint.get(fingerprint)
+        if existing is not None:
+            merged = existing.setdefault("signals", {}).setdefault("residual_surfaces", [])
+            for value in residuals:
+                if value not in merged and len(merged) < MAX_RESIDUAL_SURFACES:
+                    merged.append(value)
+            merged.sort()
+            existing_reasons = existing.setdefault("reasons", [])
+            for reason in reasons:
+                if reason not in existing_reasons:
+                    existing_reasons.append(reason)
+            core_existing = existing.setdefault("_quarantine_core", evidence_key)
+            if core_existing != evidence_key:
+                if "quarantine_duplicate_evidence_conflict" not in existing_reasons:
+                    existing_reasons.append("quarantine_duplicate_evidence_conflict")
+            existing["reasons"] = _unique(existing_reasons)
+            if existing["reasons"]:
+                existing["status"] = "unresolved"
+            continue
+        asset = candidate.get("source_asset") or candidate.get("image") or candidate.get("evidence")
+        record = _record(
+            output_dir=output_dir,
+            kind=kind,
+            index=ordinal,
+            page_no=page,
+            bbox=candidate.get("bbox"),
+            source_ref=source_ref or f"{kind}:{ordinal}",
+            source_asset=asset,
+            signals={
+                "picture_overlap": picture_overlap,
+                "residual_surfaces": residuals,
+                "quarantine_action": action or None,
+            },
+            status="verified_semantic" if not reasons else "unresolved",
+            critical=True,
+            reasons=reasons,
+            text_preview=preview,
         )
+        record["_quarantine_core"] = evidence_key
+        records.append(record)
+        if source_ref:
+            by_identity[identity] = record
+        else:
+            by_fingerprint[fingerprint] = record
+    if invalid_count:
         records.append(
             _record(
                 output_dir=output_dir,
-                kind=kind,
-                index=ordinal,
-                page_no=page,
-                bbox=candidate.get("bbox"),
-                source_ref=source_ref or f"{kind}:{ordinal}",
-                source_asset=asset,
-                signals={
-                    "picture_overlap": picture_overlap,
-                    "residual_surfaces": residuals,
-                    "quarantine_action": action or None,
-                },
-                status=record_status,
+                kind="picture_ocr",
+                index="schema-item",
+                source_ref="picture_ocr:quarantine-schema-item",
+                status="unresolved",
                 critical=True,
-                reasons=reasons,
-                text_preview=preview,
+                reasons=["quarantine_candidate_invalid"],
+                signals={"invalid_candidate_count": invalid_count},
             )
         )
     if candidates_overflow:
@@ -2025,9 +3254,11 @@ def _quarantine_records(output_dir: Path, quality: dict[str, Any]) -> list[dict[
                 status="unresolved",
                 critical=True,
                 reasons=["quarantine_candidate_limit_exceeded"],
-                signals={"candidate_count": len(candidates)},
+                signals={"candidate_count": len(raw_candidates)},
             )
         )
+    for record in records:
+        record.pop("_quarantine_core", None)
     return records
 
 
@@ -2150,6 +3381,11 @@ def _source_identity(
         for name, digest in declared
         if digest and name != "conversion_input_sha256"
     }
+    if not values:
+        # The immutable source bytes are not identity-bound by the conversion
+        # output unless at least one metadata, inventory, or manifest digest is
+        # declared.  A conversion-only digest is intentionally not sufficient.
+        reasons.append("source_hash_declaration_missing")
     if len(values) > 1:
         reasons.append("source_hash_conflict")
     actual = _hash_root_file(root, "source.pdf", max_bytes=MAX_SOURCE_PDF_BYTES)
@@ -2179,7 +3415,7 @@ def _summary(records: list[dict[str, Any]], *, truncated: bool, total: int) -> d
     }
 
 
-def evaluate_regions(
+def _evaluate_regions_impl(
     output_dir: Path | str,
     document_json: Any = None,
     metadata: dict[str, Any] | None = None,
@@ -2193,9 +3429,10 @@ def evaluate_regions(
 
     The input dictionaries are mutated only to append the compact quality
     signal and the two generated-output names.  Document surfaces are never
-    changed.  If dictionaries are omitted they are loaded from the output
-    directory and the resulting metadata/status files are updated, which makes
-    this function suitable as an independent post-publish validator.
+    changed.  With ``write_sidecars=True``, valid caller-provided metadata and
+    status are persisted too; this keeps their failure state consistent with
+    partially published sidecars.  If dictionaries are omitted they are loaded
+    from the output directory, which also supports a stand-alone validator.
     """
 
     root = Path(output_dir)
@@ -2216,10 +3453,8 @@ def evaluate_regions(
         errors.append("metadata_json_invalid")
     if caller_status_invalid:
         errors.append("status_json_invalid")
-    try:
-        root_safe = root.is_dir() and not root.is_symlink()
-    except OSError:
-        root_safe = False
+    root_context = _root_context_for(root)
+    root_safe = root_context is not None and _root_path_matches_context(root, root_context)
     if not root_safe:
         errors.append("output_dir_missing_or_unsafe")
     if document_json is None:
@@ -2255,20 +3490,41 @@ def evaluate_regions(
 
     if "quality_signals" in status and not isinstance(status.get("quality_signals"), dict):
         errors.append("status_quality_signals_invalid")
+        if loaded_status:
+            status_read_ok = False
     if "quality_signals" in metadata and not isinstance(metadata.get("quality_signals"), dict):
         errors.append("metadata_quality_signals_invalid")
+        if loaded_metadata:
+            metadata_read_ok = False
     quality, source_visuals = _source_signals(status, metadata)
     if pdf_inventory is None:
-        stored_inventory = metadata.get("final_pdf_inventory") or metadata.get(
-            "pdf_structure_inventory"
-        )
+        stored_inventory = None
+        inventory_declared = False
+        for inventory_key in ("final_pdf_inventory", "pdf_structure_inventory"):
+            if inventory_key in metadata:
+                inventory_declared = True
+                stored_inventory = metadata.get(inventory_key)
+                if isinstance(stored_inventory, dict):
+                    break
         if isinstance(stored_inventory, dict):
             pdf_inventory = stored_inventory
+        elif inventory_declared:
+            errors.append("pdf_inventory_invalid")
+            pdf_inventory = {}
+    elif not isinstance(pdf_inventory, dict):
+        errors.append("pdf_inventory_invalid")
+        pdf_inventory = {}
     source_sha, source_identity_reasons, source_identity_diagnostics = _source_identity(
         root, metadata, pdf_inventory
     )
     errors.extend(source_identity_reasons)
     primary = quality.get("primary_surface")
+    if "primary_surface" in quality and not isinstance(primary, dict):
+        errors.append("primary_surface_invalid")
+    if isinstance(primary, dict) and "counts" in primary and not isinstance(
+        primary.get("counts"), dict
+    ):
+        errors.append("primary_counts_invalid")
     primary_counts = primary.get("counts") if isinstance(primary, dict) else {}
     primary_counts = primary_counts if isinstance(primary_counts, dict) else {}
     records: list[dict[str, Any]] = []
@@ -2344,11 +3600,11 @@ def evaluate_regions(
     }
 
     if isinstance(status, dict):
-        quality_signals = status.setdefault("quality_signals", {})
-        if not isinstance(quality_signals, dict):
-            quality_signals = {}
-            status["quality_signals"] = quality_signals
-        quality_signals["region_quality_gate"] = signals
+        quality_signals = status.get("quality_signals")
+        if isinstance(quality_signals, dict):
+            quality_signals["region_quality_gate"] = signals
+        elif "quality_signals" not in status:
+            status["quality_signals"] = {"region_quality_gate": signals}
         if not ok:
             status["ok"] = False
             status["success_class"] = "degraded_failure"
@@ -2408,10 +3664,34 @@ def evaluate_regions(
                 if name in written_payloads and name not in generated:
                     generated.append(name)
 
+        caller_metadata_state_valid = bool(
+            not loaded_metadata
+            and not caller_metadata_invalid
+            and (
+                "quality_signals" not in metadata
+                or isinstance(metadata.get("quality_signals"), dict)
+            )
+        )
+        caller_status_state_valid = bool(
+            not loaded_status
+            and not caller_status_invalid
+            and (
+                "quality_signals" not in status
+                or isinstance(status.get("quality_signals"), dict)
+            )
+        )
         state_errors: list[str] = []
         for name, should_write, state_payload in (
-            ("metadata.json", loaded_metadata and metadata_read_ok, metadata),
-            ("status.json", loaded_status and status_read_ok, status),
+            (
+                "metadata.json",
+                (loaded_metadata and metadata_read_ok) or caller_metadata_state_valid,
+                metadata,
+            ),
+            (
+                "status.json",
+                (loaded_status and status_read_ok) or caller_status_state_valid,
+                status,
+            ),
         ):
             if not should_write:
                 continue
@@ -2440,6 +3720,63 @@ def evaluate_regions(
         "metadata": metadata,
         "status": status,
     }
+
+
+def evaluate_regions(
+    output_dir: Path | str,
+    document_json: Any = None,
+    metadata: dict[str, Any] | None = None,
+    status: dict[str, Any] | None = None,
+    *,
+    pdf_inventory: dict[str, Any] | None = None,
+    max_records: int = DEFAULT_MAX_RECORDS,
+    write_sidecars: bool = True,
+) -> dict[str, Any]:
+    """Pin *output_dir* for one evaluation and release it on every exit path."""
+
+    root = Path(output_dir)
+    root_fd: int | None = None
+    token = None
+    try:
+        root_fd, root_stat = _open_root_dir(root)
+    except OSError:
+        # The implementation will emit the bounded unsafe-root failure and
+        # avoid all path-based writes when no pinned descriptor is available.
+        root_fd = None
+    if root_fd is not None:
+        try:
+            token = _ROOT_CONTEXT.set(
+                (
+                    os.path.abspath(os.fspath(root)),
+                    root_fd,
+                    root_stat.st_dev,
+                    root_stat.st_ino,
+                )
+            )
+        except BaseException:
+            os.close(root_fd)
+            root_fd = None
+            raise
+    try:
+        return _evaluate_regions_impl(
+            root,
+            document_json,
+            metadata,
+            status,
+            pdf_inventory=pdf_inventory,
+            max_records=max_records,
+            write_sidecars=write_sidecars,
+        )
+    finally:
+        try:
+            if token is not None:
+                _ROOT_CONTEXT.reset(token)
+        finally:
+            if root_fd is not None:
+                try:
+                    os.close(root_fd)
+                except OSError:
+                    pass
 
 
 def _parse_args() -> argparse.Namespace:
