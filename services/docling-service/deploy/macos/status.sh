@@ -1,10 +1,16 @@
 #!/bin/zsh
 set -euo pipefail
 
-API_PORT=${DOCLING_API_PORT:-8000}
-if curl -fsS http://127.0.0.1:${API_PORT}/healthz; then
-  print
-  exit 0
+SCRIPT_DIR=${0:A:h}
+SERVICE_DIR=${SCRIPT_DIR:h:h}
+REPO_ROOT=${SERVICE_DIR:h:h}
+RUNTIME_DIR=${REPO_ROOT}/.runtime/docling-release/macos
+VENV_DIR=${RUNTIME_DIR}/venv
+
+if [[ ! -x ${VENV_DIR}/bin/python ]]; then
+  print -u2 "Release is not installed. Run ${SCRIPT_DIR}/install.sh first."
+  exit 2
 fi
-print -u2 "docling-service is not healthy on port ${API_PORT}"
-exit 1
+
+exec "${VENV_DIR}/bin/python" "${SCRIPT_DIR}/lifecycle.py" status \
+  --runtime-dir "${RUNTIME_DIR}"

@@ -40,6 +40,18 @@ class DistributionTests(unittest.TestCase):
         "ui/main.js",
         "ui/styles.css",
     )
+    MACOS_REQUIRED_FILES = (
+        "services/docling-service/deploy/docker/backend-constraints.txt",
+        "services/docling-service/deploy/macos/constraints.txt",
+        "services/docling-service/deploy/macos/lifecycle.py",
+        "services/docling-service/deploy/macos/logging_wrapper.py",
+        "services/docling-service/deploy/macos/run-api.sh",
+        "services/docling-service/deploy/macos/run-backend.sh",
+        "services/docling-service/deploy/macos/runtime.txt",
+        "services/docling-service/deploy/macos/start.sh",
+        "services/docling-service/deploy/macos/status.sh",
+        "services/docling-service/deploy/macos/stop.sh",
+    )
 
     def test_dockerignore_whitelists_inventory_script(self) -> None:
         dockerignore = (REPO_ROOT / ".dockerignore").read_text(encoding="utf-8")
@@ -234,10 +246,11 @@ class DistributionTests(unittest.TestCase):
                             block,
                         )
 
-    def test_macos_start_uses_logging_wrapper(self) -> None:
+    def test_macos_start_uses_lifecycle_helper(self) -> None:
         start_script = (SERVICE_ROOT / "deploy/macos/start.sh").read_text(encoding="utf-8")
-        self.assertIn("logging_wrapper.py", start_script)
-        self.assertIn("--log-path", start_script)
+        self.assertIn("lifecycle.py", start_script)
+        self.assertIn("start-all", start_script)
+        self.assertIn("--python-bin", start_script)
 
     def test_upload_spooling_uses_managed_state_temp(self) -> None:
         dockerfile = (SERVICE_ROOT / "deploy/docker/Dockerfile.api").read_text(
@@ -393,10 +406,11 @@ class DistributionTests(unittest.TestCase):
             self.assertEqual(["linux/amd64", "linux/arm64"], manifest["docker_platforms"])
             self.assertFalse(any("/.runtime/" in name or "/reports/" in name for name in names))
             self.assertFalse(any(name.endswith((".pdf", ".log", ".pyc")) for name in names))
-            self.assertIn(
-                f"docling-service-{RELEASE_VERSION}/services/docling-service/deploy/macos/logging_wrapper.py",
-                names,
-            )
+            for relative in self.MACOS_REQUIRED_FILES:
+                self.assertIn(
+                    f"docling-service-{RELEASE_VERSION}/{relative}",
+                    names,
+                )
             inventory_bundle_path = (
                 f"docling-service-{RELEASE_VERSION}/{self.INVENTORY_TOOL}"
             )
@@ -411,6 +425,9 @@ class DistributionTests(unittest.TestCase):
             }
             self.assertTrue(ui_bundle_paths.issubset(names))
             manifest_paths = {entry.get("path") for entry in manifest["files"]}
+            self.assertTrue(
+                set(self.MACOS_REQUIRED_FILES).issubset(manifest_paths)
+            )
             self.assertIn(self.INVENTORY_TOOL, manifest_paths)
             self.assertIn(self.REGION_GATE_TOOL, manifest_paths)
             self.assertTrue(
@@ -454,6 +471,158 @@ class DistributionTests(unittest.TestCase):
                         if item.filename.endswith(f"/{self.INVENTORY_TOOL}"):
                             continue
                         target.writestr(item, source.read(item.filename))
+            with self.assertRaises(subprocess.CalledProcessError):
+                subprocess.run(
+                    [
+                        sys.executable,
+                        str(RELEASE_ROOT / "verify_release_bundle.py"),
+                        str(bad_zip),
+                    ],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+
+    def test_release_verification_rejects_missing_macos_runtime_file(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "output"
+            command = [
+                sys.executable,
+                str(RELEASE_ROOT / "build_release_bundle.py"),
+                "--source-root",
+                str(REPO_ROOT),
+                "--output-dir",
+                str(output),
+                "--version",
+                RELEASE_VERSION,
+                "--commit",
+                "0" * 40,
+                "--epoch",
+                "1785816000",
+            ]
+            subprocess.run(command, check=True, capture_output=True, text=True)
+            source_zip = output / f"docling-service-{RELEASE_VERSION}.zip"
+            with zipfile.ZipFile(source_zip, "r") as source:
+                source_payload = {
+                    item.filename: (item, source.read(item.filename))
+                    for item in source.infolist()
+                }
+            for index, missing in enumerate(self.MACOS_REQUIRED_FILES, start=1):
+                with self.subTest(missing=missing):
+                    bad_zip = output / (
+                        f"docling-service-{RELEASE_VERSION}-missing-macos-{index}.zip"
+                    )
+                    with zipfile.ZipFile(
+                        bad_zip,
+                        "w",
+                        compression=zipfile.ZIP_DEFLATED,
+                        compresslevel=9,
+                    ) as target:
+                        for name, (item, data) in source_payload.items():
+                            if name.endswith(f"/{missing}"):
+                                continue
+                            target.writestr(item, data)
+                    with self.assertRaises(subprocess.CalledProcessError):
+                        subprocess.run(
+                            [
+                                sys.executable,
+                                str(RELEASE_ROOT / "verify_release_bundle.py"),
+                                str(bad_zip),
+                            ],
+                            check=True,
+                            capture_output=True,
+                            text=True,
+                        )
+
+    def test_release_verification_rejects_tampered_macos_lifecycle_payload(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "output"
+            command = [
+                sys.executable,
+                str(RELEASE_ROOT / "build_release_bundle.py"),
+                "--source-root",
+                str(REPO_ROOT),
+                "--output-dir",
+                str(output),
+                "--version",
+                RELEASE_VERSION,
+                "--commit",
+                "0" * 40,
+                "--epoch",
+                "1785816000",
+            ]
+            subprocess.run(command, check=True, capture_output=True, text=True)
+            source_zip = output / f"docling-service-{RELEASE_VERSION}.zip"
+            bad_zip = (
+                output / f"docling-service-{RELEASE_VERSION}-tampered-lifecycle-payload.zip"
+            )
+            with zipfile.ZipFile(source_zip, "r") as source:
+                with zipfile.ZipFile(
+                    bad_zip,
+                    "w",
+                    compression=zipfile.ZIP_DEFLATED,
+                    compresslevel=9,
+                ) as target:
+                    for item in source.infolist():
+                        data = source.read(item.filename)
+                        if item.filename.endswith(
+                            "/services/docling-service/deploy/macos/lifecycle.py"
+                        ):
+                            data = data + b"# lifecycle tamper\n"
+                        target.writestr(item, data)
+            with self.assertRaises(subprocess.CalledProcessError):
+                subprocess.run(
+                    [
+                        sys.executable,
+                        str(RELEASE_ROOT / "verify_release_bundle.py"),
+                        str(bad_zip),
+                    ],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+
+    def test_release_verification_rejects_macos_lifecycle_manifest_omission(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "output"
+            command = [
+                sys.executable,
+                str(RELEASE_ROOT / "build_release_bundle.py"),
+                "--source-root",
+                str(REPO_ROOT),
+                "--output-dir",
+                str(output),
+                "--version",
+                RELEASE_VERSION,
+                "--commit",
+                "0" * 40,
+                "--epoch",
+                "1785816000",
+            ]
+            subprocess.run(command, check=True, capture_output=True, text=True)
+            source_zip = output / f"docling-service-{RELEASE_VERSION}.zip"
+            bad_zip = (
+                output / f"docling-service-{RELEASE_VERSION}-missing-lifecycle-manifest.zip"
+            )
+
+            def mutate_manifest(payload: dict[str, bytes]) -> None:
+                manifest_path = f"docling-service-{RELEASE_VERSION}/RELEASE_MANIFEST.json"
+                manifest = json.loads(payload[manifest_path].decode("utf-8"))
+                manifest["files"] = [
+                    entry
+                    for entry in manifest["files"]
+                    if str(entry.get("path")) != "services/docling-service/deploy/macos/lifecycle.py"
+                ]
+                payload[manifest_path] = (
+                    json.dumps(manifest, indent=2, sort_keys=True).encode("utf-8") + b"\n"
+                )
+
+            self._rewrite_release_zip(
+                source_zip,
+                bad_zip,
+                mutate=lambda payload: None,
+                mutate_after_manifest=mutate_manifest,
+            )
             with self.assertRaises(subprocess.CalledProcessError):
                 subprocess.run(
                     [
