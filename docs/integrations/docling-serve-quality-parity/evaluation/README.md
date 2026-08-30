@@ -42,3 +42,6 @@ Do not tune rules from filenames, paper titles, sample names, known hashes, or
 literal text unique to a document. Persistent evaluation directories outside
 Git must contain their own README explaining provenance, retention, and safe
 cleanup.
+
+Recorded run: [`results-2026-08-30.md`](results-2026-08-30.md), with immutable
+input metadata in [`corpus-lock-2026-08-30.json`](corpus-lock-2026-08-30.json).

@@ -1,5 +1,34 @@
 # Unreleased
 
+## Region-level quality evidence
+
+- the quality adapter now writes bounded, deterministic `regions.json` and
+  `quality_signals.json` sidecars covering picture OCR, header/footer,
+  pictures, tables, algorithms, code, display formulas, and inline math;
+- critical regions use explicit `verified_semantic` / `unresolved` outcomes;
+  bare pictures may be `visual_only` only when their regular crop exists.
+  Truncation, unsafe/missing evidence, or a sidecar write failure is fail-closed;
+- structural evidence is rebound to the final document node/body, source-PDF
+  digest, page/bbox, and a kind-specific source asset. Multi-page algorithms
+  remain unresolved unless every covered page and both rendered surfaces are
+  bound; no incomplete first-page crop is promoted. Manifest and semantic
+  sidecar contributor sets, node kinds, hashes, and union geometry must agree;
+- table validation now checks final cell bboxes independently of producer
+  coverage flags. It rejects one-row cells that cross another row center and
+  repeated tall numeric cells that collapse several visible rows into one,
+  incomplete declared-grid occupancy, and empty grids without an explicit
+  fallback;
+- inline-math binding preserves operators, relations, punctuation, and Unicode
+  math symbols while normalizing presentation-only subscript separators, and
+  rejects truncated candidate expressions;
+- picture-contained OCR can no longer re-enter the main body through the
+  algorithm-grouping path, and the PDF inventory recognizes strict
+  definition/procedure-style algorithms whose numbered steps continue on the
+  next page;
+- the Docker API image and release bundle include the new stdlib-only region
+  validator. A locked calibration/sealed corpus and old-baseline replay report
+  are retained as source documentation; PDF binaries remain outside Git.
+
 ## Operations Web UI and packaging
 
 - the API now serves a same-origin `/ui/` page for PDF upload, queue and

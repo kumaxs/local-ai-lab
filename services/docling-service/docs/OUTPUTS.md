@@ -65,7 +65,11 @@ location, digest, page continuity, text health, and independent high-confidence
 formula/table/algorithm/code counts. `metadata.json` and
 `status.json.quality_signals` may expose `pdf_structure_inventory`,
 `final_pdf_inventory`, `final_source_visuals`, `final_formula_surface`, and
-`final_structural_surface`. The high-confidence/ambiguous counters drive gate
+`final_structural_surface`. Current source builds also publish `regions.json`
+and `quality_signals.json`: the first is a deterministic, at-most-1,000-record
+inventory of region evidence and the second is its compact summary. Both are
+listed in `metadata.json.generated_outputs` only after they are written
+successfully. The high-confidence/ambiguous counters drive gate
 comparisons; persisted `records` arrays are bounded diagnostic samples and are
 not a second exact-count contract.
 
@@ -75,6 +79,22 @@ page/bbox and page/pixel geometry, asset digest, stable source reference, and
 normalized body identity. A blank, label-only, context-only, appendix-only, or
 unbound crop cannot satisfy exact coverage. Machine HTML/TeX remains searchable
 but cannot override a conflicting source visual.
+
+Region outcomes are `verified_semantic`, `visual_only`, and `unresolved`.
+Unresolved picture-OCR, header/footer, table, algorithm, code, formula, or
+inline-math evidence is critical and forces `degraded_failure`; an ordinary
+picture may be noncritical `visual_only` only while its regular source crop is
+present. Structural records are rebound to a final node/body identity, source
+PDF digest, page/bbox, and kind-specific source asset. Cross-page algorithms
+also require a real source asset for every covered page; until the producer can
+publish that set, they intentionally remain unresolved. Table regions
+independently detect cells that cross semantic row boundaries or collapse
+repeated visual rows, require every declared grid slot to be covered, and allow
+an empty grid only through the explicit empty-table fallback. Algorithm
+contributors must agree between the provenance manifest and
+`algorithm_blocks.json`. Inline-math identity keeps operators, relations,
+punctuation, and Unicode math symbols, so a correctly linked crop cannot
+certify a truncated expression or malformed semantic grid.
 
 The second-pass formula repair policy is configured by
 `DOCLING_FORMULA_SECOND_PASS_POLICY` (formal release:

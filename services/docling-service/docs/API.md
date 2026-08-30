@@ -163,6 +163,20 @@ confined, symlinks and traversal are rejected, and bytes are checked against the
 stored manifest while streaming. Active downloads hold a short renewable lease
 so cleanup cannot remove their files mid-transfer.
 
+For jobs produced by the current quality adapter, the output list and archive
+also include `regions.json` and `quality_signals.json` after successful sidecar
+publication. `regions.json` contains bounded per-region evidence and the
+`verified_semantic` / `visual_only` / `unresolved` outcome; the compact companion
+contains counts and failure reasons. Consumers must still read `status.json.ok`
+first: any unresolved critical region makes the job a `degraded_failure`.
+Structural success also requires final-node/body, source-PDF, page/bbox, and
+kind-specific visual identity. A detected multi-page algorithm remains
+unresolved unless every covered page has real evidence and both HTML and
+Markdown are bound. Algorithm contributor lists must agree across the manifest
+and semantic sidecar; tables require complete declared-grid occupancy unless
+the explicit empty-table fallback applies, and inline-math bindings preserve
+operators and Unicode math symbols.
+
 Example:
 
 ```bash

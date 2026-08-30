@@ -92,7 +92,28 @@
       "resolved_url": "https://arxiv.org/pdf/2608.08459",
       "size_bytes": 8243286,
       "sha256": "d9e977655fa181182894d8585dbcc75410133f24a059c013a7323632f25ad19b",
-      "content_inspected": false
+      "content_inspected": false,
+      "sealed_automated_score": {
+        "scored_at": "2026-08-30T03:51:22Z",
+        "code_revision": "dd2c4dc",
+        "scope": "non-interactive scalar PDF inventory only; no text, record, page, or render inspected",
+        "human_inspection": false,
+        "available": true,
+        "page_count": 24,
+        "reason": "unknown_tokens",
+        "counts": {
+          "algorithm": {"high_confidence": 0, "ambiguous": 0},
+          "code": {"high_confidence": 0, "ambiguous": 0},
+          "table": {"high_confidence": 7, "ambiguous": 0},
+          "formula": {"high_confidence": 1, "ambiguous": 6}
+        },
+        "proof": {
+          "algorithm": "healthy",
+          "code": "healthy",
+          "table": "healthy",
+          "formula": "unknown"
+        }
+      }
     }
   ]
 }

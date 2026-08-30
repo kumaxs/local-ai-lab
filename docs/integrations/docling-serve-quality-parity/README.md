@@ -127,6 +127,8 @@ The adapter writes one job directory under `--output-root`:
   document.json
   metadata.json
   status.json
+  regions.json                # bounded region evidence and outcomes
+  quality_signals.json        # compact region-gate summary
   tables/table_N.json
   review_index.html
   pages/page_N.png
@@ -186,6 +188,48 @@ SHA, page/bbox geometry, page/pixel dimensions, asset digest, stable source ref,
 and normalized body identity. A visual that is only an appendix, context crop,
 label, blank image, or unbound occurrence is diagnostic evidence and cannot
 satisfy exact coverage.
+
+The final region gate runs after those hard gates and before surface-status
+reconciliation. It emits at most 1,000 deterministic records across picture
+OCR, header/footer, pictures, tables, algorithms, code, display formulas, and
+inline math. Each record is `verified_semantic`, `visual_only`, or
+`unresolved`; structural, formula, inline-math, picture-OCR, and header/footer
+records are critical, while a bare picture may remain noncritical visual-only
+evidence. Any unresolved critical record, truncated inventory, unsafe/missing
+evidence path, or sidecar publication failure forces `degraded_failure`.
+
+Structural promotion is bound again at the gate to the final document node,
+normalized body identity, source-PDF digest, page/bbox, and a kind-constrained
+source asset. Missing, duplicate, extra, partial, or conflicting declarations
+remain unresolved. A multi-page algorithm additionally requires per-page
+source evidence plus HTML and Markdown binding. The current single-image
+algorithm schema cannot prove that contract, so a detected multi-page block is
+reported unresolved instead of reusing an incomplete first-page crop. The
+algorithm manifest and `algorithm_blocks.json` must name the same complete
+contributor set, node kinds, body hashes, page/bboxes, and union geometry.
+
+Table records also validate the final cell geometry independently of the
+source-visual coverage flags. A `row_span=1` cell that crosses another semantic
+row center, or repeated tall numeric cells that flatten several visible rows
+into one semantic row, is unresolved. Every declared grid slot must be covered
+by a valid cell or span; an empty grid requires the explicit empty-table
+fallback. Inline-math binding removes presentation-only subscript separators
+but retains operators, relations, punctuation, and Unicode math symbols, and a
+candidate may not truncate the source expression. This catches cases where a
+correct crop was bound to an incorrect body or grid. The implementation is
+generic: it does not branch on filename, title, sample ID, PDF hash, or
+document-specific text.
+
+For a read-only audit of an existing output directory, omit sidecar writes from
+Python with `evaluate_regions(..., write_sidecars=False)`. The standalone CLI
+writes the two sidecars and exits nonzero on a failed gate:
+
+```bash
+python3 region_quality_gate.py --output-dir /absolute/path/to/job
+```
+
+The corpus lock and 2026-08-30 evaluation record live under `evaluation/`.
+PDFs and generated review outputs remain outside Git.
 
 This lifecycle applies to the direct quality-parity CLI. The formal service
 wrapper additionally owns `/data/inputs`, `.staging`, published outputs,
