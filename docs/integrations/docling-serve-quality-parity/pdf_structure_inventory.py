@@ -17,9 +17,23 @@ KIND_HEALTHY = "healthy"
 KIND_UNKNOWN = "unknown"
 
 ALGORITHM_HEADING_RE = re.compile(r"^\s*(?:Algorithm|算法)\s*\d+\s*", re.IGNORECASE)
+ALGORITHM_DEFINITION_HEADING_RE = re.compile(
+    r"^\s*(?:Definition|Procedure|Method|定义|过程)\s*\d+(?:\.\d+)*\s*[.:：。]\s+",
+    re.IGNORECASE,
+)
+ALGORITHM_TERM_RE = re.compile(r"\bAlgorithm\b|算法", re.IGNORECASE)
 ALGORITHM_NUMBERED_LINE_RE = re.compile(r"^\s*\d+[:.)]\s+")
 ALGORITHM_CONTROL_RE = re.compile(r"^\s*(?:if|elif|else|for|while|return|break|continue|try|except|finally|with|class|def)\b", re.IGNORECASE)
 ALGORITHM_REQUIRE_KEYWORD_RE = re.compile(r"\b(?:Require|Requires|Ensure|Ensures)\b", re.IGNORECASE)
+ALGORITHM_CROSS_PAGE_CUE_RE = re.compile(
+    r"\b(?:following\s+steps?|steps?\s+(?:are|follow)|as\s+follows)\s*[:：]?\s*$|(?:步骤|如下)\s*[:：]?\s*$",
+    re.IGNORECASE,
+)
+ALGORITHM_FOLLOWING_SECTION_RE = re.compile(
+    r"^\s*(?:Theorem|Lemma|Proposition|Corollary|Proof|Remark|定理|引理|命题|推论|证明|注)\b",
+    re.IGNORECASE,
+)
+PAGE_NUMBER_ONLY_RE = re.compile(r"^\s*\d{1,4}\s*$")
 ALGORITHM_PROSE_TAIL_RE = re.compile(
     r"\b(?:is|are|was|were|this|these|that|using|used|proposed|propose|can|will|we|they|it)\b",
     re.IGNORECASE,
@@ -868,8 +882,97 @@ def _is_algorithm_heading_line(text: str) -> bool:
     return True
 
 
+def _is_definition_algorithm_heading_line(text: str) -> bool:
+    normalized = _safe_text(text).strip()
+    match = ALGORITHM_DEFINITION_HEADING_RE.match(normalized)
+    if not match or len(normalized) > 240:
+        return False
+    return bool(ALGORITHM_TERM_RE.search(normalized[match.end() :]))
+
+
 def _is_input_or_label_only_line(text: str) -> bool:
     return bool(INPUT_LABEL_ONLY_RE.match(text))
+
+
+def _classify_definition_algorithm_records(ordered: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Find definition/procedure-style algorithms, including strict page continuations.
+
+    A cross-page continuation is accepted only when the first page explicitly says
+    that steps follow and at least three numbered steps are present.  This keeps
+    ordinary prose definitions and unrelated numbered lists out of the inventory.
+    """
+
+    out: list[dict[str, Any]] = []
+    for i, node in enumerate(ordered):
+        heading_text = _safe_text(node.get("text")).strip()
+        if not _is_definition_algorithm_heading_line(heading_text):
+            continue
+        page_no = node.get("page_no")
+        if not isinstance(page_no, int):
+            continue
+
+        block = [node]
+        numbered = 0
+        cross_page_cue = bool(ALGORITHM_CROSS_PAGE_CUE_RE.search(heading_text))
+        crossed_page = False
+        j = i + 1
+        while j < len(ordered) and len(block) < 64:
+            candidate = ordered[j]
+            candidate_page = candidate.get("page_no")
+            if not isinstance(candidate_page, int):
+                break
+            if candidate_page == page_no:
+                pass
+            elif candidate_page == page_no + 1 and cross_page_cue:
+                crossed_page = True
+            else:
+                break
+
+            candidate_text = _safe_text(candidate.get("text")).strip()
+            if not candidate_text:
+                break
+            if _is_algorithm_heading_line(candidate_text) or _is_definition_algorithm_heading_line(candidate_text):
+                break
+            if _is_input_or_label_only_line(candidate_text):
+                break
+            if numbered >= 3 and ALGORITHM_FOLLOWING_SECTION_RE.match(candidate_text):
+                break
+
+            # A page number between an explicit continuation cue and the first line
+            # of the next page is layout noise, not part of the algorithm body.
+            if (
+                PAGE_NUMBER_ONLY_RE.match(candidate_text)
+                and cross_page_cue
+                and j + 1 < len(ordered)
+                and ordered[j + 1].get("page_no") == page_no + 1
+            ):
+                j += 1
+                continue
+
+            block.append(candidate)
+            if ALGORITHM_NUMBERED_LINE_RE.search(candidate_text):
+                numbered += 1
+            if ALGORITHM_CROSS_PAGE_CUE_RE.search(candidate_text):
+                cross_page_cue = True
+            j += 1
+
+        if numbered < 3 or (crossed_page and not cross_page_cue):
+            continue
+
+        rec = {
+            "kind": "algorithm",
+            "confidence": "high",
+            "text": "\n".join(_safe_text(item.get("text")).strip() for item in block),
+            "page_no": page_no,
+            "line_indexes": [int(item.get("index") or 0) for item in block],
+            "indexes": [int(item.get("index") or 0) for item in block],
+            "bbox": _extract_group_bbox([item for item in block if item.get("page_no") == page_no]),
+            "nodes": block,
+            "source": "pdf_lines",
+        }
+        rec["fingerprint"] = _record_fingerprint(rec)
+        out.append(rec)
+    return out
 
 
 def _classify_algorithm_records(nodes: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -944,7 +1047,7 @@ def _classify_algorithm_records(nodes: Sequence[dict[str, Any]]) -> list[dict[st
         rec["fingerprint"] = _record_fingerprint(rec)
         out.append(rec)
         i = j
-    return out
+    return _dedupe([*out, *_classify_definition_algorithm_records(ordered)])
 
 
 def _line_code_signals(node: dict[str, Any]) -> tuple[int, int, int]:

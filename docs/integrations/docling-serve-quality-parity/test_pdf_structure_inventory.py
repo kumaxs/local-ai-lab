@@ -109,6 +109,37 @@ class PdfStructureInventoryUnitTests(unittest.TestCase):
         self.assertEqual("algorithm", records[0]["kind"])
         self.assertEqual("high", records[0]["confidence"])
 
+    def test_definition_algorithm_can_continue_to_numbered_steps_on_next_page(self) -> None:
+        nodes = [
+            {"text": "Definition 6. A decoding algorithm", "page_no": 7, "index": 0},
+            {"text": "takes the following steps:", "page_no": 7, "index": 1},
+            {"text": "7", "page_no": 7, "index": 2},
+            {"text": "1. Compute the row support.", "page_no": 8, "index": 3},
+            {"text": "2. Compute the column support.", "page_no": 8, "index": 4},
+            {"text": "3. Peel the candidate sets.", "page_no": 8, "index": 5},
+            {"text": "4. Return the correction.", "page_no": 8, "index": 6},
+            {"text": "Theorem 1. The decoder succeeds.", "page_no": 8, "index": 7},
+        ]
+
+        records = module._classify_algorithm_records(nodes)
+
+        self.assertEqual(1, len(records))
+        self.assertEqual("algorithm", records[0]["kind"])
+        self.assertIn("4. Return the correction.", records[0]["text"])
+        self.assertNotIn("\n7\n", records[0]["text"])
+        self.assertNotIn("Theorem 1", records[0]["text"])
+
+    def test_definition_algorithm_rejects_unrelated_numbered_list_without_continuation_cue(self) -> None:
+        nodes = [
+            {"text": "Definition 2. A routing algorithm", "page_no": 1, "index": 0},
+            {"text": "The definition is discussed below.", "page_no": 1, "index": 1},
+            {"text": "1. First unrelated property.", "page_no": 2, "index": 2},
+            {"text": "2. Second unrelated property.", "page_no": 2, "index": 3},
+            {"text": "3. Third unrelated property.", "page_no": 2, "index": 4},
+        ]
+
+        self.assertEqual([], module._classify_algorithm_records(nodes))
+
     def test_bert_input_label_block_is_code_not_algorithm(self) -> None:
         nodes = [
             {"text": "Input = [CLS]", "page_no": 1, "index": 0},

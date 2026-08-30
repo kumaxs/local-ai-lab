@@ -75,7 +75,9 @@
       "resolved_url": "https://arxiv.org/pdf/2608.27211v1",
       "size_bytes": 408389,
       "sha256": "33e71eefee575b48b6958da940e866bbee525635e2ddf781ed825ec5d49d9f24",
-      "content_inspected": false
+      "content_inspected": true,
+      "first_inspected_at": "2026-08-30T03:32:00Z",
+      "inspection_scope": "PDF metadata, text inventory, and rendered pages 7, 8, and 21; calibration only"
     },
     {
       "id": "sealed-doc2db-2608.08459",
