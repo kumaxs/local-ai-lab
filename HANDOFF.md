@@ -1,13 +1,186 @@
 # Local AI Lab Session Handoff
 
-> Status: active handoff snapshot.
+> Status: active 2026-08-30 handoff snapshot.
 >
-> Prepared after the user said `准备交接`. A later session receiving
-> `交接继续` must read `AGENTS.md` and this file completely, validate the
-> recorded state, and then continue with the v2 design work without repeating
-> the completed v1.1.1 release.
+> A later session receiving `交接继续` must read `AGENTS.md` and this file
+> completely, validate the recorded state, and continue from the remaining
+> authorized end-to-end smoke rather than repeating the completed offline work.
 
-## Snapshot metadata
+## Active 2026-08-30 snapshot
+
+### Repository and branch state
+
+- Prepared at: `2026-08-30 02:32 EDT` (`America/New_York`).
+- Writable working repository: `/private/tmp/local-ai-lab-aug30-webui`.
+- Branch: `main`.
+- Push remote: `github` = `git@github.com:kumaxs/local-ai-lab.git`.
+- Engineering/documentation HEAD before this handoff-only commit:
+  `f83afa741119cd6c2251d7eeee5f6ae4eca33e66`.
+- `github/main` was the same commit immediately before this handoff-only commit.
+  After resuming, validate that `git rev-parse HEAD` and
+  `git rev-parse github/main` agree and inspect `git log -3`.
+- The writable repository was clean before this handoff edit.
+- Canonical repository `/Users/zeyuan/Projects/local-ai-lab` was clean but stale
+  at `fdaa248e66a8bf839cc212e2cbde1aaa82e6293d`. Do not pull, reset, rebase, or
+  overwrite it without the user's explicit authorization.
+- `/Users/zeyuan/Local-AI-Lab` is a retired tombstone, not the active repository.
+
+The staging repository is retained because the user-requested smoke is still
+pending. It contains the repository README and all pushed work. Do not delete it
+until its state has been safely reconciled with the canonical repository.
+
+### User goal status
+
+The offline implementation, tests, evaluation records, documentation, commits,
+and pushes requested on 2026-08-30 are complete. The only material unverified
+item is a fresh end-to-end conversion and browser smoke under the new code,
+which requires explicit authorization to start local services.
+
+Completed and pushed work includes:
+
+- `7003c72 feat(docling): add secure operations web UI`
+- `5ae0748 fix(docling): block picture OCR algorithm promotion`
+- `6cf0103 fix(docling): detect cross-page procedure algorithms`
+- `dd2c4dc feat(docling): add region-level quality gate`
+- `f406023 fix(docling): fail closed on unbound cross-page algorithms`
+- `f747b7e fix(docling): bind region evidence to final artifacts`
+- `569f1d5 fix(docling): close region evidence bypasses`
+- `f83afa7 docs(docling): record August quality evaluation`
+
+Several intervening corpus/test commits (`5ae7a5a`, `eda3755`, `6b1a2a8`,
+`9128d7d`, and `19084c9`) are also already on `github/main`.
+
+### Web UI and configuration management
+
+The Docling service now serves the operations UI from `/`, `/ui`, and `/ui/` in
+the same API process, for both Docker and direct deployment. It provides:
+
+- upload with real browser upload progress;
+- queue, job phase, and processing-progress visibility;
+- artifact inventory, download, and explicit deletion;
+- server-time-based expiry countdowns and expired-output state;
+- storage/cleanup status;
+- optimistic-concurrency runtime configuration for input, successful-output,
+  failed-output, job, staging, temporary-file, cleanup-interval, idempotency,
+  and download-lease TTL values.
+
+Runtime settings use `SQLite override > environment > default`; setting a value
+to `null` clears its override. Updating a TTL does not silently recalculate
+existing deadlines. The Janitor safely adopts changes without duplicate loops.
+
+Security and failure-path work includes a restrictive CSP, no browser storage,
+memory-only token handling, `410 Gone` for expired outputs, symlink/TOCTOU
+hardening, directory-fd/inode checks, and a 256 MiB protected browser Blob cap.
+The direct-install default port is `8000`; Docker publishes `8766`.
+
+### Literature-quality work
+
+The region-level gate now fails closed unless final artifacts are independently
+bound to source evidence. Important covered cases include:
+
+- page-header/footer and picture-OCR quarantine so they cannot pollute body text
+  or be promoted to algorithms;
+- page/bbox/union identity for formula, algorithm, table, and inline-math
+  evidence, including cross-page procedure algorithms;
+- algorithm-sidecar kind, contributor, hash, final-node, and candidate binding;
+- strict table topology: bounded geometry and work, valid bounds/spans, no
+  overlap, no row collapse/crossing, and full declared-grid occupancy;
+- normalized inline-math comparison that retains operators, relations,
+  punctuation, and Unicode math symbols, while rejecting truncated candidates;
+- typed, bounded, duplicate-free formula/inline/structural collections and
+  explicit failure for malformed or partial sidecar state;
+- persistence of caller-supplied status/metadata when sidecars are written, so
+  a late sidecar failure cannot leave a false-success record.
+
+The independent final reviewer reported **PASS** with no reproducible P0, P1,
+or P2 finding.
+
+### Validation evidence
+
+Final offline validation on the pushed code:
+
+```text
+Focused region-gate suite: 85 tests, OK
+Full quality-parity suite: 723 tests, OK, 5 skipped
+Independent adapter replay: 347 tests, OK, 5 skipped
+Docling service suite: 181 tests, OK
+Python compile checks: passed
+JavaScript syntax check: passed
+JSON/jq checks: passed
+git diff --check: passed
+```
+
+No service process was started, stopped, or reconfigured during this work.
+Read-only inspection found no listener on `5001`, `8000`, `8001`, or `8766`.
+
+### Evaluation corpus and results
+
+Versioned evaluation records are in:
+
+- `docs/integrations/docling-serve-quality-parity/evaluation/results-2026-08-30.md`
+- `docs/integrations/docling-serve-quality-parity/evaluation/corpus-lock-2026-08-30.json`
+
+The fresh, diverse corpus contains LongDocBench, Pseudo2CodeQA, PP-FormulaNet,
+FRCD (including a page 7-to-8 cross-page algorithm), and a sealed Doc2DB paper.
+The sealed paper was inventoried but not visually inspected or used for tuning.
+The historical ten-PDF inventory remains locked for regression comparison.
+
+A strict read-only replay of the existing 23-paper artifacts produced:
+
+```text
+cases: 23
+passed: 0
+failed: 23
+verified_semantic: 1981
+visual_only: 131
+unresolved: 1120
+critical_unresolved: 1120
+```
+
+This is an intentional fail-closed gate result, not a claim that all extracted
+content is unusable. It exposes remaining critical structural uncertainty. The
+new `2607.25988` case verified its algorithm and 11 of 12 ordinary tables; its
+remaining table failed because the declared 11x8 grid has an incomplete header
+slot. PdfTable still exposes row collapse/incomplete occupancy, and the old
+table-transformer case still exposes incomplete grids, row collapse, and an
+algorithm bbox mismatch.
+
+Fresh source PDFs and rendered inspection pages are temporarily retained at
+`/private/tmp/docling-eval-2026-08-30` only for the pending authorized smoke.
+They are deliberately uncommitted. Delete that exact directory after the smoke
+and documentation update, or if the user decides not to run the smoke.
+
+### Remaining blocker and exact next action
+
+The fresh corpus has been inventoried and the offline gates have been tested,
+but it has not yet been converted end to end by the local Docling backend,
+formula service, and API under this branch. The Web UI has likewise passed
+syntax/service tests but not a live browser upload/queue/TTL/download smoke.
+
+Repository rules require explicit user permission before starting those local
+services. On authorization:
+
+1. Start the local Docling backend, formula service, and API without changing
+   the user's existing configuration.
+2. Convert a Chinese case, an English/two-column case, and at least one fresh
+   calibration case; include the sealed case only as a blind final observation.
+3. Verify source-to-final region sidecars and inspect formula, inline math,
+   algorithm/code indentation, tables, headers, and footers.
+4. Exercise Web UI upload progress, queue/phase display, TTL configuration and
+   countdown, artifact download, expiry behavior, and deletion.
+5. Stop only processes started by this task, record results in the evaluation
+   docs and this handoff, run the relevant regression suites, commit, and push.
+6. Remove `/private/tmp/docling-eval-2026-08-30` and any new transient files.
+
+Do not mark the goal complete before this smoke is either run successfully or
+the user explicitly accepts its omission.
+
+## Archived 2026-08-12 snapshot
+
+Everything below this point is the preserved earlier release handoff. It is
+historical context and must not override the active 2026-08-30 state above.
+
+### Snapshot metadata
 
 - Prepared at: `2026-08-12 12:42 EDT` (`America/New_York`).
 - Canonical repository: `/Users/zeyuan/Projects/local-ai-lab`.
@@ -29,7 +202,7 @@
 Important path warning: `/Users/zeyuan/Local-AI-Lab` is a retired tombstone.
 Always work in the canonical path above.
 
-## Objective and scope
+### Objective and scope
 
 The completed workstream hardened the existing Docling v1 conversion path,
 published it as the reproducible `v1.1.1` checkpoint, and retained a unified
@@ -41,9 +214,9 @@ The next workstream is **Docling v2 architecture**, not another round of v1
 paper-specific fixes. V1 remains available and released, but is not approved
 for unattended high-fidelity production use.
 
-## Completed and verified
+### Completed and verified
 
-### 1. Docling v1.1.1 quality hardening
+#### 1. Docling v1.1.1 quality hardening
 
 Release commit `eeda304` contains:
 
@@ -69,7 +242,7 @@ Primary implementation files:
 - `docs/integrations/docling-serve-quality-parity/test_semantic_readability_regressions.py`
 - `docs/integrations/docling-serve-quality-parity/test_source_evidence_identity.py`
 
-### 2. Version, push, tag, and GitHub Release
+#### 2. Version, push, tag, and GitHub Release
 
 - `main` push: `5ffd64c..eeda304` succeeded.
 - Annotated tag `v1.1.1` was pushed successfully.
@@ -99,7 +272,7 @@ The workflow also published `1.1.1` and refreshed `latest` for:
 - `ghcr.io/kumaxs/local-ai-lab-docling-backend`
 - `ghcr.io/kumaxs/local-ai-lab-docling-formula`
 
-### 3. Manual-review bundle
+#### 3. Manual-review bundle
 
 Persistent local review entry:
 
@@ -124,7 +297,7 @@ This proves that v1's producer and validators can agree on the same incorrect
 structure. Release Notes explicitly state that v1.1.1 is a checkpoint, not a
 production-readiness approval.
 
-## Tests and validation
+### Tests and validation
 
 Final local validation before the release commit/tag:
 
@@ -156,7 +329,7 @@ The release bundle was built and verified twice in automatically cleaned
 `eeda304f20e6d91fe11fc1368c0ce1bea4a7520a`, version `1.1.1`, 72 files, and
 both `linux/amd64` and `linux/arm64` platform declarations.
 
-## Runtime and external state
+### Runtime and external state
 
 - Existing listeners at final inspection:
   - `127.0.0.1:5001`, Python PID `12313` (Docling backend)
@@ -169,22 +342,22 @@ both `linux/amd64` and `linux/arm64` platform declarations.
   that requires authenticated `gh` operations should run `gh auth login` first.
 - Release verification temporary directories were removed automatically.
 
-## In progress
+### In progress
 
 No implementation, conversion, release, or CI operation is in progress.
 
 V2 has been designed at the proposal level only. No v2 production source,
 schema, migration, or benchmark implementation has been created yet.
 
-## Blockers, risks, and failed approaches
+### Blockers, risks, and failed approaches
 
-### Production-readiness blocker
+#### Production-readiness blocker
 
 V1 is blocked from unattended high-fidelity production use. Publishing
 `v1.1.1` does not remove this block. The fresh holdout review demonstrated
 semantic false positives, omissions, and a false-success gate.
 
-### Architectural root cause
+#### Architectural root cause
 
 The two main v1 files total roughly 35,000 lines and mix parsing, paper repair,
 source evidence, mutation of final HTML/Markdown, and validation. Many gates
@@ -192,7 +365,7 @@ verify consistency among artifacts produced by the same assumptions instead
 of independently checking the PDF. Adding another paper-specific rule should
 be treated as an anti-pattern, even when it makes a known fixture pass.
 
-### V2 direction already agreed with the user
+#### V2 direction already agreed with the user
 
 1. Freeze v1 except for security, data-loss, or release-critical fixes.
 2. Introduce a typed region-level Document IR containing stable IDs, page/bbox,
@@ -223,7 +396,7 @@ Useful primary references previously reviewed:
 - olmOCR benchmark: `https://github.com/allenai/olmocr`
 - Selective classification/reject option: `https://arxiv.org/abs/1705.08500`
 
-## Next action
+### Next action
 
 When the user says `交接继续` in a new session:
 
