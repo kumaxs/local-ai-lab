@@ -804,12 +804,17 @@ class PdfInventoryGateTests(unittest.TestCase):
                 events.append("reconcile")
                 return {"ok": True}
 
+            def fake_regions(*_args: object, **_kwargs: object) -> dict[str, Any]:
+                events.append("regions")
+                return {"ok": True, "summary": {"critical_unresolved_count": 0}}
+
             with (
                 patch.object(adapter, "record_cn_accepted_baseline", side_effect=fake_record),
                 patch.object(adapter, "restore_final_delivery_visuals", side_effect=fake_restore),
                 patch.object(adapter, "validate_final_formula_surfaces", side_effect=fake_formula),
                 patch.object(adapter, "validate_final_structural_surfaces", side_effect=fake_structural),
                 patch.object(adapter, "_evaluate_pdf_inventory_gate", side_effect=fake_inventory),
+                patch.object(adapter, "evaluate_regions", side_effect=fake_regions),
                 patch.object(adapter, "reconcile_final_surface_status", side_effect=fake_reconcile),
             ):
                 result = adapter._finalize_delivery_surfaces(
@@ -823,12 +828,13 @@ class PdfInventoryGateTests(unittest.TestCase):
                     pdf_inventory={"available": True},
                 )
 
-        self.assertEqual(events, ["record", "restore", "formula", "structural", "inventory", "reconcile"])
+        self.assertEqual(events, ["record", "restore", "formula", "structural", "inventory", "regions", "reconcile"])
         self.assertIn("pdf_structure_inventory", metadata)
         self.assertIn("final_pdf_inventory", metadata)
         self.assertIn("pdf_structure_inventory", status["quality_signals"])
         self.assertIn("final_pdf_inventory", status["quality_signals"])
         self.assertIn("pdf_inventory", result)
+        self.assertIn("regions", result)
 
     def test_finalize_delivery_surfaces_legacy_inventory_bypass_marks_applied_false(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

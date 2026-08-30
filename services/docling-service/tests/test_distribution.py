@@ -27,6 +27,10 @@ class DistributionTests(unittest.TestCase):
         "docs/integrations/docling-serve-quality-parity/"
         "pdf_structure_inventory.py"
     )
+    REGION_GATE_TOOL = (
+        "docs/integrations/docling-serve-quality-parity/"
+        "region_quality_gate.py"
+    )
     UI_ASSETS = (
         "ui/index.html",
         "ui/main.js",
@@ -35,9 +39,8 @@ class DistributionTests(unittest.TestCase):
 
     def test_dockerignore_whitelists_inventory_script(self) -> None:
         dockerignore = (REPO_ROOT / ".dockerignore").read_text(encoding="utf-8")
-        self.assertIn(
-            f"!{self.INVENTORY_TOOL}", dockerignore
-        )
+        self.assertIn(f"!{self.INVENTORY_TOOL}", dockerignore)
+        self.assertIn(f"!{self.REGION_GATE_TOOL}", dockerignore)
 
     def test_python_package_contains_webui_static_assets(self) -> None:
         """Build a wheel in a scratch tree and verify the served UI is packaged."""
@@ -251,6 +254,11 @@ class DistributionTests(unittest.TestCase):
             "pdf_structure_inventory.py /opt/docling-quality/pdf_structure_inventory.py",
             dockerfile,
         )
+        self.assertIn(
+            "COPY docs/integrations/docling-serve-quality-parity/"
+            "region_quality_gate.py /opt/docling-quality/region_quality_gate.py",
+            dockerfile,
+        )
 
     def test_release_workflow_publishes_assets_and_multiarch_images(self) -> None:
         workflow_path = REPO_ROOT / ".github/workflows/docling-service-release.yml"
@@ -327,6 +335,10 @@ class DistributionTests(unittest.TestCase):
                 f"docling-service-{RELEASE_VERSION}/{self.INVENTORY_TOOL}"
             )
             self.assertIn(inventory_bundle_path, names)
+            region_gate_bundle_path = (
+                f"docling-service-{RELEASE_VERSION}/{self.REGION_GATE_TOOL}"
+            )
+            self.assertIn(region_gate_bundle_path, names)
             ui_bundle_paths = {
                 f"docling-service-{RELEASE_VERSION}/services/docling-service/docling_service/{asset}"
                 for asset in self.UI_ASSETS
@@ -334,6 +346,7 @@ class DistributionTests(unittest.TestCase):
             self.assertTrue(ui_bundle_paths.issubset(names))
             manifest_paths = {entry.get("path") for entry in manifest["files"]}
             self.assertIn(self.INVENTORY_TOOL, manifest_paths)
+            self.assertIn(self.REGION_GATE_TOOL, manifest_paths)
             self.assertTrue(
                 {
                     f"services/docling-service/docling_service/{asset}"

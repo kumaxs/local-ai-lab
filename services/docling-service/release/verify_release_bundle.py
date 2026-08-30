@@ -26,6 +26,7 @@ REQUIRED_FILES = {
     "services/docling-service/docling_service/ui/styles.css",
     "docs/integrations/docling-serve-quality-parity/quality_parity_adapter.py",
     "docs/integrations/docling-serve-quality-parity/pdf_structure_inventory.py",
+    "docs/integrations/docling-serve-quality-parity/region_quality_gate.py",
 }
 BANNED_PARTS = {".git", ".runtime", ".venv", "__pycache__", "reports", "inputs", "outputs"}
 BANNED_SUFFIXES = {".pdf", ".log", ".pyc", ".pyo"}

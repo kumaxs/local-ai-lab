@@ -49,6 +49,7 @@ from semantic_reflow import (
     rebuild_semantic_surfaces,
     source_algorithm_block,
 )
+from region_quality_gate import REGION_STATUSES, evaluate_regions
 
 GXX_RE = re.compile(r"/G[0-9A-Fa-f]{2}")
 DATA_IMAGE_RE = re.compile(r"data:image/[^\"')\s]+")
@@ -27351,11 +27352,44 @@ def _finalize_delivery_surfaces(
         warning = "final_pdf_inventory_failed:" + ",".join(inventory["failure_reasons"])
         if warning not in status.setdefault("warnings", []):
             status["warnings"].append(warning)
+    # Emit a generic, bounded region inventory after all source-backed visuals
+    # and hard structural/formula gates are final.  The validator is
+    # paper-independent and supplements (never weakens) the existing gates.
+    try:
+        regions = evaluate_regions(
+            output_dir,
+            document_json=final_document if isinstance(final_document, dict) else {},
+            metadata=metadata,
+            status=status,
+            pdf_inventory=inventory,
+            max_records=1000,
+        )
+    except Exception as exc:  # fail closed if a malformed diagnostic escapes
+        regions = {
+            "ok": False,
+            "summary": {
+                "by_kind": {},
+                "by_status": {status_name: 0 for status_name in REGION_STATUSES},
+                "critical_unresolved_count": 1,
+                "total_record_count": 0,
+                "truncated": False,
+            },
+            "failure_reasons": [
+                f"region_quality_gate_exception:{type(exc).__name__}"
+            ],
+            "records": [],
+        }
+        status["ok"] = False
+        status["success_class"] = "degraded_failure"
+        warning = "region_quality_gate_failed:region_quality_gate_exception"
+        if warning not in status.setdefault("warnings", []):
+            status["warnings"].append(warning)
     reconciliation = reconcile_final_surface_status(output_dir, metadata, status)
     return {
         "visuals": visuals,
         "formula": formula,
         "structural": structural,
+        "regions": regions,
         "reconciliation": reconciliation,
         "pdf_inventory": inventory,
     }

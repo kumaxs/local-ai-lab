@@ -10,6 +10,7 @@
 !docs/integrations/docling-serve-quality-parity/semantic_reflow.py
 !docs/integrations/docling-serve-quality-parity/formula_only_second_pass.py
 !docs/integrations/docling-serve-quality-parity/pdf_structure_inventory.py
+!docs/integrations/docling-serve-quality-parity/region_quality_gate.py
 
 services/docling-service/.venv
 # Defense in depth if a generated local review corpus is recreated by mistake.
