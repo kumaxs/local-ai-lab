@@ -111,14 +111,62 @@ class PdfStructureInventoryUnitTests(unittest.TestCase):
 
     def test_definition_algorithm_can_continue_to_numbered_steps_on_next_page(self) -> None:
         nodes = [
-            {"text": "Definition 6. A decoding algorithm", "page_no": 7, "index": 0},
-            {"text": "takes the following steps:", "page_no": 7, "index": 1},
-            {"text": "7", "page_no": 7, "index": 2},
-            {"text": "1. Compute the row support.", "page_no": 8, "index": 3},
-            {"text": "2. Compute the column support.", "page_no": 8, "index": 4},
-            {"text": "3. Peel the candidate sets.", "page_no": 8, "index": 5},
-            {"text": "4. Return the correction.", "page_no": 8, "index": 6},
-            {"text": "Theorem 1. The decoder succeeds.", "page_no": 8, "index": 7},
+            {
+                "text": "Definition 6. A decoding algorithm",
+                "page_no": 7,
+                "index": 0,
+                "source": "pdf_lines",
+                "bbox": {"l": 70, "r": 310, "t": 120, "b": 108},
+            },
+            {
+                "text": "takes the following steps:",
+                "page_no": 7,
+                "index": 1,
+                "source": "pdf_lines",
+                "bbox": {"l": 70, "r": 260, "t": 140, "b": 128},
+            },
+            {
+                "text": "7",
+                "page_no": 7,
+                "index": 2,
+                "source": "pdf_lines",
+                "bbox": {"l": 300, "r": 306, "t": 760, "b": 750},
+            },
+            {
+                "text": "1. Compute the row support.",
+                "page_no": 8,
+                "index": 3,
+                "source": "pdf_lines",
+                "bbox": {"l": 88, "r": 300, "t": 80, "b": 68},
+            },
+            {
+                "text": "2. Compute the column support.",
+                "page_no": 8,
+                "index": 4,
+                "source": "pdf_lines",
+                "bbox": {"l": 88, "r": 320, "t": 98, "b": 86},
+            },
+            {
+                "text": "3. Peel the candidate sets.",
+                "page_no": 8,
+                "index": 5,
+                "source": "pdf_lines",
+                "bbox": {"l": 88, "r": 300, "t": 116, "b": 104},
+            },
+            {
+                "text": "4. Return the correction.",
+                "page_no": 8,
+                "index": 6,
+                "source": "pdf_lines",
+                "bbox": {"l": 88, "r": 292, "t": 134, "b": 122},
+            },
+            {
+                "text": "Theorem 1. The decoder succeeds.",
+                "page_no": 8,
+                "index": 7,
+                "source": "pdf_lines",
+                "bbox": {"l": 70, "r": 290, "t": 170, "b": 158},
+            },
         ]
 
         records = module._classify_algorithm_records(nodes)
@@ -128,6 +176,68 @@ class PdfStructureInventoryUnitTests(unittest.TestCase):
         self.assertIn("4. Return the correction.", records[0]["text"])
         self.assertNotIn("\n7\n", records[0]["text"])
         self.assertNotIn("Theorem 1", records[0]["text"])
+
+        self.assertEqual(
+            records[0]["page_span"],
+            {"start_page": 7, "end_page": 8, "pages": [7, 8]},
+        )
+        self.assertEqual(
+            [item["page_no"] for item in records[0]["page_bboxes"]],
+            [7, 8],
+        )
+        self.assertEqual(
+            {item["page_no"] for item in records[0]["node_sources"]},
+            {7, 8},
+        )
+
+    def test_add_to_counts_preserves_cross_page_algorithm_evidence(self) -> None:
+        nodes = [
+            {
+                "text": "Definition 6. A decoding algorithm",
+                "page_no": 7,
+                "index": 0,
+                "source": "pdf_lines",
+                "bbox": {"l": 70, "r": 310, "t": 120, "b": 108},
+            },
+            {
+                "text": "takes the following steps:",
+                "page_no": 7,
+                "index": 1,
+                "source": "pdf_lines",
+                "bbox": {"l": 70, "r": 260, "t": 140, "b": 128},
+            },
+            {
+                "text": "1. Compute the row support.",
+                "page_no": 8,
+                "index": 2,
+                "source": "pdf_lines",
+                "bbox": {"l": 88, "r": 300, "t": 80, "b": 68},
+            },
+            {
+                "text": "2. Compute the column support.",
+                "page_no": 8,
+                "index": 3,
+                "source": "pdf_lines",
+                "bbox": {"l": 88, "r": 320, "t": 98, "b": 86},
+            },
+            {
+                "text": "3. Peel the candidate sets.",
+                "page_no": 8,
+                "index": 4,
+                "source": "pdf_lines",
+                "bbox": {"l": 88, "r": 300, "t": 116, "b": 104},
+            },
+        ]
+        record = module._classify_algorithm_records(nodes)[0]
+        counts = {kind: module._build_base_counts() for kind in module.KIND_ORDER}
+        module._add_to_counts(counts, [record])
+        persisted = counts["algorithm"]["records"][0]
+        self.assertEqual(persisted["page_span"]["pages"], [7, 8])
+        self.assertEqual(
+            [item["page_no"] for item in persisted["page_bboxes"]],
+            [7, 8],
+        )
+        self.assertTrue(all(item["source"] == "pdf_lines" for item in persisted["node_sources"]))
 
     def test_definition_algorithm_rejects_unrelated_numbered_list_without_continuation_cue(self) -> None:
         nodes = [

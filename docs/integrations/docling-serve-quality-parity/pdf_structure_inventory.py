@@ -185,6 +185,97 @@ def _extract_group_bbox(nodes: Sequence[dict[str, Any]]) -> Optional[dict[str, f
     }
 
 
+def _record_page_evidence(
+    record: dict[str, Any],
+) -> tuple[list[dict[str, Any]], dict[str, Any], list[dict[str, Any]]]:
+    """Return bounded per-page geometry and source-node evidence for a record.
+
+    ``page_no`` and ``bbox`` remain the first-page compatibility fields used by
+    older consumers.  A grouped record (notably a definition/procedure that
+    continues onto the next page) must additionally retain every contributing
+    page; otherwise a downstream crop can silently certify only the heading.
+    The returned values intentionally contain only scalar provenance and short
+    text snippets, never the full raw nodes.
+    """
+
+    raw_nodes = record.get("nodes")
+    if not isinstance(raw_nodes, list) or not raw_nodes:
+        raw_nodes = [record]
+
+    by_page: dict[int, dict[str, Any]] = {}
+    node_sources: list[dict[str, Any]] = []
+    for node_index, node in enumerate(raw_nodes):
+        if not isinstance(node, dict):
+            continue
+        page_no = _safe_int(node.get("page_no"))
+        if page_no is None:
+            page_no = _first_page_no(node)
+        if page_no is None or page_no <= 0:
+            continue
+        bbox = _extract_node_bbox(node)
+        source = _safe_text(node.get("source") or record.get("source") or "unknown")
+        line_index = _safe_int(node.get("index"))
+        line_no = _safe_int(node.get("line_no"))
+        node_source = {
+            "node_index": node_index,
+            "page_no": page_no,
+            "source": source,
+        }
+        if line_index is not None:
+            node_source["line_index"] = line_index
+        if line_no is not None:
+            node_source["line_no"] = line_no
+        text = _safe_text(node.get("text")).strip()
+        if text:
+            node_source["text"] = text[:240]
+        node_sources.append(node_source)
+
+        page_entry = by_page.setdefault(
+            page_no,
+            {
+                "page_no": page_no,
+                "bbox": None,
+                "node_count": 0,
+                "sources": [],
+                "line_indexes": [],
+            },
+        )
+        page_entry["node_count"] += 1
+        if source not in page_entry["sources"]:
+            page_entry["sources"].append(source)
+        if line_index is not None:
+            page_entry["line_indexes"].append(line_index)
+        if bbox is not None:
+            previous_bbox = page_entry.get("bbox")
+            page_entry["bbox"] = _extract_group_bbox(
+                [
+                    {"bbox": previous_bbox}
+                    for _ in [0]
+                    if isinstance(previous_bbox, dict)
+                ]
+                + [{"bbox": bbox}]
+            )
+
+    page_numbers = sorted(by_page)
+    page_bboxes = []
+    for page_no in page_numbers:
+        entry = by_page[page_no]
+        entry["sources"] = sorted(set(str(value) for value in entry["sources"]))
+        entry["line_indexes"] = sorted(
+            set(int(value) for value in entry["line_indexes"])
+        )
+        page_bboxes.append(entry)
+    if page_numbers:
+        page_span = {
+            "start_page": page_numbers[0],
+            "end_page": page_numbers[-1],
+            "pages": page_numbers,
+        }
+    else:
+        page_span = {"start_page": None, "end_page": None, "pages": []}
+    return page_bboxes, page_span, node_sources
+
+
 def _record_fingerprint(record: dict[str, Any]) -> str:
     payload = [
         _safe_text(record.get("kind")),
@@ -840,6 +931,7 @@ def _add_to_counts(counts: dict[str, dict[str, Any]], records: Sequence[dict[str
             bucket["high_confidence"] += 1
         else:
             bucket["ambiguous"] += 1
+        page_bboxes, page_span, node_sources = _record_page_evidence(record)
         bucket["records"].append(
             {
                 "text": record.get("text"),
@@ -849,6 +941,11 @@ def _add_to_counts(counts: dict[str, dict[str, Any]], records: Sequence[dict[str
                 "bbox": record.get("bbox"),
                 "fingerprint": record.get("fingerprint"),
                 "line_indexes": list(record.get("line_indexes") or []),
+                # Keep all contributing pages in the persisted inventory.  The
+                # first-page ``page_no``/``bbox`` above remain for old readers.
+                "page_bboxes": page_bboxes,
+                "page_span": page_span,
+                "node_sources": node_sources,
             }
         )
 
@@ -970,6 +1067,10 @@ def _classify_definition_algorithm_records(ordered: Sequence[dict[str, Any]]) ->
             "nodes": block,
             "source": "pdf_lines",
         }
+        page_bboxes, page_span, node_sources = _record_page_evidence(rec)
+        rec["page_bboxes"] = page_bboxes
+        rec["page_span"] = page_span
+        rec["node_sources"] = node_sources
         rec["fingerprint"] = _record_fingerprint(rec)
         out.append(rec)
     return out
@@ -1044,6 +1145,10 @@ def _classify_algorithm_records(nodes: Sequence[dict[str, Any]]) -> list[dict[st
             "nodes": block,
             "source": "pdf_lines",
         }
+        page_bboxes, page_span, node_sources = _record_page_evidence(rec)
+        rec["page_bboxes"] = page_bboxes
+        rec["page_span"] = page_span
+        rec["node_sources"] = node_sources
         rec["fingerprint"] = _record_fingerprint(rec)
         out.append(rec)
         i = j

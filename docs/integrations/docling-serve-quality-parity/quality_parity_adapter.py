@@ -12588,6 +12588,7 @@ def _algorithm_candidate_records(document_json: Any, pdf_path: Path) -> list[dic
                 source_title = ""
         else:
             source_title = ""
+        page_bboxes, page_span = _algorithm_page_evidence([node])
         caption, caption_indexes, caption_targets = _nearby_algorithm_caption(
             nodes,
             text_index,
@@ -12632,6 +12633,8 @@ def _algorithm_candidate_records(document_json: Any, pdf_path: Path) -> list[dic
                 "formula_no": formula_no,
                 "page_no": prov.get("page_no"),
                 "bbox": bbox_geometry(prov),
+                "page_bboxes": page_bboxes,
+                "page_span": page_span,
                 "layout": layout,
                 "original_label": label,
                 "html_targets": caption_targets,
@@ -12717,6 +12720,7 @@ def _algorithm_candidate_records(document_json: Any, pdf_path: Path) -> list[dic
                 formatted = source_body
                 layout = None
                 source_reflow_used = True
+        page_bboxes, page_span = _algorithm_page_evidence([table])
         semantic_numbered_steps: list[int] = []
         for cell in ((table.get("data") or {}).get("table_cells") or []):
             if not isinstance(cell, dict):
@@ -12741,6 +12745,8 @@ def _algorithm_candidate_records(document_json: Any, pdf_path: Path) -> list[dic
                 "formula_no": None,
                 "page_no": prov.get("page_no"),
                 "bbox": bbox_geometry(prov),
+                "page_bboxes": page_bboxes,
+                "page_span": page_span,
                 "layout": layout,
                 "original_label": "algorithm_like_table",
                 "table_index": table_index,
@@ -14210,6 +14216,8 @@ def recover_algorithm_blocks_in_outputs(
                 "label": record.get("label"),
                 "page_no": record.get("page_no"),
                 "bbox": record.get("bbox"),
+                "page_bboxes": record.get("page_bboxes") or [],
+                "page_span": record.get("page_span") or {},
                 "numbered_steps": [
                     int(value)
                     for value in (
@@ -18140,6 +18148,44 @@ def _merge_bbox_geometry(nodes: list[dict[str, Any]]) -> dict[str, Any] | None:
     return result
 
 
+def _algorithm_page_evidence(
+    nodes: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Summarize every source page contributing to an algorithm candidate."""
+
+    by_page: dict[int, list[dict[str, Any]]] = {}
+    for node in nodes:
+        if not isinstance(node, dict):
+            continue
+        prov = first_prov(node) or {}
+        page_no = prov.get("page_no")
+        if not isinstance(page_no, int) or isinstance(page_no, bool) or page_no <= 0:
+            continue
+        by_page.setdefault(page_no, []).append(node)
+    pages = sorted(by_page)
+    page_bboxes = []
+    for page_no in pages:
+        bbox = _merge_bbox_geometry(by_page[page_no])
+        page_bboxes.append(
+            {
+                "page_no": page_no,
+                "bbox": bbox,
+                "node_count": len(by_page[page_no]),
+                "sources": sorted(
+                    {
+                        str(node.get("source") or node.get("label") or "unknown")
+                        for node in by_page[page_no]
+                    }
+                ),
+            }
+        )
+    return page_bboxes, {
+        "start_page": pages[0] if pages else None,
+        "end_page": pages[-1] if pages else None,
+        "pages": pages,
+    }
+
+
 def _algorithm_cluster_reading_key(item: tuple[int, dict[str, Any]]) -> tuple[int, float, float]:
     index, node = item
     bbox = bbox_geometry(first_prov(node) or {}) or {}
@@ -18280,6 +18326,9 @@ def _algorithm_cluster_records(
             )
             for cluster_index, cluster_node in ordered_cluster
         ]
+        page_bboxes, page_span = _algorithm_page_evidence(
+            [cluster_node for _, cluster_node in ordered_cluster]
+        )
         records.append(
             {
                 "id": f"algorithm-block-{start_record_no + len(records)}",
@@ -18292,6 +18341,8 @@ def _algorithm_cluster_records(
                 "formula_no": None,
                 "page_no": page_no,
                 "bbox": merged_bbox,
+                "page_bboxes": page_bboxes,
+                "page_span": page_span,
                 "layout": layout,
                 "original_label": "algorithm_cluster",
                 "html_targets": [str(cluster_node.get("text") or "") for _, cluster_node in ordered_cluster],
@@ -26833,12 +26884,23 @@ def _summarize_inventory_counts(counts: Any) -> dict[str, Any]:
         visible_records = []
         for record in records[:20]:
             if isinstance(record, dict):
+                page_bboxes = record.get("page_bboxes")
+                if not isinstance(page_bboxes, list):
+                    page_bboxes = []
                 visible_records.append(
                     {
                         "text": record.get("text"),
                         "page_no": record.get("page_no"),
                         "confidence": record.get("confidence"),
                         "source": record.get("source"),
+                        "bbox": record.get("bbox"),
+                        "page_bboxes": page_bboxes[:16],
+                        "page_span": record.get("page_span"),
+                        "node_sources": (
+                            record.get("node_sources")[:64]
+                            if isinstance(record.get("node_sources"), list)
+                            else []
+                        ),
                     }
                 )
         summary[kind] = {
@@ -26891,6 +26953,153 @@ def _normalize_inventory_text_health(text_health: Any) -> dict[str, Any]:
     }
 
 
+def _inventory_algorithm_page_set(record: dict[str, Any]) -> set[int]:
+    """Return every page contributing to one inventory algorithm record."""
+
+    pages: set[int] = set()
+    span = record.get("page_span")
+    if isinstance(span, dict):
+        values = span.get("pages")
+        if isinstance(values, list):
+            for value in values:
+                if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+                    pages.add(value)
+        for key in ("start_page", "end_page"):
+            value = span.get(key)
+            if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+                pages.add(value)
+    page_bboxes = record.get("page_bboxes")
+    if isinstance(page_bboxes, list):
+        for item in page_bboxes:
+            if not isinstance(item, dict):
+                continue
+            value = item.get("page_no")
+            if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+                pages.add(value)
+    value = record.get("page_no")
+    if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+        pages.add(value)
+    return pages
+
+
+def _inventory_algorithm_delivery_reasons(
+    inventory: dict[str, Any],
+    final_source_visuals: Any,
+) -> list[str]:
+    """Fail closed when detected PDF algorithms lack bound final evidence.
+
+    The inventory is an independent PDF-text signal.  It must not be possible
+    for a semantic classifier that returned zero (or a partial candidate) to
+    turn a high-confidence PDF algorithm into a vacuous success.  This check is
+    intentionally conservative: it never fabricates a multi-page crop; it only
+    accepts a candidate when actual per-page source images, HTML binding, and
+    Markdown binding are all present and the candidate covers every inventory
+    page with overlapping body text.  The current producer exposes one
+    ``source_image`` per record, so a multi-page inventory record deliberately
+    remains unresolved until a page-to-image mapping is published.
+    """
+
+    counts = inventory.get("counts") if isinstance(inventory, dict) else None
+    bucket = counts.get("algorithm") if isinstance(counts, dict) else None
+    if not isinstance(bucket, dict):
+        return []
+    high_confidence = _coerce_non_negative_int(bucket.get("high_confidence"))
+    if not high_confidence:
+        return []
+    if not isinstance(final_source_visuals, dict):
+        # Direct unit callers can validate the inventory in isolation.  The
+        # production finalization path always supplies final_source_visuals.
+        return []
+
+    renderings = final_source_visuals.get("algorithm_source_renderings")
+    reasons: list[str] = []
+    if not isinstance(renderings, dict):
+        return ["pdf_inventory_algorithm_delivery_evidence_missing"]
+    candidate_records = renderings.get("records")
+    if not isinstance(candidate_records, list):
+        return ["pdf_inventory_algorithm_delivery_records_missing"]
+    if not candidate_records:
+        return ["pdf_inventory_algorithm_delivery_records_missing"]
+    html_bound = {
+        str(value)
+        for value in (renderings.get("html_bound_source_refs") or [])
+        if str(value)
+    }
+    markdown_bound = {
+        str(value)
+        for value in (renderings.get("markdown_bound_source_refs") or [])
+        if str(value)
+    }
+    high_records = [
+        record
+        for record in (bucket.get("records") or [])
+        if isinstance(record, dict)
+        and str(record.get("confidence") or "").lower() == "high"
+    ]
+    if len(high_records) < high_confidence:
+        reasons.append("pdf_inventory_algorithm_records_incomplete")
+    if not high_records:
+        return sorted(set(reasons + ["pdf_inventory_algorithm_records_missing_for_delivery"]))
+
+    def token_overlap(left: str, right: str) -> bool:
+        left_tokens = [
+            token
+            for token in _normalized_noise_text(left).lower().split()
+            if len(token) >= 3
+        ]
+        right_text = _normalized_noise_text(right).lower()
+        if not left_tokens or not right_text:
+            return False
+        # The caption/heading is enough to identify a candidate; full body
+        # identity remains enforced by validate_final_structural_surfaces.
+        return sum(token in right_text for token in left_tokens[:8]) >= min(3, len(left_tokens))
+
+    for index, inventory_record in enumerate(high_records, start=1):
+        inventory_pages = _inventory_algorithm_page_set(inventory_record)
+        inventory_text = str(inventory_record.get("text") or "")
+        matched = False
+        for candidate in candidate_records:
+            if not isinstance(candidate, dict):
+                continue
+            source_ref = str(candidate.get("source_ref") or "")
+            source_image = str(candidate.get("source_image") or "")
+            if not source_ref or not source_image:
+                continue
+            if source_ref not in html_bound or source_ref not in markdown_bound:
+                continue
+            candidate_pages = _inventory_algorithm_page_set(candidate)
+            if inventory_pages and not inventory_pages.issubset(candidate_pages):
+                continue
+            if len(inventory_pages) > 1:
+                source_page_images = candidate.get("source_page_images")
+                if not isinstance(source_page_images, list):
+                    continue
+                image_pages = {
+                    item.get("page_no")
+                    for item in source_page_images
+                    if isinstance(item, dict)
+                    and isinstance(item.get("page_no"), int)
+                    and not isinstance(item.get("page_no"), bool)
+                    and str(item.get("path") or "")
+                }
+                if not inventory_pages.issubset(image_pages):
+                    continue
+            if inventory_pages and not candidate_pages:
+                continue
+            candidate_text = " ".join(
+                str(candidate.get(key) or "")
+                for key in ("label", "caption", "text", "original_text")
+            )
+            if not token_overlap(inventory_text, candidate_text):
+                continue
+            matched = True
+            break
+        if not matched:
+            fingerprint = str(inventory_record.get("fingerprint") or index)
+            reasons.append(f"pdf_inventory_algorithm_unbound:{fingerprint}")
+    return sorted(set(reasons))
+
+
 def _evaluate_pdf_inventory_gate(
     inventory: dict[str, Any],
     structural: dict[str, Any],
@@ -26898,6 +27107,7 @@ def _evaluate_pdf_inventory_gate(
     *,
     expected_source_pdf_sha256: str | None,
     source_pdf: str = "source.pdf",
+    final_source_visuals: Any = None,
 ) -> dict[str, Any]:
     global_reasons: list[str] = []
     structural_failure_reasons: list[str] = []
@@ -27129,6 +27339,17 @@ def _evaluate_pdf_inventory_gate(
                 reason = f"pdf_inventory_{kind}_high_count_exceeds_expected:{high_confidence}>{expected}"
                 structural_failure_reasons.append(reason)
 
+    # The inventory is independent from semantic classification.  If it found
+    # a high-confidence algorithm, require the final source-image/HTML/MD
+    # delivery surfaces to bind that same record.  This is deliberately run
+    # after the count checks so ``expected_algorithms == 0`` remains a clear
+    # hard failure and a partial cross-page candidate cannot certify success.
+    algorithm_delivery_reasons = _inventory_algorithm_delivery_reasons(
+        inventory,
+        final_source_visuals,
+    )
+    structural_failure_reasons.extend(algorithm_delivery_reasons)
+
     for reason in global_reasons:
         if reason not in structural_failure_reasons:
             structural_failure_reasons.append(reason)
@@ -27171,6 +27392,10 @@ def _evaluate_pdf_inventory_gate(
         "global_failure_reasons": sorted(set(global_reasons)),
         "structural_failure_reasons": sorted(set(structural_failure_reasons)),
         "formula_failure_reasons": sorted(set(formula_failure_reasons)),
+        "algorithm_delivery": {
+            "checked": isinstance(final_source_visuals, dict),
+            "failure_reasons": sorted(set(algorithm_delivery_reasons)),
+        },
         "failure_reasons": sorted(
             set(global_reasons + structural_failure_reasons + formula_failure_reasons)
         ),
@@ -27308,6 +27533,10 @@ def _finalize_delivery_surfaces(
             expected_source_pdf_sha256=metadata.get("visual_evidence_input_sha256")
             or metadata.get("source_pdf_sha256"),
             source_pdf="source.pdf",
+            final_source_visuals=(
+                metadata.get("final_source_visuals")
+                or (status.get("quality_signals") or {}).get("final_source_visuals")
+            ),
         )
     if not inventory["ok"]:
         failure_reasons = {

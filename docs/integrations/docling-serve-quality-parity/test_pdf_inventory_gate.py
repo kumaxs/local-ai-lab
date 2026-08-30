@@ -431,6 +431,162 @@ class PdfInventoryGateTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(result["structural"]["failure_reasons"], [])
 
+    def test_evaluate_pdf_inventory_gate_semantic_zero_algorithm_is_hard_failure_when_inventory_is_high(self) -> None:
+        inventory = self._inventory(source_pdf_sha256="A" * 64)
+        inventory["counts"]["algorithm"] = {
+            "high_confidence": 1,
+            "ambiguous": 0,
+            "records": [
+                {
+                    "text": "Algorithm 1 Example decode 1: initialize 2: return",
+                    "page_no": 1,
+                    "confidence": "high",
+                    "source": "pdf_lines",
+                    "page_span": {"start_page": 1, "end_page": 1, "pages": [1]},
+                    "page_bboxes": [{"page_no": 1, "bbox": None}],
+                    "node_sources": [{"page_no": 1, "source": "pdf_lines"}],
+                }
+            ],
+        }
+        structural = {
+            "expected_tables": 0,
+            "expected_algorithms": 0,
+            "expected_code_blocks": 0,
+        }
+        result = adapter._evaluate_pdf_inventory_gate(
+            inventory,
+            structural,
+            {"formula_count": 0},
+            expected_source_pdf_sha256="a" * 64,
+            final_source_visuals={
+                "algorithm_source_renderings": {
+                    "records": [],
+                    "html_bound_source_refs": [],
+                    "markdown_bound_source_refs": [],
+                }
+            },
+        )
+        self.assertFalse(result["ok"])
+        self.assertIn(
+            "pdf_inventory_algorithm_delivery_records_missing",
+            result["structural_failure_reasons"],
+        )
+        self.assertIn(
+            "pdf_inventory_algorithm_unexpected_high:1",
+            result["structural_failure_reasons"],
+        )
+
+    def test_evaluate_pdf_inventory_gate_cross_page_algorithm_requires_bound_html_and_markdown_asset(self) -> None:
+        inventory = self._inventory(source_pdf_sha256="A" * 64, page_count=8)
+        inventory["text_health"]["pages"] = [
+            {"page_no": page_no, "healthy": True, "reasons": []}
+            for page_no in range(1, 9)
+        ]
+        inventory["counts"]["algorithm"] = {
+            "high_confidence": 1,
+            "ambiguous": 0,
+            "records": [
+                {
+                    "text": "Definition 6 decoding algorithm takes the following steps 1 Compute row support 2 Compute column support 3 Return correction",
+                    "page_no": 7,
+                    "confidence": "high",
+                    "source": "pdf_lines",
+                    "page_span": {"start_page": 7, "end_page": 8, "pages": [7, 8]},
+                    "page_bboxes": [
+                        {"page_no": 7, "bbox": None},
+                        {"page_no": 8, "bbox": None},
+                    ],
+                    "node_sources": [
+                        {"page_no": 7, "source": "pdf_lines"},
+                        {"page_no": 8, "source": "pdf_lines"},
+                    ],
+                }
+            ],
+        }
+        result = adapter._evaluate_pdf_inventory_gate(
+            inventory,
+            {
+                "expected_tables": 0,
+                "expected_algorithms": 1,
+                "expected_code_blocks": 0,
+            },
+            {"formula_count": 0},
+            expected_source_pdf_sha256="a" * 64,
+            final_source_visuals={
+                "algorithm_source_renderings": {
+                    "records": [
+                        {
+                            "label": "Definition 6 decoding algorithm",
+                            "text": "Definition 6 decoding algorithm",
+                            "page_no": 7,
+                            "page_span": {
+                                "start_page": 7,
+                                "end_page": 7,
+                                "pages": [7],
+                            },
+                            "source_ref": "algorithm-ref-1",
+                            # Even a real first-page crop and both surface
+                            # bindings cannot certify the missing page-8 steps.
+                            "source_image": "algorithms/algorithm_1.png",
+                        }
+                    ],
+                    "html_bound_source_refs": ["algorithm-ref-1"],
+                    "markdown_bound_source_refs": ["algorithm-ref-1"],
+                }
+            },
+        )
+        self.assertFalse(result["ok"])
+        self.assertIn(
+            "pdf_inventory_algorithm_unbound:1",
+            result["structural_failure_reasons"],
+        )
+
+    def test_evaluate_pdf_inventory_gate_keeps_single_page_algorithm_compatibility_when_bound(self) -> None:
+        inventory = self._inventory(source_pdf_sha256="A" * 64)
+        inventory["counts"]["algorithm"] = {
+            "high_confidence": 1,
+            "ambiguous": 0,
+            "records": [
+                {
+                    "text": "Algorithm 1 Example decode 1: initialize 2: return",
+                    "page_no": 1,
+                    "confidence": "high",
+                    "source": "pdf_lines",
+                    "page_span": {"start_page": 1, "end_page": 1, "pages": [1]},
+                }
+            ],
+        }
+        result = adapter._evaluate_pdf_inventory_gate(
+            inventory,
+            {
+                "expected_tables": 0,
+                "expected_algorithms": 1,
+                "expected_code_blocks": 0,
+            },
+            {"formula_count": 0},
+            expected_source_pdf_sha256="a" * 64,
+            final_source_visuals={
+                "algorithm_source_renderings": {
+                    "records": [
+                        {
+                            "label": "Algorithm 1 Example decode",
+                            "caption": "Algorithm 1 Example decode",
+                            "text": "Algorithm 1 Example decode 1: initialize 2: return",
+                            "original_text": "Algorithm 1 Example decode 1: initialize 2: return",
+                            "page_no": 1,
+                            "page_span": {"start_page": 1, "end_page": 1, "pages": [1]},
+                            "source_ref": "algorithm-ref-1",
+                            "source_image": "algorithms/algorithm_1.png",
+                        }
+                    ],
+                    "html_bound_source_refs": ["algorithm-ref-1"],
+                    "markdown_bound_source_refs": ["algorithm-ref-1"],
+                }
+            },
+        )
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["algorithm_delivery"]["failure_reasons"], [])
+
     def test_evaluate_pdf_inventory_gate_text_health_pages_not_list_fails_without_crash(self) -> None:
         inventory = self._inventory(source_pdf_sha256="A" * 64)
         inventory["text_health"] = {
