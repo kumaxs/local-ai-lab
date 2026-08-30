@@ -856,6 +856,12 @@ class QpaInputLifecycleTests(unittest.TestCase):
             "quality_signals": {},
         }
         seen: list[tuple[str, Path, bytes]] = []
+        seen_formula_authority_ids: list[tuple[str, int]] = []
+        formula_authority = adapter._FormulaEvidenceAuthority(
+            identity_manifest={},
+            formula_crop_diagnostics=[],
+            suspicious_formula_diagnostics=[],
+        )
 
         def record_args(label: str, args: Namespace) -> None:
             seen.append((label, args.input_file, args._input_snapshot.read_bytes()))
@@ -871,24 +877,33 @@ class QpaInputLifecycleTests(unittest.TestCase):
             _metadata: dict[str, object],
             _status: dict[str, object],
             args: Namespace,
-        ) -> None:
+        ) -> adapter._FormulaEvidenceAuthority:
             record_args("visual", args)
+            return formula_authority
 
         def fake_portable_ocr(
             _output: Path,
             _metadata: dict[str, object],
             _status: dict[str, object],
             args: Namespace,
+            **_kwargs: object,
         ) -> None:
             record_args("portable-ocr", args)
+            seen_formula_authority_ids.append(
+                ("portable-ocr", id(_kwargs["trusted_formula_authority"]))
+            )
 
         def fake_formula_second_pass(
             _output: Path,
             _metadata: dict[str, object],
             _status: dict[str, object],
             args: Namespace,
+            **_kwargs: object,
         ) -> None:
             record_args("formula-second-pass", args)
+            seen_formula_authority_ids.append(
+                ("formula-second-pass", id(_kwargs["trusted_formula_authority"]))
+            )
 
         def fake_semantic(
             _output: Path,
@@ -911,6 +926,9 @@ class QpaInputLifecycleTests(unittest.TestCase):
         ) -> dict[str, object]:
             seen.append(("final-semantic", semantic_path, semantic_path.read_bytes()))
             seen.append(("final-visual", visual_path, visual_path.read_bytes()))
+            seen_formula_authority_ids.append(
+                ("finalize", id(_kwargs["trusted_formula_authority"]))
+            )
             return {}
 
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -952,6 +970,14 @@ class QpaInputLifecycleTests(unittest.TestCase):
                 self.assertEqual(adapter.main(), 0)
 
             sibling_mock.assert_not_called()
+            self.assertEqual(
+                [
+                    ("portable-ocr", id(formula_authority)),
+                    ("formula-second-pass", id(formula_authority)),
+                    ("finalize", id(formula_authority)),
+                ],
+                seen_formula_authority_ids,
+            )
             output_dir = output_root / "job-1"
             source_pdf = output_dir / "source.pdf"
             self.assertEqual(source_pdf.read_bytes(), payload)
@@ -2533,9 +2559,18 @@ class PortableFormulaOcrTests(unittest.TestCase):
                     }
                 ],
             }
+            authority = adapter._FormulaEvidenceAuthority(
+                identity_manifest={},
+                formula_crop_diagnostics=[],
+                suspicious_formula_diagnostics=[],
+            )
             with patch.object(adapter, "post_json", return_value=response) as post:
                 result = adapter.run_portable_formula_ocr(
-                    output_dir, metadata, status, args
+                    output_dir,
+                    metadata,
+                    status,
+                    args,
+                    trusted_formula_authority=authority,
                 )
 
             document = json.loads((output_dir / "document.json").read_text())
@@ -2551,6 +2586,7 @@ class PortableFormulaOcrTests(unittest.TestCase):
         self.assertFalse(result["source_semantic_gate"]["enabled"])
         self.assertIsNone(request_payload["items"][0]["source_text"])
         self.assertTrue(status["ok"])
+        self.assertIn(1, authority.identity_manifest)
 
     def test_private_formula_service_refreshes_trusted_crop_identity_after_ocr(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -2609,11 +2645,20 @@ class PortableFormulaOcrTests(unittest.TestCase):
                     }
                 ],
             }
+            authority = adapter._FormulaEvidenceAuthority(
+                identity_manifest={},
+                formula_crop_diagnostics=metadata["formula_crop_diagnostics"],
+                suspicious_formula_diagnostics=[],
+            )
             with patch.object(
                 adapter, "post_json", return_value=response
             ), patch.object(adapter, "_formula_output_safety_reasons", return_value=[]):
                 result = adapter.run_portable_formula_ocr(
-                    output_dir, metadata, status, args
+                    output_dir,
+                    metadata,
+                    status,
+                    args,
+                    trusted_formula_authority=authority,
                 )
 
             final_formula = _formula_test_node("x = y")
@@ -2652,6 +2697,8 @@ class PortableFormulaOcrTests(unittest.TestCase):
                     1,
                     formula=final_formula,
                     for_context=False,
+                    trusted_formula_identity=authority.identity_manifest[1],
+                    require_trusted_formula_identity=True,
                 )
             )
             self.assertEqual(
@@ -2660,8 +2707,18 @@ class PortableFormulaOcrTests(unittest.TestCase):
                     [final_formula],
                     formula_crop_diagnostics=diagnostics,
                     formula_by_index={1: final_formula},
+                    trusted_formula_identity_manifest=(
+                        authority.identity_manifest
+                    ),
+                    require_trusted_formula_identity=True,
                 )[0]["selected"],
                 "source",
+            )
+            self.assertEqual(
+                authority.formula_crop_diagnostics[0][
+                    "formula_content_identity_sha256"
+                ],
+                adapter._formula_content_identity_sha256("x = y"),
             )
 
     def test_trusted_formula_crop_refresh_fails_closed_for_evidence_and_final_tampering(self) -> None:
@@ -2771,6 +2828,95 @@ class PortableFormulaOcrTests(unittest.TestCase):
                 )
             )
 
+    def test_portable_formula_ocr_does_not_authorize_patched_json_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            (output_dir / "formulas").mkdir()
+            _write_formula_text_test_png(output_dir / "formulas" / "formula_1.png")
+            _write_visible_test_png(
+                output_dir / "formulas" / "formula_1_context.png",
+                (160, 80),
+            )
+            initial_formula = _formula_test_node("")
+            (output_dir / "document.json").write_text(
+                json.dumps({"texts": [initial_formula]}), encoding="utf-8"
+            )
+            (output_dir / "document.html").write_text(
+                "<html><body>Formula</body></html>", encoding="utf-8"
+            )
+            (output_dir / "document.md").write_text("Formula\n", encoding="utf-8")
+            metadata: dict[str, object] = {
+                "formula_crop_diagnostics": [
+                    _formula_test_crop_diagnostic(output_dir, 1, initial_formula)
+                ],
+                "suspicious_formula_diagnostics": [],
+            }
+            status: dict[str, object] = {
+                "ok": True,
+                "success_class": "success",
+                "warnings": [],
+                "quality_signals": {},
+            }
+            authority = adapter._FormulaEvidenceAuthority(
+                identity_manifest={},
+                formula_crop_diagnostics=metadata["formula_crop_diagnostics"],
+                suspicious_formula_diagnostics=[],
+            )
+            args = Namespace(
+                formula_policy="formula_service",
+                enable_formula_mlx=False,
+                formula_ocr_url="http://formula:8001",
+                input_file=output_dir / "source.pdf",
+                timeout_seconds=60,
+                http_retries=0,
+                http_retry_sleep_seconds=0,
+            )
+            response = {
+                "ok": True,
+                "model": "test/guarded-ensemble",
+                "results": [
+                    {
+                        "id": "1",
+                        "latex": "x = y",
+                        "ok": True,
+                        "safety_reasons": [],
+                        "variant": "source_crop",
+                    }
+                ],
+            }
+
+            def tamper_after_patch(*_args: object, **_kwargs: object) -> list[int]:
+                (output_dir / "document.json").write_text(
+                    json.dumps({"texts": [_formula_test_node("x = z")]}),
+                    encoding="utf-8",
+                )
+                return [1]
+
+            with patch.object(
+                adapter, "post_json", return_value=response
+            ), patch.object(
+                adapter, "_formula_output_safety_reasons", return_value=[]
+            ), patch.object(
+                adapter, "_patch_formula_json_nodes", side_effect=tamper_after_patch
+            ):
+                result = adapter.run_portable_formula_ocr(
+                    output_dir,
+                    metadata,
+                    status,
+                    args,
+                    trusted_formula_authority=authority,
+                )
+
+            self.assertFalse(result["ok"])
+            self.assertFalse(result["trusted_formula_document_verified"])
+            self.assertEqual({}, authority.identity_manifest)
+            self.assertEqual(
+                "",
+                authority.formula_crop_diagnostics[0][
+                    "formula_content_identity_sha256"
+                ],
+            )
+
     def test_trusted_second_pass_update_refreshes_crop_identity_immediately(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             output_dir = Path(tmpdir)
@@ -2794,6 +2940,11 @@ class PortableFormulaOcrTests(unittest.TestCase):
                 "warnings": [],
                 "quality_signals": {},
             }
+            authority = adapter._FormulaEvidenceAuthority(
+                identity_manifest={},
+                formula_crop_diagnostics=metadata["formula_crop_diagnostics"],
+                suspicious_formula_diagnostics=[],
+            )
 
             # This is the same in-process acceptance point used after a
             # successful Route-B/second-pass primary apply.
@@ -2801,6 +2952,7 @@ class PortableFormulaOcrTests(unittest.TestCase):
                 metadata,
                 status,
                 {1: final_formula},
+                trusted_formula_authority=authority,
             )
 
             diagnostic = metadata["formula_crop_diagnostics"][0]
@@ -2813,13 +2965,19 @@ class PortableFormulaOcrTests(unittest.TestCase):
                 adapter._formula_raw_content_sha256("x = y"),
             )
             self.assertEqual(
+                authority.identity_manifest[1][
+                    "formula_content_identity_sha256"
+                ],
+                adapter._formula_content_identity_sha256("x = y"),
+            )
+            self.assertEqual(
                 status["quality_signals"]["formula_crop_diagnostics"][0][
                     "formula_raw_content_sha256"
                 ],
                 adapter._formula_raw_content_sha256("x = y"),
             )
 
-    def test_second_pass_apply_point_refreshes_crop_identity_from_final_json(self) -> None:
+    def test_second_pass_apply_point_refreshes_from_trusted_replacement_log(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             output_dir = Path(tmpdir)
             (output_dir / "formulas").mkdir()
@@ -2862,6 +3020,11 @@ class PortableFormulaOcrTests(unittest.TestCase):
                 "warnings": [],
                 "quality_signals": {},
             }
+            authority = adapter._FormulaEvidenceAuthority(
+                identity_manifest={},
+                formula_crop_diagnostics=metadata["formula_crop_diagnostics"],
+                suspicious_formula_diagnostics=[],
+            )
             args = Namespace(
                 formula_second_pass_policy="apply",
                 formula_second_pass_route_b_dir=route_b_dir,
@@ -2920,7 +3083,11 @@ class PortableFormulaOcrTests(unittest.TestCase):
                 return_value={"ok": True},
             ):
                 adapter.run_optional_formula_second_pass(
-                    output_dir, metadata, status, args
+                    output_dir,
+                    metadata,
+                    status,
+                    args,
+                    trusted_formula_authority=authority,
                 )
 
             self.assertTrue(metadata["formula_second_pass_applied"])
@@ -2932,6 +3099,70 @@ class PortableFormulaOcrTests(unittest.TestCase):
             self.assertEqual(
                 diagnostic["source"]["formula_raw_content_sha256"],
                 adapter._formula_raw_content_sha256("x = y"),
+            )
+            self.assertEqual(
+                authority.identity_manifest[1][
+                    "formula_content_identity_sha256"
+                ],
+                adapter._formula_content_identity_sha256("x = y"),
+            )
+            self.assertEqual(
+                authority.formula_crop_diagnostics[0]["source"][
+                    "formula_raw_content_sha256"
+                ],
+                adapter._formula_raw_content_sha256("x = y"),
+            )
+
+    def test_trusted_raw_only_formula_update_refreshes_appendix_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            (output_dir / "formulas").mkdir()
+            _write_formula_text_test_png(
+                output_dir / "formulas" / "formula_1.png"
+            )
+            _write_visible_test_png(
+                output_dir / "formulas" / "formula_1_context.png",
+                (160, 80),
+            )
+            initial_formula = _formula_test_node("")
+            final_formula = _formula_test_node("(2)")
+            diagnostics = [
+                _formula_test_crop_diagnostic(output_dir, 1, initial_formula)
+            ]
+            metadata: dict[str, object] = {
+                "formula_crop_diagnostics": diagnostics,
+                "suspicious_formula_diagnostics": [],
+            }
+            status: dict[str, object] = {
+                "ok": True,
+                "success_class": "success",
+                "warnings": [],
+                "quality_signals": {},
+            }
+            authority = adapter._FormulaEvidenceAuthority(
+                identity_manifest={},
+                formula_crop_diagnostics=diagnostics,
+                suspicious_formula_diagnostics=[],
+            )
+
+            adapter._refresh_formula_crop_diagnostics_after_accepted_formula_update(
+                metadata,
+                status,
+                {1: final_formula},
+                trusted_formula_authority=authority,
+            )
+
+            trusted = authority.identity_manifest[1]
+            self.assertEqual("", trusted["formula_content_identity_sha256"])
+            self.assertEqual(
+                adapter._formula_raw_content_sha256("(2)"),
+                trusted["formula_raw_content_sha256"],
+            )
+            self.assertEqual(
+                trusted["formula_raw_content_sha256"],
+                authority.formula_crop_diagnostics[0][
+                    "formula_raw_content_sha256"
+                ],
             )
 
     def test_final_restore_does_not_self_authorize_tampered_formula(self) -> None:
@@ -2970,17 +3201,32 @@ class PortableFormulaOcrTests(unittest.TestCase):
                 "warnings": [],
                 "quality_signals": {"primary_surface": {"counts": {}}},
             }
-            adapter._set_formula_crop_identity_manifest(
+            authority = adapter._FormulaEvidenceAuthority(
+                identity_manifest={},
+                formula_crop_diagnostics=metadata["formula_crop_diagnostics"],
+                suspicious_formula_diagnostics=[],
+            )
+            adapter._refresh_formula_crop_diagnostics_after_accepted_formula_update(
                 metadata,
                 status,
                 {1: accepted_formula},
+                trusted_formula_authority=authority,
             )
             tampered_identity = adapter._formula_crop_identity_manifest_for_indexed_formulas(
                 {1: tampered_formula}
             )[1]
-            metadata["formula_crop_content_identity_manifest"]["1"] = tampered_identity
+            metadata["formula_crop_content_identity_manifest"]["1"] = copy.deepcopy(
+                tampered_identity
+            )
             status["quality_signals"]["formula_crop_content_identity_manifest"]["1"] = (
                 copy.deepcopy(tampered_identity)
+            )
+            for diagnostic in metadata["formula_crop_diagnostics"]:
+                diagnostic.update(copy.deepcopy(tampered_identity))
+                for metric_name in ("source", "context"):
+                    diagnostic[metric_name].update(copy.deepcopy(tampered_identity))
+            status["quality_signals"]["formula_crop_diagnostics"] = copy.deepcopy(
+                metadata["formula_crop_diagnostics"]
             )
 
             with patch.object(
@@ -3011,16 +3257,23 @@ class PortableFormulaOcrTests(unittest.TestCase):
                     metadata,
                     status,
                     visual_pdf_path=Path("missing.pdf"),
+                    trusted_formula_authority=authority,
                 )
 
-            # The accepted OCR identity remains the only authority.  The
-            # final tampered text cannot cause the stale empty crop hash to be
-            # rewritten, so no inline source binding is reported.
+            # Document, both persisted diagnostics, and both audit manifests
+            # were coordinated to x=z.  The detached in-process x=y authority
+            # still rejects the final crop binding.
             self.assertEqual(
                 metadata["formula_crop_diagnostics"][0][
                     "formula_content_identity_sha256"
                 ],
-                "",
+                adapter._formula_content_identity_sha256("x = z"),
+            )
+            self.assertEqual(
+                authority.formula_crop_diagnostics[0][
+                    "formula_content_identity_sha256"
+                ],
+                adapter._formula_content_identity_sha256("x = y"),
             )
             self.assertEqual(
                 visuals["formula_source_renderings"]["missing_candidate_indexes"],

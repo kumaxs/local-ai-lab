@@ -927,6 +927,7 @@ class PdfInventoryGateTests(unittest.TestCase):
                 _status: dict[str, Any],
                 *,
                 visual_pdf_path: Path,
+                **_kwargs: object,
             ) -> dict[str, Any]:
                 events.append("restore")
                 return {"table_source_candidate_count": 0}
@@ -1022,6 +1023,7 @@ class PdfInventoryGateTests(unittest.TestCase):
                 _status: dict[str, Any],
                 *,
                 visual_pdf_path: Path,
+                **_kwargs: object,
             ) -> dict[str, Any]:
                 return {"table_source_candidate_count": 0}
 
@@ -1079,6 +1081,7 @@ class PdfInventoryGateTests(unittest.TestCase):
                 _status: dict[str, Any],
                 *,
                 visual_pdf_path: Path,
+                **_kwargs: object,
             ) -> dict[str, Any]:
                 return {"table_source_candidate_count": 0}
 

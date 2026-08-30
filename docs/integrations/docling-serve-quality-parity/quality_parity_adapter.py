@@ -6078,6 +6078,8 @@ def _formula_crop_provenance_is_verified(
     for_context: bool,
     expected_visual_pdf_sha256: str | None = None,
     allow_raw_identity: bool = False,
+    trusted_formula_identity: dict[str, str] | None = None,
+    require_trusted_formula_identity: bool = False,
 ) -> bool:
     item = formula_crop_diagnostics.get(formula_index)
     if not isinstance(item, dict):
@@ -6157,6 +6159,17 @@ def _formula_crop_provenance_is_verified(
         or item_identity_sha256 != current_identity_sha256
     ):
         return False
+    if require_trusted_formula_identity:
+        trusted_identity_sha256 = (
+            str(trusted_formula_identity.get(identity_field) or "").lower()
+            if isinstance(trusted_formula_identity, dict)
+            else ""
+        )
+        if (
+            not re.fullmatch(r"[0-9a-f]{64}", trusted_identity_sha256)
+            or trusted_identity_sha256 != current_identity_sha256
+        ):
+            return False
     page_size = metric.get("page_size") or {}
     try:
         page_width = float(page_size.get("width") or 0.0)
@@ -6407,6 +6420,8 @@ def _formula_indexed_candidates(
     expected_visual_pdf_sha256: str | None = None,
     formula_by_index: dict[int, dict[str, Any]] | None = None,
     diagnostic_only_indexes: set[int] | None = None,
+    trusted_formula_identity_manifest: dict[int, dict[str, str]] | None = None,
+    require_trusted_formula_identity: bool = False,
 ) -> list[dict[str, Any]]:
     diagnostic_only_indexes = set(diagnostic_only_indexes or set())
     if strict_indexes is not None:
@@ -6470,6 +6485,12 @@ def _formula_indexed_candidates(
             for_context=False,
             expected_visual_pdf_sha256=expected_visual_pdf_sha256,
             allow_raw_identity=index in diagnostic_only_indexes,
+            trusted_formula_identity=(
+                trusted_formula_identity_manifest.get(index)
+                if isinstance(trusted_formula_identity_manifest, dict)
+                else None
+            ),
+            require_trusted_formula_identity=require_trusted_formula_identity,
         )
         context_provenance_verified = _formula_crop_provenance_is_verified(
             context_path_abs,
@@ -6479,6 +6500,12 @@ def _formula_indexed_candidates(
             for_context=True,
             expected_visual_pdf_sha256=expected_visual_pdf_sha256,
             allow_raw_identity=index in diagnostic_only_indexes,
+            trusted_formula_identity=(
+                trusted_formula_identity_manifest.get(index)
+                if isinstance(trusted_formula_identity_manifest, dict)
+                else None
+            ),
+            require_trusted_formula_identity=require_trusted_formula_identity,
         )
         context_usable = bool(
             context_provenance_verified
@@ -6740,6 +6767,53 @@ def _formula_raw_content_sha256(value: str) -> str:
 _FORMULA_CROP_CONTENT_IDENTITY_MANIFEST = "formula_crop_content_identity_manifest"
 
 
+class _FormulaEvidenceAuthority:
+    """Process-local formula crop provenance that persisted files cannot edit."""
+
+    __slots__ = (
+        "identity_manifest",
+        "formula_crop_diagnostics",
+        "suspicious_formula_diagnostics",
+    )
+
+    def __init__(
+        self,
+        *,
+        identity_manifest: dict[int, dict[str, str]],
+        formula_crop_diagnostics: list[dict[str, Any]] | None,
+        suspicious_formula_diagnostics: list[dict[str, Any]] | None,
+    ) -> None:
+        self.identity_manifest = copy.deepcopy(identity_manifest)
+        self.formula_crop_diagnostics = copy.deepcopy(
+            formula_crop_diagnostics or []
+        )
+        self.suspicious_formula_diagnostics = copy.deepcopy(
+            suspicious_formula_diagnostics or []
+        )
+
+    def snapshot(self) -> dict[str, Any]:
+        return {
+            "identity_manifest": copy.deepcopy(self.identity_manifest),
+            "formula_crop_diagnostics": copy.deepcopy(
+                self.formula_crop_diagnostics
+            ),
+            "suspicious_formula_diagnostics": copy.deepcopy(
+                self.suspicious_formula_diagnostics
+            ),
+        }
+
+    def restore(self, snapshot: dict[str, Any]) -> None:
+        self.identity_manifest = copy.deepcopy(
+            snapshot.get("identity_manifest") or {}
+        )
+        self.formula_crop_diagnostics = copy.deepcopy(
+            snapshot.get("formula_crop_diagnostics") or []
+        )
+        self.suspicious_formula_diagnostics = copy.deepcopy(
+            snapshot.get("suspicious_formula_diagnostics") or []
+        )
+
+
 def _formula_crop_identity_manifest_for_indexed_formulas(
     formula_by_index: dict[int, dict[str, Any]] | None,
 ) -> dict[int, dict[str, str]]:
@@ -6763,7 +6837,13 @@ def _formula_crop_identity_manifest_for_indexed_formulas(
         text = str(formula.get("text") or "").strip()
         semantic_identity = _formula_content_identity_sha256(text)
         raw_identity = _formula_raw_content_sha256(text)
-        if not semantic_identity or not raw_identity:
+        # Number-only formulas are intentionally excluded from the semantic
+        # surface but may still be retained in the diagnostic appendix.  Keep
+        # their raw identity in the process-local authority; regular formula
+        # candidates still require the non-empty semantic field.
+        if not raw_identity or (
+            not semantic_identity and not _is_formula_number_only(text)
+        ):
             continue
         manifest[raw_index] = {
             "formula_content_identity_sha256": semantic_identity,
@@ -6782,18 +6862,36 @@ def _set_formula_crop_identity_manifest(
     manifest = _formula_crop_identity_manifest_for_indexed_formulas(
         formula_by_index
     )
-    persisted = {str(index): value for index, value in sorted(manifest.items())}
-    metadata[_FORMULA_CROP_CONTENT_IDENTITY_MANIFEST] = persisted
+    _persist_formula_crop_identity_manifest(metadata, status, manifest)
+    return manifest
+
+
+def _persist_formula_crop_identity_manifest(
+    metadata: dict[str, Any],
+    status: dict[str, Any],
+    manifest: dict[int, dict[str, str]],
+) -> None:
+    """Write a detached audit copy of an in-process identity authority."""
+
+    persisted = {
+        str(index): copy.deepcopy(value)
+        for index, value in sorted(manifest.items())
+    }
+    # Neither persisted surface may share nested objects with the in-process
+    # authority.  A coordinated edit of document.json and metadata/status must
+    # never be able to mutate the authority later used by final restoration.
+    metadata[_FORMULA_CROP_CONTENT_IDENTITY_MANIFEST] = copy.deepcopy(persisted)
     status.setdefault("quality_signals", {})[
         _FORMULA_CROP_CONTENT_IDENTITY_MANIFEST
     ] = copy.deepcopy(persisted)
-    return manifest
 
 
 def _refresh_formula_crop_diagnostics_after_accepted_formula_update(
     metadata: dict[str, Any],
     status: dict[str, Any],
     formula_by_index: dict[int, dict[str, Any]] | None,
+    *,
+    trusted_formula_authority: _FormulaEvidenceAuthority,
 ) -> dict[int, dict[str, str]]:
     """Refresh crop identities immediately after a trusted formula update.
 
@@ -6803,25 +6901,41 @@ def _refresh_formula_crop_diagnostics_after_accepted_formula_update(
     manifest and then use it to bless a tampered final formula.
     """
 
-    trusted_manifest = _set_formula_crop_identity_manifest(
+    if not isinstance(trusted_formula_authority, _FormulaEvidenceAuthority):
+        raise ValueError("trusted_formula_authority_required")
+    trusted_manifest = _formula_crop_identity_manifest_for_indexed_formulas(
+        formula_by_index,
+    )
+    trusted_formula_authority.identity_manifest.update(
+        copy.deepcopy(trusted_manifest)
+    )
+    persisted_authority = trusted_formula_authority.identity_manifest
+    _persist_formula_crop_identity_manifest(
         metadata,
         status,
-        formula_by_index,
+        persisted_authority,
     )
     for diagnostic_key in (
         "formula_crop_diagnostics",
         "suspicious_formula_diagnostics",
     ):
-        diagnostics = metadata.get(diagnostic_key)
+        authority_attribute = diagnostic_key
+        diagnostics = getattr(trusted_formula_authority, authority_attribute)
         if not isinstance(diagnostics, list):
             continue
-        metadata[diagnostic_key] = _refresh_formula_crop_content_identities(
+        refreshed_diagnostics = _refresh_formula_crop_content_identities(
             diagnostics,
             formula_by_index,
             trusted_identity_manifest=trusted_manifest,
         )
+        setattr(
+            trusted_formula_authority,
+            authority_attribute,
+            copy.deepcopy(refreshed_diagnostics),
+        )
+        metadata[diagnostic_key] = copy.deepcopy(refreshed_diagnostics)
         status.setdefault("quality_signals", {})[diagnostic_key] = copy.deepcopy(
-            metadata[diagnostic_key]
+            refreshed_diagnostics
         )
     return trusted_manifest
 
@@ -6860,11 +6974,24 @@ def _refresh_formula_crop_content_identities(
         text = str(formula.get("text") or "").strip()
         semantic_identity = _formula_content_identity_sha256(text)
         raw_identity = _formula_raw_content_sha256(text)
+        raw_only_number = bool(
+            not semantic_identity and _is_formula_number_only(text)
+        )
         if (
-            not semantic_identity
-            or not raw_identity
-            or semantic_identity != trusted.get("formula_content_identity_sha256")
+            not raw_identity
             or raw_identity != trusted.get("formula_raw_content_sha256")
+            or (
+                raw_only_number
+                and bool(trusted.get("formula_content_identity_sha256"))
+            )
+            or (
+                not raw_only_number
+                and (
+                    not semantic_identity
+                    or semantic_identity
+                    != trusted.get("formula_content_identity_sha256")
+                )
+            )
         ):
             continue
         item["formula_content_identity_sha256"] = semantic_identity
@@ -6967,6 +7094,8 @@ def append_formula_source_renderings(
     primary: dict[str, Any] | None = None,
     formula_by_index: dict[int, dict[str, Any]] | None = None,
     diagnostic_only_indexes: set[int] | None = None,
+    trusted_formula_identity_manifest: dict[int, dict[str, str]] | None = None,
+    require_trusted_formula_identity: bool = False,
 ) -> dict[str, Any]:
     """Bind each accepted formula index to a usable crop at its occurrence.
 
@@ -6977,13 +7106,12 @@ def append_formula_source_renderings(
 
     del status  # accepted for call-site/test symmetry; this helper is pure output accounting.
     if metadata:
-        formula_crop_diagnostics = (
-            formula_crop_diagnostics or metadata.get("formula_crop_diagnostics")
-        )
-        suspicious_formula_diagnostics = (
-            suspicious_formula_diagnostics
-            or metadata.get("suspicious_formula_diagnostics")
-        )
+        if formula_crop_diagnostics is None:
+            formula_crop_diagnostics = metadata.get("formula_crop_diagnostics")
+        if suspicious_formula_diagnostics is None:
+            suspicious_formula_diagnostics = metadata.get(
+                "suspicious_formula_diagnostics"
+            )
 
     html_path = output_dir / "document.html"
     md_path = output_dir / "document.md"
@@ -7105,6 +7233,8 @@ def append_formula_source_renderings(
         ),
         formula_by_index=formula_by_index,
         diagnostic_only_indexes=diagnostic_only_indexes,
+        trusted_formula_identity_manifest=trusted_formula_identity_manifest,
+        require_trusted_formula_identity=require_trusted_formula_identity,
     )
     candidate_by_index = {
         int(candidate["formula_index"]): candidate for candidate in candidates
@@ -20845,7 +20975,7 @@ def restore_review_artifact_layer(
     metadata: dict[str, Any],
     status: dict[str, Any],
     args: argparse.Namespace,
-) -> None:
+) -> _FormulaEvidenceAuthority:
     document = response.get("document") or {}
     document_json = document.get("json_content")
     evidence_document_json = _document_with_resolved_page_provenance(document_json)
@@ -20951,6 +21081,17 @@ def restore_review_artifact_layer(
         )
     metadata.update(crop_counts)
     metadata.update(diagnostics)
+    # Capture the crop-time document identities in a private process-local
+    # authority before OCR/second-pass mutations.  Persisted copies are audit
+    # only and deliberately do not share nested objects with this return value.
+    initial_formula_identity_manifest = _set_formula_crop_identity_manifest(
+        metadata,
+        status,
+        {
+            index: formula
+            for index, formula in enumerate(formulas, start=1)
+        },
+    )
     metadata["table_visual_fallbacks"] = table_visual_fallbacks
     metadata["table_source_renderings"] = table_source_renderings
     metadata["formula_source_renderings"] = formula_source_renderings
@@ -21038,6 +21179,13 @@ def restore_review_artifact_layer(
     )
     (output_dir / "status.json").write_text(
         json.dumps(status, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
+    return _FormulaEvidenceAuthority(
+        identity_manifest=initial_formula_identity_manifest,
+        formula_crop_diagnostics=metadata.get("formula_crop_diagnostics"),
+        suspicious_formula_diagnostics=metadata.get(
+            "suspicious_formula_diagnostics"
+        ),
     )
 
 
@@ -23044,12 +23192,60 @@ def apply_cn_final_document_polish(
         "ok": ok,
         "applied": True,
         "formula_texts": sorted(formula_texts),
+        # Consumed and removed by the caller before the public diagnostic is
+        # persisted.  These exact accepted texts, rather than a later JSON
+        # reload, are the authority update source.
+        "_trusted_formula_texts_by_index": copy.deepcopy(formula_texts),
         "candidate_sources": source_map,
         "missing_source_formulas": missing_sources,
         "document_json_patched": json_patched,
         "document_md_patched": markdown_patched,
         "document_html_patch": html_patch,
     }
+
+
+def _trusted_formula_texts_from_replacement_log(
+    replacement_log: list[dict[str, Any]],
+) -> dict[int, str]:
+    trusted: dict[int, str] = {}
+    for entry in replacement_log:
+        if not isinstance(entry, dict) or entry.get("status") != "replaced":
+            continue
+        formula_no = entry.get("formula_no")
+        if (
+            not isinstance(formula_no, int)
+            or isinstance(formula_no, bool)
+            or formula_no <= 0
+        ):
+            continue
+        text = str(
+            entry.get("route_b_candidate")
+            or entry.get("display_override")
+            or _strip_display_math_wrapper(str(entry.get("markdown_after") or ""))
+        ).strip()
+        if text:
+            trusted[formula_no] = text
+    return trusted
+
+
+def _verified_formula_update_nodes(
+    document: Any,
+    trusted_texts_by_index: dict[int, str],
+) -> tuple[bool, dict[int, dict[str, str]]]:
+    if not trusted_texts_by_index:
+        return True, {}
+    if not isinstance(document, dict):
+        return False, {}
+    formulas = extract_label_nodes(document, "formula")
+    verified: dict[int, dict[str, str]] = {}
+    for index, expected_text in trusted_texts_by_index.items():
+        if not (0 < index <= len(formulas)):
+            return False, {}
+        actual_text = str(formulas[index - 1].get("text") or "")
+        if actual_text != expected_text:
+            return False, {}
+        verified[index] = {"text": expected_text}
+    return True, verified
 
 
 def _current_formula_display_texts(output_dir: Path) -> tuple[dict[int, str], dict[int, str]]:
@@ -23461,6 +23657,8 @@ def run_portable_formula_ocr(
     metadata: dict[str, Any],
     status: dict[str, Any],
     args: argparse.Namespace,
+    *,
+    trusted_formula_authority: _FormulaEvidenceAuthority | None = None,
 ) -> dict[str, Any]:
     """Replace Docker formula placeholders using the private guarded sidecar."""
 
@@ -23718,33 +23916,28 @@ def run_portable_formula_ocr(
         prefer_index_anchor=True,
     )
     patched_document = _load_json_file(output_dir / "document.json")
-    patched_nodes = (
-        extract_label_nodes(patched_document, "formula")
-        if isinstance(patched_document, dict)
-        else []
-    )
     # ``render_page_images_and_crops`` runs before OCR and therefore records
     # empty identities for placeholder formula nodes.  Only formulas that
     # were actually accepted and verified in the patched JSON may authorize a
     # diagnostic refresh; missing/unsafe results remain fail-closed.
-    accepted_formula_by_index = {
-        index: formula
-        for index, formula in enumerate(patched_nodes, start=1)
-        if index in formula_texts
-        and str(formula.get("text") or "") == formula_texts[index]
-    }
-    trusted_formula_manifest = (
-        _refresh_formula_crop_diagnostics_after_accepted_formula_update(
-            metadata,
-            status,
-            accepted_formula_by_index,
-        )
+    trusted_formula_document_verified, accepted_formula_by_index = (
+        _verified_formula_update_nodes(patched_document, formula_texts)
     )
-    verified = [
-        index
-        for index, formula in enumerate(patched_nodes, start=1)
-        if str(formula.get("text") or "") == formula_texts.get(index)
-    ]
+    trusted_formula_manifest = {}
+    if trusted_formula_document_verified:
+        trusted_formula_manifest = (
+            _refresh_formula_crop_diagnostics_after_accepted_formula_update(
+                metadata,
+                status,
+                accepted_formula_by_index,
+                trusted_formula_authority=trusted_formula_authority,
+            )
+        )
+    verified = (
+        sorted(accepted_formula_by_index)
+        if trusted_formula_document_verified
+        else []
+    )
     missing_results = sorted(set(range(1, len(formulas) + 1)) - set(formula_texts))
     surface_sidecar_dir = output_dir / "formula_display_portable"
     markdown_patched = _patch_markdown_formula_blocks(output_dir, formula_texts)
@@ -23765,6 +23958,7 @@ def run_portable_formula_ocr(
         not service_error
         and not missing_crops
         and not unsafe
+        and trusted_formula_document_verified
         and len(verified) == len(formulas)
     )
     result = {
@@ -23785,6 +23979,7 @@ def run_portable_formula_ocr(
         "formula_crop_identity_refreshed_indexes": sorted(
             trusted_formula_manifest
         ),
+        "trusted_formula_document_verified": trusted_formula_document_verified,
         "verified_count": len(verified),
         "verified_indexes": verified,
         "missing_crop_indexes": missing_crops,
@@ -23833,6 +24028,8 @@ def run_optional_formula_second_pass(
     metadata: dict[str, Any],
     status: dict[str, Any],
     args: argparse.Namespace,
+    *,
+    trusted_formula_authority: _FormulaEvidenceAuthority | None = None,
 ) -> None:
     """Run optional formula-only second pass and update adapter metadata/status."""
     requested_policy = args.formula_second_pass_policy
@@ -23990,8 +24187,23 @@ def run_optional_formula_second_pass(
         message = "formula_second_pass_route_b_dir_required"
         if is_cn_accepted_path(args):
             cn_final_polish = apply_cn_final_document_polish(output_dir, sidecar_dir, args)
-            metadata["cn_final_document_polish"] = cn_final_polish
-            status["quality_signals"]["cn_final_document_polish"] = cn_final_polish
+            trusted_cn_texts = cn_final_polish.pop(
+                "_trusted_formula_texts_by_index", {}
+            )
+            trusted_cn_verified, trusted_cn_nodes = _verified_formula_update_nodes(
+                _load_json_file(output_dir / "document.json"),
+                trusted_cn_texts,
+            )
+            if cn_final_polish.get("applied") and not trusted_cn_verified:
+                cn_final_polish["ok"] = False
+                cn_final_polish["trusted_formula_identity_verified"] = False
+                cn_final_polish["error"] = "cn_formula_authority_document_mismatch"
+            elif cn_final_polish.get("applied"):
+                cn_final_polish["trusted_formula_identity_verified"] = True
+            metadata["cn_final_document_polish"] = copy.deepcopy(cn_final_polish)
+            status["quality_signals"]["cn_final_document_polish"] = copy.deepcopy(
+                cn_final_polish
+            )
             metadata["formula_second_pass"] = {
                 "ok": bool(cn_final_polish.get("ok")),
                 "error": message,
@@ -24003,17 +24215,12 @@ def run_optional_formula_second_pass(
                 status["ok"] = False
                 status["success_class"] = "degraded_failure"
             elif cn_final_polish.get("applied"):
-                final_document = _load_json_file(output_dir / "document.json")
-                if isinstance(final_document, dict):
-                    final_formulas = extract_label_nodes(final_document, "formula")
-                    _refresh_formula_crop_diagnostics_after_accepted_formula_update(
-                        metadata,
-                        status,
-                        {
-                            index: formula
-                            for index, formula in enumerate(final_formulas, start=1)
-                        },
-                    )
+                _refresh_formula_crop_diagnostics_after_accepted_formula_update(
+                    metadata,
+                    status,
+                    trusted_cn_nodes,
+                    trusted_formula_authority=trusted_formula_authority,
+                )
             write_updated_contract_state()
             return
         fallback_result = apply_current_formula_display_fallback(
@@ -24255,28 +24462,32 @@ def run_optional_formula_second_pass(
         except Exception as exc:
             abort_primary_apply("patch_and_synchronize_primary_contract", exc)
             return
+        trusted_formula_texts = _trusted_formula_texts_from_replacement_log(
+            raw_replacement_log
+        )
+        trusted_replacement_count = sum(
+            1
+            for entry in raw_replacement_log
+            if isinstance(entry, dict) and entry.get("status") == "replaced"
+        )
+        trusted_cn_texts = cn_final_polish.pop(
+            "_trusted_formula_texts_by_index", {}
+        )
+        if cn_final_polish.get("applied"):
+            trusted_formula_texts = trusted_cn_texts
         validation_log = list(result.get("replacement_log") or [])
         if cn_final_polish.get("applied"):
-            final_document = _load_json_file(output_dir / "document.json")
-            if isinstance(final_document, dict):
-                validation_log = []
-                for formula_no, formula in enumerate(
-                    extract_label_nodes(final_document, "formula"),
-                    start=1,
-                ):
-                    formula_text = str(formula.get("text") or "")
-                    formula_meta = formula.get("local_ai_lab_formula_second_pass") or {}
-                    formula_status = str(formula_meta.get("status") or "replaced")
-                    validation_log.append(
-                        {
-                            "formula_no": formula_no,
-                            "status": "replaced" if formula_status == "replaced" else formula_status,
-                            "display_override": formula_text,
-                            "route_a_text": formula_text,
-                            "eq_number": formula_no,
-                            "fallback_reason": formula_meta.get("fallback_reason"),
-                        }
-                    )
+            validation_log = [
+                {
+                    "formula_no": formula_no,
+                    "status": "replaced",
+                    "display_override": formula_text,
+                    "route_b_candidate": formula_text,
+                    "route_a_text": formula_text,
+                    "eq_number": formula_no,
+                }
+                for formula_no, formula_text in sorted(trusted_formula_texts.items())
+            ]
         try:
             html_gate = validate_formula_second_pass_html(
                 output_dir,
@@ -24298,15 +24509,31 @@ def run_optional_formula_second_pass(
             except Exception as exc:
                 abort_primary_apply("apply_markdown_main_flow_supplement", exc)
                 return
+        trusted_update_verified, trusted_update_nodes = _verified_formula_update_nodes(
+            _load_json_file(output_dir / "document.json"),
+            trusted_formula_texts,
+        )
+        if (
+            not cn_final_polish.get("applied")
+            and len(trusted_formula_texts) != trusted_replacement_count
+        ):
+            trusted_update_verified = False
+        if cn_final_polish.get("applied") and not trusted_formula_texts:
+            trusted_update_verified = False
+        cn_final_polish["trusted_formula_identity_verified"] = bool(
+            trusted_update_verified
+        )
         metadata["formula_second_pass_html_patch"] = html_patch
         metadata["formula_second_pass_html_gate"] = html_gate
         metadata["formula_second_pass_contract_sync"] = contract_sync
-        metadata["cn_final_document_polish"] = cn_final_polish
+        metadata["cn_final_document_polish"] = copy.deepcopy(cn_final_polish)
         metadata["post_formula_markdown_main_flow_supplement"] = markdown_supplement
         status["quality_signals"]["formula_second_pass_html_patch"] = html_patch
         status["quality_signals"]["formula_second_pass_html_gate"] = html_gate
         status["quality_signals"]["formula_second_pass_contract_sync"] = contract_sync
-        status["quality_signals"]["cn_final_document_polish"] = cn_final_polish
+        status["quality_signals"]["cn_final_document_polish"] = copy.deepcopy(
+            cn_final_polish
+        )
         status["quality_signals"]["post_formula_markdown_main_flow_supplement"] = markdown_supplement
         primary_apply_ok = bool(
             html_patch.get("ok")
@@ -24314,6 +24541,7 @@ def run_optional_formula_second_pass(
             and contract_sync.get("ok")
             and cn_final_polish.get("ok")
             and markdown_supplement.get("ok")
+            and trusted_update_verified
         )
         if not primary_apply_ok:
             # The sidecar remains available for diagnosis, but primary Route-A
@@ -24332,6 +24560,10 @@ def run_optional_formula_second_pass(
                     "cn_final_document_polish_failed:"
                     f"missing_sources={cn_final_polish.get('missing_source_formulas')}:"
                     f"html_missing={cn_final_polish.get('document_html_patch', {}).get('missing_indexes')}"
+                )
+            if not trusted_update_verified:
+                status["warnings"].append(
+                    "formula_second_pass_trusted_identity_document_mismatch"
                 )
         elif any(
             source.startswith("anchor-missing-")
@@ -24353,17 +24585,12 @@ def run_optional_formula_second_pass(
             # formula surface.  Record its indexed identities before final
             # visual restoration so placeholder crop hashes can be refreshed
             # without allowing later document tampering to self-authorise.
-            final_document = _load_json_file(output_dir / "document.json")
-            if isinstance(final_document, dict):
-                final_formulas = extract_label_nodes(final_document, "formula")
-                _refresh_formula_crop_diagnostics_after_accepted_formula_update(
-                    metadata,
-                    status,
-                    {
-                        index: formula
-                        for index, formula in enumerate(final_formulas, start=1)
-                    },
-                )
+            _refresh_formula_crop_diagnostics_after_accepted_formula_update(
+                metadata,
+                status,
+                trusted_update_nodes,
+                trusted_formula_authority=trusted_formula_authority,
+            )
     else:
         metadata["formula_second_pass_applied"] = False
         status["quality_signals"]["formula_second_pass_applied"] = False
@@ -24376,6 +24603,8 @@ def run_optional_formula_second_pass_safely(
     metadata: dict[str, Any],
     status: dict[str, Any],
     args: argparse.Namespace,
+    *,
+    trusted_formula_authority: _FormulaEvidenceAuthority | None = None,
 ) -> dict[str, Any]:
     """Converge outer I/O failures without leaving a half-applied primary."""
 
@@ -24386,8 +24615,19 @@ def run_optional_formula_second_pass_safely(
     }
     metadata_snapshot = copy.deepcopy(metadata)
     status_snapshot = copy.deepcopy(status)
+    authority_snapshot = (
+        trusted_formula_authority.snapshot()
+        if trusted_formula_authority is not None
+        else None
+    )
     try:
-        run_optional_formula_second_pass(output_dir, metadata, status, args)
+        run_optional_formula_second_pass(
+            output_dir,
+            metadata,
+            status,
+            args,
+            trusted_formula_authority=trusted_formula_authority,
+        )
         return {"ok": True, "error": None}
     except Exception as exc:
         restore_errors: list[str] = []
@@ -24405,6 +24645,8 @@ def run_optional_formula_second_pass_safely(
         metadata.update(metadata_snapshot)
         status.clear()
         status.update(status_snapshot)
+        if trusted_formula_authority is not None and authority_snapshot is not None:
+            trusted_formula_authority.restore(authority_snapshot)
         error = f"formula_second_pass_outer_exception:{exc.__class__.__name__}:{exc}"
         result = {
             "ok": False,
@@ -25034,6 +25276,7 @@ def restore_final_delivery_visuals(
     status: dict[str, Any],
     *,
     visual_pdf_path: Path | None = None,
+    trusted_formula_authority: _FormulaEvidenceAuthority | None = None,
 ) -> dict[str, Any]:
     """Restore source-backed visuals after semantic reflow rewrites surfaces."""
 
@@ -25108,9 +25351,24 @@ def restore_final_delivery_visuals(
             for index, formula in zip(sorted(semantic_formula_indexes), formulas)
         }
 
+    trusted_formula_crop_diagnostics = (
+        trusted_formula_authority.formula_crop_diagnostics
+        if trusted_formula_authority is not None
+        else []
+    )
+    trusted_suspicious_formula_diagnostics = (
+        trusted_formula_authority.suspicious_formula_diagnostics
+        if trusted_formula_authority is not None
+        else []
+    )
+    trusted_formula_identity_manifest = (
+        trusted_formula_authority.identity_manifest
+        if trusted_formula_authority is not None
+        else {}
+    )
     crop_diagnostics_by_index = _parse_formula_source_crop_diagnostics(
-        metadata.get("formula_crop_diagnostics"),
-        metadata.get("suspicious_formula_diagnostics"),
+        copy.deepcopy(trusted_formula_crop_diagnostics),
+        copy.deepcopy(trusted_suspicious_formula_diagnostics),
     )
     allowed_dropped_indexes: set[int] = set()
     validated_dropped_artifacts: list[dict[str, Any]] = []
@@ -25171,6 +25429,10 @@ def restore_final_delivery_visuals(
                 for_context=False,
                 expected_visual_pdf_sha256=expected_visual_pdf_sha256,
                 allow_raw_identity=True,
+                trusted_formula_identity=trusted_formula_identity_manifest.get(
+                    raw_index
+                ),
+                require_trusted_formula_identity=True,
             )
             context_verified = _formula_crop_provenance_is_verified(
                 output_dir / "formulas" / f"formula_{raw_index}_context.png",
@@ -25180,6 +25442,10 @@ def restore_final_delivery_visuals(
                 for_context=True,
                 expected_visual_pdf_sha256=expected_visual_pdf_sha256,
                 allow_raw_identity=True,
+                trusted_formula_identity=trusted_formula_identity_manifest.get(
+                    raw_index
+                ),
+                require_trusted_formula_identity=True,
             )
             if not source_verified or not context_verified:
                 reasons.append("dropped_formula_crop_manifest_unverified")
@@ -25209,9 +25475,11 @@ def restore_final_delivery_visuals(
     formula_sources = append_formula_source_renderings(
         output_dir,
         formulas,
-        formula_crop_diagnostics=metadata.get("formula_crop_diagnostics"),
-        suspicious_formula_diagnostics=metadata.get(
-            "suspicious_formula_diagnostics"
+        formula_crop_diagnostics=copy.deepcopy(
+            trusted_formula_crop_diagnostics
+        ),
+        suspicious_formula_diagnostics=(
+            copy.deepcopy(trusted_suspicious_formula_diagnostics)
         ),
         # Dropped compact/number-only raw nodes are not primary semantic
         # formulas, but they still require a usable context crop in the
@@ -25223,6 +25491,8 @@ def restore_final_delivery_visuals(
         primary=primary,
         formula_by_index=formula_by_index,
         diagnostic_only_indexes=allowed_dropped_indexes,
+        trusted_formula_identity_manifest=trusted_formula_identity_manifest,
+        require_trusted_formula_identity=True,
     )
     inline_math_sources = append_inline_math_source_renderings(
         output_dir,
@@ -27843,6 +28113,7 @@ def _finalize_delivery_surfaces(
     args: argparse.Namespace,
     *,
     pdf_inventory: dict[str, Any] | None,
+    trusted_formula_authority: _FormulaEvidenceAuthority | None = None,
 ) -> dict[str, Any]:
     """Apply the last structural mutation before rebuilding and gating evidence."""
 
@@ -27875,6 +28146,7 @@ def _finalize_delivery_surfaces(
             metadata,
             status,
             visual_pdf_path=visual_pdf_path,
+            trusted_formula_authority=trusted_formula_authority,
         )
     formula = validate_final_formula_surfaces(output_dir, metadata, status)
     structural = validate_final_structural_surfaces(output_dir, metadata, status)
@@ -28294,15 +28566,28 @@ def _run_snapshot_job(
         "contract_files_written"
     ] = True
     checkpoint(verify_tree=True)
-    restore_review_artifact_layer(output_dir, response, metadata, status, visual_args)
+    trusted_formula_authority = restore_review_artifact_layer(
+        output_dir,
+        response,
+        metadata,
+        status,
+        visual_args,
+    )
     checkpoint(verify_tree=True)
-    run_portable_formula_ocr(output_dir, metadata, status, visual_args)
+    run_portable_formula_ocr(
+        output_dir,
+        metadata,
+        status,
+        visual_args,
+        trusted_formula_authority=trusted_formula_authority,
+    )
     checkpoint(verify_tree=True)
     run_optional_formula_second_pass_safely(
         output_dir,
         metadata,
         status,
         conversion_args,
+        trusted_formula_authority=trusted_formula_authority,
     )
     checkpoint(verify_tree=True)
     recovered_document = _load_json_file(output_dir / "document.json")
@@ -28335,6 +28620,7 @@ def _run_snapshot_job(
         status,
         conversion_args,
         pdf_inventory=pdf_inventory,
+        trusted_formula_authority=trusted_formula_authority,
     )
     checkpoint(verify_tree=True)
     _verify_job_source(

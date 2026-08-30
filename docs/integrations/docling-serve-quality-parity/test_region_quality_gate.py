@@ -433,6 +433,22 @@ def _fixture(root: Path) -> tuple[dict[str, object], dict[str, object], dict[str
 
 
 class RegionQualityGateTests(unittest.TestCase):
+    def test_default_record_id_digest_remains_backward_compatible(self):
+        self.assertEqual(
+            "formula:5c3c7524a65d1daf",
+            gate._record_id("formula", "#/texts/1", 1, 1),
+        )
+        self.assertNotEqual(
+            gate._record_id("picture_ocr", "picture_ocr:1", 1, 1),
+            gate._record_id(
+                "picture_ocr",
+                "picture_ocr:1",
+                1,
+                1,
+                namespace="quarantine-derived",
+            ),
+        )
+
     def test_all_region_kinds_are_deterministic_and_sidecars_are_bounded(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -690,6 +706,26 @@ class RegionQualityGateTests(unittest.TestCase):
             self.assertEqual(2, len(invalid))
             self.assertEqual(1, len(valid))
             self.assertFalse(result["ok"])
+
+    def test_quarantine_invalid_and_legal_fallback_visible_refs_keep_unique_ids(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            document, metadata, status = _fixture(root)
+            base = dict(status["quality_signals"]["structural_quarantine_qc"]["candidates"][0])
+            first = dict(base, source_ref="picture:foo bar")
+            second = dict(base, source_ref="picture_ocr:1")
+            status["quality_signals"]["structural_quarantine_qc"]["candidates"] = [
+                first,
+                second,
+            ]
+
+            result = evaluate_regions(root, document, metadata, status, write_sidecars=False)
+
+            picture_records = [
+                item for item in result["records"] if item["kind"] == "picture_ocr"
+            ]
+            self.assertEqual(2, len(picture_records))
+            self.assertEqual(2, len({item["id"] for item in picture_records}))
 
     def test_quarantine_without_source_ref_missing_bbox_stays_separate_and_unresolved(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -1853,6 +1889,128 @@ class RegionQualityGateTests(unittest.TestCase):
             inline = next(item for item in result["records"] if item["kind"] == "inline_math")
             self.assertIn("inline_math_binding_text_truncated", inline["reasons"])
             self.assertTrue(inline["signals"]["binding_text_truncated"])
+            self.assertFalse(result["ok"])
+
+    def test_inline_invalid_explicit_source_ref_does_not_alias_to_valid_node(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            document, metadata, status = _fixture(root)
+            document["texts"][3]["self_ref"] = "#/texts/foo_bar"
+            document["texts"][3]["text"] = "alpha_{s_j} and beta_{t_k} in body"
+            status["quality_signals"]["primary_surface"]["inline_math_source_regions"] = [
+                {
+                    "anchor": "inline:1",
+                    "page_no": 1,
+                    "bbox": BBOX,
+                    "source_text": "alpha_{s_j}",
+                    "binding_mode": "inline",
+                    "source_ref": "#/texts/foo bar",
+                },
+                {
+                    "anchor": "inline:2",
+                    "page_no": 1,
+                    "bbox": BBOX,
+                    "source_text": "alpha_{s_j}",
+                    "binding_mode": "inline",
+                    "source_ref": "#/texts/foo_bar",
+                },
+            ]
+            status["quality_signals"]["primary_surface"]["inline_math_source_region_count"] = 2
+            status["quality_signals"]["final_source_visuals"].update(
+                {
+                    "inline_math_source_expected_anchors": ["inline:1", "inline:2"],
+                    "inline_math_source_html_anchors": ["inline:1", "inline:2"],
+                    "inline_math_source_markdown_anchors": ["inline:1", "inline:2"],
+                    "inline_math_source_renderings": {
+                        "candidates": [
+                            {
+                                "anchor": "inline:1",
+                                "image": "inline_math/0001-inline-1.png",
+                                "page_no": 1,
+                                "bbox": BBOX,
+                                "source_text": "alpha_{s_j}",
+                                "source_ref": "#/texts/foo bar",
+                            },
+                            {
+                                "anchor": "inline:2",
+                                "image": "inline_math/0001-inline-1.png",
+                                "page_no": 1,
+                                "bbox": BBOX,
+                                "source_text": "alpha_{s_j}",
+                                "source_ref": "#/texts/foo_bar",
+                            },
+                        ]
+                    },
+                }
+            )
+
+            result = evaluate_regions(root, document, metadata, status, write_sidecars=False)
+
+            records = [item for item in result["records"] if item["kind"] == "inline_math"]
+            self.assertEqual(2, len(records))
+            invalid = next(item for item in records if item["source_ref"] == "inline:1")
+            self.assertIn("inline_math_source_ref_invalid", invalid["reasons"])
+            self.assertFalse(result["ok"])
+
+    def test_inline_occurrences_cannot_reuse_same_final_node(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            document, metadata, status = _fixture(root)
+            document["texts"][3]["self_ref"] = "#/texts/shared"
+            document["texts"][3]["text"] = "alpha_{s_j} and beta_{t_k} in body"
+            status["quality_signals"]["primary_surface"]["inline_math_source_regions"] = [
+                {
+                    "anchor": "inline:1",
+                    "page_no": 1,
+                    "bbox": BBOX,
+                    "source_text": "alpha_{s_j}",
+                    "binding_mode": "inline",
+                    "source_ref": "#/texts/shared",
+                },
+                {
+                    "anchor": "inline:2",
+                    "page_no": 1,
+                    "bbox": BBOX,
+                    "source_text": "alpha_{s_j}",
+                    "binding_mode": "inline",
+                    "source_ref": "#/texts/shared",
+                },
+            ]
+            status["quality_signals"]["primary_surface"]["inline_math_source_region_count"] = 2
+            status["quality_signals"]["final_source_visuals"].update(
+                {
+                    "inline_math_source_expected_anchors": ["inline:1", "inline:2"],
+                    "inline_math_source_html_anchors": ["inline:1", "inline:2"],
+                    "inline_math_source_markdown_anchors": ["inline:1", "inline:2"],
+                    "inline_math_source_renderings": {
+                        "candidates": [
+                            {
+                                "anchor": "inline:1",
+                                "image": "inline_math/0001-inline-1.png",
+                                "page_no": 1,
+                                "bbox": BBOX,
+                                "source_text": "alpha_{s_j}",
+                                "source_ref": "#/texts/shared",
+                            },
+                            {
+                                "anchor": "inline:2",
+                                "image": "inline_math/0001-inline-1.png",
+                                "page_no": 1,
+                                "bbox": BBOX,
+                                "source_text": "alpha_{s_j}",
+                                "source_ref": "#/texts/shared",
+                            },
+                        ]
+                    },
+                }
+            )
+
+            result = evaluate_regions(root, document, metadata, status, write_sidecars=False)
+
+            records = [item for item in result["records"] if item["kind"] == "inline_math"]
+            self.assertEqual(2, len(records))
+            self.assertTrue(all("inline_math_final_node_reused" in item["reasons"] for item in records))
+            self.assertTrue(all(item["signals"]["final_node_unique"] is False for item in records))
             self.assertFalse(result["ok"])
 
     def test_inline_binding_tail_difference_past_limit_fails_closed(self):

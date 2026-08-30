@@ -148,15 +148,15 @@ def _source_ref(value: Any, limit: int = 180) -> str | None:
     return _SAFE_SOURCE_REF_RE.sub("_", value)
 
 
-def _strict_quarantine_source_ref(value: Any) -> tuple[str | None, bool]:
-    """Keep explicit quarantine refs exact; invalid producer refs fail closed."""
+def _strict_exact_source_ref(value: Any, limit: int = 180) -> tuple[str | None, bool]:
+    """Accept only exact, already-safe source refs without normalization."""
 
     if value is None:
         return None, False
     if not isinstance(value, str):
         return None, True
     raw = value
-    if not raw or len(raw) > 180:
+    if not raw or len(raw) > limit:
         return None, True
     if _SAFE_SOURCE_REF_RE.search(raw):
         return None, True
@@ -169,6 +169,12 @@ def _strict_quarantine_source_ref(value: Any) -> tuple[str | None, bool]:
     ):
         return None, True
     return raw, False
+
+
+def _strict_quarantine_source_ref(value: Any) -> tuple[str | None, bool]:
+    """Keep explicit quarantine refs exact; invalid producer refs fail closed."""
+
+    return _strict_exact_source_ref(value, limit=180)
 
 
 def _sha256_text(value: Any) -> str:
@@ -341,16 +347,16 @@ def _chunk_part_map(document_json: Any) -> dict[int, int]:
     return result
 
 
-def _node_source_ref(node: dict[str, Any], part_index: int | None = None) -> str | None:
-    raw = _text(node.get("self_ref"), 180)
-    if not raw:
-        return None
+def _node_source_ref(node: dict[str, Any], part_index: int | None = None) -> tuple[str | None, bool]:
+    raw, invalid = _strict_exact_source_ref(node.get("self_ref"), limit=180)
+    if invalid or not raw:
+        return None, invalid
     explicit_part = node.get("_local_ai_lab_chunk_part_index")
     if isinstance(explicit_part, int) and not isinstance(explicit_part, bool):
         part_index = explicit_part
     if part_index is not None and not raw.startswith("chunk:"):
-        return _source_ref(f"chunk:{part_index}:{raw}")
-    return _source_ref(raw)
+        return _strict_exact_source_ref(f"chunk:{part_index}:{raw}", limit=180)
+    return raw, False
 
 
 def _document_nodes(document_json: Any, labels: set[str] | None = None) -> list[dict[str, Any]]:
@@ -376,6 +382,7 @@ def _document_nodes(document_json: Any, labels: set[str] | None = None) -> list[
                 if isinstance(provenance, dict) and "page_no" in provenance:
                     raw_page_no = provenance.get("page_no")
                     break
+        source_ref, source_ref_invalid = _node_source_ref(node, part_index)
         records.append(
             {
                 "label": label,
@@ -385,7 +392,8 @@ def _document_nodes(document_json: Any, labels: set[str] | None = None) -> list[
                 "page_no": _first_page(node),
                 "raw_page_no": raw_page_no,
                 "bbox": _first_bbox(node),
-                "source_ref": _node_source_ref(node, part_index),
+                "source_ref": source_ref,
+                "source_ref_invalid": source_ref_invalid,
                 "part_index": part_index,
                 "node": node,
             }
@@ -631,9 +639,24 @@ def _status_value(status: str, *, critical: bool, reasons: list[str]) -> tuple[s
     return status, bool(critical and status == "unresolved")
 
 
-def _record_id(kind: str, source_ref: str | None, page_no: int | None, index: Any) -> str:
+def _record_id(
+    kind: str,
+    source_ref: str | None,
+    page_no: int | None,
+    index: Any,
+    *,
+    namespace: str | None = None,
+) -> str:
     identity = source_ref or f"page={page_no or 0};index={index}"
-    digest = _sha256_text(f"{kind}|{identity}")[:16]
+    record_namespace = _text(namespace, 64)
+    digest_input = (
+        f"{record_namespace}|{kind}|{identity}"
+        if record_namespace
+        else f"{kind}|{identity}"
+    )
+    digest = _sha256_text(digest_input)[:16]
+    # Keep the public ID shape stable (`<kind>:<digest>`); the private
+    # namespace only separates otherwise colliding identity classes.
     return f"{kind}:{digest}"
 
 
@@ -654,6 +677,8 @@ def _record(
     critical: bool,
     reasons: Iterable[Any] = (),
     text_preview: Any = None,
+    id_namespace: Any = None,
+    id_source_ref: Any = None,
 ) -> dict[str, Any]:
     page = _safe_page(page_no)
     safe_box = _safe_bbox(bbox)
@@ -682,13 +707,16 @@ def _record(
         normalized_reasons.append("unsafe_source_ref_mapping")
     if critical and normalized_reasons and status != "unresolved":
         status = "unresolved"
+    id_ref = ref
+    if id_source_ref is not None:
+        id_ref = _source_ref(id_source_ref, 180)
     status, _critical_unresolved = _status_value(
         status,
         critical=critical,
         reasons=normalized_reasons,
     )
     return {
-        "id": _record_id(kind, ref, page, index),
+        "id": _record_id(kind, id_ref, page, index, namespace=_text(id_namespace, 64) or None),
         "kind": _text(kind, 48),
         "page_no": page,
         "bbox": safe_box,
@@ -3034,8 +3062,8 @@ def _inline_math_records(
     document_nodes = _document_nodes(document_json, None)
     document_nodes_by_ref: dict[str, list[dict[str, Any]]] = {}
     for node_item in document_nodes:
-        node_ref = _source_ref(node_item.get("source_ref"))
-        if node_ref:
+        node_ref = node_item.get("source_ref")
+        if isinstance(node_ref, str) and node_ref:
             document_nodes_by_ref.setdefault(node_ref, []).append(node_item)
     has_extra_occurrences = bool(
         by_anchor
@@ -3068,11 +3096,13 @@ def _inline_math_records(
             )
         ]
     records: list[dict[str, Any]] = []
+    final_node_bindings: dict[str, list[dict[str, Any]]] = {}
     for ordinal, anchor in enumerate(sorted(expected), start=1):
         region = by_anchor.get(anchor) or {}
         candidate = candidate_by_anchor.get(anchor) or {}
         reasons: list[str] = list(global_reasons)
         node_text_truncated = False
+        matched_node_identity: str | None = None
         region_source_text = region.get("source_text")
         candidate_source_text = candidate.get("source_text")
         region_source_truncated = _full_text_truncated(region_source_text)
@@ -3141,13 +3171,50 @@ def _inline_math_records(
                 reasons.append("inline_math_source_asset_hash_invalid")
             elif _hash_relative_asset(output_dir, asset) != candidate_asset_sha:
                 reasons.append("inline_math_source_asset_hash_mismatch")
-        explicit_body_ref = _source_ref(region.get("source_ref") or candidate.get("source_ref"))
+        raw_region_body_ref = (
+            region.get("source_ref")
+            if isinstance(region, dict) and "source_ref" in region
+            else None
+        )
+        raw_candidate_body_ref = (
+            candidate.get("source_ref")
+            if isinstance(candidate, dict) and "source_ref" in candidate
+            else None
+        )
+        region_body_ref, region_body_ref_invalid = _strict_exact_source_ref(
+            raw_region_body_ref,
+            limit=180,
+        )
+        candidate_body_ref, candidate_body_ref_invalid = _strict_exact_source_ref(
+            raw_candidate_body_ref,
+            limit=180,
+        )
+        explicit_body_ref_present = (
+            raw_region_body_ref is not None or raw_candidate_body_ref is not None
+        )
+        if region_body_ref_invalid or candidate_body_ref_invalid:
+            reasons.append("inline_math_source_ref_invalid")
+        explicit_body_ref_conflict = bool(
+            region_body_ref
+            and candidate_body_ref
+            and region_body_ref != candidate_body_ref
+        )
+        if explicit_body_ref_conflict:
+            reasons.append("inline_math_source_ref_mismatch")
+        explicit_body_ref = None
+        if explicit_body_ref_present and not (
+            region_body_ref_invalid
+            or candidate_body_ref_invalid
+            or explicit_body_ref_conflict
+        ):
+            explicit_body_ref = region_body_ref or candidate_body_ref
         if explicit_body_ref:
             body_nodes = document_nodes_by_ref.get(explicit_body_ref, [])
             if len(body_nodes) != 1:
                 reasons.append("inline_math_final_node_binding_missing")
             else:
                 body_node_item = body_nodes[0]
+                matched_node_identity = f"explicit:{explicit_body_ref}"
                 node_text_truncated = bool(body_node_item.get("full_text_truncated"))
                 if node_text_truncated:
                     binding_text_truncated = True
@@ -3187,7 +3254,7 @@ def _inline_math_records(
                     )
                     if not source_text or not node_text or source_text not in node_text:
                         reasons.append("inline_math_final_node_body_unverified")
-        else:
+        elif not explicit_body_ref_present:
             # Inline regions emitted by semantic_reflow normally carry a
             # paragraph anchor rather than a Docling self_ref.  Bind them to
             # exactly one final text/paragraph node by page, part, bbox, and
@@ -3256,12 +3323,29 @@ def _inline_math_records(
             if len(paragraph_matches) != 1:
                 reasons.append("inline_math_final_node_binding_missing_or_ambiguous")
             else:
+                node_item = paragraph_matches[0]
+                node_ref = node_item.get("source_ref")
+                if isinstance(node_ref, str) and node_ref:
+                    matched_node_identity = f"fallback:{node_ref}"
+                else:
+                    matched_node_identity = "fallback:" + _sha256_text(
+                        json.dumps(
+                            {
+                                "page_no": node_item.get("page_no"),
+                                "bbox": node_item.get("bbox"),
+                                "text": node_item.get("full_text"),
+                            },
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            default=str,
+                        )
+                    )
                 expected_body_sha = _sha256(
                     region.get("final_body_identity_sha256")
                     or candidate.get("final_body_identity_sha256")
                 )
                 if expected_body_sha is not None:
-                    node = paragraph_matches[0].get("node") if isinstance(paragraph_matches[0].get("node"), dict) else {}
+                    node = node_item.get("node") if isinstance(node_item.get("node"), dict) else {}
                     if _body_identity_sha("inline_math", _structural_body_identity(node.get("text"))) != expected_body_sha:
                         reasons.append("inline_math_final_node_body_mismatch")
         signals = {
@@ -3273,26 +3357,39 @@ def _inline_math_records(
             "candidate_source_text_truncated": candidate_source_truncated,
             "node_text_truncated": node_text_truncated,
             "binding_text_truncated": binding_text_truncated,
+            "final_node_unique": True,
             "source_unresolved": bool(region.get("unresolved")),
         }
-        records.append(
-            _record(
-                output_dir=output_dir,
-                kind="inline_math",
-                index=ordinal,
-                page_no=region.get("page_no") or candidate.get("page_no"),
-                bbox=region.get("bbox") or candidate.get("bbox"),
-                source_ref=anchor,
-                source_asset=asset,
-                html_anchor=anchor if anchor in html else None,
-                markdown_anchor=anchor if anchor in markdown else None,
-                signals=signals,
-                status="verified_semantic" if not reasons else "unresolved",
-                critical=True,
-                reasons=reasons,
-                text_preview=region.get("source_text"),
-            )
+        record = _record(
+            output_dir=output_dir,
+            kind="inline_math",
+            index=ordinal,
+            page_no=region.get("page_no") or candidate.get("page_no"),
+            bbox=region.get("bbox") or candidate.get("bbox"),
+            source_ref=anchor,
+            source_asset=asset,
+            html_anchor=anchor if anchor in html else None,
+            markdown_anchor=anchor if anchor in markdown else None,
+            signals=signals,
+            status="verified_semantic" if not reasons else "unresolved",
+            critical=True,
+            reasons=reasons,
+            text_preview=region.get("source_text"),
         )
+        records.append(record)
+        if matched_node_identity:
+            final_node_bindings.setdefault(matched_node_identity, []).append(record)
+    for bound_records in final_node_bindings.values():
+        if len(bound_records) <= 1:
+            continue
+        for record in bound_records:
+            reasons = list(record.get("reasons") or [])
+            if "inline_math_final_node_reused" not in reasons:
+                reasons.append("inline_math_final_node_reused")
+            record["reasons"] = _unique(reasons)
+            record["status"] = "unresolved"
+            if isinstance(record.get("signals"), dict):
+                record["signals"]["final_node_unique"] = False
     return records
 
 
@@ -3485,13 +3582,15 @@ def _quarantine_records(output_dir: Path, quality: dict[str, Any]) -> list[dict[
                 existing["status"] = "unresolved"
             continue
         asset = candidate.get("source_asset") or candidate.get("image") or candidate.get("evidence")
+        derived_source_ref = source_ref or f"{kind}:{ordinal}"
+        id_namespace = "quarantine-derived" if not source_ref or invalid_source_ref else None
         record = _record(
             output_dir=output_dir,
             kind=kind,
             index=ordinal,
             page_no=page,
             bbox=candidate.get("bbox"),
-            source_ref=source_ref or f"{kind}:{ordinal}",
+            source_ref=derived_source_ref,
             source_asset=asset,
             signals={
                 "picture_overlap": picture_overlap,
@@ -3504,6 +3603,14 @@ def _quarantine_records(output_dir: Path, quality: dict[str, Any]) -> list[dict[
             critical=True,
             reasons=reasons,
             text_preview=preview,
+            id_namespace=id_namespace,
+            id_source_ref=(
+                f"invalid:{kind}:{ordinal}"
+                if invalid_source_ref
+                else f"missing:{kind}:{ordinal}"
+            )
+            if id_namespace
+            else None,
         )
         record["_quarantine_core"] = evidence_key
         records.append(record)

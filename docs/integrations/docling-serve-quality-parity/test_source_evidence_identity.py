@@ -2451,6 +2451,7 @@ class SourceEvidenceIdentityTests(unittest.TestCase):
             duplicate: bool = False,
             overlap: bool = False,
             out_of_range: bool = False,
+            with_authority: bool = True,
         ) -> dict[str, object]:
             output_dir = Path(tempfile.mkdtemp())
             self.addCleanup(lambda: __import__("shutil").rmtree(output_dir, ignore_errors=True))
@@ -2540,14 +2541,30 @@ class SourceEvidenceIdentityTests(unittest.TestCase):
                     }
                 },
             }
-            return adapter.restore_final_delivery_visuals(
+            authority = adapter._FormulaEvidenceAuthority(
+                identity_manifest=(
+                    adapter._formula_crop_identity_manifest_for_indexed_formulas(
+                        {
+                            index: formula
+                            for index, formula in enumerate(formulas, start=1)
+                        }
+                    )
+                ),
+                formula_crop_diagnostics=diagnostics,
+                suspicious_formula_diagnostics=[],
+            )
+            authority_before = authority.snapshot()
+            result = adapter.restore_final_delivery_visuals(
                 output_dir,
                 document,
                 output_dir / "missing-conversion.pdf",
                 metadata,
                 status,
                 visual_pdf_path=output_dir / "missing-visual.pdf",
+                trusted_formula_authority=authority if with_authority else None,
             )
+            self.assertEqual(authority_before, authority.snapshot())
+            return result
 
         valid = run_case()
         self.assertEqual([1, 3], valid["formula_source_html_indexes"], valid)
@@ -2556,6 +2573,16 @@ class SourceEvidenceIdentityTests(unittest.TestCase):
         self.assertIn(2, valid["formula_source_html_appendix_indexes"])
         self.assertIn(2, valid["formula_source_markdown_appendix_indexes"])
         self.assertEqual([], valid["formula_source_disallowed_dropped_artifacts"])
+
+        missing_authority = run_case(with_authority=False)
+        self.assertEqual(
+            [1, 3],
+            missing_authority["formula_source_missing_indexes"],
+        )
+        self.assertEqual(
+            [],
+            missing_authority["formula_source_allowed_dropped_indexes"],
+        )
 
         for invalid in (
             run_case(wrong_body=True),
@@ -3519,14 +3546,30 @@ class SourceEvidenceIdentityTests(unittest.TestCase):
                 "quality_signals": {},
             }
             args = Namespace()
+            authority = adapter._FormulaEvidenceAuthority(
+                identity_manifest=(
+                    adapter._formula_crop_identity_manifest_for_indexed_formulas(
+                        {1: {"text": "x = y"}}
+                    )
+                ),
+                formula_crop_diagnostics=[],
+                suspicious_formula_diagnostics=[],
+            )
+            authority_before = authority.snapshot()
 
             def explode(*_args: object, **_kwargs: object) -> None:
                 (output_dir / "document.md").write_text("partial", encoding="utf-8")
+                received = _kwargs["trusted_formula_authority"]
+                received.identity_manifest.clear()
                 raise OSError("disk full")
 
             with patch.object(adapter, "run_optional_formula_second_pass", side_effect=explode):
                 result = adapter.run_optional_formula_second_pass_safely(
-                    output_dir, metadata, status, args
+                    output_dir,
+                    metadata,
+                    status,
+                    args,
+                    trusted_formula_authority=authority,
                 )
 
             self.assertFalse(result["ok"])
@@ -3535,6 +3578,7 @@ class SourceEvidenceIdentityTests(unittest.TestCase):
                 self.assertEqual(payload, (output_dir / name).read_bytes())
             self.assertFalse(status["ok"])
             self.assertTrue((output_dir / "status.json").is_file())
+            self.assertEqual(authority_before, authority.snapshot())
 
     def test_job_output_dir_rejects_traversal_and_symlink_escape(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
