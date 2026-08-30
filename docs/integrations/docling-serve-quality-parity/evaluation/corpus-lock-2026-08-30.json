@@ -61,6 +61,23 @@
       "inspection_scope": "PDF metadata, text inventory, and rendered page 6; calibration only"
     },
     {
+      "id": "calibration-frcd-2608.27211v1",
+      "split": "calibration",
+      "title": "The Find Rows and Columns and Decode algorithm for quantum expander codes",
+      "source": "arXiv",
+      "source_id": "2608.27211v1",
+      "selected_at": "2026-08-30T03:30:19Z",
+      "selection_basis": "official arXiv Atom metadata only; PDF not downloaded or inspected",
+      "abstract_url": "https://arxiv.org/abs/2608.27211v1",
+      "pdf_url": "https://arxiv.org/pdf/2608.27211v1",
+      "focus": ["algorithm", "pseudocode", "indentation", "display_formula", "inline_math"],
+      "downloaded_at": null,
+      "resolved_url": null,
+      "size_bytes": null,
+      "sha256": null,
+      "content_inspected": false
+    },
+    {
       "id": "sealed-doc2db-2608.08459",
       "split": "sealed",
       "title": "Beyond Tables: Doc2DB-Bench for Relationally Faithful Document-to-Database Construction",
