@@ -7,6 +7,7 @@ const UI_STATE = {
   jobsCursorHistory: [null],
   jobsNextCursor: null,
   jobsLoadingPage: false,
+  jobsRefreshPending: false,
   jobsRequestSequence: 0,
   refreshTimer: null,
   config: null,
@@ -261,6 +262,7 @@ function resetJobsPagination() {
   UI_STATE.jobsCursorHistory = [null];
   UI_STATE.jobsNextCursor = null;
   UI_STATE.jobsLoadingPage = false;
+  UI_STATE.jobsRefreshPending = false;
   renderJobs();
   applyCounts();
 }
@@ -1055,11 +1057,17 @@ async function requestJobsPage(url) {
 
 async function refreshDashboardData({ resetJobs = false, cancelNavigation = false } = {}) {
   if (UI_STATE.jobsLoadingPage) {
-    if (!cancelNavigation) {
+    if (!cancelNavigation && !UI_STATE.jobsRefreshPending) {
+      // Let a normal page transition finish, then immediately refresh the page
+      // it reached.  A second timer tick takes over below so a hung navigation
+      // cannot suppress automatic refresh forever.
+      UI_STATE.jobsRefreshPending = true;
       return false;
     }
     // A deliberate manual/programmatic refresh owns the list lane. Invalidate
     // the navigation response and reload the page that is currently visible.
+    // The second automatic tick uses the same path as a bounded hang fallback.
+    UI_STATE.jobsRefreshPending = false;
     UI_STATE.refreshSequence += 1;
     UI_STATE.jobsRequestSequence += 1;
     UI_STATE.jobsLoadingPage = false;
@@ -1236,7 +1244,12 @@ async function navigateJobsPage(direction) {
       requestSequence === UI_STATE.jobsRequestSequence
     ) {
       UI_STATE.jobsLoadingPage = false;
+      const refreshPending = UI_STATE.jobsRefreshPending;
+      UI_STATE.jobsRefreshPending = false;
       renderJobsPagination();
+      if (refreshPending) {
+        refreshDashboardData().catch(() => undefined);
+      }
     }
   }
 }

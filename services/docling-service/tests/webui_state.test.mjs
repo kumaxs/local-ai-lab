@@ -314,6 +314,87 @@ test("manual refresh cancels navigation and reloads the visible page", async () 
 });
 
 
+test("an automatic refresh waits for navigation and then reloads its page", async () => {
+  const harness = createHarness();
+  const { UI_STATE, navigateJobsPage, refreshDashboardData } = harness.hook;
+  const delayedNavigation = deferred();
+  let cursorTwoRequests = 0;
+  seedSecondPage(UI_STATE);
+  harness.setFetch((url) => {
+    const value = String(url);
+    if (value === "/v1/capabilities") {
+      return Promise.resolve(jsonResponse({ ok: true }));
+    }
+    if (value === "/v1/system/storage") {
+      return Promise.resolve(jsonResponse({ usage: {}, limits: {} }));
+    }
+    if (value.includes("cursor=cursor-2")) {
+      cursorTwoRequests += 1;
+      if (cursorTwoRequests === 1) {
+        return delayedNavigation.promise;
+      }
+      return Promise.resolve(
+        jsonResponse({ items: [job("refreshed-page-3")], next_cursor: "cursor-3" }),
+      );
+    }
+    throw new Error(`unexpected fetch: ${value}`);
+  });
+
+  const navigation = navigateJobsPage(1);
+  assert.equal(await refreshDashboardData(), false);
+  assert.equal(UI_STATE.jobsRefreshPending, true);
+  delayedNavigation.resolve(
+    jsonResponse({ items: [job("page-3")], next_cursor: "cursor-3" }),
+  );
+  assert.equal(await navigation, true);
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(cursorTwoRequests, 2);
+  assert.equal(UI_STATE.jobsPageIndex, 2);
+  assert.equal(UI_STATE.jobs[0].job_id, "refreshed-page-3");
+  assert.equal(UI_STATE.jobsRefreshPending, false);
+});
+
+
+test("a second automatic tick takes over a hung navigation", async () => {
+  const harness = createHarness();
+  const { UI_STATE, navigateJobsPage, refreshDashboardData } = harness.hook;
+  const delayedNavigation = deferred();
+  seedSecondPage(UI_STATE);
+  harness.setFetch((url) => {
+    const value = String(url);
+    if (value === "/v1/capabilities") {
+      return Promise.resolve(jsonResponse({ ok: true }));
+    }
+    if (value === "/v1/system/storage") {
+      return Promise.resolve(jsonResponse({ usage: {}, limits: {} }));
+    }
+    if (value.includes("cursor=cursor-2")) {
+      return delayedNavigation.promise;
+    }
+    if (value.includes("cursor=cursor-1")) {
+      return Promise.resolve(
+        jsonResponse({ items: [job("timer-refreshed-page-2")], next_cursor: "cursor-2" }),
+      );
+    }
+    throw new Error(`unexpected fetch: ${value}`);
+  });
+
+  const navigation = navigateJobsPage(1);
+  assert.equal(await refreshDashboardData(), false);
+  assert.equal(UI_STATE.jobsRefreshPending, true);
+  assert.equal(await refreshDashboardData(), true);
+  assert.equal(UI_STATE.jobsPageIndex, 1);
+  assert.equal(UI_STATE.jobs[0].job_id, "timer-refreshed-page-2");
+
+  delayedNavigation.resolve(
+    jsonResponse({ items: [job("stale-page-3")], next_cursor: null }),
+  );
+  assert.equal(await navigation, false);
+  assert.equal(UI_STATE.jobs[0].job_id, "timer-refreshed-page-2");
+});
+
+
 test("old config and output responses are ignored after a token change", async () => {
   const harness = createHarness();
   const { UI_STATE, loadConfig, loadOutputs, setToken } = harness.hook;
