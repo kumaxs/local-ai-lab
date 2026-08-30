@@ -88,6 +88,42 @@ Compose network and is not published on the host. The API sends PDF content to
 the backend over that private network; only the API can create or modify input
 files, job state, and outputs.
 
+### Web UI
+
+This section describes images built from the current post-1.1.1 source tree
+and the next tagged release. The published `1.1.1` images do not contain this
+UI.
+
+Open `http://127.0.0.1:8766/ui/` after the API is healthy. The UI is served by
+the API container from the packaged `docling_service/ui/` assets; it adds no
+Node.js build step and no Compose service. It provides PDF upload (drag/drop or
+picker), upload transport progress, queue rows, trusted phase-level job
+progress (never a page-level completion claim), output listing and download,
+terminal-job deletion, TTL countdowns, and managed-storage usage.
+
+Enter the configured bearer token in the page when prompted. The value stays in
+the current page's memory only and is not written to browser storage, SQLite,
+or the container. Reloading or clearing the token discards it. The UI calls
+the same `/v1/jobs`, `/v1/system/storage`, and output/archive endpoints as
+other clients, so an expired artifact or an active-download lease is shown
+with the API's normal response.
+
+Without API authentication, downloads use the browser's native streaming path.
+With bearer authentication, page downloads are capped at 256 MiB; use a
+streaming API client for larger protected files or archives.
+
+The System configuration panel uses `GET/PATCH /v1/system/config` with a
+SQLite compare-and-swap `revision`. It can edit
+`input_ttl_seconds`, `success_output_ttl_seconds`,
+`failed_output_ttl_seconds`, `job_ttl_seconds`, `staging_ttl_seconds`,
+`temp_ttl_seconds`, `cleanup_interval_seconds`, `idempotency_ttl_seconds`,
+and `download_lease_seconds`. The effective value is SQLite override, then
+the environment, then the built-in default; `null` removes an override. A
+stale revision returns `409`. Existing job deadlines are historical and are
+not recomputed after a TTL change. Paths, token, model/engine settings, and
+concurrency/capacity limits remain read-only and must be changed through the
+deployment environment.
+
 Check health and logs:
 
 ```bash

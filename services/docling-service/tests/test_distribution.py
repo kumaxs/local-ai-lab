@@ -7,6 +7,7 @@ import subprocess
 import sys
 import tarfile
 import os
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
@@ -26,12 +27,49 @@ class DistributionTests(unittest.TestCase):
         "docs/integrations/docling-serve-quality-parity/"
         "pdf_structure_inventory.py"
     )
+    UI_ASSETS = (
+        "ui/index.html",
+        "ui/main.js",
+        "ui/styles.css",
+    )
 
     def test_dockerignore_whitelists_inventory_script(self) -> None:
         dockerignore = (REPO_ROOT / ".dockerignore").read_text(encoding="utf-8")
         self.assertIn(
             f"!{self.INVENTORY_TOOL}", dockerignore
         )
+
+    def test_python_package_contains_webui_static_assets(self) -> None:
+        """Build a wheel in a scratch tree and verify the served UI is packaged."""
+        with tempfile.TemporaryDirectory() as directory:
+            scratch = Path(directory) / "service"
+            wheel_dir = Path(directory) / "wheel"
+            shutil.copytree(
+                SERVICE_ROOT,
+                scratch,
+                ignore=shutil.ignore_patterns(
+                    ".venv", "__pycache__", "*.pyc", "*.egg-info"
+                ),
+            )
+            build_script = (
+                "from pathlib import Path; import sys; "
+                "from setuptools.build_meta import build_wheel; "
+                "out = Path(sys.argv[1]); out.mkdir(parents=True, exist_ok=True); "
+                "build_wheel(str(out))"
+            )
+            subprocess.run(
+                [sys.executable, "-c", build_script, str(wheel_dir)],
+                cwd=scratch,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            wheels = sorted(wheel_dir.glob("*.whl"))
+            self.assertEqual(1, len(wheels))
+            with zipfile.ZipFile(wheels[0]) as archive:
+                names = set(archive.namelist())
+            for asset in self.UI_ASSETS:
+                self.assertIn(f"docling_service/{asset}", names)
 
     def _get_service_block(self, compose_text: str, service: str) -> str:
         lines = compose_text.splitlines()
@@ -289,8 +327,22 @@ class DistributionTests(unittest.TestCase):
                 f"docling-service-{RELEASE_VERSION}/{self.INVENTORY_TOOL}"
             )
             self.assertIn(inventory_bundle_path, names)
+            ui_bundle_paths = {
+                f"docling-service-{RELEASE_VERSION}/services/docling-service/docling_service/{asset}"
+                for asset in self.UI_ASSETS
+            }
+            self.assertTrue(ui_bundle_paths.issubset(names))
             manifest_paths = {entry.get("path") for entry in manifest["files"]}
             self.assertIn(self.INVENTORY_TOOL, manifest_paths)
+            self.assertTrue(
+                {
+                    f"services/docling-service/docling_service/{asset}"
+                    for asset in self.UI_ASSETS
+                }.issubset(manifest_paths)
+            )
+            with zipfile.ZipFile(zip_path) as archive:
+                zip_names = set(archive.namelist())
+            self.assertTrue(ui_bundle_paths.issubset(zip_names))
 
     def test_release_verification_rejects_missing_inventory_script(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -321,6 +373,54 @@ class DistributionTests(unittest.TestCase):
                 ) as target:
                     for item in source.infolist():
                         if item.filename.endswith(f"/{self.INVENTORY_TOOL}"):
+                            continue
+                        target.writestr(item, source.read(item.filename))
+            with self.assertRaises(subprocess.CalledProcessError):
+                subprocess.run(
+                    [
+                        sys.executable,
+                        str(RELEASE_ROOT / "verify_release_bundle.py"),
+                        str(bad_zip),
+                    ],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+
+    def test_release_verification_rejects_missing_webui_asset(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "output"
+            subprocess.run(
+                [
+                    sys.executable,
+                    str(RELEASE_ROOT / "build_release_bundle.py"),
+                    "--source-root",
+                    str(REPO_ROOT),
+                    "--output-dir",
+                    str(output),
+                    "--version",
+                    RELEASE_VERSION,
+                    "--commit",
+                    "0" * 40,
+                    "--epoch",
+                    "1785816000",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            source_zip = output / f"docling-service-{RELEASE_VERSION}.zip"
+            bad_zip = output / f"docling-service-{RELEASE_VERSION}-missing-ui.zip"
+            missing_suffix = "/services/docling-service/docling_service/ui/index.html"
+            with zipfile.ZipFile(source_zip, "r") as source:
+                with zipfile.ZipFile(
+                    bad_zip,
+                    "w",
+                    compression=zipfile.ZIP_DEFLATED,
+                    compresslevel=9,
+                ) as target:
+                    for item in source.infolist():
+                        if item.filename.endswith(missing_suffix):
                             continue
                         target.writestr(item, source.read(item.filename))
             with self.assertRaises(subprocess.CalledProcessError):

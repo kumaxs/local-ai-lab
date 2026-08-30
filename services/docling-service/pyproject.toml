@@ -34,5 +34,12 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools]
 packages = ["docling_service"]
 
+[tool.setuptools.package-data]
+docling_service = [
+  "ui/index.html",
+  "ui/main.js",
+  "ui/styles.css",
+]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]

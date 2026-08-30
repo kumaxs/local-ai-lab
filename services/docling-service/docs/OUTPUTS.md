@@ -4,6 +4,15 @@ Each accepted request owns one directory named by the server-generated UUID.
 The primary reading surfaces are semantic HTML and Markdown. Source visuals
 for formula/table/algorithm/code are the authoritative visual review layer.
 
+The operations Web UI (`/ui/`) presents this same contract without treating
+page images as reading progress. It reports queue and conversion phases at job
+scope, lists only files present in the verified published manifest, and uses the API's
+download lease while streaming a file or archive. The UI shows the input,
+output, and tombstone deadlines plus `artifact_state`; a `410`/expired result
+is a lifecycle outcome, not a missing file. A terminal job can be explicitly
+deleted from the UI, subject to the same active-download and retention checks
+as `DELETE /v1/jobs/{job_id}`.
+
 ## Required files
 
 | File | Meaning |
@@ -183,6 +192,16 @@ claims. Direct `quality_parity_adapter.py` runs, batch review helpers, and VLM
 evaluation runs are not registered with that Janitor; operators must remove
 their temporary output roots after review. The archive endpoint deliberately
 filters out `source.pdf` even when it exists in the internal job tree.
+
+Lifecycle TTLs can be viewed and edited from the Web UI through the
+SQLite-backed `GET/PATCH /v1/system/config` contract. Editable controls are
+the input, successful-output, failed-output, job, staging, temporary,
+cleanup-interval, idempotency, and download-lease TTLs. Configuration updates
+use a compare-and-swap revision; `null` removes a SQLite override and falls
+back to the environment/default precedence. Deadlines persisted on existing
+jobs are not recomputed, so changing a TTL does not retroactively extend or
+shorten an already accepted task. Paths, token, models, and concurrency or
+capacity limits are deployment-level read-only values.
 
 In some deployments, `portable_formula_ocr.crop_tightening` records the visible-ink crop,
 edge-clipping decision, and the primary/fallback image selected per formula.

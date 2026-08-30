@@ -5,6 +5,7 @@ import importlib.util
 import io
 import json
 import hashlib
+import os
 import subprocess
 import tempfile
 import time
@@ -205,6 +206,19 @@ class ApiTests(unittest.TestCase):
                     self.assertIn("manifest.json", bundle.namelist())
                     self.assertIn("document.md", bundle.namelist())
                     self.assertNotIn("source.pdf", bundle.namelist())
+                if os.name != "nt":
+                    published = config.output_root / job_id
+                    real_published = config.output_root / f"{job_id}.real"
+                    published.replace(real_published)
+                    published.symlink_to(real_published, target_is_directory=True)
+                    try:
+                        unsafe_archive = client.get(
+                            f"/v1/jobs/{job_id}/archive", headers=headers
+                        )
+                        self.assertEqual(409, unsafe_archive.status_code)
+                    finally:
+                        published.unlink()
+                        real_published.replace(published)
                 (root / "outputs" / job_id / "document.md").write_text(
                     "tampered", encoding="utf-8"
                 )
@@ -216,6 +230,24 @@ class ApiTests(unittest.TestCase):
                     f"/v1/jobs/{job_id}/archive", headers=headers
                 )
                 self.assertEqual(409, corrupted_archive.status_code)
+                manager.store.update_job(
+                    job_id,
+                    output_expires_at="2020-01-01T00:00:00+00:00",
+                )
+                expired_status = client.get(f"/v1/jobs/{job_id}", headers=headers)
+                self.assertEqual("expired", expired_status.json()["artifact_state"])
+                expired_outputs = client.get(
+                    f"/v1/jobs/{job_id}/outputs", headers=headers
+                )
+                self.assertEqual(410, expired_outputs.status_code)
+                expired_file = client.get(
+                    f"/v1/jobs/{job_id}/files/document.md", headers=headers
+                )
+                self.assertEqual(410, expired_file.status_code)
+                expired_archive = client.get(
+                    f"/v1/jobs/{job_id}/archive", headers=headers
+                )
+                self.assertEqual(410, expired_archive.status_code)
                 storage = client.get("/v1/system/storage", headers=headers)
                 self.assertEqual(200, storage.status_code)
                 self.assertIn("total_managed_bytes", storage.json()["usage"])
@@ -705,6 +737,234 @@ class ApiTests(unittest.TestCase):
             self.assertEqual(413, oversized[0]["status"])
             accepted = asyncio.run(invoke(multipart(b"%PDF-1.7\n%%EOF\n")))
             self.assertEqual(200, accepted[0]["status"])
+
+    def test_webui_static_assets_have_csp_and_root_is_not_a_redirect(self) -> None:
+        from fastapi.testclient import TestClient
+
+        from docling_service.api import create_app
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            adapter = root / "adapter.py"
+            adapter.write_text("# test\n", encoding="utf-8")
+            config = ReleaseConfig(
+                profile="docker",
+                serve_url="http://backend:5001",
+                adapter_path=adapter,
+                input_root=root / "inputs",
+                output_root=root / "outputs",
+                state_root=root / "state",
+                max_upload_bytes=1024,
+                max_concurrent_jobs=1,
+                conversion_timeout_seconds=60,
+                image_export_mode="referenced",
+                formula_policy="formula_service",
+                cn_ocr_parity=False,
+                api_token=None,
+                formula_ocr_url="http://formula:8001",
+            )
+
+            class FakeManager:
+                def shutdown(self) -> None:
+                    return None
+
+            with TestClient(create_app(config=config, manager=FakeManager())) as client:
+                for path in ("/", "/ui", "/ui/", "/ui/main.js", "/ui/styles.css"):
+                    response = client.get(path)
+                    self.assertEqual(200, response.status_code, path)
+                    self.assertIn("default-src 'self'", response.headers["content-security-policy"])
+                self.assertIn("文献处理系统", client.get("/").text)
+
+    def test_system_config_auth_cas_and_strict_patch_contract(self) -> None:
+        from fastapi.testclient import TestClient
+
+        from docling_service import api
+        from docling_service.api import create_app
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            adapter = root / "adapter.py"
+            adapter.write_text("# test\n", encoding="utf-8")
+            config = ReleaseConfig(
+                profile="docker",
+                serve_url="http://backend:5001",
+                adapter_path=adapter,
+                input_root=root / "inputs",
+                output_root=root / "outputs",
+                state_root=root / "state",
+                max_upload_bytes=1024,
+                max_concurrent_jobs=1,
+                conversion_timeout_seconds=60,
+                image_export_mode="referenced",
+                formula_policy="formula_service",
+                cn_ocr_parity=False,
+                api_token="test-token",
+                formula_ocr_url="http://formula:8001",
+            )
+            values = {
+                key: {
+                    "value": 60,
+                    "environment_value": 60,
+                    "overridden": False,
+                    "minimum": 1,
+                    "maximum": 3600,
+                    "unit": "seconds",
+                    "label": key,
+                    "description": "test lifecycle setting",
+                    "requires_restart": False,
+                }
+                for key in (
+                    "input_ttl_seconds",
+                    "success_output_ttl_seconds",
+                    "failed_output_ttl_seconds",
+                    "job_ttl_seconds",
+                    "staging_ttl_seconds",
+                    "temp_ttl_seconds",
+                    "cleanup_interval_seconds",
+                    "idempotency_ttl_seconds",
+                    "download_lease_seconds",
+                )
+            }
+
+            class FakeManager:
+                revision = 4
+
+                def shutdown(self) -> None:
+                    return None
+
+                def runtime_config_snapshot(self) -> dict[str, Any]:
+                    return {
+                        "revision": self.revision,
+                        "updated_at": None,
+                        "server_time": "2026-08-29T00:00:00+00:00",
+                        "existing_job_expiries_unchanged": True,
+                        "editable": values,
+                        "readonly": {
+                            "api_token_configured": {
+                                "value": True,
+                                "reason": "whether a token is configured",
+                            },
+                            "max_upload_bytes": {
+                                "value": 1024,
+                                "reason": "fixed at process start",
+                            },
+                        },
+                    }
+
+                def update_runtime_config(self, expected_revision: int, changes: dict[str, Any]) -> dict[str, Any]:
+                    if expected_revision != self.revision:
+                        raise api.RuntimeConfigConflict("stale revision")
+                    self.revision += 1
+                    for key, value in changes.items():
+                        values[key]["value"] = values[key]["environment_value"] if value is None else value
+                        values[key]["overridden"] = value is not None
+                    return self.runtime_config_snapshot()
+
+            manager = FakeManager()
+            with TestClient(create_app(config=config, manager=manager)) as client:
+                self.assertEqual(401, client.get("/v1/system/config").status_code)
+                headers = {"Authorization": "Bearer test-token"}
+                snapshot = client.get("/v1/system/config", headers=headers)
+                self.assertEqual(200, snapshot.status_code)
+                payload = snapshot.json()
+                self.assertEqual(9, len(payload["editable"]))
+                self.assertNotIn("test-token", snapshot.text)
+                self.assertTrue(payload["readonly"]["api_token_configured"]["value"])
+
+                for invalid in (
+                    {"revision": 4, "changes": {"max_pending_jobs": 2}},
+                    {"revision": 4, "changes": {"input_ttl_seconds": True}},
+                    {"revision": 4, "changes": {"input_ttl_seconds": 1.5}},
+                    {"revision": 4, "changes": {"input_ttl_seconds": "60"}},
+                    {"revision": 4, "changes": {}},
+                ):
+                    response = client.patch("/v1/system/config", headers=headers, json=invalid)
+                    self.assertEqual(422, response.status_code, invalid)
+
+                oversized = client.patch(
+                    "/v1/system/config",
+                    headers={**headers, "Content-Type": "application/json"},
+                    content=(
+                        b'{"revision":4,"changes":{"input_ttl_seconds":120},"padding":"'
+                        + (b"x" * (70 * 1024))
+                        + b'"}'
+                    ),
+                )
+                self.assertEqual(413, oversized.status_code)
+
+                updated = client.patch(
+                    "/v1/system/config",
+                    headers=headers,
+                    json={"revision": 4, "changes": {"input_ttl_seconds": 120}},
+                )
+                self.assertEqual(200, updated.status_code)
+                self.assertEqual(5, updated.json()["revision"])
+                conflict = client.patch(
+                    "/v1/system/config",
+                    headers=headers,
+                    json={"revision": 4, "changes": {"input_ttl_seconds": 180}},
+                )
+                self.assertEqual(409, conflict.status_code)
+
+    def test_job_payload_exposes_progress_and_three_lifecycle_deadlines(self) -> None:
+        from fastapi.testclient import TestClient
+
+        from docling_service.api import create_app
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            adapter = root / "adapter.py"
+            adapter.write_text("# test\n", encoding="utf-8")
+            config = ReleaseConfig(
+                profile="docker",
+                serve_url="http://backend:5001",
+                adapter_path=adapter,
+                input_root=root / "inputs",
+                output_root=root / "outputs",
+                state_root=root / "state",
+                max_upload_bytes=1024,
+                max_concurrent_jobs=1,
+                conversion_timeout_seconds=60,
+                image_export_mode="referenced",
+                formula_policy="formula_service",
+                cn_ocr_parity=False,
+                api_token=None,
+                formula_ocr_url="http://formula:8001",
+            )
+            job_id = "00000000-0000-4000-8000-000000000001"
+
+            class FakeManager:
+                def shutdown(self) -> None:
+                    return None
+
+                def get_job_details(self, requested: str) -> dict[str, Any]:
+                    if requested != job_id:
+                        return {}
+                    return {
+                        "job_id": job_id,
+                        "state": "running",
+                        "original_name": "paper.pdf",
+                        "created_at": "2026-08-29T00:00:00+00:00",
+                        "input_expires_at": "2026-08-30T00:00:00+00:00",
+                        "output_expires_at": "2026-09-01T00:00:00+00:00",
+                        "tombstone_expires_at": "2026-09-29T00:00:00+00:00",
+                        "progress_stage": "识别正文",
+                        "progress_percent": 42,
+                        "progress_message": "处理中",
+                        "progress_updated_at": "2026-08-29T00:01:00+00:00",
+                        "queue_position": 2,
+                    }
+
+            with TestClient(create_app(config=config, manager=FakeManager())) as client:
+                response = client.get(f"/v1/jobs/{job_id}")
+                self.assertEqual(200, response.status_code)
+                payload = response.json()
+                self.assertEqual("识别正文", payload["progress_stage"])
+                self.assertEqual(42, payload["progress_percent"])
+                self.assertEqual(2, payload["queue_position"])
+                self.assertEqual("2026-08-30T00:00:00+00:00", payload["input_expires_at"])
+                self.assertEqual("2026-09-01T00:00:00+00:00", payload["output_expires_at"])
+                self.assertEqual("2026-09-29T00:00:00+00:00", payload["tombstone_expires_at"])
 
 
 if __name__ == "__main__":

@@ -80,6 +80,32 @@ The PIDs written by `start.sh` now point to the wrapper process. `stop.sh`
 retains its existing safety check and still sends termination signals to the
 wrapper.
 
+### Web UI
+
+This section applies to installs built from the current post-1.1.1 source tree
+and the next tagged release. The published `v1.1.1` bundle does not contain
+this UI.
+
+With the API running, open `http://127.0.0.1:8000/ui/`. The static page is
+served by the API process and is included in the release package, so no Node.js
+installation or second service is needed. It supports PDF upload, upload
+progress, queue inspection, trusted phase-level (not page-level) progress,
+output listing/download, terminal-job deletion, TTL countdowns, and storage
+usage.
+
+Unauthenticated downloads use the browser's native streaming path. When bearer
+authentication is enabled, page downloads are capped at 256 MiB; use a
+streaming API client for larger protected artifacts.
+
+The page's System configuration panel uses the authenticated
+`GET/PATCH /v1/system/config` endpoints and a SQLite CAS revision. It edits
+only input, successful/failed output, job, staging, temporary, cleanup,
+idempotency, and download-lease TTLs. SQLite overrides take precedence over
+environment values, which take precedence over built-in defaults; `null`
+clears an override. Existing job deadlines are not rewritten, so a change is
+not retroactive. Input/output/state paths, token, model/engine settings, and
+concurrency/capacity limits are read-only deployment settings.
+
 To require a bearer token, export it before starting both processes:
 
 ```bash

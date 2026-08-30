@@ -52,6 +52,9 @@ REQUIRED_BUNDLE_FILES = {
     Path("services/docling-service/deploy/docker/compose.release.yaml"),
     Path("services/docling-service/deploy/macos/install.sh"),
     Path("services/docling-service/docling_service/release.py"),
+    Path("services/docling-service/docling_service/ui/index.html"),
+    Path("services/docling-service/docling_service/ui/main.js"),
+    Path("services/docling-service/docling_service/ui/styles.css"),
     Path("docs/integrations/docling-serve-quality-parity/quality_parity_adapter.py"),
     Path("docs/integrations/docling-serve-quality-parity/pdf_structure_inventory.py"),
 }

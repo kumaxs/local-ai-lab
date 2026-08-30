@@ -12,7 +12,10 @@ import uuid
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from docling_service.persistence import SQLiteStore  # noqa: E402
+from docling_service.persistence import (  # noqa: E402
+    RuntimeConfigConflict,
+    SQLiteStore,
+)
 
 
 def _tmp_db_root() -> str:
@@ -68,9 +71,9 @@ class SQLiteStoreTests(unittest.TestCase):
         try:
             row = conn.execute("SELECT MAX(version) FROM schema_migrations").fetchone()
             self.assertIsNotNone(row[0])
-            self.assertEqual(1, row[0])
+            self.assertEqual(2, row[0])
             count = conn.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0]
-            self.assertEqual(1, count)
+            self.assertEqual(2, count)
         finally:
             conn.close()
 
@@ -137,6 +140,41 @@ class SQLiteStoreTests(unittest.TestCase):
                 "job_state_conflict",
                 store.update_job(job_a, state="queued")["error"],
             )
+
+    def test_v2_progress_fifo_position_and_runtime_cas(self) -> None:
+        root = _tmp_db_root()
+        with self._new_store(root) as store:
+            first, second, third = _make_job_ids()
+            common_created = "2024-01-01T00:00:00+00:00"
+            for job_id in (first, second, third):
+                store.create_job(
+                    job_id=job_id,
+                    original_name=f"{job_id}.pdf",
+                    input_path=f"{root}/input/{job_id}.pdf",
+                    output_dir=f"{root}/output/{job_id}",
+                    created_at=common_created,
+                )
+            self.assertEqual(1, store.get_job(first)["queue_position"])
+            self.assertEqual(2, store.get_job(second)["queue_position"])
+            self.assertEqual(3, store.get_job(third)["queue_position"])
+
+            progress = store.update_progress(first, "extracting", message="working")
+            self.assertEqual("extracting", progress["progress_stage"])
+            self.assertIsNone(progress["progress_percent"])
+            self.assertEqual("working", progress["progress_message"])
+            running = store.update_job(first, state="running")
+            self.assertIsNone(running["queue_position"])
+            self.assertEqual("running", running["progress_stage"])
+
+            initial = store.runtime_config_snapshot()
+            self.assertEqual(0, initial["revision"])
+            updated = store.update_runtime_config(
+                initial["revision"], {"input_ttl_seconds": 120}
+            )
+            self.assertEqual(1, updated["revision"])
+            self.assertEqual(120, updated["overrides"]["input_ttl_seconds"])
+            with self.assertRaises(RuntimeConfigConflict):
+                store.update_runtime_config(0, {})
 
     def test_concurrent_finalizers_cannot_overwrite_terminal_state(self) -> None:
         root = _tmp_db_root()
@@ -355,11 +393,16 @@ class SQLiteStoreTests(unittest.TestCase):
         jobs_dir = state_root / "jobs"
         jobs_dir.mkdir(parents=True)
         valid_job = str(uuid.uuid4())
+        terminal_job = str(uuid.uuid4())
         invalid_uuid_job = "invalid-uuid"
         bad_root_job = str(uuid.uuid4())
         with open(jobs_dir / "valid.json", "w", encoding="utf-8") as fp:
             fp.write(
                 f"""{{"job_id":"{valid_job}","state":"queued","original_name":"v.pdf","input_path":"{input_root / "v.pdf"}","output_dir":"{output_root / "v"}","created_at":"2020-01-01T00:00:00+00:00","started_at":null,"finished_at":null,"exit_code":null,"error":null}}"""
+            )
+        with open(jobs_dir / "terminal.json", "w", encoding="utf-8") as fp:
+            fp.write(
+                f"""{{"job_id":"{terminal_job}","state":"succeeded","original_name":"done.pdf","input_path":"{input_root / "done.pdf"}","output_dir":"{output_root / "done"}","created_at":"2020-01-01T00:00:00+00:00","started_at":"2020-01-01T00:01:00+00:00","finished_at":"2020-01-01T00:10:00+00:00","exit_code":0,"error":null}}"""
             )
         with open(jobs_dir / "invalid_uuid.json", "w", encoding="utf-8") as fp:
             fp.write(
@@ -373,13 +416,55 @@ class SQLiteStoreTests(unittest.TestCase):
         with SQLiteStore(
             root / "docling.sqlite", input_root=input_root, output_root=output_root
         ) as store:
-            first = store.import_legacy_state_jobs(state_root)
-            self.assertEqual(1, len(first["imported"]))
+            first = store.import_legacy_state_jobs(
+                state_root,
+                runtime_config_revision=3,
+                input_ttl_seconds=120,
+                success_output_ttl_seconds=240,
+                failed_output_ttl_seconds=180,
+                job_ttl_seconds=360,
+            )
+            self.assertEqual(2, len(first["imported"]))
             self.assertEqual(2, len(first["skipped"]))
             second = store.import_legacy_state_jobs(state_root)
             self.assertEqual(0, len(second["imported"]))
             self.assertEqual({}, store.get_job(invalid_uuid_job))
-            self.assertNotEqual({}, store.get_job(valid_job))
+            imported = store.get_job(valid_job)
+            self.assertEqual("queued", imported["progress_stage"])
+            self.assertEqual(1, imported["queue_position"])
+            self.assertEqual(3, imported["runtime_config_revision"])
+            self.assertEqual(240, imported["success_output_ttl_seconds"])
+            self.assertEqual("2020-01-01T00:02:00+00:00", imported["input_expires_at"])
+            terminal = store.get_job(terminal_job)
+            self.assertEqual("succeeded", terminal["progress_stage"])
+            self.assertEqual(100, terminal["progress_percent"])
+            self.assertEqual(
+                "2020-01-01T00:14:00+00:00",
+                terminal["output_expires_at"],
+            )
+            self.assertEqual(
+                "2020-01-01T00:16:00+00:00",
+                terminal["tombstone_expires_at"],
+            )
+
+    def test_expired_output_cannot_acquire_download_lease(self) -> None:
+        root = _tmp_db_root()
+        with self._new_store(root) as store:
+            job_id = _make_job_ids()[0]
+            store.create_job(
+                job_id=job_id,
+                original_name="expired.pdf",
+                input_path=f"{root}/input/expired.pdf",
+                output_dir=f"{root}/output/{job_id}",
+                state="succeeded",
+                output_expires_at="2020-01-01T00:00:00+00:00",
+            )
+            result = store.acquire_download_lease(
+                job_id,
+                "__archive__",
+                ttl_seconds=60,
+            )
+            self.assertEqual("output_expired", result["error"])
 
     def test_idempotency_keys(self) -> None:
         root = _tmp_db_root()

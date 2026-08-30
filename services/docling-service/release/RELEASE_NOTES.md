@@ -1,3 +1,29 @@
+# Unreleased
+
+## Operations Web UI and packaging
+
+- the API now serves a same-origin `/ui/` page for PDF upload, queue and
+  trusted phase-level (not page-level) progress, TTL/storage visibility,
+  artifact download, and terminal-job deletion;
+- `ui/index.html`, `ui/main.js`, and `ui/styles.css` are declared as Python
+  package data and retained by the recursive source bundle; no Node.js runtime
+  or additional Compose service is introduced;
+- lifecycle controls are persisted in SQLite and updated with a compare-and-
+  swap revision. The UI can edit input, successful/failed output, job,
+  staging/temp, cleanup, idempotency, and download-lease TTLs. SQLite
+  overrides take precedence over environment/default values, `null` clears an
+  override, and deadlines already assigned to existing jobs are not
+  recalculated;
+- paths, bearer token, model/engine settings, and concurrency/capacity limits
+  remain read-only in the UI. A token entered in the page is kept in memory
+  only;
+- unauthenticated downloads use the browser's native streaming path. Bearer-
+  protected browser downloads are capped at 256 MiB; use a streaming API
+  client for larger protected artifacts.
+
+This section describes the current source tree and the next release. The
+published `v1.1.1` archives and container images do not contain this Web UI.
+
 # Docling Service 1.1.1
 
 ## V1 quality and source-evidence hardening

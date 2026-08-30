@@ -1,0 +1,138 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>文献处理系统</title>
+  <link rel="stylesheet" href="/ui/styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="topbar__title">文献处理系统</div>
+    <div class="topbar__controls">
+      <label class="token-box" for="tokenInput">API Token（可选）:</label>
+      <input id="tokenInput" type="password" autocomplete="off" placeholder="未启用鉴权可留空">
+      <button id="tokenSaveButton" type="button">保存到内存</button>
+      <button id="clearTokenButton" type="button">清空</button>
+    </div>
+  </header>
+
+  <main class="shell">
+    <section class="panel upload-panel">
+      <h1>上传与队列</h1>
+      <div class="upload-zone" id="uploadDropZone" tabindex="0">
+        <p>拖拽 PDF 到这里，或点击选择文件后上传</p>
+        <input id="fileInput" type="file" accept="application/pdf,.pdf" aria-label="选择PDF文件">
+        <button id="selectFileButton" type="button">选择 PDF</button>
+      </div>
+      <div class="progress">
+        <div id="uploadState" role="status" aria-live="polite">未上传</div>
+        <progress id="uploadProgress" value="0" max="100">0</progress>
+      </div>
+      <div class="toolbar">
+        <button id="refreshDashboard" type="button">刷新</button>
+        <label for="stateFilter">任务筛选</label>
+        <select id="stateFilter">
+          <option value="">全部</option>
+          <option value="queued">queued</option>
+          <option value="running">running</option>
+          <option value="succeeded">succeeded</option>
+          <option value="failed">failed</option>
+          <option value="interrupted">interrupted</option>
+        </select>
+      </div>
+    </section>
+
+    <section class="grid-cards">
+      <article class="panel" id="serviceCard">
+        <h2>服务状态</h2>
+        <p id="serviceHealth" role="status" aria-live="polite">加载中...</p>
+        <dl>
+          <dt>发布版本</dt><dd id="serviceVersion">-</dd>
+          <dt>并发任务上限</dt><dd id="serviceQueued">-</dd>
+          <dt>运行配置</dt><dd id="serviceProfile">-</dd>
+        </dl>
+      </article>
+
+      <article class="panel" id="storageCard">
+        <h2>存储与清理</h2>
+        <dl>
+          <dt>待处理任务</dt><dd id="pendingCount">-</dd>
+          <dt>输入字节</dt><dd id="inputBytes">-</dd>
+          <dt>输出字节</dt><dd id="outputBytes">-</dd>
+          <dt>预留输出</dt><dd id="reservedBytes">-</dd>
+          <dt>总占用</dt><dd id="totalBytes">-</dd>
+          <dt>文件系统可用</dt><dd id="filesystemFree">-</dd>
+          <dt>受管数据上限</dt><dd id="maxDataBytes">-</dd>
+          <dt>单任务输出上限</dt><dd id="maxOutputBytes">-</dd>
+          <dt>磁盘保留空间</dt><dd id="minFreeBytes">-</dd>
+          <dt>待处理任务上限</dt><dd id="maxPendingJobs">-</dd>
+          <dt>清理间隔(秒)</dt><dd id="cleanupInterval">-</dd>
+        </dl>
+      </article>
+
+      <article class="panel">
+        <h2>状态计数</h2>
+        <ul id="stateCounts">
+          <li>queued: <strong id="countQueued">0</strong></li>
+          <li>running: <strong id="countRunning">0</strong></li>
+          <li>terminal: <strong id="countTerminal">0</strong></li>
+          <li>total: <strong id="countTotal">0</strong></li>
+        </ul>
+      </article>
+    </section>
+
+    <section class="panel">
+      <h2>任务清单</h2>
+      <div id="jobsEmpty" role="status" aria-live="polite">暂无任务</div>
+      <div class="table-wrap" id="jobsContainer"></div>
+    </section>
+
+    <section class="panel">
+      <div class="drawer-header">
+        <h2>系统配置</h2>
+        <button id="toggleConfig" type="button" aria-expanded="false" aria-controls="configBody">展开配置</button>
+      </div>
+      <div id="configBody" hidden>
+        <div id="configRevision" class="mono"></div>
+        <p>未配置 / 只读字段仅用于对照。修改时使用 CAS revision 回写。</p>
+        <table class="config-table">
+          <thead>
+            <tr>
+              <th>项</th>
+              <th>环境值</th>
+              <th>当前值（秒）</th>
+              <th>友好显示</th>
+              <th>重置</th>
+            </tr>
+          </thead>
+          <tbody id="configRows"></tbody>
+        </table>
+        <button id="applyConfig" type="button">提交配置</button>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>只读配置</h2>
+      <table class="config-table">
+        <thead>
+          <tr><th>项</th><th>值 / 说明</th></tr>
+        </thead>
+        <tbody id="readonlyRows"></tbody>
+      </table>
+    </section>
+
+    <section class="panel">
+      <h2>只读说明</h2>
+      <ul>
+        <li>已存在任务的失效时间为已形成历史，不会追溯重算；新的更新时间只影响后续任务行为。</li>
+        <li>无 Token 时使用浏览器原生流式下载；带 Token 时通过 Fetch + Blob 携带 Authorization，页面上限为 256 MiB。</li>
+        <li>更大的受保护产物请使用支持流式写盘的 API 客户端下载。</li>
+        <li>本页不持久化 Token，仅保留在当前页面内存。</li>
+      </ul>
+    </section>
+  </main>
+
+  <script src="/ui/main.js" defer></script>
+</body>
+</html>

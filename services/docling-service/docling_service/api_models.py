@@ -6,7 +6,16 @@ from typing import Any, Literal
 
 import json
 
-from pydantic import BaseModel, ConfigDict, Field, HttpUrl, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    HttpUrl,
+    StrictBool,
+    StrictInt,
+    StrictStr,
+    field_validator,
+)
 
 
 JobState = Literal["queued", "running", "succeeded", "failed", "interrupted"]
@@ -102,6 +111,12 @@ class JobResponse(BaseModel):
     output_deleted_at: str | None = None
     deleted_at: str | None = None
     artifact_state: Literal["pending", "available", "expired", "deleted"]
+    progress_stage: str | None = None
+    progress_percent: int | None = Field(default=None, ge=0, le=100)
+    progress_message: str | None = None
+    progress_updated_at: str | None = None
+    queue_position: int | None = None
+    server_time: str
     outputs_url: str
     links: JobLinks
 
@@ -176,6 +191,89 @@ class StorageResponse(BaseModel):
     usage: StorageUsage
     limits: StorageLimits
     cleanup_interval_seconds: int
+
+
+RuntimeConfigKey = Literal[
+    "input_ttl_seconds",
+    "success_output_ttl_seconds",
+    "failed_output_ttl_seconds",
+    "job_ttl_seconds",
+    "staging_ttl_seconds",
+    "temp_ttl_seconds",
+    "cleanup_interval_seconds",
+    "idempotency_ttl_seconds",
+    "download_lease_seconds",
+]
+
+# Keep this list in one place so the HTTP model and the UI cannot accidentally
+# expose operational limits, webhook secrets, or environment-only settings as
+# editable values.
+RUNTIME_CONFIG_KEYS: tuple[str, ...] = (
+    "input_ttl_seconds",
+    "success_output_ttl_seconds",
+    "failed_output_ttl_seconds",
+    "job_ttl_seconds",
+    "staging_ttl_seconds",
+    "temp_ttl_seconds",
+    "cleanup_interval_seconds",
+    "idempotency_ttl_seconds",
+    "download_lease_seconds",
+)
+
+
+class SystemConfigEditableValue(BaseModel):
+    """One safe, editable runtime lifecycle setting.
+
+    The service owns range validation; this model intentionally only enforces
+    the wire type and metadata shape.  ``StrictInt`` prevents JSON booleans,
+    floating point values, and numeric strings from silently changing policy.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    value: StrictInt
+    environment_value: StrictInt
+    overridden: StrictBool
+    minimum: StrictInt
+    maximum: StrictInt
+    unit: Literal["seconds"]
+    label: StrictStr
+    description: StrictStr
+    requires_restart: Literal[False] = False
+
+
+class SystemConfigReadonlyValue(BaseModel):
+    """A non-editable setting with a human-readable reason.
+
+    Values are strict so an accidentally included credential or object cannot
+    be coerced into a string and reflected by the API/UI.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    value: StrictStr | StrictInt | StrictBool | None
+    reason: StrictStr
+
+
+class SystemConfigPatchRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    revision: StrictInt = Field(ge=0)
+    changes: dict[RuntimeConfigKey, StrictInt | None] = Field(
+        min_length=1,
+        max_length=len(RUNTIME_CONFIG_KEYS),
+    )
+
+
+class SystemConfigResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    revision: StrictInt = Field(ge=0)
+    updated_at: StrictStr | None = None
+    server_time: StrictStr
+    existing_job_expiries_unchanged: Literal[True] = True
+    editable: dict[RuntimeConfigKey, SystemConfigEditableValue]
+    readonly: dict[StrictStr, SystemConfigReadonlyValue]
 
 
 class WebhookSubscriptionCreate(BaseModel):

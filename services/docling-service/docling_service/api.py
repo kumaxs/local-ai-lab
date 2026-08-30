@@ -11,10 +11,14 @@ import shutil
 import tempfile
 import threading
 import uuid
+from collections.abc import Mapping
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
+
+from . import release as release_module
 
 from .api_models import (
     CapabilitiesResponse,
@@ -27,6 +31,9 @@ from .api_models import (
     ManifestResponse,
     OutputListResponse,
     ProblemDetails,
+    RUNTIME_CONFIG_KEYS,
+    SystemConfigPatchRequest,
+    SystemConfigResponse,
     StorageResponse,
     WebhookDeliveryListResponse,
     WebhookDeliveryResponse,
@@ -42,10 +49,20 @@ from .lifecycle import QueueFullError, StorageQuotaError
 from .release import (
     RELEASE_VERSION,
     JobManager,
+    OutputExpiredError,
     ReleaseConfig,
     probe_backend,
     probe_formula_service,
+    utc_now,
 )
+
+
+RuntimeConfigConflict = getattr(release_module, "RuntimeConfigConflict", None)
+
+
+if RuntimeConfigConflict is None:  # pragma: no cover - compatibility path
+    class RuntimeConfigConflict(RuntimeError):
+        """Fallback when release runtime config CAS exceptions are unavailable."""
 
 
 LOGGER = logging.getLogger(__name__)
@@ -94,7 +111,10 @@ class _RequestBodyLimitMiddleware:
                 and path.startswith("/v1/webhooks/subscriptions/")
             )
         )
-        if scope.get("type") != "http" or not (is_job_upload or is_webhook_write):
+        is_config_write = method == "PATCH" and path == "/v1/system/config"
+        if scope.get("type") != "http" or not (
+            is_job_upload or is_webhook_write or is_config_write
+        ):
             await self.app(scope, receive, send)
             return
 
@@ -230,7 +250,11 @@ def create_app(config: ReleaseConfig | None = None, manager: JobManager | None =
             status,
         )
         from fastapi.exceptions import RequestValidationError
-        from fastapi.responses import JSONResponse, StreamingResponse
+        from fastapi.responses import (
+            FileResponse,
+            JSONResponse,
+            StreamingResponse,
+        )
         from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
         from starlette.exceptions import HTTPException as StarletteHTTPException
         from starlette.requests import ClientDisconnect
@@ -266,6 +290,49 @@ def create_app(config: ReleaseConfig | None = None, manager: JobManager | None =
     async def lifespan(_app: Any):
         yield
         actual_manager.shutdown()
+
+    ui_assets_root = Path(__file__).resolve().parent / "ui"
+
+    def _ui_security_headers(response: Response) -> None:
+        response.headers["Content-Security-Policy"] = (
+            "default-src 'self'; "
+            "script-src 'self'; "
+            "style-src 'self'; "
+            "img-src 'self' data:; "
+            "connect-src 'self'; "
+            "font-src 'self'; "
+            "base-uri 'self'; "
+            "object-src 'none'; "
+            "form-action 'self'; "
+            "frame-ancestors 'none'"
+        )
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["Referrer-Policy"] = "no-referrer"
+        response.headers["Cache-Control"] = "no-store"
+        response.headers["Pragma"] = "no-cache"
+
+    def _serve_ui_file(relative_path: str, default_filename: str | None = None) -> Any:
+        path_obj = Path(relative_path)
+        if (
+            path_obj.is_absolute()
+            or any(part == ".." for part in path_obj.parts)
+            or path_obj.name in {"", "."}
+        ):
+            raise HTTPException(status_code=404, detail="ui asset not found")
+        if default_filename and relative_path == "":
+            path_obj = Path(default_filename)
+        target = (ui_assets_root / path_obj).resolve()
+        ui_root_resolved = ui_assets_root.resolve()
+        if not str(target).startswith(str(ui_root_resolved) + os.sep) and target != ui_root_resolved:
+            raise HTTPException(status_code=404, detail="ui asset not found")
+        if not target.exists() or target.is_dir():
+            raise HTTPException(status_code=404, detail="ui asset not found")
+        media_type, _ = mimetypes.guess_type(target.name)
+        if media_type is None:
+            media_type = "application/octet-stream"
+        response = FileResponse(target, media_type=media_type)
+        _ui_security_headers(response)
+        return response
 
     problem_documentation = {
         code: {
@@ -381,19 +448,239 @@ def create_app(config: ReleaseConfig | None = None, manager: JobManager | None =
                 headers={"WWW-Authenticate": "Bearer"},
             )
 
-    def job_payload(record: dict[str, Any]) -> JobResponse:
+    _secret_readonly_markers = (
+        "token",
+        "secret",
+        "password",
+        "credential",
+        "authorization",
+        "api_key",
+    )
+
+    def _safe_system_config_snapshot(snapshot: Any) -> dict[str, Any]:
+        """Validate and redact a manager snapshot before it crosses HTTP.
+
+        The release manager owns the canonical shape.  This small boundary
+        adapter keeps older managers useful during rolling upgrades while
+        ensuring that an accidental environment dump (especially an API token)
+        can never be reflected by the web UI.
+        """
+
+        if isinstance(snapshot, BaseException):
+            raise HTTPException(status_code=500, detail="invalid runtime configuration snapshot")
+        if hasattr(snapshot, "model_dump"):
+            snapshot = snapshot.model_dump()
+        if not isinstance(snapshot, Mapping):
+            raise HTTPException(
+                status_code=500,
+                detail="invalid runtime configuration snapshot",
+            )
+
+        # The final manager contract uses ``editable`` entries.  A short-lived
+        # compatibility path accepts the pre-CAS runtime/environment mapping
+        # and converts it to the same safe wire shape.  It is intentionally
+        # limited to the nine lifecycle values.
+        editable_raw = snapshot.get("editable")
+        if not isinstance(editable_raw, Mapping):
+            runtime = snapshot.get("runtime")
+            environment = snapshot.get("environment")
+            if isinstance(runtime, Mapping) and isinstance(environment, Mapping):
+                converted: dict[str, Any] = {}
+                for key in RUNTIME_CONFIG_KEYS:
+                    if key not in runtime:
+                        continue
+                    value = runtime[key]
+                    env_value = environment.get(key, value)
+                    converted[key] = {
+                        "value": value,
+                        "environment_value": env_value,
+                        "overridden": value != env_value,
+                        "minimum": 1,
+                        "maximum": 2**63 - 1,
+                        "unit": "seconds",
+                        "label": key,
+                        "description": "runtime lifecycle setting",
+                        "requires_restart": False,
+                    }
+                editable_raw = converted
+            else:
+                editable_raw = {}
+
+        editable: dict[str, Any] = {}
+        if isinstance(editable_raw, Mapping):
+            for key in RUNTIME_CONFIG_KEYS:
+                entry = editable_raw.get(key)
+                if not isinstance(entry, Mapping):
+                    continue
+                # Keep only the documented entry fields.  Values are checked
+                # strictly by SystemConfigEditableValue below.
+                editable[key] = {
+                    "value": entry.get("value"),
+                    "environment_value": entry.get("environment_value"),
+                    "overridden": entry.get("overridden", False),
+                    "minimum": entry.get("minimum", 1),
+                    "maximum": entry.get("maximum", 2**63 - 1),
+                    "unit": entry.get("unit", "seconds"),
+                    "label": entry.get("label", key),
+                    "description": entry.get("description", "runtime lifecycle setting"),
+                    "requires_restart": entry.get("requires_restart", False),
+                }
+
+        readonly_raw = snapshot.get("readonly")
+        readonly: dict[str, Any] = {}
+        if isinstance(readonly_raw, Mapping):
+            for raw_key, raw_entry in readonly_raw.items():
+                key = str(raw_key)
+                lowered = key.casefold()
+                # A secret-bearing setting may only cross the boundary as an
+                # explicit configured boolean.  Never preserve its raw value.
+                if any(marker in lowered for marker in _secret_readonly_markers):
+                    configured_key = lowered == "api_token" or lowered.endswith(
+                        ("_configured", "_set", "configured", "set")
+                    )
+                    if not configured_key:
+                        continue
+                    if isinstance(raw_entry, Mapping):
+                        candidate = raw_entry.get("value")
+                        if not isinstance(candidate, bool):
+                            candidate = bool(candidate)
+                        raw_entry = {
+                            "value": candidate,
+                            "reason": raw_entry.get("reason") or "whether a credential is configured",
+                        }
+                    elif isinstance(raw_entry, bool):
+                        raw_entry = {
+                            "value": raw_entry,
+                            "reason": "whether a credential is configured",
+                        }
+                    else:
+                        continue
+                if isinstance(raw_entry, Mapping):
+                    readonly[key] = {
+                        "value": raw_entry.get("value"),
+                        "reason": raw_entry.get("reason") or "read-only service setting",
+                    }
+
+        return {
+            "revision": snapshot.get("revision", 0),
+            "updated_at": snapshot.get("updated_at"),
+            "server_time": snapshot.get("server_time") or utc_now(),
+            "existing_job_expiries_unchanged": bool(
+                snapshot.get("existing_job_expiries_unchanged", True)
+            ),
+            "editable": editable,
+            "readonly": readonly,
+        }
+
+    def _system_config_response(snapshot: Any) -> SystemConfigResponse:
+        try:
+            return SystemConfigResponse(**_safe_system_config_snapshot(snapshot))
+        except HTTPException:
+            raise
+        except Exception as exc:
+            LOGGER.warning("invalid runtime configuration snapshot: %s", exc)
+            raise HTTPException(
+                status_code=500,
+                detail="invalid runtime configuration snapshot",
+            ) from None
+
+    @app.get("/", include_in_schema=False)
+    def ui_root() -> Any:
+        response = _serve_ui_file("index.html")
+        _ui_security_headers(response)
+        return response
+
+    @app.get("/ui", include_in_schema=False)
+    def ui_root_without_slash() -> Any:
+        response = _serve_ui_file("index.html")
+        _ui_security_headers(response)
+        return response
+
+    @app.get("/ui/", include_in_schema=False)
+    def ui_index() -> Any:
+        response = _serve_ui_file("index.html")
+        _ui_security_headers(response)
+        return response
+
+    @app.get("/ui/{asset_path:path}", include_in_schema=False)
+    def ui_asset(asset_path: str) -> Any:
+        if asset_path == "":
+            response = _serve_ui_file("index.html")
+        else:
+            response = _serve_ui_file(asset_path)
+        _ui_security_headers(response)
+        return response
+
+    def job_payload(record: Mapping[str, Any]) -> JobResponse:
         job_id = str(record["job_id"])
+        output_deadline = record.get("output_expires_at")
+        output_deadline_passed = False
+        if isinstance(output_deadline, str) and output_deadline:
+            try:
+                normalized_deadline = output_deadline.replace("Z", "+00:00")
+                deadline = datetime.fromisoformat(normalized_deadline)
+                if deadline.tzinfo is None:
+                    deadline = deadline.replace(tzinfo=timezone.utc)
+                output_deadline_passed = deadline <= datetime.now(timezone.utc)
+            except ValueError:
+                output_deadline_passed = False
         if record.get("output_deleted_at"):
             artifact_state = "deleted"
         elif record.get("state") in {"queued", "running"}:
             artifact_state = "pending"
+        elif output_deadline_passed:
+            artifact_state = "expired"
         elif Path(str(record.get("output_dir", ""))).is_dir():
             artifact_state = "available"
         else:
             artifact_state = "expired"
+
+        # Progress is optional in persisted records and may be represented by
+        # either flat columns or a nested ``progress`` object while workers are
+        # upgraded.  Normalize both forms to the stable HTTP contract.
+        progress = record.get("progress")
+        progress_map = progress if isinstance(progress, Mapping) else {}
+        progress_stage = record.get("progress_stage") or progress_map.get("stage")
+        progress_percent = record.get("progress_percent")
+        if progress_percent is None:
+            progress_percent = progress_map.get("percent")
+        progress_message = record.get("progress_message") or progress_map.get("message")
+        progress_updated_at = record.get("progress_updated_at") or progress_map.get(
+            "updated_at"
+        )
+        queue_position = record.get("queue_position")
+        if queue_position is None:
+            queue_position = record.get("queue")
+            if isinstance(queue_position, Mapping):
+                queue_position = queue_position.get("position")
+        known = {
+            "job_id": job_id,
+            "state": record.get("state", "queued"),
+            "original_name": record.get("original_name") or "document.pdf",
+            "client_reference": record.get("client_reference"),
+            "created_at": record.get("created_at") or utc_now(),
+            "started_at": record.get("started_at"),
+            "finished_at": record.get("finished_at"),
+            "exit_code": record.get("exit_code"),
+            "error": record.get("error"),
+            "input_size_bytes": record.get("input_size_bytes", record.get("input_bytes", 0)) or 0,
+            "output_size_bytes": record.get("output_size_bytes", record.get("output_bytes", 0)) or 0,
+            "input_expires_at": record.get("input_expires_at"),
+            "output_expires_at": record.get("output_expires_at"),
+            "tombstone_expires_at": record.get("tombstone_expires_at"),
+            "input_deleted_at": record.get("input_deleted_at"),
+            "output_deleted_at": record.get("output_deleted_at"),
+            "deleted_at": record.get("deleted_at"),
+            "progress_stage": progress_stage,
+            "progress_percent": progress_percent,
+            "progress_message": progress_message,
+            "progress_updated_at": progress_updated_at,
+            "queue_position": queue_position,
+        }
         return JobResponse(
-            **record,
+            **known,
             artifact_state=artifact_state,
+            server_time=utc_now(),
             outputs_url=f"/v1/jobs/{job_id}/outputs",
             links=JobLinks(
                 status=f"/v1/jobs/{job_id}",
@@ -409,9 +696,9 @@ def create_app(config: ReleaseConfig | None = None, manager: JobManager | None =
             secret_set=bool(record.get("secret")),
         )
 
-    def file_chunks(path: Path, lease: Any):
+    def file_chunks(handle: Any, lease: Any):
         try:
-            with path.open("rb") as handle:
+            with handle:
                 while chunk := handle.read(1024 * 1024):
                     lease.renew()
                     yield chunk
@@ -617,9 +904,13 @@ def create_app(config: ReleaseConfig | None = None, manager: JobManager | None =
         record = actual_manager.get_job_details(job_id)
         if not record:
             raise HTTPException(status_code=404, detail="job not found")
+        try:
+            files = actual_manager.output_files(job_id)
+        except OutputExpiredError:
+            raise HTTPException(status_code=410, detail="job outputs have expired") from None
         return OutputListResponse(
             job_id=job_id,
-            files=actual_manager.output_files(job_id),
+            files=files,
             archive_url=f"/v1/jobs/{job_id}/archive",
             manifest_url=f"/v1/jobs/{job_id}/manifest",
             expires_at=record.get("output_expires_at"),
@@ -634,6 +925,8 @@ def create_app(config: ReleaseConfig | None = None, manager: JobManager | None =
     def manifest(job_id: str) -> ManifestResponse:
         try:
             return ManifestResponse(**actual_manager.manifest(job_id))
+        except OutputExpiredError:
+            raise HTTPException(status_code=410, detail="job outputs have expired") from None
         except FileNotFoundError:
             raise HTTPException(status_code=404, detail="job not found") from None
 
@@ -654,10 +947,17 @@ def create_app(config: ReleaseConfig | None = None, manager: JobManager | None =
         },
     )
     def output_file(job_id: str, relative_path: str) -> Any:
+        record = actual_manager.get_job_details(job_id)
+        if not record:
+            raise HTTPException(status_code=404, detail="job not found")
+        if record.get("state") not in {"succeeded", "failed", "interrupted"}:
+            raise HTTPException(status_code=409, detail="job has not finished")
         try:
             lease = actual_manager.acquire_download_lease(
                 job_id, relative_path, holder=f"file:{uuid.uuid4()}"
             )
+        except OutputExpiredError:
+            raise HTTPException(status_code=410, detail="job outputs have expired") from None
         except FileNotFoundError:
             raise HTTPException(status_code=404, detail="output file not found") from None
         except PermissionError:
@@ -665,7 +965,7 @@ def create_app(config: ReleaseConfig | None = None, manager: JobManager | None =
         except RuntimeError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from None
         try:
-            path = actual_manager.resolve_output_file(job_id, relative_path)
+            handle, size_bytes = actual_manager.open_output_file(job_id, relative_path)
         except FileNotFoundError:
             lease.release()
             raise HTTPException(status_code=404, detail="output file not found") from None
@@ -675,16 +975,17 @@ def create_app(config: ReleaseConfig | None = None, manager: JobManager | None =
         except ValueError as exc:
             lease.release()
             raise HTTPException(status_code=409, detail=str(exc)) from None
-        media_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
-        chunks = file_chunks(path, lease)
+        download_name = Path(relative_path).name
+        media_type = mimetypes.guess_type(download_name)[0] or "application/octet-stream"
+        chunks = file_chunks(handle, lease)
         return CloseableStreamingResponse(
             chunks,
             close=chunks.close,
             media_type=media_type,
             headers={
-                "Content-Length": str(path.stat().st_size),
+                "Content-Length": str(size_bytes),
                 "Content-Disposition": (
-                    "attachment; filename*=UTF-8''" + quote(path.name)
+                    "attachment; filename*=UTF-8''" + quote(download_name)
                 ),
             },
         )
@@ -719,26 +1020,36 @@ def create_app(config: ReleaseConfig | None = None, manager: JobManager | None =
                 job_id, "__archive__", holder=f"archive:{uuid.uuid4()}"
             )
             files = actual_manager.output_files(job_id)
+            if hasattr(actual_manager, "resolve_output_root"):
+                output_root = actual_manager.resolve_output_root(job_id)
+            else:  # compatibility for adapters implementing the v1 manager surface
+                output_root = Path(str(record["output_dir"]))
             preflight_archive(
-                Path(str(record["output_dir"])),
+                output_root,
                 files,
                 lease=lease,
                 max_total_bytes=actual_config.max_output_bytes,
             )
             stream = iter_archive(
-                Path(str(record["output_dir"])),
+                output_root,
                 files,
                 lease=lease,
-                lease_renew_seconds=min(
-                    30.0, actual_config.download_lease_seconds / 2
+                lease_renew_seconds=getattr(
+                    lease,
+                    "renew_interval_seconds",
+                    min(30.0, actual_config.download_lease_seconds / 2),
                 ),
                 max_total_bytes=actual_config.max_output_bytes,
             )
-        except FileNotFoundError:
+        except OutputExpiredError:
             if lease is not None:
                 lease.release()
             raise HTTPException(status_code=410, detail="job outputs have expired") from None
-        except (ArchiveError, RuntimeError, ValueError) as exc:
+        except FileNotFoundError:
+            if lease is not None:
+                lease.release()
+            raise HTTPException(status_code=404, detail="job not found") from None
+        except (ArchiveError, PermissionError, RuntimeError, ValueError) as exc:
             if lease is not None:
                 lease.release()
             raise HTTPException(status_code=409, detail=str(exc)) from None
@@ -763,6 +1074,52 @@ def create_app(config: ReleaseConfig | None = None, manager: JobManager | None =
     )
     def storage() -> StorageResponse:
         return StorageResponse(**actual_manager.storage_status())
+
+    @app.get(
+        "/v1/system/config",
+        tags=["system"],
+        dependencies=[Depends(authorize)],
+        response_model=SystemConfigResponse,
+    )
+    def get_system_config() -> SystemConfigResponse:
+        if not hasattr(actual_manager, "runtime_config_snapshot"):
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="runtime config is currently unavailable",
+            )
+        return _system_config_response(actual_manager.runtime_config_snapshot())
+
+    @app.patch(
+        "/v1/system/config",
+        tags=["system"],
+        dependencies=[Depends(authorize)],
+        response_model=SystemConfigResponse,
+    )
+    def patch_system_config(
+        request: SystemConfigPatchRequest,
+    ) -> SystemConfigResponse:
+        if not hasattr(actual_manager, "update_runtime_config"):
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="runtime config is currently unavailable",
+            )
+        changes = dict(request.changes)
+        try:
+            return _system_config_response(
+                actual_manager.update_runtime_config(
+                    request.revision,
+                    changes,
+                )
+            )
+        except RuntimeConfigConflict:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="runtime configuration changed; refresh and retry",
+            ) from None
+        except ValueError as exc:
+            # Backend range validation is deliberately authoritative, while
+            # malformed values are still a client error on the HTTP boundary.
+            raise HTTPException(status_code=422, detail=str(exc)) from None
 
     def validate_event_types(event_types: list[str]) -> None:
         allowed = {

@@ -108,6 +108,10 @@ _MIGRATION_LOCKS: dict[str, threading.Lock] = {}
 _LOCKS_LOCK = threading.Lock()
 
 
+class RuntimeConfigConflict(RuntimeError):
+    """Raised when a runtime configuration CAS revision is stale."""
+
+
 class SQLiteStore:
     VALID_STATES = {"queued", "running", "succeeded", "failed", "interrupted"}
     TERMINAL_STATES = {"succeeded", "failed", "interrupted"}
@@ -257,6 +261,11 @@ class SQLiteStore:
                         manifest_version INTEGER NOT NULL DEFAULT 0,
                         manifest_sha256 TEXT,
                         input_expires_at TEXT,
+                        runtime_config_revision INTEGER NOT NULL DEFAULT 0,
+                        input_ttl_seconds INTEGER,
+                        success_output_ttl_seconds INTEGER,
+                        failed_output_ttl_seconds INTEGER,
+                        job_ttl_seconds INTEGER,
                         output_expires_at TEXT,
                         tombstone_expires_at TEXT,
                         tombstoned_at TEXT,
@@ -272,6 +281,11 @@ class SQLiteStore:
                         finished_at TEXT,
                         exit_code INTEGER,
                         error TEXT,
+                        progress_stage TEXT,
+                        progress_percent INTEGER,
+                        progress_message TEXT,
+                        progress_updated_at TEXT,
+                        queue_order INTEGER,
                         updated_at TEXT NOT NULL
                     )
                     """
@@ -412,6 +426,21 @@ class SQLiteStore:
                     """
                 )
 
+                # Runtime policy overrides are deliberately kept separate from
+                # the environment-backed ReleaseConfig.  A single-row JSON
+                # document gives us one atomic revision for CAS updates while
+                # retaining room for future policy keys.
+                self._conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS runtime_config (
+                        id INTEGER PRIMARY KEY CHECK (id = 1),
+                        revision INTEGER NOT NULL DEFAULT 0,
+                        overrides_json TEXT NOT NULL DEFAULT '{}',
+                        updated_at TEXT
+                    )
+                    """
+                )
+
                 self._conn.executescript(
                     """
                     CREATE INDEX IF NOT EXISTS idx_jobs_state ON jobs(state);
@@ -442,9 +471,67 @@ class SQLiteStore:
                     (_utc_now(),),
                 )
 
+                # v2 adds progress/queue observability and runtime-config CAS.
+                # ALTER is required for databases created by v1; CREATE above
+                # already supplies these columns for new databases.
                 job_columns = {
                     row["name"] for row in self._conn.execute("PRAGMA table_info(jobs)")
                 }
+                for column, declaration in (
+                    ("progress_stage", "TEXT"),
+                    ("progress_percent", "INTEGER"),
+                    ("progress_message", "TEXT"),
+                    ("progress_updated_at", "TEXT"),
+                    ("queue_order", "INTEGER"),
+                    ("runtime_config_revision", "INTEGER NOT NULL DEFAULT 0"),
+                    ("input_ttl_seconds", "INTEGER"),
+                    ("success_output_ttl_seconds", "INTEGER"),
+                    ("failed_output_ttl_seconds", "INTEGER"),
+                    ("job_ttl_seconds", "INTEGER"),
+                ):
+                    if column not in job_columns:
+                        self._conn.execute(
+                            f"ALTER TABLE jobs ADD COLUMN {column} {declaration}"
+                        )
+                self._conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_jobs_queue_order "
+                    "ON jobs(state, queue_order)"
+                )
+                # Preserve insertion order for old rows and assign the next
+                # monotonic sequence under the migration transaction.
+                self._conn.execute(
+                    "UPDATE jobs SET queue_order = rowid WHERE queue_order IS NULL"
+                )
+                self._conn.execute(
+                    """
+                    UPDATE jobs
+                    SET progress_stage = state,
+                        progress_percent = CASE
+                            WHEN state IN ('succeeded', 'failed', 'interrupted') THEN 100
+                            ELSE progress_percent
+                        END,
+                        progress_updated_at = COALESCE(updated_at, created_at)
+                    WHERE progress_stage IS NULL
+                    """
+                )
+                self._conn.execute(
+                    """
+                    INSERT INTO runtime_config(id, revision, overrides_json, updated_at)
+                    VALUES (1, 0, '{}', NULL)
+                    ON CONFLICT(id) DO NOTHING
+                    """
+                )
+                self._conn.execute(
+                    """
+                    INSERT INTO schema_migrations(version, name, applied_at)
+                    VALUES (2, 'v2_progress_runtime_config', ?)
+                    ON CONFLICT(version) DO UPDATE SET
+                        name = excluded.name,
+                        applied_at = excluded.applied_at
+                    """,
+                    (_utc_now(),),
+                )
+
                 if "manifest_sha256" not in job_columns:
                     self._conn.execute("ALTER TABLE jobs ADD COLUMN manifest_sha256 TEXT")
                 legacy_columns = {
@@ -469,12 +556,59 @@ class SQLiteStore:
             "reserved_output_bytes",
             "manifest_version",
             "exit_code",
+            "progress_percent",
+            "queue_order",
         ):
             if name in data and data[name] is not None:
                 data[name] = _coerce_int(data[name])
         data["output_dir"] = data.get("output_dir")
         data["output_path"] = data.get("output_dir")
+        # queue_order is an internal monotonic insertion marker.  It is used
+        # to calculate a stable FIFO position, but is not part of the API
+        # contract exposed to callers.
+        data.pop("queue_order", None)
         return data
+
+    def _queue_position(self, job_id: str, *, queue_order: int | None = None) -> int | None:
+        """Return a 1-based position for queued jobs, or ``None`` otherwise.
+
+        Positions are calculated from the persisted queue order rather than
+        wall-clock timestamps so submissions sharing a timestamp remain FIFO.
+        Running and terminal jobs intentionally have no queue position.
+        """
+        if not _is_uuid(job_id):
+            return None
+        row = self._fetch_one(
+            "SELECT state, queue_order FROM jobs WHERE job_id = ?",
+            (job_id,),
+        )
+        if not row or row["state"] != "queued":
+            return None
+        marker = queue_order if queue_order is not None else row["queue_order"]
+        if marker is None:
+            return None
+        ahead = self._fetch_one(
+            """
+            SELECT COUNT(*) AS count
+            FROM jobs
+            WHERE state = 'queued'
+              AND tombstoned_at IS NULL
+              AND deleted = 0
+              AND queue_order < ?
+            """,
+            (int(marker),),
+        )
+        return int(ahead["count"] if ahead else 0) + 1
+
+    def _job_payload(self, row: sqlite3.Row | None) -> dict[str, Any]:
+        """Convert a row and attach its derived queue position."""
+        payload = self._row_to_job(row)
+        if payload:
+            payload["queue_position"] = self._queue_position(
+                str(payload["job_id"]),
+                queue_order=(row["queue_order"] if row is not None and "queue_order" in row.keys() else None),
+            )
+        return payload
 
     def _row_to_manifest_item(self, row: sqlite3.Row | None) -> dict[str, Any] | None:
         payload = self._to_dict(row)
@@ -614,10 +748,19 @@ class SQLiteStore:
         output_size_bytes: int | None = None,
         reserved_output_bytes: int | None = None,
         input_expires_at: str | None = None,
+        runtime_config_revision: int = 0,
+        input_ttl_seconds: int | None = None,
+        success_output_ttl_seconds: int | None = None,
+        failed_output_ttl_seconds: int | None = None,
+        job_ttl_seconds: int | None = None,
         output_expires_at: str | None = None,
         tombstone_expires_at: str | None = None,
         created_at: str | None = None,
         manifest_version: int = 0,
+        progress_stage: str | None = None,
+        progress_percent: int | None = None,
+        progress_message: str | None = None,
+        progress_updated_at: str | None = None,
     ) -> dict[str, Any]:
         if not _is_uuid(job_id):
             return {"error": "invalid_job_id"}
@@ -625,6 +768,17 @@ class SQLiteStore:
             return {"error": "invalid_state"}
 
         created = created_at or _utc_now()
+        progress_stage = progress_stage or state
+        if not isinstance(progress_stage, str) or not progress_stage.strip() or len(progress_stage) > 64:
+            return {"error": "invalid_progress_stage"}
+        if progress_percent is not None:
+            if isinstance(progress_percent, bool) or not isinstance(progress_percent, int) or not 0 <= progress_percent <= 100:
+                return {"error": "invalid_progress_percent"}
+        if progress_message is not None and (
+            not isinstance(progress_message, str) or len(progress_message) > 1000
+        ):
+            return {"error": "invalid_progress_message"}
+        progress_updated_at = progress_updated_at or created
         self._validate_rooted_path(input_path, self._input_root, "input_path")
         self._validate_rooted_path(output_dir, self._output_root, "output_dir")
 
@@ -633,18 +787,25 @@ class SQLiteStore:
             if existing:
                 return {"error": "job_id_conflict"}
 
+            queue_row = self._conn.execute(
+                "SELECT COALESCE(MAX(queue_order), 0) + 1 AS next_order FROM jobs"
+            ).fetchone()
+            queue_order = int(queue_row["next_order"] if queue_row else 1)
             self._conn.execute(
                 """
                 INSERT INTO jobs (
                     job_id, state, original_name, client_reference, input_path,
                     output_dir, input_sha256, input_size_bytes, output_size_bytes,
-                    manifest_version, input_expires_at, output_expires_at,
+                    manifest_version, input_expires_at, runtime_config_revision,
+                    input_ttl_seconds, success_output_ttl_seconds,
+                    failed_output_ttl_seconds, job_ttl_seconds, output_expires_at,
                     tombstone_expires_at, tombstoned_at, tombstone_reason,
                     reserved_output_bytes, input_deleted_at, output_deleted_at, deleted,
                     delete_requested_at, deleted_at, created_at, started_at, finished_at,
-                    exit_code, error, updated_at
+                    exit_code, error, progress_stage, progress_percent,
+                    progress_message, progress_updated_at, queue_order, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, NULL, NULL, 0, NULL, NULL, ?, NULL, NULL, NULL, NULL, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     job_id,
@@ -658,21 +819,42 @@ class SQLiteStore:
                     int(output_size_bytes or 0),
                     int(manifest_version),
                     input_expires_at,
+                    int(runtime_config_revision),
+                    input_ttl_seconds,
+                    success_output_ttl_seconds,
+                    failed_output_ttl_seconds,
+                    job_ttl_seconds,
                     output_expires_at,
                     tombstone_expires_at,
+                    None,
+                    None,
                     int(reserved_output_bytes or 0),
+                    None,
+                    None,
+                    0,
+                    None,
+                    None,
                     created,
+                    None,
+                    None,
+                    None,
+                    None,
+                    progress_stage,
+                    progress_percent,
+                    progress_message,
+                    progress_updated_at,
+                    queue_order,
                     created,
                 ),
             )
-            return self._row_to_job(
+            return self._job_payload(
                 self._fetch_one("SELECT * FROM jobs WHERE job_id = ?", (job_id,))
             )
 
     def get_job(self, job_id: str) -> dict[str, Any]:
         if not _is_uuid(job_id):
             return {}
-        return self._row_to_job(self._fetch_one("SELECT * FROM jobs WHERE job_id = ?", (job_id,)))
+        return self._job_payload(self._fetch_one("SELECT * FROM jobs WHERE job_id = ?", (job_id,)))
 
     def update_job(self, job_id: str, **fields: Any) -> dict[str, Any]:
         if not _is_uuid(job_id):
@@ -703,6 +885,10 @@ class SQLiteStore:
             "finished_at",
             "exit_code",
             "error",
+            "progress_stage",
+            "progress_percent",
+            "progress_message",
+            "progress_updated_at",
         }
 
         updates = {k: v for k, v in fields.items() if k in allowed}
@@ -715,6 +901,38 @@ class SQLiteStore:
             self._validate_rooted_path(str(updates["output_dir"]), self._output_root, "output_dir")
         if "state" in updates and updates["state"] not in self.VALID_STATES:
             return {"error": "invalid_state"}
+        if "progress_stage" in updates:
+            stage = updates["progress_stage"]
+            if not isinstance(stage, str) or not stage.strip() or len(stage) > 64:
+                return {"error": "invalid_progress_stage"}
+        if "progress_percent" in updates:
+            percent = updates["progress_percent"]
+            if percent is not None and (
+                isinstance(percent, bool)
+                or not isinstance(percent, int)
+                or not 0 <= percent <= 100
+            ):
+                return {"error": "invalid_progress_percent"}
+        if "progress_message" in updates:
+            message = updates["progress_message"]
+            if message is not None and (
+                not isinstance(message, str) or len(message) > 1000
+            ):
+                return {"error": "invalid_progress_message"}
+        # State transitions are the only progress values we can claim to know
+        # reliably.  Keep percentage unknown (``NULL``) and advance the
+        # timestamp atomically with the state update unless callers supplied an
+        # explicit stage/timestamp.
+        if "state" in updates:
+            if "progress_stage" not in updates:
+                updates["progress_stage"] = str(updates["state"])
+            if "progress_percent" not in updates:
+                updates["progress_percent"] = None
+            if "progress_updated_at" not in updates:
+                updates["progress_updated_at"] = _utc_now()
+        elif any(key in updates for key in ("progress_stage", "progress_percent", "progress_message")):
+            if "progress_updated_at" not in updates:
+                updates["progress_updated_at"] = _utc_now()
         expected_state: str | None = None
         if "state" in updates:
             current = self.get_job(job_id)
@@ -753,6 +971,112 @@ class SQLiteStore:
             if result.rowcount == 0:
                 return {"error": "job_state_conflict" if expected_state else "job_not_found"}
         return self.get_job(job_id)
+
+    def update_progress(
+        self,
+        job_id: str,
+        stage: str,
+        *,
+        message: str | None = None,
+    ) -> dict[str, Any]:
+        """Record a trustworthy stage-only progress update.
+
+        The service does not expose fabricated percentages.  ``progress_percent``
+        remains NULL until a future producer can provide an independently
+        verified numeric estimate.
+        """
+        return self.update_job(
+            job_id,
+            progress_stage=stage,
+            progress_percent=None,
+            progress_message=message,
+            progress_updated_at=_utc_now(),
+        )
+
+    # Alias used by a few integrations that call the operation ``set_progress``.
+    set_progress = update_progress
+
+    # --------------------
+    # Runtime configuration CAS
+    # --------------------
+    def runtime_config_snapshot(self) -> dict[str, Any]:
+        """Return the persisted override document and revision.
+
+        The store intentionally knows nothing about environment defaults or
+        secret-bearing settings; those are merged and redacted by JobManager.
+        """
+        row = self._fetch_one(
+            "SELECT revision, overrides_json, updated_at FROM runtime_config WHERE id = 1"
+        )
+        if row is None:
+            # This is only reachable for a manually damaged database.  Repair
+            # it through the same write path used by normal initialization.
+            with self._write_txn():
+                self._conn.execute(
+                    "INSERT OR IGNORE INTO runtime_config(id, revision, overrides_json, updated_at) VALUES (1, 0, '{}', NULL)"
+                )
+            row = self._fetch_one(
+                "SELECT revision, overrides_json, updated_at FROM runtime_config WHERE id = 1"
+            )
+        overrides: dict[str, Any] = {}
+        if row is not None:
+            try:
+                parsed = json.loads(row["overrides_json"] or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                parsed = {}
+            if isinstance(parsed, Mapping):
+                overrides = dict(parsed)
+        return {
+            "revision": int(row["revision"] if row is not None else 0),
+            "overrides": overrides,
+            "updated_at": row["updated_at"] if row is not None else None,
+        }
+
+    def update_runtime_config(
+        self,
+        expected_revision: int,
+        overrides: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Replace the override document when ``expected_revision`` matches.
+
+        Validation of editable keys/ranges belongs to JobManager, but this
+        method still requires a mapping and performs the revision check and
+        replacement atomically so concurrent API writers cannot clobber one
+        another.
+        """
+        if isinstance(expected_revision, bool) or not isinstance(expected_revision, int) or expected_revision < 0:
+            raise ValueError("invalid runtime configuration revision")
+        if not isinstance(overrides, Mapping):
+            raise ValueError("runtime configuration overrides must be a mapping")
+        serialized = json.dumps(dict(overrides), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        now = _utc_now()
+        with self._write_txn():
+            row = self._fetch_one(
+                "SELECT revision FROM runtime_config WHERE id = 1"
+            )
+            current_revision = int(row["revision"] if row is not None else 0)
+            if current_revision != expected_revision:
+                raise RuntimeConfigConflict(
+                    f"runtime configuration revision {current_revision} does not match {expected_revision}"
+                )
+            next_revision = current_revision + 1
+            self._conn.execute(
+                """
+                INSERT INTO runtime_config(id, revision, overrides_json, updated_at)
+                VALUES (1, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    revision = excluded.revision,
+                    overrides_json = excluded.overrides_json,
+                    updated_at = excluded.updated_at
+                """,
+                (next_revision, serialized, now),
+            )
+        return self.runtime_config_snapshot()
+
+    # Explicitly named aliases make the persistence CAS surface discoverable
+    # to callers that use ``get_``/``compare_and_set_`` terminology.
+    get_runtime_config = runtime_config_snapshot
+    compare_and_set_runtime_config = update_runtime_config
 
     def create_job_with_idempotency(
         self,
@@ -829,10 +1153,25 @@ class SQLiteStore:
                 output_size_bytes=_coerce_int(job_fields.get("output_size_bytes") ),
                 reserved_output_bytes=_coerce_int(job_fields.get("reserved_output_bytes")),
                 input_expires_at=job_fields.get("input_expires_at"),
+                runtime_config_revision=_coerce_int(
+                    job_fields.get("runtime_config_revision", 0)
+                ),
+                input_ttl_seconds=job_fields.get("input_ttl_seconds"),
+                success_output_ttl_seconds=job_fields.get(
+                    "success_output_ttl_seconds"
+                ),
+                failed_output_ttl_seconds=job_fields.get(
+                    "failed_output_ttl_seconds"
+                ),
+                job_ttl_seconds=job_fields.get("job_ttl_seconds"),
                 output_expires_at=job_fields.get("output_expires_at"),
                 tombstone_expires_at=job_fields.get("tombstone_expires_at"),
                 created_at=job_fields.get("created_at", now),
                 manifest_version=_coerce_int(job_fields.get("manifest_version", 0)),
+                progress_stage=job_fields.get("progress_stage"),
+                progress_percent=job_fields.get("progress_percent"),
+                progress_message=job_fields.get("progress_message"),
+                progress_updated_at=job_fields.get("progress_updated_at"),
             )
 
             if created.get("error"):
@@ -923,7 +1262,7 @@ class SQLiteStore:
             tuple(params + [limit + 1]),
         )
 
-        items = [self._row_to_job(row) for row in rows[:limit]]
+        items = [self._job_payload(row) for row in rows[:limit]]
         next_cursor = None
         if len(rows) > limit and items:
             last = items[-1]
@@ -1119,7 +1458,16 @@ class SQLiteStore:
     # --------------------
     # Legacy mirror sync queue
     # --------------------
-    def import_legacy_state_jobs(self, state_root: str | Path) -> dict[str, Any]:
+    def import_legacy_state_jobs(
+        self,
+        state_root: str | Path,
+        *,
+        runtime_config_revision: int = 0,
+        input_ttl_seconds: int | None = None,
+        success_output_ttl_seconds: int | None = None,
+        failed_output_ttl_seconds: int | None = None,
+        job_ttl_seconds: int | None = None,
+    ) -> dict[str, Any]:
         root = Path(state_root).resolve()
         jobs_dir = root / "jobs"
         if not jobs_dir.is_dir():
@@ -1178,26 +1526,84 @@ class SQLiteStore:
 
             with self._write_txn():
                 try:
+                    legacy_state = str(payload.get("state"))
+                    queue_row = self._conn.execute(
+                        "SELECT COALESCE(MAX(queue_order), 0) + 1 AS next_order FROM jobs"
+                    ).fetchone()
+                    queue_order = int(queue_row["next_order"] if queue_row else 1)
+                    progress_time = (
+                        payload.get("finished_at")
+                        or payload.get("started_at")
+                        or payload.get("created_at")
+                        or now
+                    )
+                    legacy_input_expires_at = None
+                    created_at = payload.get("created_at")
+                    finished_at = payload.get("finished_at")
+                    if isinstance(created_at, str) and isinstance(input_ttl_seconds, int):
+                        try:
+                            legacy_input_expires_at = (
+                                datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+                                + timedelta(seconds=input_ttl_seconds)
+                            ).isoformat()
+                        except ValueError:
+                            legacy_input_expires_at = None
+                    legacy_output_expires_at = None
+                    legacy_tombstone_expires_at = None
+                    if legacy_state in self.TERMINAL_STATES:
+                        terminal_base = finished_at or created_at
+                        if isinstance(terminal_base, str):
+                            try:
+                                base_time = datetime.fromisoformat(
+                                    terminal_base.replace("Z", "+00:00")
+                                )
+                                output_ttl = (
+                                    success_output_ttl_seconds
+                                    if legacy_state == "succeeded"
+                                    else failed_output_ttl_seconds
+                                )
+                                if isinstance(output_ttl, int):
+                                    legacy_output_expires_at = (
+                                        base_time + timedelta(seconds=output_ttl)
+                                    ).isoformat()
+                                if isinstance(job_ttl_seconds, int):
+                                    legacy_tombstone_expires_at = (
+                                        base_time + timedelta(seconds=job_ttl_seconds)
+                                    ).isoformat()
+                            except ValueError:
+                                pass
                     self._conn.execute(
                         """
                         INSERT INTO jobs (
                             job_id, state, original_name, client_reference, input_path,
                             output_dir, input_sha256, input_size_bytes, output_size_bytes,
-                            manifest_version, input_expires_at, output_expires_at,
+                            manifest_version, input_expires_at, runtime_config_revision,
+                            input_ttl_seconds, success_output_ttl_seconds,
+                            failed_output_ttl_seconds, job_ttl_seconds, output_expires_at,
                             tombstone_expires_at, tombstoned_at, tombstone_reason,
                             reserved_output_bytes, input_deleted_at, output_deleted_at, deleted,
                             delete_requested_at, deleted_at,
-                            created_at, started_at, finished_at, exit_code, error, updated_at
+                            created_at, started_at, finished_at, exit_code, error,
+                            progress_stage, progress_percent, progress_message,
+                            progress_updated_at, queue_order, updated_at
                         )
-                        VALUES (?, ?, ?, NULL, ?, ?, NULL, 0, 0, 0, NULL, NULL, NULL, NULL, NULL, 0, NULL, NULL, 0, NULL, NULL,
-                                ?, ?, ?, ?, ?, ?)
+                        VALUES (?, ?, ?, NULL, ?, ?, NULL, 0, 0, 0, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, 0, NULL, NULL, 0, NULL, NULL,
+                                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             job_id,
-                            str(payload.get("state")),
+                            legacy_state,
                             str(payload.get("original_name")),
                             str(payload.get("input_path")),
                             str(payload.get("output_dir")),
+                            legacy_input_expires_at,
+                            int(runtime_config_revision),
+                            input_ttl_seconds,
+                            success_output_ttl_seconds,
+                            failed_output_ttl_seconds,
+                            job_ttl_seconds,
+                            legacy_output_expires_at,
+                            legacy_tombstone_expires_at,
                             payload.get("created_at"),
                             payload.get("started_at"),
                             payload.get("finished_at"),
@@ -1207,6 +1613,11 @@ class SQLiteStore:
                                 else None
                             ),
                             payload.get("error"),
+                            legacy_state,
+                            100 if legacy_state in self.TERMINAL_STATES else None,
+                            "imported legacy state",
+                            progress_time,
+                            queue_order,
                             _utc_now(),
                         ),
                     )
@@ -1484,6 +1895,9 @@ class SQLiteStore:
                 return {"error": "job_not_found"}
             if job.get("output_deleted_at") is not None or bool(job.get("deleted")):
                 return {"error": "output_expired"}
+            output_expires_at = _parse_datetime(job.get("output_expires_at"))
+            if output_expires_at is not None and output_expires_at <= now:
+                return {"error": "output_expired"}
             cleanup = self._fetch_one(
                 """
                 SELECT 1 FROM cleanup_claims
@@ -1633,7 +2047,7 @@ class SQLiteStore:
             """,
             tuple(values) + (cutoff,),
         )
-        return {"items": [self._row_to_job(row) for row in rows], "count": len(rows)}
+        return {"items": [self._job_payload(row) for row in rows], "count": len(rows)}
 
     def tombstone_jobs(self, job_ids: Sequence[str], *, reason: str | None = None) -> dict[str, Any]:
         ids = [str(job_id) for job_id in job_ids if _is_uuid(str(job_id))]
@@ -2409,7 +2823,7 @@ class SQLiteStore:
 
         try:
             with self._write_txn():
-                record = self._row_to_job(
+                record = self._job_payload(
                     self._fetch_one("SELECT * FROM jobs WHERE job_id = ?", (job_id,))
                 )
                 if not record:
@@ -2432,6 +2846,12 @@ class SQLiteStore:
                     "manifest_version": _coerce_int(manifest_version, _coerce_int(record.get("manifest_version")) + 1),
                     "manifest_sha256": manifest_sha256,
                     "reserved_output_bytes": 0,
+                    "progress_stage": state,
+                    "progress_percent": 100,
+                    "progress_message": (
+                        "completed" if state == "succeeded" else (error or state)
+                    ),
+                    "progress_updated_at": now,
                 }
                 sets = ", ".join(f"{key} = ?" for key in updates)
                 values = list(updates.values()) + [job_id]

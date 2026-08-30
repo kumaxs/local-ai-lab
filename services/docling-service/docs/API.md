@@ -10,6 +10,79 @@ operation under `/v1`.
 The schema contains typed request and response bodies, bearer authentication,
 RFC 9457 errors, and the outgoing `docling-job-event` webhook definition.
 
+## Web UI
+
+The API serves a small, same-origin operations UI at `/ui/`; it is part of the
+Python package and does not require Node.js, a frontend build, or another
+Compose service. Open the address that matches the deployment:
+
+This section documents the current post-1.1.1 source tree and the next tagged
+release. The published `v1.1.1` archives and images do not contain the UI.
+
+| Deployment | URL |
+| --- | --- |
+| Docker | `http://127.0.0.1:8766/ui/` |
+| macOS | `http://127.0.0.1:8000/ui/` |
+
+The page accepts a PDF by drag-and-drop or file picker, shows upload transport
+progress, and polls the queue and job status. Queue rows include the server's
+`state`, `queue_position`, `progress_stage`, `progress_message`, and optional
+`progress_percent`. These are trusted **phase-level** signals (for example,
+queued, running, validating, and publishing); they are not page-level
+progress, and a missing percentage must not be interpreted as a page count or
+as evidence that a particular page has completed. The UI can expand a terminal
+job to list output files, download an individual file or ZIP archive, and
+delete a terminal job.
+
+Unauthenticated downloads use the browser's native streaming path. When bearer
+authentication is configured, the page must use an in-memory `Blob` and caps
+downloads at 256 MiB; use a streaming API client for larger protected files or
+archives.
+
+Expiry and storage are visible in the same view. Each row shows the applicable
+input/output/tombstone deadline and `artifact_state`; the storage card reads
+`/v1/system/storage` and shows pending jobs, input/output/reserved bytes,
+filesystem free space, limits, and the Janitor interval. Expired output is
+reported by the API (normally `410`) and cannot be downloaded; an active
+download lease keeps a file from being removed during the transfer. Deleting
+an active job is rejected (`409`), while deleting a terminal job removes its
+registered input and output and leaves the normal tombstone retention record.
+
+The **System configuration** panel uses the authenticated endpoints
+`GET /v1/system/config` and `PATCH /v1/system/config`. A patch includes the
+last `revision` and a `changes` object, for example:
+
+```json
+{
+  "revision": 12,
+  "changes": {
+    "success_output_ttl_seconds": 259200,
+    "download_lease_seconds": 600
+  }
+}
+```
+
+The editable lifecycle controls are `input_ttl_seconds`,
+`success_output_ttl_seconds`, `failed_output_ttl_seconds`,
+`job_ttl_seconds`, `staging_ttl_seconds`, `temp_ttl_seconds`,
+`cleanup_interval_seconds`, `idempotency_ttl_seconds`, and
+`download_lease_seconds`. Configuration is persisted in SQLite and guarded by
+compare-and-swap: a stale revision returns `409`, so refresh before retrying.
+The effective-value precedence is **SQLite override, then environment value,
+then the built-in default**. Sending `null` for an editable field removes its
+SQLite override and immediately falls back to the environment/default value.
+Deadlines already written to existing jobs are historical and are not
+recomputed when a TTL changes; new jobs and future cleanup decisions use the
+new effective policy. The UI labels this non-retroactive behavior explicitly.
+
+Paths (input, output, state, staging, and temporary roots), the bearer token,
+model/engine and backend settings, and concurrency/capacity limits are
+read-only in the UI. Change those through the deployment environment and
+restart when required. The token entered on the page is kept only in page
+memory, is sent as a bearer header for API calls, and is not written to
+localStorage, cookies, SQLite, or server configuration; reload or clear the
+page to discard it.
+
 ## Authentication and errors
 
 When `DOCLING_SERVICE_API_TOKEN` is configured, every `/v1` request must send:

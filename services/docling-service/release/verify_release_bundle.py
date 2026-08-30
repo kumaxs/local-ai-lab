@@ -21,6 +21,9 @@ REQUIRED_FILES = {
     "services/docling-service/deploy/docker/compose.release.yaml",
     "services/docling-service/deploy/macos/install.sh",
     "services/docling-service/docling_service/release.py",
+    "services/docling-service/docling_service/ui/index.html",
+    "services/docling-service/docling_service/ui/main.js",
+    "services/docling-service/docling_service/ui/styles.css",
     "docs/integrations/docling-serve-quality-parity/quality_parity_adapter.py",
     "docs/integrations/docling-serve-quality-parity/pdf_structure_inventory.py",
 }

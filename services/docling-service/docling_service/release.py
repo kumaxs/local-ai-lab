@@ -13,6 +13,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
@@ -20,7 +21,7 @@ import urllib.parse
 import urllib.request
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping
@@ -31,15 +32,82 @@ from .lifecycle import (
     QuotaManager,
     QuotaPolicy,
     RetentionPolicy,
+    open_relative_file,
     safe_delete_tree,
     safe_resolve,
 )
-from .persistence import SQLiteStore
+from .persistence import RuntimeConfigConflict, SQLiteStore
 from .webhook import WebhookDispatcher, validate_callback_url
 
 
 RELEASE_VERSION = "1.1.1"
 TERMINAL_STATES = {"succeeded", "failed", "interrupted"}
+
+
+class OutputExpiredError(FileNotFoundError):
+    """Raised when output existed but its persisted lifecycle deadline passed."""
+
+
+# Settings that can be changed safely while the service is running.  The
+# environment-backed ReleaseConfig remains the immutable baseline; persisted
+# overrides are layered on top and can be removed by sending ``null``.
+RUNTIME_CONFIG_SPECS: dict[str, dict[str, Any]] = {
+    "input_ttl_seconds": {
+        "minimum": 60,
+        "maximum": 10 * 365 * 24 * 60 * 60,
+        "label": "Input retention",
+        "description": "Seconds before uploaded source files are eligible for cleanup.",
+    },
+    "success_output_ttl_seconds": {
+        "minimum": 60,
+        "maximum": 10 * 365 * 24 * 60 * 60,
+        "label": "Successful output retention",
+        "description": "Seconds before successful artifacts are eligible for cleanup.",
+    },
+    "failed_output_ttl_seconds": {
+        "minimum": 60,
+        "maximum": 10 * 365 * 24 * 60 * 60,
+        "label": "Failed output retention",
+        "description": "Seconds before failed/interrupted artifacts are eligible for cleanup.",
+    },
+    "job_ttl_seconds": {
+        "minimum": 60,
+        "maximum": 10 * 365 * 24 * 60 * 60,
+        "label": "Job record retention",
+        "description": "Seconds before terminal job tombstones are eligible for cleanup.",
+    },
+    "staging_ttl_seconds": {
+        "minimum": 60,
+        "maximum": 7 * 24 * 60 * 60,
+        "label": "Staging retention",
+        "description": "Seconds before abandoned staging directories are eligible for cleanup.",
+    },
+    "temp_ttl_seconds": {
+        "minimum": 60,
+        "maximum": 7 * 24 * 60 * 60,
+        "label": "Temporary retention",
+        "description": "Seconds before unprotected temporary uploads are eligible for cleanup.",
+    },
+    "cleanup_interval_seconds": {
+        "minimum": 10,
+        "maximum": 24 * 60 * 60,
+        "label": "Cleanup interval",
+        "description": "Seconds between janitor scans.",
+    },
+    "idempotency_ttl_seconds": {
+        "minimum": 60,
+        "maximum": 30 * 24 * 60 * 60,
+        "label": "Idempotency retention",
+        "description": "Seconds idempotency keys remain replayable.",
+    },
+    "download_lease_seconds": {
+        "minimum": 30,
+        "maximum": 24 * 60 * 60,
+        "label": "Download lease",
+        "description": "Seconds an active download lease protects an artifact.",
+    },
+}
+EDITABLE_RUNTIME_KEYS = tuple(RUNTIME_CONFIG_SPECS)
 
 
 def utc_now() -> str:
@@ -317,9 +385,15 @@ class ReleaseConfig:
             profile=profile,
             serve_url=os.getenv("DOCLING_SERVE_URL", "http://127.0.0.1:5001").rstrip("/"),
             adapter_path=Path(os.getenv("DOCLING_QUALITY_ADAPTER", str(default_adapter))).resolve(),
-            input_root=Path(os.getenv("DOCLING_INPUT_ROOT", str(default_data / "inputs"))).resolve(),
-            output_root=Path(os.getenv("DOCLING_OUTPUT_ROOT", str(default_data / "outputs"))).resolve(),
-            state_root=Path(os.getenv("DOCLING_STATE_ROOT", str(default_data / "state"))).resolve(),
+            input_root=Path(
+                os.getenv("DOCLING_INPUT_ROOT", str(default_data / "inputs"))
+            ).expanduser().absolute(),
+            output_root=Path(
+                os.getenv("DOCLING_OUTPUT_ROOT", str(default_data / "outputs"))
+            ).expanduser().absolute(),
+            state_root=Path(
+                os.getenv("DOCLING_STATE_ROOT", str(default_data / "state"))
+            ).expanduser().absolute(),
             max_upload_bytes=int(os.getenv("DOCLING_MAX_UPLOAD_BYTES", str(256 * 1024 * 1024))),
             max_concurrent_jobs=max(1, int(os.getenv("DOCLING_MAX_CONCURRENT_JOBS", "1"))),
             conversion_timeout_seconds=max(
@@ -432,7 +506,11 @@ class ReleaseConfig:
             self.staging_root,
             self.temp_root,
         ):
+            if path.absolute().is_symlink():
+                raise ValueError(f"configured runtime directory must not be a symlink: {path}")
             path.mkdir(parents=True, exist_ok=True)
+            if path.absolute().is_symlink() or not path.is_dir():
+                raise ValueError(f"configured runtime directory is unsafe: {path}")
 
     @property
     def database_path(self) -> Path:
@@ -607,11 +685,60 @@ def probe_formula_service(config: ReleaseConfig, timeout: float = 3.0) -> dict[s
 
 def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    serialized = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
+    if os.name == "nt":  # pragma: no cover - production profiles are POSIX
+        descriptor, temporary_name = tempfile.mkstemp(
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+        )
+        temporary = Path(temporary_name)
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                handle.write(serialized)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, path)
+        finally:
+            temporary.unlink(missing_ok=True)
+        return
+
+    parent = path.parent.absolute()
+    if parent.is_symlink():
+        raise PermissionError(f"refusing to write through symlink directory: {parent}")
+    directory_fd = os.open(
+        parent,
+        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
     )
-    temporary.replace(path)
+    temporary_name = f".{path.name}.{uuid.uuid4().hex}.tmp"
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(
+            temporary_name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+            dir_fd=directory_fd,
+        )
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            descriptor = None
+            handle.write(serialized)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(
+            temporary_name,
+            path.name,
+            src_dir_fd=directory_fd,
+            dst_dir_fd=directory_fd,
+        )
+        os.fsync(directory_fd)
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        try:
+            os.unlink(temporary_name, dir_fd=directory_fd)
+        except FileNotFoundError:
+            pass
+        os.close(directory_fd)
 
 
 def _sha256_path(path: Path) -> str:
@@ -707,6 +834,10 @@ class DownloadLease:
                 self._lease_id, ttl_seconds=self._ttl_seconds
             )
 
+    @property
+    def renew_interval_seconds(self) -> float:
+        return min(30.0, max(1.0, self._ttl_seconds / 2))
+
     def release(self) -> None:
         if not self._released:
             self._store.release_download_lease(self._lease_id)
@@ -727,6 +858,10 @@ class JobManager:
     ) -> None:
         config.validate()
         config.ensure_directories()
+        # Keep this object immutable forever as the environment baseline.  The
+        # public ``config`` attribute is an effective dataclass rebuilt from
+        # that baseline plus validated persisted overrides.
+        self._environment_config = config
         self.config = config
         self._runner = runner
         self._lock = threading.RLock()
@@ -739,9 +874,22 @@ class JobManager:
             webhook_max_attempts=config.webhook_max_attempts,
             max_webhook_subscriptions=config.max_webhook_subscriptions,
         )
+        persisted_runtime = self.store.runtime_config_snapshot()
+        self._runtime_config_revision = int(persisted_runtime.get("revision", 0))
+        self._runtime_overrides = self._validated_runtime_overrides(
+            persisted_runtime.get("overrides", {})
+        )
+        self.config = replace(self._environment_config, **self._runtime_overrides)
         self._pending_input_ids: set[str] = set()
         self._active_temp_names: set[str] = set()
-        self.store.import_legacy_state_jobs(config.state_root)
+        self.store.import_legacy_state_jobs(
+            config.state_root,
+            runtime_config_revision=self._runtime_config_revision,
+            input_ttl_seconds=self.config.input_ttl_seconds,
+            success_output_ttl_seconds=self.config.success_output_ttl_seconds,
+            failed_output_ttl_seconds=self.config.failed_output_ttl_seconds,
+            job_ttl_seconds=self.config.job_ttl_seconds,
+        )
         self._quota = QuotaManager(
             QuotaPolicy(
                 max_pending=config.max_pending_jobs,
@@ -758,12 +906,12 @@ class JobManager:
         self._janitor = Janitor(
             self.store,
             retention=RetentionPolicy(
-                input_ttl=config.input_ttl_seconds,
-                success_output_ttl=config.success_output_ttl_seconds,
-                failed_output_ttl=config.failed_output_ttl_seconds,
-                tombstone_ttl=config.job_ttl_seconds,
-                staging_ttl=config.staging_ttl_seconds,
-                temp_ttl=config.temp_ttl_seconds,
+                input_ttl=self.config.input_ttl_seconds,
+                success_output_ttl=self.config.success_output_ttl_seconds,
+                failed_output_ttl=self.config.failed_output_ttl_seconds,
+                tombstone_ttl=self.config.job_ttl_seconds,
+                staging_ttl=self.config.staging_ttl_seconds,
+                temp_ttl=self.config.temp_ttl_seconds,
             ),
             input_root=config.input_root,
             output_root=config.output_root,
@@ -771,14 +919,14 @@ class JobManager:
             staging_root=config.staging_root,
             temp_root=config.temp_root,
             download_lease=self.store.has_active_download,
-            scan_interval_seconds=config.cleanup_interval_seconds,
+            scan_interval_seconds=self.config.cleanup_interval_seconds,
             pending_inputs=self._pending_inputs_snapshot,
             protected_temp_entries=self._active_temp_snapshot,
             maintenance=(
                 self.store.purge_expired_download_leases,
                 self.store.purge_expired_idempotency_keys,
                 lambda: self.store.purge_webhook_deliveries(
-                    max_age_seconds=config.webhook_delivery_ttl_seconds
+                    max_age_seconds=self.config.webhook_delivery_ttl_seconds
                 ),
             ),
         )
@@ -801,6 +949,183 @@ class JobManager:
 
     def _state_path(self, job_id: str) -> Path:
         return self.config.state_root / "jobs" / f"{job_id}.json"
+
+    @staticmethod
+    def _validate_runtime_value(key: str, value: Any) -> int | None:
+        if key not in RUNTIME_CONFIG_SPECS:
+            raise ValueError(f"runtime configuration key is not editable: {key}")
+        if value is None:
+            return None
+        if isinstance(value, bool) or type(value) is not int:
+            raise ValueError(f"{key} must be an integer or null")
+        spec = RUNTIME_CONFIG_SPECS[key]
+        minimum = int(spec["minimum"])
+        maximum = int(spec["maximum"])
+        if value < minimum or value > maximum:
+            raise ValueError(f"{key} must be between {minimum} and {maximum}")
+        return value
+
+    @classmethod
+    def _validated_runtime_overrides(cls, overrides: Any) -> dict[str, int]:
+        if not isinstance(overrides, Mapping):
+            return {}
+        valid: dict[str, int] = {}
+        for key, value in overrides.items():
+            # Invalid persisted values are ignored rather than allowed to
+            # poison service startup.  API writes are strict and fail before
+            # reaching the store.
+            if key not in RUNTIME_CONFIG_SPECS:
+                continue
+            try:
+                normalized = cls._validate_runtime_value(str(key), value)
+            except ValueError:
+                continue
+            if normalized is not None:
+                valid[str(key)] = normalized
+        return valid
+
+    def _reconfigure_janitor_locked(self) -> None:
+        """Apply the effective lifecycle policy to the live janitor.
+
+        Caller must hold ``self._lock``.  The Janitor itself synchronizes its
+        policy and only wakes its wait; no cleanup is run inline.
+        """
+        if not hasattr(self, "_janitor"):
+            return
+        self._janitor.reconfigure(
+            retention=RetentionPolicy(
+                input_ttl=self.config.input_ttl_seconds,
+                success_output_ttl=self.config.success_output_ttl_seconds,
+                failed_output_ttl=self.config.failed_output_ttl_seconds,
+                tombstone_ttl=self.config.job_ttl_seconds,
+                staging_ttl=self.config.staging_ttl_seconds,
+                temp_ttl=self.config.temp_ttl_seconds,
+            ),
+            scan_interval_seconds=self.config.cleanup_interval_seconds,
+        )
+
+    def _refresh_runtime_config_locked(self) -> dict[str, Any]:
+        persisted = self.store.runtime_config_snapshot()
+        revision = int(persisted.get("revision", self._runtime_config_revision))
+        if revision != self._runtime_config_revision:
+            self._runtime_config_revision = revision
+            self._runtime_overrides = self._validated_runtime_overrides(
+                persisted.get("overrides", {})
+            )
+            self.config = replace(self._environment_config, **self._runtime_overrides)
+            self._reconfigure_janitor_locked()
+        return persisted
+
+    def runtime_config_snapshot(self) -> dict[str, Any]:
+        """Return the redacted runtime policy snapshot used by the Web UI."""
+        with self._lock:
+            persisted = self._refresh_runtime_config_locked()
+            revision = int(persisted.get("revision", self._runtime_config_revision))
+
+            editable: dict[str, dict[str, Any]] = {}
+            for key in EDITABLE_RUNTIME_KEYS:
+                spec = RUNTIME_CONFIG_SPECS[key]
+                effective = int(getattr(self.config, key))
+                environment_value = int(getattr(self._environment_config, key))
+                editable[key] = {
+                    "value": effective,
+                    "environment_value": environment_value,
+                    "overridden": key in self._runtime_overrides,
+                    "minimum": int(spec["minimum"]),
+                    "maximum": int(spec["maximum"]),
+                    "unit": "seconds",
+                    "label": str(spec["label"]),
+                    "description": str(spec["description"]),
+                    "requires_restart": False,
+                }
+
+            # Never include api_token (or any token-bearing path) in this
+            # payload.  A configured boolean is sufficient for operators.
+            readonly_values: dict[str, tuple[Any, str]] = {
+                "max_upload_bytes": (
+                    int(self._environment_config.max_upload_bytes),
+                    "environment-managed upload limit",
+                ),
+                "max_concurrent_uploads": (
+                    int(self._environment_config.max_concurrent_uploads),
+                    "environment-managed upload concurrency",
+                ),
+                "max_concurrent_jobs": (
+                    int(self._environment_config.max_concurrent_jobs),
+                    "environment-managed worker concurrency",
+                ),
+                "min_free_bytes": (
+                    int(self._environment_config.min_free_bytes),
+                    "environment-managed free-space guard",
+                ),
+                "webhook_max_attempts": (
+                    int(self._environment_config.webhook_max_attempts),
+                    "environment-managed retry limit",
+                ),
+                "webhook_delivery_ttl_seconds": (
+                    int(self._environment_config.webhook_delivery_ttl_seconds),
+                    "not editable while the service is running",
+                ),
+                "api_token_configured": (
+                    bool(self._environment_config.api_token),
+                    "only whether a token is configured is exposed",
+                ),
+            }
+            readonly = {
+                key: {"value": value, "reason": reason}
+                for key, (value, reason) in readonly_values.items()
+            }
+            return {
+                "revision": revision,
+                "updated_at": persisted.get("updated_at"),
+                "server_time": utc_now(),
+                "existing_job_expiries_unchanged": True,
+                "editable": editable,
+                "readonly": readonly,
+            }
+
+    def update_runtime_config(
+        self,
+        expected_revision: int,
+        changes: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Apply a strict runtime override patch using optimistic CAS."""
+        if isinstance(expected_revision, bool) or type(expected_revision) is not int or expected_revision < 0:
+            raise ValueError("revision must be a non-negative integer")
+        if not isinstance(changes, Mapping):
+            raise ValueError("changes must be an object")
+
+        with self._lock:
+            persisted = self.store.runtime_config_snapshot()
+            current_revision = int(persisted.get("revision", 0))
+            if current_revision != expected_revision:
+                raise RuntimeConfigConflict(
+                    f"runtime configuration revision {current_revision} does not match {expected_revision}"
+                )
+            current_overrides = self._validated_runtime_overrides(
+                persisted.get("overrides", {})
+            )
+            for raw_key, raw_value in changes.items():
+                key = str(raw_key)
+                normalized = self._validate_runtime_value(key, raw_value)
+                if normalized is None:
+                    current_overrides.pop(key, None)
+                else:
+                    current_overrides[key] = normalized
+
+            stored = self.store.update_runtime_config(
+                expected_revision,
+                current_overrides,
+            )
+            self._runtime_config_revision = int(stored.get("revision", expected_revision + 1))
+            self._runtime_overrides = dict(current_overrides)
+            self.config = replace(self._environment_config, **self._runtime_overrides)
+
+            # Apply only the components whose runtime policy changed.  The
+            # janitor's reconfigure wakes its wait but deliberately does not
+            # invoke run_once, so a PATCH cannot trigger an immediate purge.
+            self._reconfigure_janitor_locked()
+            return self.runtime_config_snapshot()
 
     def _pending_inputs_snapshot(self) -> set[str]:
         with self._lock:
@@ -847,6 +1172,15 @@ class JobManager:
         base = datetime.fromisoformat(start) if start else datetime.now(timezone.utc)
         return (base + timedelta(seconds=seconds)).isoformat()
 
+    @staticmethod
+    def _job_policy_ttl(
+        record: Mapping[str, Any], key: str, fallback: int
+    ) -> int:
+        value = record.get(key)
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+            return value
+        return fallback
+
     def _recover_interrupted_jobs(self) -> None:
         for state in ("queued", "running"):
             page = self.store.list_jobs(state=state, limit=1000, include_tombstoned=True)
@@ -873,9 +1207,19 @@ class JobManager:
                     self.store.update_job(
                         job_id,
                         output_expires_at=self._expiry(
-                            self.config.success_output_ttl_seconds
+                            self._job_policy_ttl(
+                                record,
+                                "success_output_ttl_seconds",
+                                self.config.success_output_ttl_seconds,
+                            )
                         ),
-                        tombstone_expires_at=self._expiry(self.config.job_ttl_seconds),
+                        tombstone_expires_at=self._expiry(
+                            self._job_policy_ttl(
+                                record,
+                                "job_ttl_seconds",
+                                self.config.job_ttl_seconds,
+                            )
+                        ),
                     )
                     self.store.finalize_job(
                         job_id,
@@ -891,9 +1235,19 @@ class JobManager:
                     self.store.update_job(
                         job_id,
                         output_expires_at=self._expiry(
-                            self.config.failed_output_ttl_seconds
+                            self._job_policy_ttl(
+                                record,
+                                "failed_output_ttl_seconds",
+                                self.config.failed_output_ttl_seconds,
+                            )
                         ),
-                        tombstone_expires_at=self._expiry(self.config.job_ttl_seconds),
+                        tombstone_expires_at=self._expiry(
+                            self._job_policy_ttl(
+                                record,
+                                "job_ttl_seconds",
+                                self.config.job_ttl_seconds,
+                            )
+                        ),
                     )
                     self.store.finalize_job(
                         job_id,
@@ -914,6 +1268,18 @@ class JobManager:
         request_fingerprint: str | None = None,
         client_reference: str | None = None,
     ) -> tuple[JobRecord, bool]:
+        # Runtime-config PATCH uses the same lock. A job therefore captures one
+        # coherent lifecycle policy, and completion can never mix old/new TTLs.
+        with self._lock:
+            self._refresh_runtime_config_locked()
+            lifecycle_policy = {
+                "runtime_config_revision": self._runtime_config_revision,
+                "input_ttl_seconds": self.config.input_ttl_seconds,
+                "success_output_ttl_seconds": self.config.success_output_ttl_seconds,
+                "failed_output_ttl_seconds": self.config.failed_output_ttl_seconds,
+                "job_ttl_seconds": self.config.job_ttl_seconds,
+                "idempotency_ttl_seconds": self.config.idempotency_ttl_seconds,
+            }
         input_size = input_path.stat().st_size
         input_sha256 = _sha256_path(input_path)
         fingerprint = request_fingerprint or hashlib.sha256(
@@ -961,7 +1327,7 @@ class JobManager:
                 idempotency_key=idempotency_key or f"internal:{job_id}",
                 job_id=job_id,
                 request_fingerprint=fingerprint,
-                idempotency_ttl_seconds=self.config.idempotency_ttl_seconds,
+                idempotency_ttl_seconds=lifecycle_policy["idempotency_ttl_seconds"],
                 original_name=original_name,
                 client_reference=client_reference,
                 input_path=str(final_input),
@@ -970,8 +1336,17 @@ class JobManager:
                 input_size_bytes=input_size,
                 reserved_output_bytes=self.config.max_output_bytes,
                 input_expires_at=self._expiry(
-                    self.config.input_ttl_seconds, start=created_at
+                    lifecycle_policy["input_ttl_seconds"], start=created_at
                 ),
+                runtime_config_revision=lifecycle_policy["runtime_config_revision"],
+                input_ttl_seconds=lifecycle_policy["input_ttl_seconds"],
+                success_output_ttl_seconds=lifecycle_policy[
+                    "success_output_ttl_seconds"
+                ],
+                failed_output_ttl_seconds=lifecycle_policy[
+                    "failed_output_ttl_seconds"
+                ],
+                job_ttl_seconds=lifecycle_policy["job_ttl_seconds"],
                 created_at=created_at,
             )
         except BaseException:
@@ -1295,6 +1670,8 @@ class JobManager:
                 state="running",
                 started_at=utc_now(),
                 error=None,
+                progress_stage="converting",
+                progress_message="conversion adapter running",
             )
             if updated.get("error"):
                 return
@@ -1325,9 +1702,19 @@ class JobManager:
                 )
             exit_code = completed.returncode
             if completed.returncode == 0:
+                self.store.update_progress(
+                    job_id,
+                    "validating",
+                    message="checking the published output contract",
+                )
                 manifest = self._validate_success_outputs(
                     self.config.staging_root / job_id,
                     expected_input_sha256=expected_input_sha256,
+                )
+                self.store.update_progress(
+                    job_id,
+                    "publishing",
+                    message="publishing validated artifacts",
                 )
                 self._publish_staging(job_id)
                 state = "succeeded"
@@ -1349,17 +1736,30 @@ class JobManager:
             # durable task to a terminal state on unexpected adapter failures.
             error = f"unexpected conversion failure: {type(exc).__name__}: {exc}"
             manifest = self._publish_partial(job_id)
-        output_ttl = (
-            self.config.success_output_ttl_seconds
-            if state == "succeeded"
-            else self.config.failed_output_ttl_seconds
+        output_ttl = self._job_policy_ttl(
+            updated,
+            (
+                "success_output_ttl_seconds"
+                if state == "succeeded"
+                else "failed_output_ttl_seconds"
+            ),
+            (
+                self.config.success_output_ttl_seconds
+                if state == "succeeded"
+                else self.config.failed_output_ttl_seconds
+            ),
+        )
+        tombstone_ttl = self._job_policy_ttl(
+            updated,
+            "job_ttl_seconds",
+            self.config.job_ttl_seconds,
         )
         event_type = f"docling.job.{state}"
         with self._lock:
             self.store.update_job(
                 job_id,
                 output_expires_at=self._expiry(output_ttl),
-                tombstone_expires_at=self._expiry(self.config.job_ttl_seconds),
+                tombstone_expires_at=self._expiry(tombstone_ttl),
             )
             result = self.store.finalize_job(
                 job_id,
@@ -1380,6 +1780,16 @@ class JobManager:
             raise FileNotFoundError(job_id)
         if record.get("output_deleted_at"):
             return []
+        output_expires_at = record.get("output_expires_at")
+        if isinstance(output_expires_at, str) and output_expires_at:
+            try:
+                deadline = datetime.fromisoformat(output_expires_at.replace("Z", "+00:00"))
+                if deadline.tzinfo is None:
+                    deadline = deadline.replace(tzinfo=timezone.utc)
+                if deadline <= datetime.now(timezone.utc):
+                    raise OutputExpiredError("output_expired")
+            except ValueError:
+                pass
         manifest = self.store.list_manifest(job_id)
         files = []
         for item in manifest.get("items", []):
@@ -1400,22 +1810,20 @@ class JobManager:
             )
         return files
 
-    def resolve_output_file(self, job_id: str, relative_path: str) -> Path:
+    def resolve_output_root(self, job_id: str) -> Path:
         record = self.store.get_job(job_id)
-        if not record:
+        if not record or record.get("output_deleted_at"):
             raise FileNotFoundError(job_id)
-        if record.get("output_deleted_at"):
-            raise FileNotFoundError(relative_path)
         raw_root = Path(str(record["output_dir"]))
         expected_root = self.config.output_root / job_id
-        if raw_root != expected_root or raw_root.is_symlink():
+        if raw_root != expected_root or raw_root.absolute().is_symlink():
             raise PermissionError("output job directory is outside its configured boundary")
         root = safe_resolve(self.config.output_root, raw_root)
-        if root != expected_root.resolve():
+        if root != expected_root.resolve() or not root.is_dir():
             raise PermissionError("output job directory is outside its configured boundary")
-        candidate = safe_resolve(root, root / relative_path)
-        if candidate == root:
-            raise PermissionError("output path must name a file")
+        return root
+
+    def _published_output_item(self, job_id: str, relative_path: str) -> dict[str, Any]:
         published = {
             str(item.get("path")): item
             for item in self.store.list_manifest(job_id).get("items", [])
@@ -1423,6 +1831,39 @@ class JobManager:
         manifest_item = published.get(relative_path)
         if manifest_item is None:
             raise FileNotFoundError(relative_path)
+        return manifest_item
+
+    def open_output_file(self, job_id: str, relative_path: str) -> tuple[Any, int]:
+        """Return a verified, already-open output handle anchored below the job root."""
+
+        root = self.resolve_output_root(job_id)
+        manifest_item = self._published_output_item(job_id, relative_path)
+        try:
+            handle = open_relative_file(root, relative_path)
+        except OSError as exc:
+            raise FileNotFoundError(relative_path) from exc
+        try:
+            size_bytes = int(os.fstat(handle.fileno()).st_size)
+            if size_bytes != int(manifest_item.get("size_bytes", -1)):
+                raise ValueError("output size no longer matches the published manifest")
+            digest = hashlib.sha256()
+            while chunk := handle.read(1024 * 1024):
+                digest.update(chunk)
+            expected_sha256 = str(manifest_item.get("sha256") or "")
+            if len(expected_sha256) != 64 or digest.hexdigest() != expected_sha256:
+                raise ValueError("output hash no longer matches the published manifest")
+            handle.seek(0)
+            return handle, size_bytes
+        except BaseException:
+            handle.close()
+            raise
+
+    def resolve_output_file(self, job_id: str, relative_path: str) -> Path:
+        root = self.resolve_output_root(job_id)
+        candidate = safe_resolve(root, root / relative_path)
+        if candidate == root:
+            raise PermissionError("output path must name a file")
+        manifest_item = self._published_output_item(job_id, relative_path)
         if not candidate.is_file() or candidate.is_symlink():
             raise FileNotFoundError(relative_path)
         if candidate.stat().st_size != int(manifest_item.get("size_bytes", -1)):
@@ -1471,11 +1912,9 @@ class JobManager:
         if result.get("error"):
             if result["error"] == "invalid_relative_path":
                 raise PermissionError(str(result["error"]))
-            if result["error"] in {
-                "job_not_found",
-                "output_expired",
-                "file_not_published",
-            }:
+            if result["error"] == "output_expired":
+                raise OutputExpiredError(str(result["error"]))
+            if result["error"] in {"job_not_found", "file_not_published"}:
                 raise FileNotFoundError(str(result["error"]))
             raise RuntimeError(str(result["error"]))
         return DownloadLease(
@@ -1515,16 +1954,26 @@ class JobManager:
             raise FileNotFoundError(job_id)
         if record.get("state") not in TERMINAL_STATES:
             raise RuntimeError("job_not_terminal")
-        if self.store.has_active_download(job_id):
-            raise RuntimeError("download_in_progress")
         now = datetime.now(timezone.utc).timestamp()
-        for kind, root, target in (
-            ("input", self.config.input_root, Path(str(record["input_path"])).parent),
-            ("output", self.config.output_root, Path(str(record["output_dir"]))),
+
+        # Claim output first. The store checks download leases and publishes
+        # the cleanup claim in one transaction; later lease acquisition checks
+        # that same claim, so neither side can slip through the other's check.
+        for kind, root, target, deleted_field in (
+            ("output", self.config.output_root, Path(str(record["output_dir"])), "output_deleted_at"),
+            ("input", self.config.input_root, Path(str(record["input_path"])).parent, "input_deleted_at"),
         ):
+            current = self.store.get_job(job_id)
+            if current.get(deleted_field):
+                continue
             lease_id = self.store.claim_cleanup(job_id, kind, now)
             if not lease_id:
-                continue
+                current = self.store.get_job(job_id)
+                if current.get(deleted_field):
+                    continue
+                if kind == "output" and self.store.has_active_download(job_id):
+                    raise RuntimeError("download_in_progress")
+                raise RuntimeError(f"{kind}_cleanup_in_progress")
             try:
                 deleted = safe_delete_tree(root, target)
             except Exception as exc:
@@ -1544,9 +1993,16 @@ class JobManager:
                 error=None,
             )
         deleted_at = utc_now()
+        tombstone_expires_at = record.get("tombstone_expires_at") or self._expiry(
+            self._job_policy_ttl(
+                record,
+                "job_ttl_seconds",
+                self.config.job_ttl_seconds,
+            )
+        )
         self.store.update_job(
             job_id,
-            tombstone_expires_at=self._expiry(self.config.job_ttl_seconds),
+            tombstone_expires_at=tombstone_expires_at,
             delete_requested_at=deleted_at,
             deleted=True,
             deleted_at=deleted_at,

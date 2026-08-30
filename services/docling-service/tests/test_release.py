@@ -3,12 +3,14 @@ from __future__ import annotations
 import errno
 import hashlib
 from dataclasses import replace
+from datetime import datetime
 import json
 import os
 import subprocess
 import tempfile
 import time
 import unittest
+import uuid
 from unittest.mock import patch
 from pathlib import Path
 
@@ -17,6 +19,8 @@ from docling_service.release import (
     JobManager,
     JobRecord,
     ReleaseConfig,
+    RuntimeConfigConflict,
+    _atomic_json,
     build_adapter_command,
 )
 
@@ -191,6 +195,169 @@ class ReleaseConfigTests(unittest.TestCase):
             config2 = make_config(root / "auto-missing", formula_second_pass_policy="auto")
             self.assertEqual("off", config.effective_formula_second_pass_policy())
             self.assertEqual("off", config2.effective_formula_second_pass_policy())
+
+    def test_runtime_config_cas_reset_and_startup_override(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = replace(make_config(root), api_token="test-token")
+            manager = JobManager(config, runner=lambda *args, **kwargs: None)
+            try:
+                initial = manager.runtime_config_snapshot()
+                self.assertEqual(0, initial["revision"])
+                self.assertEqual(
+                    {
+                        "input_ttl_seconds",
+                        "success_output_ttl_seconds",
+                        "failed_output_ttl_seconds",
+                        "job_ttl_seconds",
+                        "staging_ttl_seconds",
+                        "temp_ttl_seconds",
+                        "cleanup_interval_seconds",
+                        "idempotency_ttl_seconds",
+                        "download_lease_seconds",
+                    },
+                    set(initial["editable"]),
+                )
+                self.assertIsInstance(
+                    initial["readonly"]["api_token_configured"]["value"], bool
+                )
+                self.assertNotIn("test-token", json.dumps(initial))
+
+                changed = manager.update_runtime_config(
+                    initial["revision"],
+                    {
+                        "input_ttl_seconds": 120,
+                        "failed_output_ttl_seconds": 180,
+                        "cleanup_interval_seconds": 15,
+                        "download_lease_seconds": 60,
+                    },
+                )
+                self.assertEqual(120, changed["editable"]["input_ttl_seconds"]["value"])
+                self.assertEqual(
+                    86400,
+                    changed["editable"]["input_ttl_seconds"]["environment_value"],
+                )
+                with self.assertRaises(RuntimeConfigConflict):
+                    manager.update_runtime_config(initial["revision"], {})
+
+                reset = manager.update_runtime_config(
+                    changed["revision"], {"input_ttl_seconds": None}
+                )
+                self.assertFalse(reset["editable"]["input_ttl_seconds"]["overridden"])
+                self.assertEqual(86400, reset["editable"]["input_ttl_seconds"]["value"])
+            finally:
+                manager.shutdown()
+
+            restarted = JobManager(config, runner=lambda *args, **kwargs: None)
+            try:
+                persisted = restarted.runtime_config_snapshot()
+                self.assertEqual(60, persisted["editable"]["download_lease_seconds"]["value"])
+                self.assertEqual(180, restarted._janitor.retention.failed_output_ttl)
+                self.assertEqual(15.0, restarted._janitor.scan_interval_seconds)
+                self.assertEqual(2, persisted["revision"])
+            finally:
+                restarted.shutdown()
+
+    def test_accepted_jobs_keep_their_lifecycle_policy_after_config_patch(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = make_config(root)
+
+            def failed_runner(command, **_kwargs):
+                return subprocess.CompletedProcess(command, 1, "", "expected failure")
+
+            manager = JobManager(config, runner=failed_runner)
+            try:
+                with patch.object(manager._executor, "submit", return_value=None):
+                    before_upload = root / "before.pdf"
+                    before_upload.write_bytes(b"%PDF-1.7\nbefore\n%%EOF\n")
+                    before, _ = manager.submit_job(before_upload, "before.pdf")
+                    before_record = manager.store.get_job(before.job_id)
+                    before_input_deadline = before_record["input_expires_at"]
+
+                    snapshot = manager.runtime_config_snapshot()
+                    manager.update_runtime_config(
+                        snapshot["revision"],
+                        {
+                            "input_ttl_seconds": 120,
+                            "failed_output_ttl_seconds": 240,
+                            "job_ttl_seconds": 300,
+                        },
+                    )
+                    after_upload = root / "after.pdf"
+                    after_upload.write_bytes(b"%PDF-1.7\nafter\n%%EOF\n")
+                    after, _ = manager.submit_job(after_upload, "after.pdf")
+
+                self.assertEqual(before_input_deadline, manager.store.get_job(before.job_id)["input_expires_at"])
+                self.assertEqual(
+                    config.failed_output_ttl_seconds,
+                    manager.store.get_job(before.job_id)["failed_output_ttl_seconds"],
+                )
+                self.assertEqual(240, manager.store.get_job(after.job_id)["failed_output_ttl_seconds"])
+
+                manager._run(before.job_id)
+                manager._run(after.job_id)
+                before_done = manager.store.get_job(before.job_id)
+                after_done = manager.store.get_job(after.job_id)
+                before_output_ttl = (
+                    datetime.fromisoformat(before_done["output_expires_at"])
+                    - datetime.fromisoformat(before_done["finished_at"])
+                ).total_seconds()
+                after_output_ttl = (
+                    datetime.fromisoformat(after_done["output_expires_at"])
+                    - datetime.fromisoformat(after_done["finished_at"])
+                ).total_seconds()
+                self.assertAlmostEqual(config.failed_output_ttl_seconds, before_output_ttl, delta=2)
+                self.assertAlmostEqual(240, after_output_ttl, delta=2)
+            finally:
+                manager.shutdown()
+
+    def test_delete_does_not_tombstone_when_download_wins_cleanup_race(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = make_config(root)
+            manager = JobManager(config, runner=lambda *_args, **_kwargs: None)
+            try:
+                job_id = str(uuid.uuid4())
+                input_file = config.input_root / job_id / "source.pdf"
+                input_file.parent.mkdir(parents=True)
+                input_file.write_bytes(b"%PDF-1.7\n%%EOF\n")
+                output_dir = config.output_root / job_id
+                output_dir.mkdir()
+                (output_dir / "result.txt").write_text("keep", encoding="utf-8")
+                manager.store.create_job(
+                    job_id=job_id,
+                    original_name="race.pdf",
+                    input_path=str(input_file),
+                    output_dir=str(output_dir),
+                    state="succeeded",
+                )
+
+                original_claim = manager.store.claim_cleanup
+                acquired: dict[str, str] = {}
+
+                def racing_claim(requested_job: str, kind: str, now: float) -> str | None:
+                    if kind == "output" and not acquired:
+                        lease = manager.store.acquire_download_lease(
+                            job_id,
+                            "__archive__",
+                            holder="racing-download",
+                            ttl_seconds=60,
+                        )
+                        acquired["lease_id"] = str(lease["lease_id"])
+                    return original_claim(requested_job, kind, now)
+
+                with patch.object(manager.store, "claim_cleanup", side_effect=racing_claim):
+                    with self.assertRaisesRegex(RuntimeError, "download_in_progress"):
+                        manager.delete_job(job_id)
+
+                current = manager.store.get_job(job_id)
+                self.assertFalse(bool(current["deleted"]))
+                self.assertIsNone(current["output_deleted_at"])
+                self.assertTrue((output_dir / "result.txt").is_file())
+                manager.store.release_download_lease(acquired["lease_id"])
+            finally:
+                manager.shutdown()
 
     def test_effective_formula_second_pass_policy_requires_global_route_b_document(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -946,8 +1113,45 @@ class ReleaseConfigTests(unittest.TestCase):
             self.assertEqual(7, config.max_concurrent_uploads)
             self.assertEqual(9, config.max_webhook_subscriptions)
 
+    @unittest.skipIf(os.name == "nt", "symlink behavior requires POSIX")
+    def test_from_env_preserves_and_rejects_symlink_runtime_root(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            real_state = root / "real-state"
+            real_state.mkdir()
+            linked_state = root / "linked-state"
+            linked_state.symlink_to(real_state, target_is_directory=True)
+            with patch.dict(
+                "os.environ",
+                {
+                    "DOCLING_RELEASE_PROFILE": "macos",
+                    "DOCLING_STATE_ROOT": str(linked_state),
+                },
+                clear=True,
+            ):
+                config = ReleaseConfig.from_env()
+            self.assertTrue(config.state_root.is_symlink())
+            with self.assertRaisesRegex(ValueError, "must not be a symlink"):
+                config.ensure_directories()
+
 
 class JobManagerTests(unittest.TestCase):
+    @unittest.skipIf(os.name == "nt", "symlink behavior requires POSIX")
+    def test_atomic_json_does_not_follow_predictable_temp_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / "jobs" / "job.json"
+            target.parent.mkdir()
+            victim = root / "victim.txt"
+            victim.write_text("do not overwrite", encoding="utf-8")
+            predictable_temp = target.with_suffix(target.suffix + ".tmp")
+            predictable_temp.symlink_to(victim)
+
+            _atomic_json(target, {"state": "safe"})
+
+            self.assertEqual("do not overwrite", victim.read_text(encoding="utf-8"))
+            self.assertEqual({"state": "safe"}, json.loads(target.read_text()))
+
     @unittest.skipIf(os.name == "nt", "symlink behavior requires POSIX")
     def test_staging_job_symlink_is_rejected_and_unlinked(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

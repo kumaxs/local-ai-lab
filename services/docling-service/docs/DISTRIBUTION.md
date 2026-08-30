@@ -82,6 +82,35 @@ The Docker host needs Compose v2, 8 GB assigned memory at minimum (12 GB
 recommended), 15 GB free disk space, and initial network access for model
 downloads. The API binds only to `127.0.0.1` unless explicitly overridden.
 
+## Web UI in the bundle
+
+This section applies to bundles built from the current post-1.1.1 source tree
+and to the next tagged release. The published `v1.1.1` archives and images do
+not contain the Web UI.
+
+Both deployment profiles serve the same packaged UI from the API process:
+
+- Docker: `http://127.0.0.1:8766/ui/`
+- macOS: `http://127.0.0.1:8000/ui/`
+
+`docling_service/ui/index.html`, `main.js`, and `styles.css` are declared as
+package data and are also copied by the release builder's recursive
+`docling_service` source path into both archive formats. The bundle therefore
+needs no Node.js toolchain and does not add a UI Compose service. The page
+supports upload/queue monitoring with trusted phase-level (not page-level)
+progress, artifact download/delete, TTL and storage visibility, and lifecycle
+configuration.
+
+The configuration panel sends revisioned SQLite CAS updates to
+`/v1/system/config`. It can change only input/success-output/failed-output/job,
+staging/temp, cleanup interval, idempotency, and download-lease TTLs. SQLite
+overrides win over environment values, which win over defaults; a `null`
+change clears an override. Existing job deadlines remain unchanged. Paths,
+token, model/engine settings, and concurrency/capacity limits are read-only.
+Unauthenticated downloads use the browser's native streaming path. Bearer-
+protected page downloads are capped at 256 MiB; use a streaming API client for
+larger protected artifacts.
+
 ## Source-build fallback
 
 The bundle retains the tested Dockerfiles and source-build Compose definition.

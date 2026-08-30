@@ -24,6 +24,7 @@ from docling_service.lifecycle import (
     StorageQuotaError,
     StoreProtocol,
     safe_delete_tree,
+    safe_resolve,
 )
 
 
@@ -104,6 +105,30 @@ def _old(path: Path, age_seconds: float, now: float) -> None:
         os.utime(path, (mtime, mtime), follow_symlinks=False)
     except TypeError:
         os.utime(path, (mtime, mtime))
+
+
+class LifecyclePathTests(unittest.TestCase):
+    @unittest.skipIf(os.name == "nt", "symlink behavior requires POSIX")
+    def test_symlink_root_is_rejected_without_deleting_target(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            real_root = base / "real"
+            real_root.mkdir()
+            target = real_root / "keep.txt"
+            target.write_text("keep", encoding="utf-8")
+            linked_root = base / "linked"
+            linked_root.symlink_to(real_root, target_is_directory=True)
+
+            with self.assertRaises(PermissionError):
+                safe_resolve(linked_root, linked_root / "keep.txt")
+            with self.assertRaises(PermissionError):
+                safe_delete_tree(linked_root, linked_root / "keep.txt")
+            self.assertTrue(target.exists())
+
+    def test_retention_rejects_non_finite_values(self) -> None:
+        for value in (float("nan"), float("inf"), float("-inf")):
+            with self.assertRaises(ValueError):
+                RetentionPolicy(input_ttl=value)
 
 
 class QuotaManagerTests(unittest.TestCase):
@@ -619,6 +644,47 @@ class JanitorTests(unittest.TestCase):
             janitor.stop(wait=2.0)
             janitor.stop(wait=2.0)
             janitor.run_once()
+
+    def test_janitor_reconfigure_is_thread_safe_and_does_not_purge_inline(self) -> None:
+        with tempfile.TemporaryDirectory() as root_dir:
+            root = Path(root_dir)
+            with self.assertRaisesRegex(ValueError, "positive"):
+                Janitor(
+                    FakeStore([]),
+                    retention=RetentionPolicy(),
+                    input_root=root,
+                    output_root=root,
+                    tombstone_root=root,
+                    scan_interval_seconds=0,
+                )
+            janitor = Janitor(
+                FakeStore([]),
+                retention=RetentionPolicy(),
+                input_root=root,
+                output_root=root,
+                tombstone_root=root,
+                scan_interval_seconds=60,
+            )
+            calls: list[str] = []
+            original_run_once = janitor.run_once
+
+            def tracked_run_once() -> None:
+                calls.append("run")
+                original_run_once()
+
+            janitor.run_once = tracked_run_once  # type: ignore[method-assign]
+            janitor.start()
+            try:
+                with self.assertRaisesRegex(ValueError, "positive"):
+                    janitor.reconfigure(scan_interval_seconds=float("nan"))
+                janitor.reconfigure(input_ttl=120, scan_interval_seconds=60)
+                # Reconfigure wakes the worker but intentionally does not run
+                # cleanup inline.
+                self.assertEqual(120, janitor.retention.input_ttl)
+                self.assertEqual(60.0, janitor.scan_interval_seconds)
+                self.assertEqual([], calls)
+            finally:
+                janitor.stop(wait=2)
 
     def test_maintenance_purges_run_and_failures_are_retried(self) -> None:
         with tempfile.TemporaryDirectory() as root_dir:

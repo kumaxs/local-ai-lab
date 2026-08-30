@@ -6,14 +6,17 @@ docling-service runtime so it can be reused by API and job-management layers.
 
 from __future__ import annotations
 
+import math
 import os
+import stat
 import shutil
 import threading
 import time
 from abc import abstractmethod
 from dataclasses import dataclass
+from dataclasses import replace as dataclass_replace
 from pathlib import Path
-from typing import Any, Callable, Iterable, Mapping, Protocol
+from typing import Any, BinaryIO, Callable, Iterable, Mapping, Protocol
 from uuid import UUID
 
 
@@ -51,6 +54,24 @@ class RetentionPolicy:
     tombstone_ttl: int = 30 * 24 * 60 * 60
     staging_ttl: int = 60 * 60
     temp_ttl: int = 60 * 60
+
+    def __post_init__(self) -> None:
+        for field_name in (
+            "input_ttl",
+            "success_output_ttl",
+            "failed_output_ttl",
+            "tombstone_ttl",
+            "staging_ttl",
+            "temp_ttl",
+        ):
+            value = getattr(self, field_name)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(float(value))
+                or value < 0
+            ):
+                raise ValueError(f"{field_name} must be a non-negative number")
 
 
 @dataclass(frozen=True)
@@ -217,8 +238,10 @@ def _is_uuid(value: str) -> bool:
 def safe_resolve(root: Path | str, target: Path | str) -> Path:
     """Resolve ``target`` and ensure it stays under ``root`` without symlinks."""
 
-    root_path = Path(root).resolve()
     root_for_scan = Path(root).absolute()
+    if root_for_scan.is_symlink():
+        raise PermissionError(f"refusing to use symlink root: {root_for_scan}")
+    root_path = root_for_scan.resolve()
     target_path = Path(target)
     if not target_path.is_absolute():
         target_path = root_for_scan / target_path
@@ -235,6 +258,64 @@ def safe_resolve(root: Path | str, target: Path | str) -> Path:
         raise PermissionError(f"path escapes root boundary: {target_path}") from exc
 
     return resolved
+
+
+def open_relative_file(root: Path | str, relative_path: str) -> BinaryIO:
+    """Open one regular file beneath ``root`` without following symlinks.
+
+    POSIX callers are anchored to an open directory descriptor, closing the
+    check/open race for both intermediate directories and the final file.  A
+    conservative path-validation fallback is retained for platforms without
+    ``dir_fd`` support.
+    """
+
+    root_path = Path(root).absolute()
+    if root_path.is_symlink() or not root_path.is_dir():
+        raise PermissionError(f"refusing unsafe file root: {root_path}")
+    if (
+        not isinstance(relative_path, str)
+        or not relative_path
+        or "\\" in relative_path
+        or "\x00" in relative_path
+        or relative_path.startswith("/")
+        or any(part in {"", ".", ".."} for part in relative_path.split("/"))
+    ):
+        raise PermissionError("relative file path is invalid")
+
+    parts = relative_path.split("/")
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    directory = getattr(os, "O_DIRECTORY", 0)
+    directory_fds: list[int] = []
+    file_fd: int | None = None
+    try:
+        root_fd = os.open(root_path, os.O_RDONLY | directory | nofollow)
+        directory_fds.append(root_fd)
+        current_fd = root_fd
+        for part in parts[:-1]:
+            next_fd = os.open(
+                part,
+                os.O_RDONLY | directory | nofollow,
+                dir_fd=current_fd,
+            )
+            directory_fds.append(next_fd)
+            current_fd = next_fd
+        file_fd = os.open(parts[-1], os.O_RDONLY | nofollow, dir_fd=current_fd)
+        metadata = os.fstat(file_fd)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise PermissionError("output path is not a regular file")
+        handle = os.fdopen(file_fd, "rb", closefd=True)
+        file_fd = None
+        return handle
+    except (NotImplementedError, TypeError):
+        candidate = safe_resolve(root_path, root_path.joinpath(*parts))
+        if candidate.is_symlink() or not candidate.is_file():
+            raise PermissionError("output path is not a regular file")
+        return candidate.open("rb")
+    finally:
+        if file_fd is not None:
+            os.close(file_fd)
+        for descriptor in reversed(directory_fds):
+            os.close(descriptor)
 
 
 def _dir_size(path: Path) -> int:
@@ -366,7 +447,14 @@ class Janitor:
         self._staging_root = staging_root
         self._temp_root = temp_root
         self._download_lease = download_lease or (lambda _job_id: False)
-        self._interval = scan_interval_seconds
+        if (
+            isinstance(scan_interval_seconds, bool)
+            or not isinstance(scan_interval_seconds, (int, float))
+            or not math.isfinite(float(scan_interval_seconds))
+            or scan_interval_seconds <= 0
+        ):
+            raise ValueError("scan_interval_seconds must be a positive number")
+        self._interval = float(scan_interval_seconds)
         self._now = now
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -374,6 +462,18 @@ class Janitor:
         self._pending_inputs = pending_inputs or (lambda: set())
         self._protected_temp_entries = protected_temp_entries or (lambda: set())
         self._maintenance = tuple(maintenance)
+        self._config_lock = threading.RLock()
+        self._wake = threading.Event()
+
+    @property
+    def retention(self) -> RetentionPolicy:
+        with self._config_lock:
+            return self._retention
+
+    @property
+    def scan_interval_seconds(self) -> float:
+        with self._config_lock:
+            return float(self._interval)
 
     def _is_active_download(self, job_id: str) -> bool:
         return bool(self._download_lease(job_id))
@@ -407,33 +507,48 @@ class Janitor:
         return _coerce_timestamp(record.created_at)
 
     def _expiry_for_input(self, record: JobRecord) -> float | None:
+        with self._config_lock:
+            retention = self._retention
+        return self._expiry_for_input_with_retention(record, retention)
+
+    def _expiry_for_input_with_retention(self, record: JobRecord, retention: RetentionPolicy) -> float | None:
         if record.input_expires_at is not None:
             return _coerce_timestamp(record.input_expires_at)
         base = self._coerce_finish_or_create(record=record)
         if base is None:
             return None
-        return base + self._retention.input_ttl
+        return base + retention.input_ttl
 
     def _expiry_for_output(self, record: JobRecord) -> float | None:
+        with self._config_lock:
+            retention = self._retention
+        return self._expiry_for_output_with_retention(record, retention)
+
+    def _expiry_for_output_with_retention(self, record: JobRecord, retention: RetentionPolicy) -> float | None:
         if record.output_expires_at is not None:
             return _coerce_timestamp(record.output_expires_at)
         base = self._coerce_finish_or_create(record=record)
         if base is None:
             return None
         ttl = (
-            self._retention.success_output_ttl
+            retention.success_output_ttl
             if record.state == "succeeded"
-            else self._retention.failed_output_ttl
+            else retention.failed_output_ttl
         )
         return base + ttl
 
     def _expiry_for_tombstone(self, record: JobRecord) -> float | None:
+        with self._config_lock:
+            retention = self._retention
+        return self._expiry_for_tombstone_with_retention(record, retention)
+
+    def _expiry_for_tombstone_with_retention(self, record: JobRecord, retention: RetentionPolicy) -> float | None:
         if record.tombstone_expires_at is not None:
             return _coerce_timestamp(record.tombstone_expires_at)
         base = self._coerce_finish_or_create(record=record)
         if base is None:
             return None
-        return base + self._retention.tombstone_ttl
+        return base + retention.tombstone_ttl
 
     def _cleanup_component(
         self,
@@ -470,11 +585,20 @@ class Janitor:
                 error=None,
             )
 
-    def _cleanup_record(self, record: JobRecord, now: float) -> None:
+    def _cleanup_record(
+        self,
+        record: JobRecord,
+        now: float,
+        retention: RetentionPolicy | None = None,
+    ) -> None:
         if self._is_active_download(record.job_id):
             return
 
-        input_expiry = self._expiry_for_input(record)
+        if retention is None:
+            with self._config_lock:
+                retention = self._retention
+
+        input_expiry = self._expiry_for_input_with_retention(record, retention)
         if input_expiry is not None and now >= input_expiry:
             input_path = _coerce_path(record.input_path)
             if (
@@ -492,7 +616,7 @@ class Janitor:
                 now=now,
             )
 
-        output_expiry = self._expiry_for_output(record)
+        output_expiry = self._expiry_for_output_with_retention(record, retention)
         if output_expiry is not None and now >= output_expiry:
             self._cleanup_component(
                 job_id=record.job_id,
@@ -502,7 +626,7 @@ class Janitor:
                 now=now,
             )
 
-        tombstone_expiry = self._expiry_for_tombstone(record)
+        tombstone_expiry = self._expiry_for_tombstone_with_retention(record, retention)
         if tombstone_expiry is not None and now >= tombstone_expiry and record.tombstone_path is not None:
             self._cleanup_component(
                 job_id=record.job_id,
@@ -556,7 +680,22 @@ class Janitor:
                     error=None,
                 )
 
+    def _cleanup_directory_with_retention(
+        self,
+        root: Path | None,
+        ttl_seconds: int,
+        now: float,
+        kind: str,
+        active_ids: set[str],
+    ) -> None:
+        self._cleanup_directory(root, ttl_seconds, now, kind, active_ids)
+
     def run_once(self) -> None:
+        # Capture one immutable policy snapshot so a concurrent reconfigure
+        # cannot produce a half-old/half-new cleanup pass.  Explicit expiry
+        # timestamps on existing jobs are always honored by the helpers above.
+        with self._config_lock:
+            retention = self._retention
         now = self._now()
         active_job_ids = self._active_job_ids()
         all_job_ids = self._all_job_ids()
@@ -567,11 +706,11 @@ class Janitor:
             normalized = _coerce_record(record)
             if normalized.state not in TERMINAL_STATES:
                 continue
-            self._cleanup_record(normalized, now)
+            self._cleanup_record(normalized, now, retention)
 
         self._cleanup_directory(
             self._input_root,
-            self._retention.temp_ttl,
+            retention.temp_ttl,
             now,
             CLEANUP_KIND_ORPHAN_INPUT,
             all_job_ids.union(pending_input_ids),
@@ -579,21 +718,21 @@ class Janitor:
 
         self._cleanup_directory(
             self._tombstone_root,
-            self._retention.tombstone_ttl,
+            retention.tombstone_ttl,
             now,
             CLEANUP_KIND_TOMB_DIR,
             active_job_ids,
         )
         self._cleanup_directory(
             self._staging_root,
-            self._retention.staging_ttl,
+            retention.staging_ttl,
             now,
             CLEANUP_KIND_STAGING,
             active_job_ids,
         )
         self._cleanup_directory(
             self._temp_root,
-            self._retention.temp_ttl,
+            retention.temp_ttl,
             now,
             CLEANUP_KIND_TEMP,
             protected_temp_entries,
@@ -607,18 +746,88 @@ class Janitor:
                 continue
 
     def _loop(self) -> None:
-        while not self._stop.wait(self._interval):
-            self.run_once()
+        while not self._stop.is_set():
+            with self._config_lock:
+                interval = max(0.0, float(self._interval))
+            # A reconfigure/wake only interrupts the wait.  It deliberately
+            # does not run cleanup immediately; the next full interval uses
+            # the new policy, avoiding surprise purges from an API PATCH.
+            signaled = self._wake.wait(interval)
+            self._wake.clear()
+            if self._stop.is_set():
+                break
+            if signaled:
+                continue
+            try:
+                self.run_once()
+            except Exception:
+                # A single filesystem or store failure must not kill the
+                # background janitor.  Its next interval retries the pass.
+                continue
 
     def start(self) -> None:
         if self._thread is not None and self._thread.is_alive():
             return
         self._stop.clear()
+        self._wake.clear()
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
 
     def stop(self, *, wait: float | None = 1.0) -> None:
         self._stop.set()
+        self._wake.set()
         if self._thread is None:
             return
         self._thread.join(timeout=wait)
+
+    def reconfigure(
+        self,
+        *,
+        retention: RetentionPolicy | None = None,
+        scan_interval_seconds: float | None = None,
+        **retention_updates: int,
+    ) -> None:
+        """Atomically apply a new policy and wake a sleeping janitor.
+
+        ``retention`` can replace the complete dataclass, while keyword TTLs
+        (``input_ttl``, ``success_output_ttl``, …) are convenient for callers
+        that only changed one value.  The wake is intentionally non-destructive
+        and never invokes :meth:`run_once` inline.
+        """
+        with self._config_lock:
+            current = self._retention
+            if retention is not None and retention_updates:
+                raise ValueError("pass retention or individual TTLs, not both")
+            if retention_updates:
+                allowed = {
+                    "input_ttl",
+                    "success_output_ttl",
+                    "failed_output_ttl",
+                    "tombstone_ttl",
+                    "staging_ttl",
+                    "temp_ttl",
+                }
+                unknown = set(retention_updates).difference(allowed)
+                if unknown:
+                    raise ValueError(f"unknown retention field: {sorted(unknown)[0]}")
+                retention = dataclass_replace(current, **retention_updates)
+            if retention is not None:
+                if not isinstance(retention, RetentionPolicy):
+                    raise TypeError("retention must be a RetentionPolicy")
+                self._retention = retention
+            if scan_interval_seconds is not None:
+                if (
+                    isinstance(scan_interval_seconds, bool)
+                    or not isinstance(scan_interval_seconds, (int, float))
+                    or not math.isfinite(float(scan_interval_seconds))
+                    or scan_interval_seconds <= 0
+                ):
+                    raise ValueError(
+                        "scan_interval_seconds must be a positive number"
+                    )
+                self._interval = float(scan_interval_seconds)
+        self._wake.set()
+
+    def wake(self) -> None:
+        """Interrupt the current wait without triggering an immediate purge."""
+        self._wake.set()

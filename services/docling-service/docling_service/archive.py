@@ -13,6 +13,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator, Mapping, Sequence
 
+from .lifecycle import open_relative_file
+
 
 class ArchiveError(RuntimeError):
     """Raised when a job output cannot be safely streamed into an archive."""
@@ -97,6 +99,8 @@ def _coerce_manifest_entries(manifest: Sequence[Mapping[str, Any]]) -> list[_Man
 
 
 def _resolve_and_validate_file(root: Path, entry: _ManifestEntry) -> Path:
+    if root.absolute().is_symlink():
+        raise ArchiveError("job root is a symlink")
     root = root.resolve()
     candidate = (root / entry.path).resolve()
     if not candidate.is_relative_to(root):
@@ -113,12 +117,16 @@ def _resolve_and_validate_file(root: Path, entry: _ManifestEntry) -> Path:
     return candidate
 
 
-def _read_file_chunks(source: Path, entry: _ManifestEntry, chunk_size: int) -> "Iterator[bytes]":
+def _read_file_chunks(root: Path, entry: _ManifestEntry, chunk_size: int) -> "Iterator[bytes]":
     expected_size = entry.size_bytes
     expected_sha = entry.sha256
     digest = hashlib.sha256()
     total = 0
-    with source.open("rb") as handle:
+    try:
+        handle = open_relative_file(root, entry.path)
+    except (OSError, PermissionError) as exc:
+        raise ArchiveError(f"cannot safely open output file: {entry.path!r}") from exc
+    with handle:
         while True:
             chunk = handle.read(chunk_size)
             if not chunk:
@@ -272,7 +280,7 @@ class _ArchiveIterator(Iterator[bytes]):
 
     def _produce(self) -> None:
         root = self._root
-        if not self._root.is_dir():
+        if self._root.absolute().is_symlink() or not self._root.is_dir():
             self._thread_error = ArchiveError("job root is not a directory")
             self._done.set()
             self._try_push(_END)
@@ -291,10 +299,10 @@ class _ArchiveIterator(Iterator[bytes]):
                 for entry in self._entries:
                     if self._cancelled.is_set():
                         return
-                    source = _resolve_and_validate_file(root, entry)
+                    _resolve_and_validate_file(root, entry)
                     info = _build_zip_info(entry.path)
                     with archive.open(info, "w") as zf:
-                        for chunk in _read_file_chunks(source, entry, self._chunk_size):
+                        for chunk in _read_file_chunks(root, entry, self._chunk_size):
                             if self._cancelled.is_set():
                                 return
                             zf.write(chunk)
@@ -390,11 +398,11 @@ def preflight_archive(
     if max_total_bytes <= 0 or sum(entry.size_bytes for entry in entries) > max_total_bytes:
         raise ArchiveError(f"manifest total bytes exceed max_total_bytes ({max_total_bytes})")
     root = Path(job_root)
-    if not root.is_dir():
+    if root.absolute().is_symlink() or not root.is_dir():
         raise ArchiveError("job root is not a directory")
     for entry in entries:
-        source = _resolve_and_validate_file(root, entry)
-        for _chunk in _read_file_chunks(source, entry, chunk_size):
+        _resolve_and_validate_file(root, entry)
+        for _chunk in _read_file_chunks(root, entry, chunk_size):
             _call_if_exists(lease, "renew")
 
 

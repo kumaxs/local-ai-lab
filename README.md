@@ -27,6 +27,22 @@ Canonical GitHub: `https://github.com/kumaxs/local-ai-lab`
 - Docker Compose：Linux `amd64` / `arm64`，适合服务器、NAS 和跨机器部署；
 - macOS 安装包：Apple Silicon 为验收基线，保留本机 MLX/OCRMac 能力。
 
+### Web UI
+
+API 启动后可直接打开配套管理页面：Docker 为
+`http://127.0.0.1:8766/ui/`，macOS 为
+`http://127.0.0.1:8000/ui/`。页面支持 PDF 上传、队列和可信的阶段级（非页级）
+进度、产物列表/下载、终态任务删除、输入/产物 TTL 倒计时及存储用量查看；
+同一页面还能通过 SQLite CAS revision 管理输入、成功/失败产物、任务、staging、
+temp、清理、幂等和下载租约 TTL。SQLite 覆盖优先于环境值，环境值优先于默认值，
+提交 `null` 可清除覆盖；已有任务的截止时间不追溯重算。
+
+UI 静态文件随当前源码构建的 Python 包提供，并将在下一版本 release bundle 中提供，
+不需要 Node.js 或额外 Compose 服务；已发布的 `v1.1.1` 归档与镜像不包含此 UI。
+路径、Token、模型/引擎及并发/容量限制在 UI 中只读；页面输入的 Token 仅保留在当前
+页面内存，不写入浏览器存储或服务端。无 Token 时浏览器使用原生流式下载；启用
+Bearer Token 时页面下载上限为 256 MiB，更大的受保护产物应使用 API 客户端流式下载。
+
 ## 项目内容
 
 | 路径 | 用途 |

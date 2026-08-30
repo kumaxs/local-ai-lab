@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import os
 import tempfile
 import unittest
 import zipfile
@@ -29,6 +30,21 @@ def _build_entry(root: Path, path: Path, media_type: str = "text/plain") -> dict
 
 
 class ArchiveTests(unittest.TestCase):
+    @unittest.skipIf(os.name == "nt", "symlink behavior requires POSIX")
+    def test_symlink_job_root_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            real_root = base / "real"
+            real_root.mkdir()
+            output = real_root / "result.txt"
+            output.write_text("result", encoding="utf-8")
+            linked_root = base / "linked"
+            linked_root.symlink_to(real_root, target_is_directory=True)
+            manifest = [_build_entry(real_root, output)]
+
+            with self.assertRaises(ArchiveError):
+                b"".join(iter_archive(linked_root, manifest))
+
     def test_manifest_and_no_source_pdf_in_zip(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

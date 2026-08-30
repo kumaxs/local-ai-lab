@@ -61,4 +61,30 @@ Stop while preserving models and job data with `./docker-down.sh`.
 The two Hugging Face-backed model containers use `https://hf-mirror.com` by
 default. Set `HF_ENDPOINT` before startup to select another compatible endpoint.
 
+## Post-1.1.1 source builds: Web UI
+
+The published `v1.1.1` archives and images predate this section. The following
+describes a bundle built from the current post-1.1.1 source tree and will apply
+to the next tagged release.
+
+The API in this bundle serves the same operations page at
+`http://127.0.0.1:8766/ui/` in Docker and `http://127.0.0.1:8000/ui/` on
+macOS. It accepts uploads, shows queue and trusted phase-level (not page-level)
+progress, displays TTL/storage state, lists and downloads artifacts, and
+deletes terminal jobs. The page is static package data (`ui/index.html`,
+`ui/main.js`, `ui/styles.css`); no Node.js runtime or extra Compose service is
+needed.
+
+Lifecycle controls are edited through the revisioned SQLite config endpoint:
+input, successful/failed output, job, staging, temporary, cleanup interval,
+idempotency, and download-lease TTLs. SQLite overrides take precedence over
+environment/default values; `null` clears an override, and deadlines already
+recorded on existing jobs are not recalculated. Paths, token, model/engine,
+and concurrency/capacity values are read-only. A token typed into the page is
+held in memory only.
+
+Without a bearer token, downloads use the browser's native streaming path.
+Bearer-protected downloads from the page are capped at 256 MiB; use a streaming
+API client for larger protected files or archives.
+
 Detailed documentation is under `services/docling-service/docs/`.
