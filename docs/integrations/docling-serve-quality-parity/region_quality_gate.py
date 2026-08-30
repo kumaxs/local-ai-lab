@@ -1147,6 +1147,134 @@ def _node_body_identity(kind: str, node: dict[str, Any]) -> str:
     return _structural_body_identity(node.get("text"))
 
 
+def _algorithm_table_grid_reasons(node: dict[str, Any]) -> list[str]:
+    """Validate a table node used as an algorithm semantic contributor.
+
+    ``table_empty_fallback_expected_refs`` is intentionally scoped to the
+    ordinary table gate.  An algorithm sidecar that binds to a table must
+    prove a real, bounded semantic grid on its own; otherwise an empty or
+    sparse grid can be promoted merely by copying matching body hashes into
+    the manifest and ``algorithm_blocks.json``.  Keep this contract stricter
+    than :func:`_table_body_identity`, whose job is only canonical identity
+    and therefore quite correctly represents empty cells.
+    """
+
+    reasons: list[str] = []
+    data = node.get("data") if isinstance(node, dict) else None
+    if not isinstance(data, dict):
+        return ["algorithm_table_grid_data_missing"]
+
+    rows = _strict_nonnegative_int(data.get("num_rows"))
+    cols = _strict_nonnegative_int(data.get("num_cols"))
+    dimensions_valid = bool(
+        rows is not None
+        and cols is not None
+        and rows > 0
+        and cols > 0
+        and rows <= MAX_TABLE_CELLS
+        and cols <= MAX_TABLE_CELLS
+        and rows * cols <= MAX_TABLE_CELLS
+    )
+    if not dimensions_valid:
+        if rows is not None and cols is not None and rows > 0 and cols > 0 and (
+            rows > MAX_TABLE_CELLS
+            or cols > MAX_TABLE_CELLS
+            or rows * cols > MAX_TABLE_CELLS
+        ):
+            reasons.append("algorithm_table_grid_dimensions_exceed_limit")
+        else:
+            reasons.append("algorithm_table_grid_dimensions_invalid")
+
+    raw_cells = data.get("table_cells")
+    if not isinstance(raw_cells, list) or not raw_cells:
+        reasons.append("algorithm_table_grid_cells_missing")
+        return _unique(reasons, limit=32)
+    if len(raw_cells) > MAX_TABLE_CELLS:
+        reasons.append("algorithm_table_grid_cells_exceed_limit")
+
+    semantic_cell_count = 0
+    offsets_invalid = False
+    spans_invalid = False
+    overlap = False
+    occupied: set[tuple[int, int]] = set()
+    occupancy_work = 0
+    occupancy_work_limited = False
+    offset_keys = (
+        "start_row_offset_idx",
+        "end_row_offset_idx",
+        "start_col_offset_idx",
+        "end_col_offset_idx",
+    )
+    for raw_cell in raw_cells[:MAX_TABLE_CELLS]:
+        if not isinstance(raw_cell, dict):
+            offsets_invalid = True
+            continue
+        if _structural_visible_body_text(raw_cell.get("text")).strip():
+            semantic_cell_count += 1
+        if any(key not in raw_cell for key in offset_keys):
+            offsets_invalid = True
+            continue
+        start_row = _strict_nonnegative_int(raw_cell.get("start_row_offset_idx"))
+        end_row = _strict_nonnegative_int(raw_cell.get("end_row_offset_idx"))
+        start_col = _strict_nonnegative_int(raw_cell.get("start_col_offset_idx"))
+        end_col = _strict_nonnegative_int(raw_cell.get("end_col_offset_idx"))
+        if (
+            start_row is None
+            or end_row is None
+            or start_col is None
+            or end_col is None
+            or end_row <= start_row
+            or end_col <= start_col
+            or not dimensions_valid
+            or end_row > (rows or 0)
+            or end_col > (cols or 0)
+        ):
+            offsets_invalid = True
+            continue
+
+        row_span = _strict_nonnegative_int(raw_cell.get("row_span"))
+        col_span = _strict_nonnegative_int(raw_cell.get("col_span"))
+        if (
+            row_span is None
+            or col_span is None
+            or row_span <= 0
+            or col_span <= 0
+            or row_span != end_row - start_row
+            or col_span != end_col - start_col
+        ):
+            spans_invalid = True
+            continue
+
+        span_area = (end_row - start_row) * (end_col - start_col)
+        if (
+            span_area > MAX_TABLE_CELLS
+            or occupancy_work + span_area > MAX_TABLE_CELLS
+        ):
+            occupancy_work_limited = True
+            continue
+        occupancy_work += span_area
+        for row_index in range(start_row, end_row):
+            for col_index in range(start_col, end_col):
+                slot = (row_index, col_index)
+                if slot in occupied:
+                    overlap = True
+                occupied.add(slot)
+
+    if semantic_cell_count == 0:
+        reasons.append("algorithm_table_grid_semantic_cell_missing")
+    if offsets_invalid:
+        reasons.append("algorithm_table_grid_cell_offsets_invalid")
+    if spans_invalid:
+        reasons.append("algorithm_table_grid_cell_spans_invalid")
+    if overlap:
+        reasons.append("algorithm_table_grid_cell_overlap")
+    if occupancy_work_limited:
+        reasons.append("algorithm_table_grid_occupancy_work_limit")
+    if dimensions_valid and len(occupied) != (rows or 0) * (cols or 0):
+        reasons.append("algorithm_table_grid_occupancy_incomplete")
+    return _unique(reasons, limit=32)
+
+
 def _algorithm_page_span_reasons(candidate: dict[str, Any]) -> list[str]:
     """Keep cross-page algorithm records fail-closed until a join contract exists."""
 
@@ -1470,11 +1598,21 @@ def _manifest_diagnostics(
             if kind == "algorithm":
                 if raw_identity_kind not in {"node_text", "table_grid"}:
                     reasons.append("algorithm_source_node_body_identity_kind_invalid")
-                elif raw_identity_kind == "table_grid" and (
-                    bound_item.get("label") != "table"
-                    or not _table_body_identity(bound_node)
-                ):
-                    reasons.append("algorithm_source_node_body_identity_kind_mismatch")
+                elif raw_identity_kind == "table_grid":
+                    if bound_item.get("label") != "table":
+                        reasons.append(
+                            "algorithm_source_node_body_identity_kind_mismatch"
+                        )
+                    else:
+                        table_grid_reasons = _algorithm_table_grid_reasons(bound_node)
+                        if table_grid_reasons:
+                            # Preserve the established shape-mismatch signal
+                            # for callers while exposing the stricter table
+                            # contributor diagnostics for review and tests.
+                            reasons.append(
+                                "algorithm_source_node_body_identity_kind_mismatch"
+                            )
+                            reasons.extend(table_grid_reasons)
                 elif raw_identity_kind == "node_text" and (
                     bound_item.get("label")
                     not in {"code", "formula", "list_item", "text", "section_header"}

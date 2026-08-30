@@ -9603,6 +9603,72 @@ class EnglishReviewPolishTests(unittest.TestCase):
         self.assertIn("Figure 1: The Transformer", body_html)
         self.assertTrue(any(item["kind"] == "visual_annotation" for item in content["records"]))
 
+    def test_structural_quarantine_retains_unbound_axis_like_prose(self) -> None:
+        caption = (
+            "Figure 2 shows the complete classification error percentage for all "
+            "evaluated models over ten epochs and is discussed in the following "
+            "section. Classification Error %"
+        )
+        short_prose = "Training loss decreased"
+        document = {
+            "texts": [
+                {
+                    "label": "caption",
+                    "text": caption,
+                    "prov": [
+                        {
+                            "page_no": 1,
+                            "bbox": {"l": 80, "r": 520, "t": 360, "b": 330},
+                        }
+                    ],
+                },
+                {
+                    "label": "text",
+                    "text": short_prose,
+                    "prov": [
+                        {
+                            "page_no": 1,
+                            "bbox": {"l": 80, "r": 520, "t": 310, "b": 290},
+                        }
+                    ],
+                },
+            ],
+            "pictures": [
+                {
+                    "label": "picture",
+                    "prov": [
+                        {
+                            "page_no": 1,
+                            "bbox": {"l": 80, "r": 520, "t": 700, "b": 380},
+                        }
+                    ],
+                }
+            ],
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir)
+            (output_dir / "document.html").write_text(
+                f"<html><body><p>{caption}</p><p>{short_prose}</p></body></html>",
+                encoding="utf-8",
+            )
+            (output_dir / "document.md").write_text(
+                f"{caption}\n\n{short_prose}\n",
+                encoding="utf-8",
+            )
+
+            adapter.apply_structural_quarantine_to_outputs(output_dir, document)
+            body_html = adapter._html_without_structural_content(
+                (output_dir / "document.html").read_text(encoding="utf-8")
+            )
+            markdown = adapter._markdown_without_structural_content(
+                (output_dir / "document.md").read_text(encoding="utf-8")
+            )
+
+        self.assertIn("Classification Error %", body_html)
+        self.assertIn("Classification Error %", markdown)
+        self.assertIn(short_prose, body_html)
+        self.assertIn(short_prose, markdown)
+
     def test_structural_quarantine_removes_private_use_math_caption_prefix(self) -> None:
         text = "   Figure 1: Left: Schematic depiction of a model."
         document = {
@@ -10849,18 +10915,6 @@ class EnglishReviewPolishTests(unittest.TestCase):
         self.assertIn("**Formula 3 fallback**", updated)
         self.assertNotIn(r"\begin{array}", updated)
         self.assertNotIn("$$", updated)
-
-    def test_visual_axis_tail_is_split_from_figure_caption(self) -> None:
-        caption = (
-            "Figure 2 shows the frame classification error rate on the core test set. "
-            "The neural net has four fully-connected hidden layers Classification Error %"
-        )
-        html_text, count = adapter._quarantine_visual_axis_tail_html(f"<p>{caption}</p>")
-
-        self.assertEqual(count, 1)
-        self.assertIn("kind=visual_annotation", html_text)
-        self.assertNotIn("Classification Error %</p>", html_text)
-
 
 class SourceCropRecoveryAndDisclosureTests(unittest.TestCase):
     def test_table_crop_clamp_separates_side_by_side_tables_and_picture(self) -> None:

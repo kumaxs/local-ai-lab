@@ -730,6 +730,17 @@ def create_app(config: ReleaseConfig | None = None, manager: JobManager | None =
         response_model=CapabilitiesResponse,
     )
     def capabilities() -> CapabilitiesResponse:
+        # JobManager keeps ``config`` as the effective environment plus any
+        # persisted runtime overrides.  Reading the manager here is important
+        # after a successful runtime-config PATCH: the app's ``actual_config``
+        # is only the process-start baseline and would otherwise make the
+        # capabilities endpoint lie about the live lifecycle policy.  Small
+        # test/during-rollout managers may not expose an effective config, so
+        # retain the immutable baseline as a compatibility fallback.
+        current_config = getattr(actual_manager, "config", None)
+        public_capabilities = getattr(current_config, "public_capabilities", None)
+        if callable(public_capabilities):
+            return CapabilitiesResponse(**public_capabilities())
         return CapabilitiesResponse(**actual_config.public_capabilities())
 
     @app.post(

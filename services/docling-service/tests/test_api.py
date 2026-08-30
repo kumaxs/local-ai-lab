@@ -774,6 +774,154 @@ class ApiTests(unittest.TestCase):
                     self.assertEqual(200, response.status_code, path)
                     self.assertIn("default-src 'self'", response.headers["content-security-policy"])
                 self.assertIn("文献处理系统", client.get("/").text)
+                index = client.get("/").text
+                self.assertIn('id="previousJobsPage"', index)
+                self.assertIn('id="nextJobsPage"', index)
+                self.assertIn('id="jobsPageSummary"', index)
+                main_js = client.get("/ui/main.js").text
+                self.assertIn("next_cursor", main_js)
+                self.assertIn("jobsCursorHistory", main_js)
+                self.assertIn("navigateJobsPage", main_js)
+                self.assertIn("authGeneration", main_js)
+                self.assertIn("jobsCursorWouldLoop", main_js)
+                self.assertIn("cancelNavigation", main_js)
+                self.assertIn("刷新会重新读取本页", main_js)
+
+    def test_capabilities_follow_effective_manager_config_after_runtime_patch(self) -> None:
+        from fastapi.testclient import TestClient
+
+        from docling_service.api import create_app
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            adapter = root / "adapter.py"
+            adapter.write_text("# test\n", encoding="utf-8")
+            config = ReleaseConfig(
+                profile="docker",
+                serve_url="http://backend:5001",
+                adapter_path=adapter,
+                input_root=root / "inputs",
+                output_root=root / "outputs",
+                state_root=root / "state",
+                max_upload_bytes=1024,
+                max_concurrent_jobs=1,
+                conversion_timeout_seconds=60,
+                image_export_mode="referenced",
+                formula_policy="formula_service",
+                cn_ocr_parity=False,
+                api_token="test-token",
+                formula_ocr_url="http://formula:8001",
+                input_ttl_seconds=600,
+            )
+            manager = JobManager(config, runner=lambda *_args, **_kwargs: None)
+            with TestClient(create_app(config=config, manager=manager)) as client:
+                headers = {"Authorization": "Bearer test-token"}
+                before = client.get("/v1/capabilities", headers=headers)
+                self.assertEqual(200, before.status_code)
+                before_payload = before.json()
+                self.assertEqual(600, before_payload["lifecycle"]["input_ttl_seconds"])
+                self.assertEqual(1, before_payload["max_concurrent_jobs"])
+                self.assertEqual("formula_service", before_payload["formula_policy"])
+
+                revision = manager.runtime_config_snapshot()["revision"]
+                patched = client.patch(
+                    "/v1/system/config",
+                    headers=headers,
+                    json={
+                        "revision": revision,
+                        "changes": {"input_ttl_seconds": 1200},
+                    },
+                )
+                self.assertEqual(200, patched.status_code)
+                after = client.get("/v1/capabilities", headers=headers)
+                self.assertEqual(200, after.status_code)
+                after_payload = after.json()
+                self.assertEqual(1200, after_payload["lifecycle"]["input_ttl_seconds"])
+                self.assertEqual(
+                    before_payload["max_concurrent_jobs"],
+                    after_payload["max_concurrent_jobs"],
+                )
+                self.assertEqual(
+                    before_payload["formula_engine"],
+                    after_payload["formula_engine"],
+                )
+                self.assertEqual(
+                    before_payload["accepted_input_formats"],
+                    after_payload["accepted_input_formats"],
+                )
+
+    def test_job_api_preserves_cursor_contract_for_webui_pagination(self) -> None:
+        from fastapi.testclient import TestClient
+
+        from docling_service.api import create_app
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            adapter = root / "adapter.py"
+            adapter.write_text("# test\n", encoding="utf-8")
+            config = ReleaseConfig(
+                profile="docker",
+                serve_url="http://backend:5001",
+                adapter_path=adapter,
+                input_root=root / "inputs",
+                output_root=root / "outputs",
+                state_root=root / "state",
+                max_upload_bytes=1024,
+                max_concurrent_jobs=1,
+                conversion_timeout_seconds=60,
+                image_export_mode="referenced",
+                formula_policy="formula_service",
+                cn_ocr_parity=False,
+                api_token=None,
+                formula_ocr_url="http://formula:8001",
+            )
+            records = [
+                {
+                    "job_id": "job-new",
+                    "state": "queued",
+                    "original_name": "new.pdf",
+                    "created_at": "2026-08-30T00:00:02+00:00",
+                    "output_dir": str(root / "outputs" / "job-new"),
+                },
+                {
+                    "job_id": "job-old",
+                    "state": "succeeded",
+                    "original_name": "old.pdf",
+                    "created_at": "2026-08-30T00:00:01+00:00",
+                    "output_dir": str(root / "outputs" / "job-old"),
+                    "output_expires_at": "2099-01-01T00:00:00+00:00",
+                },
+            ]
+
+            class FakeManager:
+                def shutdown(self) -> None:
+                    return None
+
+                def list_jobs(self, *, cursor=None, **_kwargs: Any) -> dict[str, Any]:
+                    if cursor is None:
+                        return {"items": records[:1], "next_cursor": "cursor-1"}
+                    if cursor == "cursor-1":
+                        return {"items": records[1:], "next_cursor": None}
+                    return {"error": "invalid_cursor"}
+
+            with TestClient(create_app(config=config, manager=FakeManager())) as client:
+                first = client.get("/v1/jobs?limit=100")
+                self.assertEqual(200, first.status_code)
+                first_payload = first.json()
+                self.assertEqual(["job-new"], [item["job_id"] for item in first_payload["items"]])
+                self.assertEqual("cursor-1", first_payload["next_cursor"])
+
+                second = client.get(
+                    "/v1/jobs?limit=100&cursor=" + first_payload["next_cursor"]
+                )
+                self.assertEqual(200, second.status_code)
+                self.assertEqual(
+                    ["job-old"],
+                    [item["job_id"] for item in second.json()["items"]],
+                )
+                self.assertIsNone(second.json()["next_cursor"])
+                stale = client.get("/v1/jobs?limit=100&cursor=stale")
+                self.assertEqual(400, stale.status_code)
 
     def test_system_config_auth_cas_and_strict_patch_contract(self) -> None:
         from fastapi.testclient import TestClient

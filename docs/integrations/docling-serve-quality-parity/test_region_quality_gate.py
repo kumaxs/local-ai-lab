@@ -1985,6 +1985,103 @@ class RegionQualityGateTests(unittest.TestCase):
             )
             self.assertFalse(result["ok"])
 
+    def test_algorithm_table_grid_contributor_cannot_use_empty_or_sparse_fallback(self):
+        """A table contributor is strict even when the ordinary table uses fallback."""
+
+        cases = ("empty", "partial", "sparse", "complete")
+        for case in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                document, metadata, status = _fixture(root)
+                table = document["tables"][0]
+                table_ref = table["self_ref"]
+                data = table["data"]
+                if case == "empty":
+                    data.update(num_rows=1, num_cols=1, table_cells=[])
+                elif case in {"partial", "sparse"}:
+                    retained = [data["table_cells"][0]]
+                    if case == "sparse":
+                        retained = [dict(retained[0])]
+                        retained[0].update(
+                            start_row_offset_idx=1,
+                            end_row_offset_idx=2,
+                            start_col_offset_idx=1,
+                            end_col_offset_idx=2,
+                        )
+                    data.update(num_rows=2, num_cols=2, table_cells=retained)
+
+                table_identity = _node_body_identity("table", table)
+                table_entry = metadata["structural_visual_provenance_manifest"][
+                    "tables"
+                ][0]
+                table_entry["structural_body_identity_sha256"] = _body_identity_sha(
+                    "table", table_identity
+                )
+                table_entry["source_node_bindings"][0]["body_identity_sha256"] = (
+                    _body_identity_sha("table", table_identity)
+                )
+
+                # Synchronise both algorithm evidence stores to the table node,
+                # as an attacker would when trying to promote a malformed grid.
+                algorithm_entry = metadata["structural_visual_provenance_manifest"][
+                    "algorithms"
+                ][0]
+                manifest_binding = algorithm_entry["source_node_bindings"][0]
+                manifest_binding.update(
+                    {
+                        "source_ref": table_ref,
+                        "self_ref": table_ref,
+                        "body_identity_kind": "table_grid",
+                        "body_identity_sha256": _body_identity_sha(
+                            "algorithm-source-node", table_identity
+                        ),
+                    }
+                )
+                sidecar = json.loads((root / "algorithm_blocks.json").read_text())
+                semantic_binding = sidecar[0]["source_node_bindings"][0]
+                semantic_binding.update(
+                    {
+                        "source_ref": table_ref,
+                        "self_ref": table_ref,
+                        "body_identity_kind": "table_grid",
+                        "body_identity_sha256": manifest_binding[
+                            "body_identity_sha256"
+                        ],
+                    }
+                )
+                (root / "algorithm_blocks.json").write_text(
+                    json.dumps(sidecar), encoding="utf-8"
+                )
+
+                # Keep the algorithm record's own text identity intact; only
+                # its source contributor is the table.  Explicitly marking the
+                # table as an empty visual fallback must not relax this path.
+                algorithm_entry["structural_body_identity_sha256"] = _body_identity_sha(
+                    "algorithm", gate._algorithm_expected_body_identity(sidecar[0])
+                )
+                visuals = status["quality_signals"]["final_source_visuals"]
+                visuals["table_empty_fallback_expected_refs"] = [table_ref]
+                visuals["table_source_body_identity_expected_refs"] = []
+                visuals["table_source_html_body_identity_verified_refs"] = []
+                visuals["table_source_markdown_body_identity_verified_refs"] = []
+
+                result = evaluate_regions(
+                    root, document, metadata, status, write_sidecars=False
+                )
+                algorithm = next(
+                    record for record in result["records"] if record["kind"] == "algorithm"
+                )
+                if case == "complete":
+                    self.assertEqual("verified_semantic", algorithm["status"])
+                    self.assertTrue(result["ok"])
+                else:
+                    self.assertEqual("unresolved", algorithm["status"])
+                    self.assertIn(
+                        "algorithm_source_node_body_identity_kind_mismatch",
+                        algorithm["reasons"],
+                    )
+                    self.assertFalse(result["ok"])
+
     def test_inline_math_operators_are_identity_bearing(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

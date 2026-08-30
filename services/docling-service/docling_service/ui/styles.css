@@ -139,6 +139,25 @@ progress {
   overflow: auto;
 }
 
+.jobs-pagination {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 0.5rem;
+  margin-top: 0.75rem;
+}
+
+.jobs-pagination[hidden] {
+  display: none;
+}
+
+.jobs-pagination span {
+  margin-right: auto;
+  color: var(--muted);
+  font-size: 0.84rem;
+}
+
 table {
   width: 100%;
   border-collapse: collapse;

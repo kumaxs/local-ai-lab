@@ -11350,13 +11350,6 @@ def _replace_embedded_visual_ocr_noise_blocks_markdown(md_text: str) -> tuple[st
 
 EMAIL_RE = re.compile(r"\b[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}\b")
 ALGORITHM_CAPTION_RE = re.compile(r"\bAlgorithm\s+\d+\b\s*:?", re.I)
-VISUAL_AXIS_TAIL_RE = re.compile(
-    r"\s+(?P<tail>(?:[A-Z][A-Za-z]*|[A-Z]{1,4}|[%/()0-9.+-])"
-    r"(?:\s+(?:[A-Z][A-Za-z]*|[A-Z]{1,4}|[%/()0-9.+-])){1,8})\s*$"
-)
-VISUAL_LABEL_KEYWORD_RE = re.compile(
-    r"(?i)\b(?:error|accuracy|loss|epoch|iteration|train|test|classification|perplexity|probability)\b|%"
-)
 ALGORITHM_LINE_BREAK_RE = re.compile(
     r"\s+(?=(?:Require|Input|Output|Parameters?|Initialize|while|for|if|return|Sample|Update|Process|Train|"
     r"Add|Modify|Set|Compute|end(?:\s+while|\s+for|\s+if)?|"
@@ -11480,80 +11473,6 @@ def _normalize_algorithm_code_blocks_markdown(md_text: str) -> tuple[str, int]:
 
     updated = re.sub(r"```(?:text|)\n(?P<body>.*?)\n```", replace, md_text, flags=re.S)
     return updated, changed
-
-
-def _quarantine_visual_axis_tail_html(document_html: str) -> tuple[str, int]:
-    replacements: list[tuple[int, int, str]] = []
-    for match in HTML_TEXT_BLOCK_RE.finditer(document_html):
-        if match.group("tag").lower() != "p":
-            continue
-        body = match.group("body")
-        visible = html.unescape(HTML_TAG_RE.sub(" ", body))
-        normalized = _normalized_noise_text(visible)
-        item = {
-            "kind": "visual_annotation",
-            "page_no": "unknown",
-            "reasons": ["short_axis_label_split_from_main_flow"],
-        }
-        if (
-            len(normalized) <= 80
-            and VISUAL_LABEL_KEYWORD_RE.search(normalized)
-            and not re.search(r"[.!?。！？]", normalized)
-            and len(normalized.split()) <= 8
-        ):
-            replacements.append((match.start(), match.end(), _hidden_quarantine_html(item)))
-            continue
-        tail_match = VISUAL_AXIS_TAIL_RE.search(visible)
-        if not tail_match or not VISUAL_LABEL_KEYWORD_RE.search(tail_match.group("tail")):
-            continue
-        tail = tail_match.group("tail")
-        if len(visible[: tail_match.start()].strip()) < 80:
-            continue
-        escaped_tail = html.escape(tail)
-        if escaped_tail not in body:
-            continue
-        new_body = body.replace(escaped_tail, "", 1).rstrip()
-        replacement = f"<p>{new_body}</p>" + _hidden_quarantine_html(item)
-        replacements.append((match.start(), match.end(), replacement))
-    updated = document_html
-    for start, end, replacement in reversed(replacements):
-        updated = updated[:start] + replacement + updated[end:]
-    return updated, len(replacements)
-
-
-def _quarantine_visual_axis_tail_markdown(md_text: str) -> tuple[str, int]:
-    blocks = re.split(r"(\n\s*\n)", md_text)
-    changed = 0
-    for index, block in enumerate(blocks):
-        visible = _normalized_noise_text(block)
-        if (
-            len(visible) <= 80
-            and VISUAL_LABEL_KEYWORD_RE.search(visible)
-            and not re.search(r"[.!?。！？]", visible)
-            and len(visible.split()) <= 8
-        ):
-            blocks[index] = (
-                "<!-- local-ai-lab structural quarantine "
-                "kind=visual_annotation page=unknown "
-                "reasons=short_axis_label_split_from_main_flow "
-                "evidence=metadata.json -->"
-            )
-            changed += 1
-            continue
-        tail_match = VISUAL_AXIS_TAIL_RE.search(visible)
-        if not tail_match or not VISUAL_LABEL_KEYWORD_RE.search(tail_match.group("tail")):
-            continue
-        if len(visible[: tail_match.start()].strip()) < 80:
-            continue
-        tail = tail_match.group("tail")
-        blocks[index] = block.replace(tail, "", 1).rstrip() + (
-            "\n\n<!-- local-ai-lab structural quarantine "
-            "kind=visual_annotation page=unknown "
-            "reasons=short_axis_label_tail_split_from_figure_caption "
-            "evidence=metadata.json -->"
-        )
-        changed += 1
-    return "".join(blocks), changed
 
 
 def _pdf_text_for_bbox(pdf_path: Path, prov: dict[str, Any], padding: float = 5.0) -> str:
@@ -17330,8 +17249,6 @@ def apply_structural_quarantine_to_outputs(
         html_replacements += author_split_count
         html_text, algorithm_code_count = _normalize_algorithm_code_blocks_html(html_text)
         html_replacements += algorithm_code_count
-        html_text, visual_axis_tail_count = _quarantine_visual_axis_tail_html(html_text)
-        html_replacements += visual_axis_tail_count
         html_text, html_reference_link_count = _link_note_references_in_html(
             html_text,
             reference_mappings,
@@ -17387,8 +17304,6 @@ def apply_structural_quarantine_to_outputs(
         md_replacements += author_split_count
         md_text, algorithm_code_count = _normalize_algorithm_code_blocks_markdown(md_text)
         md_replacements += algorithm_code_count
-        md_text, visual_axis_tail_count = _quarantine_visual_axis_tail_markdown(md_text)
-        md_replacements += visual_axis_tail_count
         md_text, markdown_reference_link_count = _link_note_references_in_markdown(
             md_text,
             reference_mappings,
