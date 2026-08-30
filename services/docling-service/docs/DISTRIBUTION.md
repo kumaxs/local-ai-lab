@@ -99,7 +99,9 @@ package data and are also copied by the release builder's recursive
 needs no Node.js toolchain and does not add a UI Compose service. The page
 supports upload/queue monitoring with trusted phase-level (not page-level)
 progress, artifact download/delete, TTL and storage visibility, and lifecycle
-configuration.
+configuration. Job rows use cursor-based pages of at most 100 items and refresh
+the visible page without accumulating stale pages. Token changes and `401`
+responses clear protected UI state and invalidate delayed prior-token results.
 
 The configuration panel sends revisioned SQLite CAS updates to
 `/v1/system/config`. It can change only input/success-output/failed-output/job,

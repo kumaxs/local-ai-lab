@@ -10,12 +10,12 @@
 
 ### Repository and branch state
 
-- Prepared at: `2026-08-30 02:32 EDT` (`America/New_York`).
+- Prepared at: `2026-08-30 03:36 EDT` (`America/New_York`).
 - Writable working repository: `/private/tmp/local-ai-lab-aug30-webui`.
 - Branch: `main`.
 - Push remote: `github` = `git@github.com:kumaxs/local-ai-lab.git`.
-- Engineering/documentation HEAD before this handoff-only commit:
-  `f83afa741119cd6c2251d7eeee5f6ae4eca33e66`.
+- Engineering HEAD before this documentation/handoff commit:
+  `220f9f3`.
 - `github/main` was the same commit immediately before this handoff-only commit.
   After resuming, validate that `git rev-parse HEAD` and
   `git rev-parse github/main` agree and inspect `git log -3`.
@@ -32,9 +32,12 @@ until its state has been safely reconciled with the canonical repository.
 ### User goal status
 
 The offline implementation, tests, evaluation records, documentation, commits,
-and pushes requested on 2026-08-30 are complete. The only material unverified
-item is a fresh end-to-end conversion and browser smoke under the new code,
-which requires explicit authorization to start local services.
+and pushes requested on 2026-08-30 are complete. Fresh end-to-end conversions
+and a live browser smoke under the new code remain unverified because they
+require explicit authorization to start local services. The current source
+tree supports direct and source-built Docker deployment; a new formal tagged
+release containing the UI has not been published, and published `v1.1.1`
+artifacts remain the legacy no-UI checkpoint.
 
 Completed and pushed work includes:
 
@@ -46,6 +49,9 @@ Completed and pushed work includes:
 - `f747b7e fix(docling): bind region evidence to final artifacts`
 - `569f1d5 fix(docling): close region evidence bypasses`
 - `f83afa7 docs(docling): record August quality evaluation`
+- `ed51a12 docs: refresh session handoff`
+- `20b9a7a fix(docling): close web ui and region audit gaps`
+- `220f9f3 fix(webui): bound automatic refresh during navigation`
 
 Several intervening corpus/test commits (`5ae7a5a`, `eda3755`, `6b1a2a8`,
 `9128d7d`, and `19084c9`) are also already on `github/main`.
@@ -60,6 +66,8 @@ the same API process, for both Docker and direct deployment. It provides:
 - artifact inventory, download, and explicit deletion;
 - server-time-based expiry countdowns and expired-output state;
 - storage/cleanup status;
+- cursor-based previous/next pages of at most 100 jobs, current-page counts,
+  and refresh of the visible page without stale row accumulation;
 - optimistic-concurrency runtime configuration for input, successful-output,
   failed-output, job, staging, temporary-file, cleanup-interval, idempotency,
   and download-lease TTL values.
@@ -71,6 +79,12 @@ existing deadlines. The Janitor safely adopts changes without duplicate loops.
 Security and failure-path work includes a restrictive CSP, no browser storage,
 memory-only token handling, `410 Gone` for expired outputs, symlink/TOCTOU
 hardening, directory-fd/inode checks, and a 256 MiB protected browser Blob cap.
+Token save/replace/clear and `401` now invalidate delayed job, configuration,
+output, upload, storage, and download responses and clear protected UI data.
+Refresh/navigation requests use independent generations; cyclic or
+non-advancing cursors are quarantined. One automatic tick queues behind a
+normal navigation, and the second takes over a hung navigation, so automatic
+refresh cannot remain suppressed indefinitely.
 The direct-install default port is `8000`; Docker publishes `8766`.
 
 ### Literature-quality work
@@ -85,6 +99,9 @@ bound to source evidence. Important covered cases include:
 - algorithm-sidecar kind, contributor, hash, final-node, and candidate binding;
 - strict table topology: bounded geometry and work, valid bounds/spans, no
   overlap, no row collapse/crossing, and full declared-grid occupancy;
+- algorithm `table_grid` contributors independently require a real non-empty,
+  bounded, non-overlapping, fully occupied grid; the ordinary empty-table
+  fallback cannot promote an empty or sparse algorithm contributor;
 - normalized inline-math comparison that retains operators, relations,
   punctuation, and Unicode math symbols, while rejecting truncated candidates;
 - typed, bounded, duplicate-free formula/inline/structural collections and
@@ -92,21 +109,27 @@ bound to source evidence. Important covered cases include:
 - persistence of caller-supplied status/metadata when sidecars are written, so
   a late sidecar failure cannot leave a false-success record.
 
-The independent final reviewer reported **PASS** with no reproducible P0, P1,
-or P2 finding.
+The completion audit removed an unbound text-only axis-tail heuristic because
+it could erase legitimate captions or short prose. Visual/chart material is
+now removed only through source-bound structure, page/bbox, picture overlap,
+repetition, or equivalent evidence. Independent final review found no
+reproducible code-level P0/P1/P2 after these fixes, but this does not supersede
+the fresh E2E acceptance blocker below.
 
 ### Validation evidence
 
 Final offline validation on the pushed code:
 
 ```text
-Focused region-gate suite: 85 tests, OK
-Full quality-parity suite: 723 tests, OK, 5 skipped
-Independent adapter replay: 347 tests, OK, 5 skipped
-Docling service suite: 181 tests, OK
+Focused region-gate suite: 86 tests, OK
+Full quality-parity suite: 724 tests, OK, 5 skipped
+Docling service suite: 184 tests, OK
+Web UI concurrent-state suite: 9 tests, OK
 Python compile checks: passed
 JavaScript syntax check: passed
 JSON/jq checks: passed
+Source and release Compose config checks: passed
+Release/deployment shell syntax checks: passed
 git diff --check: passed
 ```
 
@@ -145,10 +168,19 @@ slot. PdfTable still exposes row collapse/incomplete occupancy, and the old
 table-transformer case still exposes incomplete grids, row collapse, and an
 algorithm bbox mismatch.
 
+Do not overstate two offline signals. A zero algorithm/code/table inventory
+count with proof `healthy` means the inventory completed consistently; it does
+not independently prove visual absence. Inline math currently preserves
+operator-bearing identity and bound source anchors/crops, but ordinary prose is
+not universally rendered as inline MathML or a dedicated semantic math span.
+Both remain fresh-E2E/manual-review questions.
+
 Fresh source PDFs and rendered inspection pages are temporarily retained at
 `/private/tmp/docling-eval-2026-08-30` only for the pending authorized smoke.
-They are deliberately uncommitted. Delete that exact directory after the smoke
-and documentation update, or if the user decides not to run the smoke.
+They are deliberately uncommitted; that directory now contains a `README.md`
+with ownership, sealed-input, and cleanup instructions. Delete that exact
+directory after the smoke and documentation update, or if the user decides not
+to run the smoke.
 
 ### Remaining blocker and exact next action
 
@@ -170,7 +202,9 @@ services. On authorization:
    countdown, artifact download, expiry behavior, and deletion.
 5. Stop only processes started by this task, record results in the evaluation
    docs and this handoff, run the relevant regression suites, commit, and push.
-6. Remove `/private/tmp/docling-eval-2026-08-30` and any new transient files.
+6. Only after that evidence, decide whether to publish a new tagged release
+   containing the UI; do not describe `v1.1.1` as containing it.
+7. Remove `/private/tmp/docling-eval-2026-08-30` and any new transient files.
 
 Do not mark the goal complete before this smoke is either run successfully or
 the user explicitly accepts its omission.

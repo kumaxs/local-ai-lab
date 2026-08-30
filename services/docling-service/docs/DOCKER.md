@@ -101,11 +101,17 @@ picker), upload transport progress, queue rows, trusted phase-level job
 progress (never a page-level completion claim), output listing and download,
 terminal-job deletion, TTL countdowns, and managed-storage usage.
 
+The queue uses cursor-based previous/next pages of at most 100 jobs. Counts are
+for the visible page; refresh re-reads that page, rejects stale/cyclic cursors,
+and has a bounded takeover path when navigation hangs.
+
 Enter the configured bearer token in the page when prompted. The value stays in
 the current page's memory only and is not written to browser storage, SQLite,
-or the container. Reloading or clearing the token discards it. The UI calls
-the same `/v1/jobs`, `/v1/system/storage`, and output/archive endpoints as
-other clients, so an expired artifact or an active-download lease is shown
+or the container. Reloading or clearing the token discards it. Replacing or
+clearing a token, and any `401`, also clears protected task/configuration/
+storage/output data and invalidates delayed requests from the prior token. The
+UI calls the same `/v1/jobs`, `/v1/system/storage`, and output/archive endpoints
+as other clients, so an expired artifact or an active-download lease is shown
 with the API's normal response.
 
 Without API authentication, downloads use the browser's native streaming path.

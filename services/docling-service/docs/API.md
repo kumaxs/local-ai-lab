@@ -34,6 +34,15 @@ as evidence that a particular page has completed. The UI can expand a terminal
 job to list output files, download an individual file or ZIP archive, and
 delete a terminal job.
 
+The task list follows the API cursor contract in pages of at most 100 records.
+Previous/next controls re-fetch one page at a time; the status counters describe
+the **current page**, not a fabricated global total. Automatic refresh re-reads
+the visible page. If a page transition is already running, one timer tick is
+queued and refreshes the page reached by that transition; a second tick takes
+over a hung transition and reloads the page that is still visible. Invalid,
+non-advancing, or cyclic cursors are quarantined instead of accumulating stale
+rows or looping between pages.
+
 Unauthenticated downloads use the browser's native streaming path. When bearer
 authentication is configured, the page must use an in-memory `Blob` and caps
 downloads at 256 MiB; use a streaming API client for larger protected files or
@@ -81,7 +90,11 @@ read-only in the UI. Change those through the deployment environment and
 restart when required. The token entered on the page is kept only in page
 memory, is sent as a bearer header for API calls, and is not written to
 localStorage, cookies, SQLite, or server configuration; reload or clear the
-page to discard it.
+page to discard it. Saving, replacing, or clearing a token invalidates all
+in-flight task/configuration/output responses and immediately clears protected
+task, storage, and configuration data from the page. A `401` response applies
+the same clearing rule, so a delayed response authorized under an older token
+cannot repopulate the UI.
 
 ## Authentication and errors
 
@@ -141,7 +154,7 @@ atomically.
 | `GET /v1/jobs?state=&client_reference=&cursor=&limit=` | Cursor-paginated task list; limit 1–100 |
 | `GET /v1/jobs/{job_id}` | State, timestamps, retention deadlines, byte counts, error and links |
 | `DELETE /v1/jobs/{job_id}` | Delete a terminal job and its retained artifacts; active jobs return `409` |
-| `GET /v1/capabilities` | Runtime profile and request limits |
+| `GET /v1/capabilities` | Runtime profile, request limits, and current effective lifecycle policy |
 | `GET /v1/system/storage` | Managed usage, reservations, free space and configured limits |
 
 SQLite in WAL mode is the authoritative task store. The service maintains a

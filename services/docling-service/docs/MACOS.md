@@ -93,6 +93,12 @@ progress, queue inspection, trusted phase-level (not page-level) progress,
 output listing/download, terminal-job deletion, TTL countdowns, and storage
 usage.
 
+The task list uses cursor-based previous/next pages of at most 100 jobs and
+refreshes the visible page. It rejects non-advancing/cyclic cursors; a queued
+timer refresh or bounded takeover prevents navigation from leaving the list
+indefinitely stale. Token replacement/clear and `401` clear protected page
+state and invalidate delayed responses from the prior token.
+
 Unauthenticated downloads use the browser's native streaming path. When bearer
 authentication is enabled, page downloads are capped at 256 MiB; use a
 streaming API client for larger protected artifacts.

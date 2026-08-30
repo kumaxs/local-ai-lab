@@ -39,6 +39,13 @@ runtime or additional Compose service is needed. This describes the current
 post-1.1.1 source tree and the next tagged release; the published `v1.1.1`
 archives and images do not contain the UI.
 
+The queue uses cursor-based previous/next pages of at most 100 tasks and
+refreshes the currently visible page; page counters are deliberately not shown
+as global totals. Non-advancing/cyclic cursors and stale refresh responses are
+rejected. Replacing or clearing the in-memory token invalidates delayed task,
+configuration, output, and upload responses and clears protected page data;
+`401` has the same fail-closed behavior.
+
 The System configuration panel is backed by SQLite compare-and-swap revisions.
 It edits only lifecycle controls (input, successful/failed output, job,
 staging, temporary, cleanup interval, idempotency, and download-lease TTLs).
@@ -62,6 +69,10 @@ supported entry point on machines that do not have a repository checkout.
 PYTHONPATH=services/docling-service python3 -m unittest discover services/docling-service/tests
 PYTHONPATH=services/docling-service services/docling-service/.venv/bin/python -m unittest discover services/docling-service/tests
 ```
+
+When Node.js is available, that service suite also runs the dependency-free
+Web UI concurrency tests in `tests/webui_state.test.mjs`. Node.js is a test-only
+tool and is not required to serve the packaged UI.
 
 The earlier placeholder CLI remains available for contract-level tests. It is
 not the formal release conversion path; production requests go through the

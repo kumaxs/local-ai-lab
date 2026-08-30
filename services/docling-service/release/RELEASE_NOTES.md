@@ -46,6 +46,12 @@
 - paths, bearer token, model/engine settings, and concurrency/capacity limits
   remain read-only in the UI. A token entered in the page is kept in memory
   only;
+- the queue uses cursor-based previous/next pages with current-page counts;
+  refresh/navigation generations reject stale or cyclic cursor results, and a
+  bounded automatic-refresh takeover prevents a hung navigation from leaving
+  the page indefinitely stale;
+- token replacement/clear and `401` invalidate delayed job/config/output/
+  upload responses and clear protected page data;
 - unauthenticated downloads use the browser's native streaming path. Bearer-
   protected browser downloads are capped at 256 MiB; use a streaming API
   client for larger protected artifacts.
