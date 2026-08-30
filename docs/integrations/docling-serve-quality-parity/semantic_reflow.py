@@ -3157,6 +3157,7 @@ def _is_algorithm_step_line(value: str) -> bool:
 def _algorithm_group_blocks(
     document: dict[str, Any],
     source: SourceReader,
+    pictures: dict[int, list[dict[str, float]]] | None = None,
 ) -> tuple[dict[str, dict[str, Any]], set[str]]:
     body = document.get("body")
     children = body.get("children") if isinstance(body, dict) else None
@@ -3164,6 +3165,25 @@ def _algorithm_group_blocks(
         return {}, set()
     blocks: dict[str, dict[str, Any]] = {}
     consumed: set[str] = set()
+    picture_boxes = pictures if pictures is not None else _picture_boxes(document)
+
+    def overlaps_picture(node: dict[str, Any] | None) -> bool:
+        if not isinstance(node, dict):
+            return False
+        for prov in node.get("prov") or []:
+            if not isinstance(prov, dict):
+                continue
+            box = _bbox(prov)
+            page_no = int(prov.get("page_no") or 0)
+            if box and page_no and _short_text_inside_picture(
+                str(node.get("text") or ""),
+                page_no,
+                box,
+                picture_boxes,
+            ):
+                return True
+        return False
+
     for position, child in enumerate(children):
         if not isinstance(child, dict) or not child.get("$ref"):
             continue
@@ -3172,11 +3192,20 @@ def _algorithm_group_blocks(
         title = str((title_node or {}).get("text") or "").strip()
         if not re.match(r"(?i)^Algorithm\s+\d+\b", title):
             continue
+        # Picture-contained OCR must never be promoted into a semantic
+        # algorithm merely because it resembles an algorithm title. The
+        # ordinary body collector already suppresses text whose provenance is
+        # inside a picture; apply the same rule before this special grouping
+        # path can bypass that protection.
+        if overlaps_picture(title_node):
+            continue
         if position + 1 >= len(children):
             continue
         group_ref = str((children[position + 1] or {}).get("$ref") or "")
         following_node = _resolve(document, group_ref)
         if str((following_node or {}).get("label") or "").lower() == "code":
+            if overlaps_picture(following_node):
+                continue
             title_prov = _first_prov(title_node or {})
             code_prov = _first_prov(following_node or {})
             valid_provs = [
@@ -3238,11 +3267,13 @@ def _algorithm_group_blocks(
         step_texts: list[str] = []
         formula_steps: dict[int, str] = {}
         provs: list[dict[str, Any]] = []
+        picture_overlap_detected = False
         title_prov = _first_prov(title_node or {})
         if title_prov:
             provs.append(title_prov)
 
         def add_group(reference: str) -> None:
+            nonlocal picture_overlap_detected
             group = _resolve(document, reference)
             if not isinstance(group, dict):
                 return
@@ -3253,6 +3284,9 @@ def _algorithm_group_blocks(
                 node = _resolve(document, child_ref)
                 if not isinstance(node, dict):
                     continue
+                if overlaps_picture(node):
+                    picture_overlap_detected = True
+                    return
                 text = str(node.get("text") or "").strip()
                 if not _is_algorithm_step_line(text):
                     continue
@@ -3267,6 +3301,8 @@ def _algorithm_group_blocks(
                     provs.append(prov)
 
         add_group(group_ref)
+        if picture_overlap_detected:
+            continue
         complete = any(
             re.search(r"(?i)\bend\s+for\b", text) for text in step_texts
         )
@@ -3285,6 +3321,9 @@ def _algorithm_group_blocks(
             )
             candidate_node = _resolve(document, candidate_ref)
             if not isinstance(candidate_node, dict):
+                break
+            if overlaps_picture(candidate_node):
+                picture_overlap_detected = True
                 break
             parts = _ref_parts(candidate_ref)
             if parts and parts[0] == "groups":
@@ -3320,6 +3359,8 @@ def _algorithm_group_blocks(
                 re.search(r"(?i)\bend\s+for\b", text) for text in step_texts
             )
             scan_position += 1
+        if picture_overlap_detected:
+            continue
         valid_provs = [
             prov for prov in provs if int(prov.get("page_no") or 0) > 0 and _bbox(prov)
         ]
@@ -3499,7 +3540,11 @@ def _collect_items(
 ) -> list[FlowItem]:
     pictures = _picture_boxes(document)
     formula_ordinals = _label_node_ordinals(document, "formula")
-    algorithm_blocks, algorithm_consumed = _algorithm_group_blocks(document, source)
+    algorithm_blocks, algorithm_consumed = _algorithm_group_blocks(
+        document,
+        source,
+        pictures,
+    )
     if dropped_formula_artifacts is None:
         dropped_formula_artifacts = []
     items: list[FlowItem] = []

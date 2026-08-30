@@ -80,6 +80,79 @@ def _table_item(cells, *, rows, cols):
 
 
 class SemanticReadabilityRegressionTests(unittest.TestCase):
+    def test_algorithm_grouping_cannot_promote_picture_contained_ocr(self):
+        def prov(left: float, right: float, top: float, bottom: float) -> list[dict[str, Any]]:
+            return [
+                {
+                    "page_no": 1,
+                    "bbox": {
+                        "l": left,
+                        "r": right,
+                        "t": top,
+                        "b": bottom,
+                        "coord_origin": "BOTTOMLEFT",
+                    },
+                }
+            ]
+
+        document = {
+            "body": {
+                "children": [
+                    {"$ref": "#/texts/0"},
+                    {"$ref": "#/groups/0"},
+                ]
+            },
+            "texts": [
+                {
+                    "label": "text",
+                    "self_ref": "#/texts/0",
+                    "text": "Algorithm 1 Picture annotation",
+                    "prov": prov(110.0, 260.0, 620.0, 600.0),
+                },
+                {
+                    "label": "text",
+                    "self_ref": "#/texts/1",
+                    "text": "1: return a visual label",
+                    "prov": prov(115.0, 255.0, 590.0, 570.0),
+                },
+            ],
+            "groups": [
+                {
+                    "label": "list",
+                    "children": [{"$ref": "#/texts/1"}],
+                }
+            ],
+            "pictures": [
+                {
+                    "label": "picture",
+                    "prov": prov(100.0, 300.0, 650.0, 500.0),
+                }
+            ],
+        }
+
+        blocks, consumed = semantic_reflow._algorithm_group_blocks(
+            document,
+            _TableSource(),
+        )
+        self.assertEqual({}, blocks)
+        self.assertEqual(set(), consumed)
+        collected = semantic_reflow._collect_items(document, _TableSource())
+        self.assertFalse(
+            any(
+                item.kind in {"algorithm", "code", "text"}
+                and "Algorithm 1" in str((item.node or {}).get("text") or "")
+                for item in collected
+            )
+        )
+
+        document["pictures"][0]["prov"] = prov(350.0, 500.0, 650.0, 500.0)
+        blocks, consumed = semantic_reflow._algorithm_group_blocks(
+            document,
+            _TableSource(),
+        )
+        self.assertIn("#/texts/0", blocks)
+        self.assertTrue({"#/texts/0", "#/groups/0", "#/texts/1"}.issubset(consumed))
+
     def test_low_similarity_cross_column_crop_keeps_clean_paragraph(self):
         clean = (
             "This paragraph explains the estimator and remains readable "
