@@ -59,6 +59,20 @@
 This section describes the current source tree and the next release. The
 published `v1.1.1` archives and container images do not contain this Web UI.
 
+## Release identity and archive verification
+
+- the release builder now refuses a requested version unless every operational
+  Python, Compose, Dockerfile, installer, and bundle-document version source
+  agrees, then repeats the gate against the copied snapshot before creating
+  output;
+- the archive verifier binds manifest image keys to the matching services and
+  rejects version drift, duplicate JSON keys, duplicate or unknown Compose
+  services, malformed Python 3.9 TOML fallback input, and hidden/conflicting
+  installer or README version markers;
+- tar and zip verification now reject unsafe paths, links, special files, and
+  duplicate payload members. Internally hash-consistent tampering fixtures
+  exercise these failure paths.
+
 # Docling Service 1.1.1
 
 ## V1 quality and source-evidence hardening

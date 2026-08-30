@@ -62,6 +62,10 @@ Tagged releases publish deterministic `.tar.gz` and `.zip` bundles, per-file
 integrity manifests, SHA-256 checksums, and prebuilt `linux/amd64` and
 `linux/arm64` images in GitHub Container Registry. The release archive is the
 supported entry point on machines that do not have a repository checkout.
+Current source builds fail closed unless the requested version agrees with all
+Python, Compose, Dockerfile, installer, and bundle-document version sources;
+the archive verifier independently repeats those checks and rejects unsafe or
+ambiguous archive members.
 
 ## Development validation
 

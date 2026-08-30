@@ -16,6 +16,14 @@ The combined `SHA256SUMS` file is also provided when both archive formats are
 downloaded. `RELEASE_MANIFEST.json` records a SHA-256 digest for every file
 inside the archive.
 
+For bundles built from the current post-1.1.1 source, the builder and verifier
+also require every operational version source to agree: Python package/API/
+formula constants, source and release Compose image tags, Dockerfile release
+arguments, this README's active markers, and the macOS installer status block.
+Version drift aborts before output creation. Verification rejects duplicate
+manifest keys, unknown or duplicate Compose services, unsafe paths, links,
+special files, and duplicate archive members.
+
 ## macOS Apple Silicon
 
 The accepted target is Apple Silicon with macOS 26.4 or newer, Python 3.11–3.13,

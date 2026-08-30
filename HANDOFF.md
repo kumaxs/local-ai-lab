@@ -10,12 +10,12 @@
 
 ### Repository and branch state
 
-- Prepared at: `2026-08-30 03:36 EDT` (`America/New_York`).
+- Prepared at: `2026-08-30 04:29 EDT` (`America/New_York`).
 - Writable working repository: `/private/tmp/local-ai-lab-aug30-webui`.
 - Branch: `main`.
 - Push remote: `github` = `git@github.com:kumaxs/local-ai-lab.git`.
 - Engineering HEAD before this documentation/handoff commit:
-  `220f9f3`.
+  `ffd7f9e`.
 - `github/main` was the same commit immediately before this handoff-only commit.
   After resuming, validate that `git rev-parse HEAD` and
   `git rev-parse github/main` agree and inspect `git log -3`.
@@ -52,6 +52,8 @@ Completed and pushed work includes:
 - `ed51a12 docs: refresh session handoff`
 - `20b9a7a fix(docling): close web ui and region audit gaps`
 - `220f9f3 fix(webui): bound automatic refresh during navigation`
+- `3360d64 docs(docling): record completion audit and handoff`
+- `ffd7f9e fix(release): fail closed on version drift`
 
 Several intervening corpus/test commits (`5ae7a5a`, `eda3755`, `6b1a2a8`,
 `9128d7d`, and `19084c9`) are also already on `github/main`.
@@ -86,6 +88,28 @@ non-advancing cursors are quarantined. One automatic tick queues behind a
 normal navigation, and the second takes over a hung navigation, so automatic
 refresh cannot remain suppressed indefinitely.
 The direct-install default port is `8000`; Docker publishes `8766`.
+
+### Release deployment integrity
+
+An offline bundle audit found a deployment-critical drift path after the first
+handoff: the builder accepted a different `--version` while copying stale
+`1.1.1` Compose image defaults and embedded service versions. A nominal future
+bundle could therefore have pulled the published no-UI `v1.1.1` images.
+
+`ffd7f9e` makes source and archive release identity fail-closed across
+`pyproject.toml`, API/formula/package constants, source/release Compose tags,
+Dockerfile arguments, the macOS installer, and active bundle documentation.
+The copied snapshot is revalidated before the output directory is created.
+The verifier also rejects duplicate manifest keys, unknown/duplicate Compose
+services, malformed Python 3.9 TOML fallback input, hidden/conflicting version
+markers, unsafe paths, links, special files, and duplicate archive members.
+Independent adversarial review found no remaining P0/P1/P2 after the fixes.
+
+An audit-only bundle from exact commit
+`ffd7f9e682344a02b7de48cbd080a0efd482ea12` verified tar and zip checksums,
+78 files, both declared Linux platforms, and byte-identical Web UI assets in
+source/tar/zip. No release/tag/image was published; formal `v1.1.1` remains
+the older no-UI checkpoint.
 
 ### Literature-quality work
 
@@ -123,7 +147,9 @@ Final offline validation on the pushed code:
 ```text
 Focused region-gate suite: 86 tests, OK
 Full quality-parity suite: 724 tests, OK, 5 skipped
-Docling service suite: 184 tests, OK
+Docling service suite: 189 tests, OK
+Release distribution gate: 21 tests, OK
+Python 3.9 release-gate subset: 4 tests, OK
 Web UI concurrent-state suite: 9 tests, OK
 Python compile checks: passed
 JavaScript syntax check: passed

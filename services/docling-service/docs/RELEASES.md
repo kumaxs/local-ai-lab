@@ -10,6 +10,12 @@ Prebuilt images include OCI revision metadata, provenance, and SBOM
 attestations. See [DISTRIBUTION.md](DISTRIBUTION.md) for installation and
 integrity verification.
 
+Current post-1.1.1 source builds enforce one release identity across Python
+constants, source/release Compose image tags, Dockerfile arguments, the macOS
+installer, and active bundle documentation. The builder checks both the source
+and copied snapshot before creating output; the verifier repeats the check
+inside tar/zip payloads and rejects ambiguous or unsafe archive entries.
+
 | Capability | macOS release | Docker release |
 | --- | --- | --- |
 | Public API | `/v1/jobs` and `/v1/jobs/{id}` | identical |

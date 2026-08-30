@@ -30,6 +30,25 @@ python3 services/docling-service/release/verify_release_bundle.py \
   docling-service-1.1.1.tar.gz
 ```
 
+Use the verifier from the same release/tag as the archive. The current
+post-1.1.1 source verifier also requires the Web UI and region gate, so it
+intentionally rejects the older published `v1.1.1` bundle that predates those
+files.
+
+For bundles built from the current source tree, release identity is fail-closed.
+The requested and manifest versions must match `pyproject.toml`, the API,
+formula, and package constants, all source/release Compose image tags, all
+three Dockerfile release arguments, the macOS installer status block, and the
+active version markers in the bundle README. A mismatch is rejected before the
+output directory or archives are created, and the copied bundle snapshot is
+checked a second time before publication.
+
+The current verifier additionally rejects duplicate manifest JSON keys,
+duplicate/unknown Compose services, malformed or conflicting version metadata,
+unsafe paths, links, special files, and duplicate archive members. Its
+per-file manifest is an integrity/consistency check, not a substitute for
+obtaining assets and checksums from the trusted GitHub Release.
+
 The bundle excludes PDFs, reports, runtime state, logs, model caches, virtual
 environments, credentials, and Git history.
 
@@ -132,3 +151,7 @@ The workflow lives at `.github/workflows/docling-service-release.yml` and runs
 only for semantic-version tags matching `v*.*.*`. A release is complete only
 after validation, macOS bundle inspection, all three multi-platform image
 publishes, and GitHub Release asset upload succeed.
+
+A version bump must update every operational version source named above in one
+change. Passing a different `--version` to the bundle builder no longer
+rewrites or masks stale source/Compose defaults.
