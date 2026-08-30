@@ -18,10 +18,10 @@
       "abstract_url": "https://arxiv.org/abs/2608.15064",
       "pdf_url": "https://arxiv.org/pdf/2608.15064",
       "focus": ["long_document", "table", "figure", "header_footer", "reading_order"],
-      "downloaded_at": null,
-      "resolved_url": null,
-      "size_bytes": null,
-      "sha256": null,
+      "downloaded_at": "2026-08-30T03:20:27Z",
+      "resolved_url": "https://arxiv.org/pdf/2608.15064",
+      "size_bytes": 7653005,
+      "sha256": "0946cf4036545e9edf6b718fbf65ae06ffadc39ec4a84b6444a970833cfc74d6",
       "content_inspected": false
     },
     {
@@ -33,10 +33,10 @@
       "abstract_url": "https://arxiv.org/abs/2608.09068",
       "pdf_url": "https://arxiv.org/pdf/2608.09068",
       "focus": ["algorithm", "pseudocode", "code", "indentation", "table"],
-      "downloaded_at": null,
-      "resolved_url": null,
-      "size_bytes": null,
-      "sha256": null,
+      "downloaded_at": "2026-08-30T03:20:27Z",
+      "resolved_url": "https://arxiv.org/pdf/2608.09068",
+      "size_bytes": 3508902,
+      "sha256": "8591c6c7630ec49e8abb5609000d49548def66c6b6202aa7d123e4b6e3e2a02a",
       "content_inspected": false
     },
     {
@@ -48,10 +48,10 @@
       "abstract_url": "https://arxiv.org/abs/2503.18382",
       "pdf_url": "https://arxiv.org/pdf/2503.18382",
       "focus": ["display_formula", "inline_math", "math_symbols", "table", "figure"],
-      "downloaded_at": null,
-      "resolved_url": null,
-      "size_bytes": null,
-      "sha256": null,
+      "downloaded_at": "2026-08-30T03:20:27Z",
+      "resolved_url": "https://arxiv.org/pdf/2503.18382",
+      "size_bytes": 2760150,
+      "sha256": "81dac9aef0f0e21878d5f81291a0c8839bfb315ccef605771041de27436a0399",
       "content_inspected": false
     },
     {
@@ -63,10 +63,10 @@
       "abstract_url": "https://arxiv.org/abs/2608.08459",
       "pdf_url": "https://arxiv.org/pdf/2608.08459",
       "focus": ["table", "figure", "long_document", "relational_structure"],
-      "downloaded_at": null,
-      "resolved_url": null,
-      "size_bytes": null,
-      "sha256": null,
+      "downloaded_at": "2026-08-30T03:20:27Z",
+      "resolved_url": "https://arxiv.org/pdf/2608.08459",
+      "size_bytes": 8243286,
+      "sha256": "d9e977655fa181182894d8585dbcc75410133f24a059c013a7323632f25ad19b",
       "content_inspected": false
     }
   ]
