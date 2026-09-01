@@ -1,13 +1,224 @@
 # Local AI Lab Session Handoff
 
-> Status: completed 2026-08-30 implementation/evaluation handoff snapshot.
+> Status: prepared 2026-09-01 continuation snapshot after the user-reviewed
+> local Docker batch, quality assessment, and explicit runtime cleanup.
 >
 > A later session receiving `交接继续` must read `AGENTS.md` and this file
 > completely, validate the recorded state, and continue from the explicit
 > quality-release blockers below rather than repeating completed implementation,
 > Docker/macOS smoke, or regression work.
 
-## Final 2026-08-30 snapshot
+## Active 2026-09-01 continuation snapshot
+
+### Start here in the next session
+
+- The active writable source checkout is
+  `/private/tmp/local-ai-lab-aug30-webui`.
+- If that temporary checkout no longer exists, create a new clean checkout from
+  `github/main` at a new path; do not repurpose either local directory described
+  below.
+- `/Users/zeyuan/Local-AI-Lab` is an intentionally retired tombstone containing
+  only its retirement README and `.gitignore`; it is not a source or handoff
+  entrypoint. Do not add a handoff copy there.
+- `/Users/zeyuan/Projects/local-ai-lab` is the stale local `origin`. It is at
+  `fdaa248`, 25 commits behind the pre-handoff engineering/evaluation HEAD
+  `5f05d4e` (and this handoff commit adds one more), and currently has
+  uncommitted user changes in `quality_parity_adapter.py` and
+  `test_quality_parity_adapter.py`. Do not pull, reset, rebase, overwrite, or
+  use it as the next working tree until those changes are deliberately
+  reconciled.
+- The push remote is `github = git@github.com:kumaxs/local-ai-lab.git`.
+  Immediately before this handoff edit, active `HEAD` and `github/main` were
+  both `5f05d4e8c7fc80091f02ad83e4c9c99ae83cf5dc`; the active checkout was clean.
+  After resuming, verify `git status --short --branch`, `git rev-parse HEAD`,
+  `git rev-parse github/main`, and `git log -3 --oneline`.
+- No Docling evaluation service or review bundle remains running or stored. The
+  next session must not expect `http://127.0.0.1:8766/ui/`, Docker job state,
+  downloaded archives, PDFs, screenshots, or model caches to exist. Rebuild a
+  fresh isolated stack only when new conversion work actually requires it.
+
+### User-visible local Docker/WebUI review
+
+The post-`v1.1.1` source build was run locally as Compose project
+`docling-user-review-20260830`, with its Web UI temporarily published at
+`http://127.0.0.1:8766/ui/`. The user reviewed the UI, queue, progress, generated
+artifacts, and screenshots, then explicitly instructed that the service and all
+runtime products be removed before handoff.
+
+The submitted corpus was 16 PDFs:
+
+- `old`: 10 historical regression papers;
+- `new`: 6 fresh/calibration submissions;
+- new-cohort CN and Transformers-GNN were intentional independent submissions
+  of the same bytes used by their old-cohort controls.
+
+The input gate matched locked byte sizes and SHA-256 digests for all 16 PDFs.
+One representative Pseudo2CodeQA job was submitted through the real Web UI;
+the remaining jobs were submitted once through the API with stable idempotency
+keys and GET-only polling.
+
+Primary/effective outcome:
+
+```text
+primary corpus jobs: 16
+primary strict state: 1 succeeded / 15 failed
+effective artifacts before cleanup: 16 / 16 available
+Web UI terminal rows: 20 = 16 primary + 4 transparent recovery jobs
+Web UI terminal state: 1 succeeded / 19 failed
+```
+
+The four extra rows were not hidden retries. Four primary jobs had no
+downloadable output during a transient backend window:
+
+- `4e355023-aa7c-46fa-b82c-84959664d7a8`: connection reset by peer;
+- `f395e255-1667-4b44-b058-83cc48d2d48c`: backend connection refused;
+- `451a9480-c672-426e-802b-4833740ef273`: backend connection refused;
+- `12f847bc-928b-4c99-a387-9df184b68e11`: backend connection refused.
+
+Each was recovered serially only after three consecutive healthy backend
+checks. All four recovery jobs produced downloadable, CRC-valid archives, but
+their strict quality state was still `failed`. Thus the 19 red Web UI rows were
+four operational failures plus 15 artifact-bearing quality failures, not 19
+missing conversions.
+
+Docker emitted one backend OOM event with exit code 137 at
+`2026-08-31T02:38:20Z` and restarted it. At final acceptance the API, backend,
+and formula containers were healthy; recorded restart counts were respectively
+0, 6, and 1. This is adequate recovery evidence, not production-stability
+evidence.
+
+### Current conversion-quality assessment
+
+The honest product classification is **engineering Beta for evidence-assisted
+human review / release-candidate quality gate**, approximately 2/5 against the
+requested high-fidelity objective. It is not approved for unattended production
+conversion, automatic structured-data ingestion, or formula/algorithm research.
+
+Strengths observed before cleanup:
+
+- all 16 effective packages existed, passed ZIP CRC validation, retained source
+  identity, and had no broken local artifact references;
+- base prose was usually readable, and all cases reported zero GXX replacement
+  residue;
+- header/footer and picture-OCR candidates were generally isolated from the
+  main reading flow; final structural residual counts were zero;
+- the CN and Transformers-GNN independent controls produced byte-identical
+  Markdown, HTML, quality signals, regions, and structural sidecars, proving
+  reproducibility (not correctness);
+- the gate failed closed instead of silently promoting unverified semantics.
+
+Aggregate region evidence across the 16 effective jobs, including the two
+intentional duplicate controls, was:
+
+| Kind | Total | Verified | Unresolved | Other |
+|---|---:|---:|---:|---:|
+| formula | 318 | 55 | 263 | 0 |
+| inline math | 282 | 78 | 204 | 0 |
+| table | 80 | 22 | 58 | 0 |
+| algorithm | 3 | 0 | 3 | 0 |
+| code | 1 | 1 | 0 | 0 |
+| header/footer | 253 | 253 | 0 | 0 |
+| picture OCR | 3,823 | 3,817 | 6 | 0 |
+| picture | 93 | 0 | 0 | 93 visual-only |
+
+There were 534 critical unresolved records in 4,853 retained region records;
+the per-job critical distribution was
+`0, 1, 4, 5, 6, 7, 10, 13, 15, 15, 18, 37, 37, 38, 41, 287`.
+LongDocBench was a near-pass with one table-occupancy residual, while FRCD was
+the severe outlier with 287 unresolved regions. The one strict pass,
+Pseudo2CodeQA, was still classified `degraded_success` and did not contain a
+real algorithm/code block, so it does not validate those harder surfaces.
+
+Material defects confirmed by artifact inspection included:
+
+- blank or OCR-garbled standalone formulas in PP-FormulaNet, LoRA, RAG, and
+  TableGTR; FRCD's standalone `formulas.tex` contained formula headings without
+  usable TeX bodies;
+- formula/inline-math occurrence, source-crop, provenance, identity-hash,
+  final-node, and two-column bounding-box failures;
+- 58/80 table regions failing occupancy, topology, overlap, row-collapse, or
+  body-identity checks; complex tables were not safe database input;
+- a real code block in BERT preserved indentation, but a normal
+  `Input/Output Representations` prose section was also falsely promoted as an
+  algorithm; Table Transformer preserved a visually useful algorithm layout
+  but could not bind it to final source evidence; FRCD's multi-page algorithm
+  was not correctly delivered;
+- review-oriented Markdown/HTML retained source-disclosure and evidence
+  appendices. Main-flow isolation was useful for people, but raw files were not
+  clean RAG input without filtering those review surfaces.
+
+Allowed use from this evidence is limited to human review with the original PDF
+and source crops. RAG is at most an allowlisted trial for strict-passing regions;
+degraded-failure main surfaces must not be treated as authoritative.
+
+### Cleanup completed at the user's request
+
+The user explicitly confirmed the review was complete and requested that the
+service, products, and runtime resources not be retained. The following were
+permanently removed:
+
+- containers `docling-user-review-20260830-api-1`,
+  `docling-user-review-20260830-backend-1`, and
+  `docling-user-review-20260830-formula-1`;
+- network `docling-user-review-20260830_default`;
+- five project-scoped volumes: `docling-inputs`, `docling-outputs`,
+  `docling-state`, `docling-models`, and `docling-formula-models` under the
+  `docling-user-review-20260830_` prefix;
+- the three source-built images used only by those containers:
+  `local-ai-lab/docling-api:1.1.1`,
+  `local-ai-lab/docling-backend:1.1.1`, and
+  `local-ai-lab/docling-formula:1.1.1`;
+- the approximately 740 MiB review bundle at
+  `.runtime/review/docling-webui-review-2026-08-30/`, including input copies,
+  archives, extracted artifacts, job/API state, screenshots, and generated
+  indexes;
+- the remaining approximately 464 KiB direct/macOS smoke runtime at
+  `.runtime/docling-release/`, consisting only of stopped-service logs, an
+  empty lifecycle lock, and test SQLite state. No process referenced that
+  directory when it was removed, and the now-empty `.runtime/` directory was
+  removed as well.
+
+Post-cleanup checks returned no container, volume, or network labeled for
+`docling-user-review-20260830`, and the review-bundle path was absent. These
+runtime products, smoke state, and screenshots are intentionally not
+recoverable from this checkout. Other historical Docker projects/resources
+were outside the cleanup scope and were not modified.
+No global Docker prune was run: shared build cache and unrelated/historical
+images and volumes remain outside this task's ownership.
+
+Because the user requested permanent cleanup, this active handoff section is
+the sole durable aggregate record of the 16-row WebUI/recovery run; the earlier
+evaluation document covers the direct six-paper and historical ten-paper runs,
+not this later queue history.
+
+### Next quality workstream
+
+Do not spend the next session recreating the deleted review bundle merely to
+repeat the same assessment. Continue with generic fixes in this priority order:
+
+1. repair two-column formula/inline-math geometry and occurrence binding,
+   source crop/provenance/hash/body identity, synchronized HTML MathML and
+   Markdown TeX, and genuinely usable standalone TeX;
+2. eliminate algorithm prose false positives, bind multi-page algorithms to
+   inventory/source/final nodes, and preserve indentation only after identity
+   is proven;
+3. repair table grid occupancy, row/column spans, collapse detection, and body
+   identity before allowing CSV/JSON ingestion;
+4. separate clean downstream surfaces from human-review disclosures, and split
+   Web UI status into conversion completion, quality degradation, and artifact
+   availability;
+5. investigate backend OOM/restarts, add memory headroom plus health-gated
+   retry/requeue, and remove the need for manual recovery;
+6. stream or raise the bounded region sidecar safely so Donut-class documents
+   do not truncate diagnostics;
+7. rerun locked old and diverse new corpora only after the fixes, requiring no
+   critical unresolved regions for the claimed document families and no
+   service OOM/refused window before any production claim.
+
+## Historical final 2026-08-30 snapshot
+
+> This older snapshot is retained for provenance. Where it differs from the
+> active 2026-09-01 section above, the active section is authoritative.
 
 ### Repository and delivery state
 
