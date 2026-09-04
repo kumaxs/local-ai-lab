@@ -51,6 +51,11 @@
     "excluded_base_document_id_overlap_count": 0,
     "sha256_required_after_download": true,
     "post_download_scope": "Compare candidate SHA-256 values within this batch and against the 16-file development input snapshot before conversion.",
+    "post_download_verified_at": "2026-09-04T15:37:55Z",
+    "candidate_sha256_unique": true,
+    "development_snapshot_file_count": 16,
+    "development_snapshot_sha256_unique": true,
+    "candidate_development_sha256_overlap_count": 0,
     "different_versions_may_not_cross_splits": true
   },
   "candidates": [
@@ -75,7 +80,13 @@
       "sample_index": 78,
       "feed_position": 242,
       "collision_steps": 0,
-      "downloaded": false,
+      "downloaded": true,
+      "downloaded_at": "2026-09-04T15:37:55Z",
+      "resolved_url": "https://arxiv.org/pdf/2609.03415v1",
+      "http_status": 200,
+      "size_bytes": 13816897,
+      "sha256": "61e92b29a59641d1bc6bdca71ad3851e701fc517e6e8991d52e7b5b3c58afbbc",
+      "download_validation": "HTTP response, byte count, SHA-256, and PDF file type only; no page, text, render, or conversion output inspected",
       "content_inspected": false
     },
     {
@@ -98,7 +109,13 @@
       "sample_index": 52,
       "feed_position": 305,
       "collision_steps": 0,
-      "downloaded": false,
+      "downloaded": true,
+      "downloaded_at": "2026-09-04T15:37:55Z",
+      "resolved_url": "https://arxiv.org/pdf/2609.03215v1",
+      "http_status": 200,
+      "size_bytes": 1968857,
+      "sha256": "001cc9772d15fbf0f763e8787713e718c878146a53dc7ff4e54520dd51482831",
+      "download_validation": "HTTP response, byte count, SHA-256, and PDF file type only; no page, text, render, or conversion output inspected",
       "content_inspected": false
     },
     {
@@ -122,7 +139,13 @@
       "sample_index": 31,
       "feed_position": 161,
       "collision_steps": 0,
-      "downloaded": false,
+      "downloaded": true,
+      "downloaded_at": "2026-09-04T15:37:55Z",
+      "resolved_url": "https://arxiv.org/pdf/2609.03660v1",
+      "http_status": 200,
+      "size_bytes": 963715,
+      "sha256": "40309c2a1272cd5790a9f1543e09bf453e343f1873c77ee26c1bfb6ebfeeb0c3",
+      "download_validation": "HTTP response, byte count, SHA-256, and PDF file type only; no page, text, render, or conversion output inspected",
       "content_inspected": false
     },
     {
@@ -143,7 +166,13 @@
       "sample_index": 18,
       "feed_position": 211,
       "collision_steps": 0,
-      "downloaded": false,
+      "downloaded": true,
+      "downloaded_at": "2026-09-04T15:37:55Z",
+      "resolved_url": "https://arxiv.org/pdf/2609.03508v1",
+      "http_status": 200,
+      "size_bytes": 292892,
+      "sha256": "cf9afc784c8abdd81e6a1ed78042e3f078aa3795d3247fd03647b42fc3f73a55",
+      "download_validation": "HTTP response, byte count, SHA-256, and PDF file type only; no page, text, render, or conversion output inspected",
       "content_inspected": false
     },
     {
@@ -168,7 +197,13 @@
       "sample_index": 4,
       "feed_position": 376,
       "collision_steps": 0,
-      "downloaded": false,
+      "downloaded": true,
+      "downloaded_at": "2026-09-04T15:37:55Z",
+      "resolved_url": "https://arxiv.org/pdf/2609.02832v1",
+      "http_status": 200,
+      "size_bytes": 1867373,
+      "sha256": "225cc5427e8f9cc74bd9073c66da74b07995faa663b1664fdb1dfde1f1887950",
+      "download_validation": "HTTP response, byte count, SHA-256, and PDF file type only; no page, text, render, or conversion output inspected",
       "content_inspected": false
     },
     {
@@ -189,7 +224,13 @@
       "sample_index": 2,
       "feed_position": 127,
       "collision_steps": 0,
-      "downloaded": false,
+      "downloaded": true,
+      "downloaded_at": "2026-09-04T15:37:55Z",
+      "resolved_url": "https://arxiv.org/pdf/2609.03768v1",
+      "http_status": 200,
+      "size_bytes": 1643846,
+      "sha256": "565b7ffbeb8499c4694cf631f6667447fee0fa7c1092652406a59b254a7f5ea0",
+      "download_validation": "HTTP response, byte count, SHA-256, and PDF file type only; no page, text, render, or conversion output inspected",
       "content_inspected": false
     }
   ]
