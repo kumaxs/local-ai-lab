@@ -1,0 +1,467 @@
+{
+  "fixture_version": "0.1.0",
+  "base": "minimal-verified.document-ir.json",
+  "cases": [
+    {
+      "case_id": "producer-status-warn",
+      "phase": "json_schema",
+      "expected": "reject",
+      "rule": "producer_status_enum",
+      "patch": [
+        {"op": "replace", "path": "/run/producer_runs/0/status", "value": "warn"}
+      ]
+    },
+    {
+      "case_id": "remote-asset-uri",
+      "phase": "json_schema",
+      "expected": "reject",
+      "rule": "no_path_or_uri_fields",
+      "patch": [
+        {"op": "add", "path": "/assets/0/uri", "value": "https://example.invalid/asset.png"}
+      ]
+    },
+    {
+      "case_id": "missing-resolution-report",
+      "phase": "json_schema",
+      "expected": "reject",
+      "rule": "verified_semantic_requires_report",
+      "patch": [
+        {"op": "replace", "path": "/regions/0/resolution/validation_report_ids", "value": []}
+      ]
+    },
+    {
+      "case_id": "strict-ineligible-green",
+      "phase": "json_schema",
+      "expected": "reject",
+      "rule": "strict_ineligible_fails_closed",
+      "patch": [
+        {"op": "replace", "path": "/delivery/strict_machine_eligible", "value": false}
+      ]
+    },
+    {
+      "case_id": "critical-visual-marked-eligible",
+      "phase": "json_schema",
+      "expected": "reject",
+      "rule": "critical_nonverified_not_strict_eligible",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/regions/0/resolution",
+          "value": {
+            "final_state": "visual_only",
+            "payload": {
+              "kind": "visual",
+              "asset_id": "asset-sha256-a3b9c5f7d1e2f4a6b8d0f2e4c6a8b0d2e4f6a8c0d2e4f6a8c0d2e4f6a8c0d2e4",
+              "label": "unverified source crop"
+            },
+            "evidence_ids": ["ev-01a2b3c4"],
+            "validation_report_ids": ["vr-01a2b3c4"],
+            "reason_codes": ["semantic_verification_failed"],
+            "review_required": true
+          }
+        },
+        {"op": "replace", "path": "/delivery/counts/verified_semantic", "value": 0},
+        {"op": "replace", "path": "/delivery/counts/visual_only", "value": 1},
+        {"op": "replace", "path": "/delivery/counts/critical_non_verified", "value": 1}
+      ]
+    },
+    {
+      "case_id": "strict-eligible-not-renderable",
+      "phase": "json_schema",
+      "expected": "reject",
+      "rule": "strict_eligible_is_renderable",
+      "patch": [
+        {"op": "replace", "path": "/delivery/renderable", "value": false}
+      ]
+    },
+    {
+      "case_id": "failed-strict-valid",
+      "phase": "semantic",
+      "expected": "accept",
+      "rule": "failed_strict_is_auditable",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/regions/0/resolution",
+          "value": {
+            "final_state": "visual_only",
+            "payload": {
+              "kind": "visual",
+              "asset_id": "asset-sha256-a3b9c5f7d1e2f4a6b8d0f2e4c6a8b0d2e4f6a8c0d2e4f6a8c0d2e4f6a8c0d2e4",
+              "label": "unverified source crop"
+            },
+            "evidence_ids": ["ev-01a2b3c4"],
+            "validation_report_ids": ["vr-01a2b3c4"],
+            "reason_codes": ["semantic_verification_failed"],
+            "review_required": true
+          }
+        },
+        {"op": "replace", "path": "/delivery/strict_machine_eligible", "value": false},
+        {"op": "replace", "path": "/delivery/state", "value": "failed"},
+        {"op": "replace", "path": "/delivery/renderable", "value": false},
+        {"op": "replace", "path": "/delivery/counts/verified_semantic", "value": 0},
+        {"op": "replace", "path": "/delivery/counts/visual_only", "value": 1},
+        {"op": "replace", "path": "/delivery/counts/critical_non_verified", "value": 1},
+        {"op": "replace", "path": "/delivery/blocking/reason_codes", "value": ["critical_region_not_verified"]},
+        {"op": "replace", "path": "/delivery/blocking/validation_report_refs", "value": ["vr-01a2b3c4"]},
+        {"op": "replace", "path": "/validation_reports/0/checks/0/result", "value": "indeterminate"},
+        {"op": "replace", "path": "/validation_reports/0/checks/0/reason_codes", "value": ["source_evidence_insufficient"]}
+      ]
+    },
+    {
+      "case_id": "document-source-digest-mismatch",
+      "phase": "semantic",
+      "expected": "reject",
+      "rule": "document_id_equals_source_sha256",
+      "patch": [
+        {"op": "replace", "path": "/document_id", "value": "doc-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}
+      ]
+    },
+    {
+      "case_id": "report-source-mismatch",
+      "phase": "semantic",
+      "expected": "reject",
+      "rule": "report_bound_to_document_source",
+      "patch": [
+        {"op": "replace", "path": "/validation_reports/0/source_sha256", "value": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}
+      ]
+    },
+    {
+      "case_id": "report-policy-replay",
+      "phase": "semantic",
+      "expected": "reject",
+      "rule": "report_bound_to_run_policy_registry",
+      "patch": [
+        {"op": "replace", "path": "/validation_reports/0/policy_sha256", "value": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}
+      ]
+    },
+    {
+      "case_id": "report-run-replay",
+      "phase": "semantic",
+      "expected": "reject",
+      "rule": "report_bound_to_run_policy_registry",
+      "patch": [
+        {"op": "replace", "path": "/validation_reports/0/run_id", "value": "run-replayed-001"}
+      ]
+    },
+    {
+      "case_id": "report-registry-replay",
+      "phase": "semantic",
+      "expected": "reject",
+      "rule": "report_bound_to_run_policy_registry",
+      "patch": [
+        {"op": "replace", "path": "/validation_reports/0/trust_registry_sha256", "value": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}
+      ]
+    },
+    {
+      "case_id": "run-policy-artifact-digest-mismatch",
+      "phase": "semantic",
+      "expected": "reject",
+      "rule": "coverage_policy_artifact_binding",
+      "patch": [
+        {"op": "replace", "path": "/run/policy_sha256", "value": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}
+      ]
+    },
+    {
+      "case_id": "producer-source-mismatch",
+      "phase": "semantic",
+      "expected": "reject",
+      "rule": "producer_bound_to_document_source",
+      "patch": [
+        {"op": "replace", "path": "/run/producer_runs/0/source_sha256", "value": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}
+      ]
+    },
+    {
+      "case_id": "asset-source-mismatch",
+      "phase": "semantic",
+      "expected": "reject",
+      "rule": "asset_bound_to_document_source",
+      "patch": [
+        {"op": "replace", "path": "/assets/0/source_sha256", "value": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}
+      ]
+    },
+    {
+      "case_id": "duplicate-region-id",
+      "phase": "semantic",
+      "expected": "reject",
+      "rule": "identifier_uniqueness",
+      "patch": [
+        {"op": "copy", "from": "/regions/0", "path": "/regions/-"},
+        {"op": "replace", "path": "/regions/1/bbox/right", "value": 539}
+      ]
+    },
+    {
+      "case_id": "unknown-candidate-reference",
+      "phase": "semantic",
+      "expected": "reject",
+      "rule": "reference_closure",
+      "patch": [
+        {"op": "replace", "path": "/regions/0/candidate_ids/0", "value": "cand-deadbeef"}
+      ]
+    },
+    {
+      "case_id": "relation-self-loop",
+      "phase": "semantic",
+      "expected": "reject",
+      "rule": "relation_graph_acyclic",
+      "patch": [
+        {
+          "op": "add",
+          "path": "/relations/-",
+          "value": {
+            "relation_id": "rel-deadbeef",
+            "relation_type": "contains",
+            "source_region_id": "reg-01a2b3c4",
+            "target_region_id": "reg-01a2b3c4"
+          }
+        }
+      ]
+    },
+    {
+      "case_id": "unknown-lineage-predecessor",
+      "phase": "semantic",
+      "expected": "reject",
+      "rule": "nested_reference_closure",
+      "patch": [
+        {"op": "replace", "path": "/regions/0/lineage/operation", "value": "remap"},
+        {"op": "replace", "path": "/regions/0/lineage/predecessor_ids", "value": ["reg-deadbeef"]}
+      ]
+    },
+    {
+      "case_id": "unrelated-report-subject",
+      "phase": "semantic",
+      "expected": "reject",
+      "rule": "validation_subject_applicability",
+      "patch": [
+        {"op": "replace", "path": "/validation_reports/0/checks/0/subject", "value": "reg-deadbeef"}
+      ]
+    },
+    {
+      "case_id": "correlated-validator",
+      "phase": "semantic",
+      "expected": "reject",
+      "rule": "producer_validator_independence",
+      "patch": [
+        {"op": "replace", "path": "/validation_reports/0/independence_group", "value": "docling-main-parser"}
+      ]
+    },
+    {
+      "case_id": "stale-final-target-report",
+      "phase": "semantic",
+      "expected": "reject",
+      "rule": "validation_target_digest_matches_final_payload",
+      "patch": [
+        {"op": "replace", "path": "/regions/0/resolution/payload/text", "value": "WRONG"},
+        {"op": "replace", "path": "/candidates/0/payload/text", "value": "WRONG"}
+      ]
+    },
+    {
+      "case_id": "wrong-role-check-class",
+      "phase": "semantic",
+      "expected": "reject",
+      "rule": "role_requires_policy_check_class",
+      "patch": [
+        {"op": "replace", "path": "/validation_reports/0/checks/0/check_class", "value": "table"}
+      ]
+    },
+    {
+      "case_id": "payload-requires-policy-check-class",
+      "phase": "semantic",
+      "expected": "reject",
+      "rule": "role_requires_policy_check_class",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/regions/0/resolution/payload",
+          "value": {
+            "kind": "formula",
+            "formula_kind": "display",
+            "notation": "latex",
+            "content": "x"
+          }
+        }
+      ]
+    },
+    {
+      "case_id": "correlated-evidence-provider",
+      "phase": "semantic",
+      "expected": "reject",
+      "rule": "producer_evidence_independence",
+      "patch": [
+        {"op": "replace", "path": "/evidence/0/independence_group", "value": "docling-main-parser"}
+      ]
+    },
+    {
+      "case_id": "unattested-validator-implementation",
+      "phase": "semantic",
+      "expected": "reject",
+      "rule": "trust_registry_validator_attestation",
+      "patch": [
+        {"op": "replace", "path": "/validation_reports/0/implementation_sha256", "value": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"}
+      ]
+    },
+    {
+      "case_id": "unattested-evidence-provider",
+      "phase": "semantic",
+      "expected": "reject",
+      "rule": "trust_registry_provider_attestation",
+      "patch": [
+        {"op": "replace", "path": "/evidence/0/provider_implementation_sha256", "value": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"}
+      ]
+    },
+    {
+      "case_id": "omitted-source-region",
+      "phase": "semantic",
+      "expected": "reject",
+      "rule": "source_inventory_region_coverage",
+      "patch": [
+        {"op": "replace", "path": "/regions", "value": []},
+        {"op": "replace", "path": "/pages/0/region_ids", "value": []},
+        {"op": "replace", "path": "/validation_reports/0/checks/0/subject", "value": "pg-01a2b3c4"},
+        {"op": "replace", "path": "/validation_reports/0/checks/0/category", "value": "source_inventory"},
+        {"op": "replace", "path": "/delivery/counts/total", "value": 0},
+        {"op": "replace", "path": "/delivery/counts/verified_semantic", "value": 0}
+      ]
+    },
+    {
+      "case_id": "source-inventory-required-class-omitted",
+      "phase": "semantic",
+      "expected": "reject",
+      "rule": "coverage_policy_required_classes",
+      "patch": [
+        {"op": "remove", "path": "/source_inventory/0/required_evidence_classes/3"},
+        {"op": "remove", "path": "/source_inventory/0/class_results/3"},
+        {"op": "replace", "path": "/validation_reports/0/checks/1/target_sha256", "value": "af543e0b87ba0309bcb0937fcd784b54d61392c2efffb832487d702974d12b78"}
+      ]
+    },
+    {
+      "case_id": "page-support-only-nonblank",
+      "phase": "semantic",
+      "expected": "reject",
+      "rule": "source_inventory_nonblank_observation",
+      "patch": [
+        {"op": "replace", "path": "/evidence/0/coverage_role", "value": "page_support"},
+        {"op": "remove", "path": "/evidence/0/observed_role"},
+        {"op": "remove", "path": "/evidence/0/observed_criticality"}
+      ]
+    },
+    {
+      "case_id": "strict-green-with-indeterminate-inventory",
+      "phase": "semantic",
+      "expected": "reject",
+      "rule": "source_inventory_target_binding",
+      "patch": [
+        {"op": "replace", "path": "/validation_reports/0/checks/1/result", "value": "indeterminate"},
+        {"op": "replace", "path": "/validation_reports/0/checks/1/evidence_ids", "value": []},
+        {"op": "replace", "path": "/validation_reports/0/checks/1/reason_codes", "value": ["source_inventory_indeterminate"]}
+      ]
+    },
+    {
+      "case_id": "incompatible-check-evidence-class",
+      "phase": "semantic",
+      "expected": "reject",
+      "rule": "check_class_evidence_mapping",
+      "patch": [
+        {"op": "replace", "path": "/evidence/0/kind", "value": "provenance"}
+      ]
+    },
+    {
+      "case_id": "incompatible-check-evidence-coverage-role",
+      "phase": "semantic",
+      "expected": "reject",
+      "rule": "check_class_evidence_mapping",
+      "patch": [
+        {"op": "copy", "from": "/evidence/0", "path": "/evidence/-"},
+        {"op": "replace", "path": "/evidence/1/evidence_id", "value": "ev-deadbeef"},
+        {"op": "replace", "path": "/evidence/1/coverage_role", "value": "page_support"},
+        {"op": "remove", "path": "/evidence/1/observed_role"},
+        {"op": "remove", "path": "/evidence/1/observed_criticality"},
+        {"op": "replace", "path": "/validation_reports/0/checks/0/evidence_ids", "value": ["ev-deadbeef"]}
+      ]
+    },
+    {
+      "case_id": "criticality-downgrade",
+      "phase": "semantic",
+      "expected": "reject",
+      "rule": "policy_derived_criticality",
+      "patch": [
+        {"op": "replace", "path": "/regions/0/criticality", "value": "normal"}
+      ]
+    },
+    {
+      "case_id": "bbox-out-of-page",
+      "phase": "semantic",
+      "expected": "reject",
+      "rule": "bbox_page_bounds",
+      "patch": [
+        {"op": "replace", "path": "/regions/0/bbox/right", "value": 700}
+      ]
+    },
+    {
+      "case_id": "delivery-count-mismatch",
+      "phase": "semantic",
+      "expected": "reject",
+      "rule": "delivery_counts_match_regions",
+      "patch": [
+        {"op": "replace", "path": "/delivery/counts/total", "value": 2}
+      ]
+    },
+    {
+      "case_id": "algorithm-step-ordinal-gap",
+      "phase": "semantic",
+      "expected": "reject",
+      "rule": "algorithm_steps_contiguous_zero_based",
+      "patch": [
+        {"op": "copy", "from": "/candidates/0", "path": "/candidates/-"},
+        {"op": "replace", "path": "/candidates/1/candidate_id", "value": "cand-deadbeef"},
+        {"op": "replace", "path": "/candidates/1/native_id", "value": "native-algorithm-gap"},
+        {"op": "replace", "path": "/candidates/1/role", "value": "algorithm"},
+        {
+          "op": "replace",
+          "path": "/candidates/1/payload",
+          "value": {
+            "kind": "algorithm",
+            "steps": [
+              {"step_id": "stp-00000001", "ordinal": 0, "text": "Initialize", "evidence_ids": ["ev-01a2b3c4"]},
+              {"step_id": "stp-00000002", "ordinal": 2, "text": "Return", "evidence_ids": ["ev-01a2b3c4"]}
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "case_id": "validator-unavailable-failed-strict",
+      "phase": "semantic",
+      "expected": "accept",
+      "rule": "validator_outage_is_auditable",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/regions/0/resolution",
+          "value": {
+            "final_state": "unresolved",
+            "payload": null,
+            "validation_report_ids": ["vr-01a2b3c4"],
+            "reason_codes": ["validator_unavailable"],
+            "review_required": true
+          }
+        },
+        {"op": "replace", "path": "/validation_reports/0/execution_status", "value": "unavailable"},
+        {"op": "replace", "path": "/validation_reports/0/checks/0/result", "value": "indeterminate"},
+        {"op": "replace", "path": "/validation_reports/0/checks/0/evidence_ids", "value": []},
+        {"op": "replace", "path": "/validation_reports/0/checks/0/reason_codes", "value": ["validator_unavailable"]},
+        {"op": "replace", "path": "/validation_reports/0/checks/1/result", "value": "indeterminate"},
+        {"op": "replace", "path": "/validation_reports/0/checks/1/evidence_ids", "value": []},
+        {"op": "replace", "path": "/validation_reports/0/checks/1/reason_codes", "value": ["validator_unavailable"]},
+        {"op": "replace", "path": "/delivery/strict_machine_eligible", "value": false},
+        {"op": "replace", "path": "/delivery/state", "value": "failed"},
+        {"op": "replace", "path": "/delivery/renderable", "value": false},
+        {"op": "replace", "path": "/delivery/counts/verified_semantic", "value": 0},
+        {"op": "replace", "path": "/delivery/counts/unresolved", "value": 1},
+        {"op": "replace", "path": "/delivery/counts/critical_non_verified", "value": 1},
+        {"op": "replace", "path": "/delivery/blocking/reason_codes", "value": ["validator_unavailable"]},
+        {"op": "replace", "path": "/delivery/blocking/validation_report_refs", "value": ["vr-01a2b3c4"]}
+      ]
+    }
+  ]
+}

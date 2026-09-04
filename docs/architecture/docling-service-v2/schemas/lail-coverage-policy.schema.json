@@ -1,0 +1,310 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:local-ai-lab:schema:lail-coverage-policy:v0.1.0",
+  "title": "LAIL Coverage Policy",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "$schema",
+    "schema_name",
+    "schema_version",
+    "policy_id",
+    "delivery_mode",
+    "required_inventory_evidence_classes",
+    "required_check_class_combination",
+    "required_check_class_rules",
+    "verified_semantic_forbidden_roles",
+    "criticality_rules",
+    "check_evidence_rules"
+  ],
+  "properties": {
+    "$schema": {
+      "type": "string",
+      "const": "../schemas/lail-coverage-policy.schema.json"
+    },
+    "schema_name": {
+      "type": "string",
+      "const": "lail.coverage-policy"
+    },
+    "schema_version": {
+      "type": "string",
+      "const": "0.1.0"
+    },
+    "policy_id": {
+      "type": "string",
+      "pattern": "^policy-[a-z0-9][a-z0-9._-]*$"
+    },
+    "delivery_mode": {
+      "type": "string",
+      "const": "strict_machine"
+    },
+    "required_inventory_evidence_classes": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/evidence_class"
+      },
+      "uniqueItems": true
+    },
+    "required_check_class_combination": {
+      "type": "string",
+      "const": "ordered_union_role_then_payload"
+    },
+    "required_check_class_rules": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/required_check_class_rule"
+      },
+      "uniqueItems": true
+    },
+    "verified_semantic_forbidden_roles": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/role"
+      },
+      "uniqueItems": true
+    },
+    "criticality_rules": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/criticality_rule"
+      },
+      "uniqueItems": true
+    },
+    "check_evidence_rules": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/check_evidence_rule"
+      },
+      "uniqueItems": true
+    }
+  },
+  "$defs": {
+    "role": {
+      "type": "string",
+      "enum": [
+        "title",
+        "heading",
+        "paragraph",
+        "list",
+        "list_item",
+        "table",
+        "figure",
+        "chart",
+        "caption",
+        "display_formula",
+        "inline_formula",
+        "algorithm",
+        "algorithm_step",
+        "code_block",
+        "footnote",
+        "header",
+        "footer",
+        "page_number",
+        "reference_entry",
+        "decorative",
+        "unknown"
+      ]
+    },
+    "payload_kind": {
+      "type": "string",
+      "enum": [
+        "text",
+        "formula",
+        "table",
+        "figure",
+        "algorithm",
+        "code"
+      ]
+    },
+    "check_class": {
+      "type": "string",
+      "enum": [
+        "text",
+        "table",
+        "formula",
+        "figure",
+        "algorithm",
+        "code",
+        "caption",
+        "reading_order",
+        "layout",
+        "provenance",
+        "security",
+        "source_inventory"
+      ]
+    },
+    "evidence_class": {
+      "type": "string",
+      "enum": [
+        "text",
+        "table",
+        "formula",
+        "figure",
+        "algorithm",
+        "code",
+        "caption",
+        "reading_order",
+        "layout",
+        "other"
+      ]
+    },
+    "evidence_kind": {
+      "type": "string",
+      "enum": [
+        "ocr",
+        "visual",
+        "layout",
+        "vector",
+        "table",
+        "formula",
+        "code",
+        "reading_order",
+        "caption",
+        "algorithm",
+        "human_annotation",
+        "ground_truth",
+        "provenance"
+      ]
+    },
+    "coverage_role": {
+      "type": "string",
+      "enum": [
+        "region_observation",
+        "page_support"
+      ]
+    },
+    "subject_scope": {
+      "type": "string",
+      "enum": [
+        "region",
+        "relation",
+        "page",
+        "document"
+      ]
+    },
+    "criticality": {
+      "type": "string",
+      "enum": [
+        "decorative",
+        "normal",
+        "material",
+        "critical"
+      ]
+    },
+    "required_check_class_rule": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "selector_type",
+            "selector",
+            "required_check_classes"
+          ],
+          "properties": {
+            "selector_type": {
+              "type": "string",
+              "const": "role"
+            },
+            "selector": {
+              "$ref": "#/$defs/role"
+            },
+            "required_check_classes": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "$ref": "#/$defs/check_class"
+              },
+              "uniqueItems": true
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "selector_type",
+            "selector",
+            "required_check_classes"
+          ],
+          "properties": {
+            "selector_type": {
+              "type": "string",
+              "const": "payload_kind"
+            },
+            "selector": {
+              "$ref": "#/$defs/payload_kind"
+            },
+            "required_check_classes": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "$ref": "#/$defs/check_class"
+              },
+              "uniqueItems": true
+            }
+          }
+        }
+      ]
+    },
+    "criticality_rule": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "role",
+        "floor"
+      ],
+      "properties": {
+        "role": {
+          "$ref": "#/$defs/role"
+        },
+        "floor": {
+          "$ref": "#/$defs/criticality"
+        }
+      }
+    },
+    "check_evidence_rule": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "check_class",
+        "allowed_evidence_kinds",
+        "allowed_coverage_roles",
+        "allowed_subject_scopes"
+      ],
+      "properties": {
+        "check_class": {
+          "$ref": "#/$defs/check_class"
+        },
+        "allowed_evidence_kinds": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/evidence_kind"
+          },
+          "uniqueItems": true
+        },
+        "allowed_coverage_roles": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/coverage_role"
+          },
+          "uniqueItems": true
+        },
+        "allowed_subject_scopes": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/subject_scope"
+          },
+          "uniqueItems": true
+        }
+      }
+    }
+  }
+}

@@ -1,10 +1,14 @@
 # Docs index
 
-This directory keeps **active integration sources** only.
+This directory keeps **active project documentation and integration sources**
+only.
 
 - `docs/integrations/docling-serve-quality-parity/`
   - parity adapter runtime scripts
   - parity quality tests
+- `docs/architecture/docling-service-v2/`
+  - proposed, design-only LAIL-IR architecture and schema
+  - component contracts, validation policy, and contract-preserving migration
 
 All historical notes, legacy reviews, and closed investigations are retained in git
 history. Query them with `git log` / `git log --follow` rather than duplicating in
