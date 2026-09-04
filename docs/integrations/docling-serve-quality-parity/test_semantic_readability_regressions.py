@@ -9,6 +9,7 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -2857,13 +2858,38 @@ class SemanticReadabilityRegressionTests(unittest.TestCase):
                 }
                 metadata: dict[str, Any] = {}
 
-                result = semantic_reflow.rebuild_semantic_surfaces(
-                    output_dir,
-                    document,
-                    Path(directory) / "paper.pdf",
-                    metadata,
-                    status,
-                )
+                with mock.patch.object(
+                    semantic_reflow,
+                    "_bind_cjk_picture_source_assets",
+                    return_value={
+                        "ok": True,
+                        "materialization": {"written": 0, "skipped": 0},
+                        "records": [
+                            {
+                                "index": 1,
+                                "self_ref": "#/pictures/0",
+                                "source_ref": "#/pictures/0",
+                                "asset": "pictures/picture_1.png",
+                                "html_bound": True,
+                                "markdown_bound": True,
+                                "status": "bound",
+                                "reasons": [],
+                            }
+                        ],
+                        "html_bound_count": 1,
+                        "markdown_bound_count": 1,
+                        "fully_bound_count": 1,
+                        "unbound_count": 0,
+                        "failure_reasons": [],
+                    },
+                ):
+                    result = semantic_reflow.rebuild_semantic_surfaces(
+                        output_dir,
+                        document,
+                        Path(directory) / "paper.pdf",
+                        metadata,
+                        status,
+                    )
 
                 self.assertTrue(result["ok"])
                 self.assertIn("counts", result)
@@ -2975,13 +3001,38 @@ class SemanticReadabilityRegressionTests(unittest.TestCase):
                 }
                 metadata: dict[str, Any] = {}
 
-                result = semantic_reflow.rebuild_semantic_surfaces(
-                    output_dir,
-                    document,
-                    Path(directory) / "paper.pdf",
-                    metadata,
-                    status,
-                )
+                with mock.patch.object(
+                    semantic_reflow,
+                    "_bind_cjk_picture_source_assets",
+                    return_value={
+                        "ok": True,
+                        "materialization": {"written": 0, "skipped": 0},
+                        "records": [
+                            {
+                                "index": 1,
+                                "self_ref": "#/pictures/0",
+                                "source_ref": "#/pictures/0",
+                                "asset": "pictures/picture_1.png",
+                                "html_bound": True,
+                                "markdown_bound": True,
+                                "status": "bound",
+                                "reasons": [],
+                            }
+                        ],
+                        "html_bound_count": 1,
+                        "markdown_bound_count": 1,
+                        "fully_bound_count": 1,
+                        "unbound_count": 0,
+                        "failure_reasons": [],
+                    },
+                ):
+                    result = semantic_reflow.rebuild_semantic_surfaces(
+                        output_dir,
+                        document,
+                        Path(directory) / "paper.pdf",
+                        metadata,
+                        status,
+                    )
 
                 self.assertFalse(result["applied"])
                 self.assertTrue(result["ok"])

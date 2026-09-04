@@ -2554,6 +2554,59 @@ class RegionQualityGateTests(unittest.TestCase):
             self.assertIn("inline_math_candidate_anchor_set_mismatch", inline["reasons"])
             self.assertFalse(result["ok"])
 
+    def test_formula_union_missing_does_not_cross_contaminate_bound_surface(self):
+        cases = (
+            ("html", [1], [], "formula_markdown_occurrence_unbound"),
+            ("markdown", [], [1], "formula_html_occurrence_unbound"),
+        )
+        for bound_surface, html_indexes, markdown_indexes, expected_reason in cases:
+            with self.subTest(bound_surface=bound_surface), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                document, metadata, status = _fixture(root)
+                visuals = status["quality_signals"]["final_source_visuals"]
+                visuals["formula_source_html_indexes"] = html_indexes
+                visuals["formula_source_markdown_indexes"] = markdown_indexes
+                visuals["formula_source_missing_html_indexes"] = (
+                    [] if html_indexes else [1]
+                )
+                visuals["formula_source_missing_markdown_indexes"] = (
+                    [] if markdown_indexes else [1]
+                )
+                # This field is intentionally the union across both surfaces.
+                visuals["formula_source_missing_indexes"] = [1]
+
+                result = evaluate_regions(
+                    root, document, metadata, status, write_sidecars=False
+                )
+                formula = next(
+                    record for record in result["records"] if record["kind"] == "formula"
+                )
+
+                self.assertIn(expected_reason, formula["reasons"])
+                bound_reason = f"formula_{bound_surface}_occurrence_unbound"
+                self.assertNotIn(bound_reason, formula["reasons"])
+                self.assertFalse(result["ok"])
+
+    def test_formula_side_missing_inventory_must_match_coverage(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            document, metadata, status = _fixture(root)
+            visuals = status["quality_signals"]["final_source_visuals"]
+            visuals["formula_source_missing_html_indexes"] = [1]
+            visuals["formula_source_missing_markdown_indexes"] = []
+
+            result = evaluate_regions(
+                root, document, metadata, status, write_sidecars=False
+            )
+            formula = next(
+                record for record in result["records"] if record["kind"] == "formula"
+            )
+
+            self.assertIn(
+                "formula_html_missing_index_set_mismatch", formula["reasons"]
+            )
+            self.assertFalse(result["ok"])
+
     def test_explicit_empty_structural_declaration_does_not_fallback_to_candidates(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -3818,6 +3871,196 @@ class RegionQualityGateTests(unittest.TestCase):
                 self.assertIn("table_cell_occupancy_incomplete", table["reasons"])
                 self.assertNotIn("table_multiline_row_ambiguity", table["reasons"])
                 self.assertFalse(result["ok"])
+
+    def test_table_explicit_blank_grid_slot_satisfies_occupancy(self):
+        blank_cells = (
+            {
+                "start_row_offset_idx": 1,
+                "end_row_offset_idx": 2,
+                "start_col_offset_idx": 1,
+                "end_col_offset_idx": 2,
+                "row_span": 1,
+                "col_span": 1,
+                "text": "",
+                "bbox": None,
+                "column_header": False,
+                "row_header": False,
+                "row_section": False,
+                "fillable": False,
+            },
+            "",
+        )
+        for blank_cell in blank_cells:
+            with self.subTest(blank_cell_type=type(blank_cell).__name__), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                document, metadata, status = _fixture(root)
+                table_node = document["tables"][0]
+                cells = table_node["data"]["table_cells"]
+                table_node["data"]["table_cells"] = cells[:3]
+                table_node["data"]["grid"] = [
+                    [cells[0], cells[1]],
+                    [cells[2], blank_cell],
+                ]
+                identity = _node_body_identity("table", table_node)
+                entry = metadata["structural_visual_provenance_manifest"]["tables"][0]
+                entry["structural_body_identity_sha256"] = _body_identity_sha(
+                    "table", identity
+                )
+                entry["source_node_bindings"][0]["body_identity_sha256"] = (
+                    _body_identity_sha("table", identity)
+                )
+
+                result = evaluate_regions(
+                    root, document, metadata, status, write_sidecars=False
+                )
+                table = next(
+                    item for item in result["records"] if item["kind"] == "table"
+                )
+                self.assertNotIn(
+                    "table_cell_occupancy_incomplete", table["reasons"]
+                )
+                geometry = table["signals"]["table_topology"][
+                    "independent_cell_geometry"
+                ]
+                self.assertEqual(1, geometry["explicit_blank_slot_count"])
+                self.assertEqual(0, geometry["unknown_slot_count"])
+
+    def test_table_grid_blank_dict_must_match_slot_and_known_schema(self):
+        mutations = {
+            "wrong_coordinates": {
+                "start_row_offset_idx": 0,
+            },
+            "non_unit_span": {
+                "col_span": 2,
+                "end_col_offset_idx": 3,
+            },
+            "semantic_flag": {
+                "column_header": True,
+            },
+            "unknown_field": {
+                "unexpected": "trusted",
+            },
+        }
+        for name, mutation in mutations.items():
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                document, metadata, status = _fixture(root)
+                table_node = document["tables"][0]
+                cells = table_node["data"]["table_cells"]
+                blank = {
+                    "start_row_offset_idx": 1,
+                    "end_row_offset_idx": 2,
+                    "start_col_offset_idx": 1,
+                    "end_col_offset_idx": 2,
+                    "row_span": 1,
+                    "col_span": 1,
+                    "text": "",
+                    "bbox": None,
+                    "column_header": False,
+                    "row_header": False,
+                    "row_section": False,
+                    "fillable": False,
+                }
+                blank.update(mutation)
+                table_node["data"]["table_cells"] = cells[:3]
+                table_node["data"]["grid"] = [
+                    [cells[0], cells[1]],
+                    [cells[2], blank],
+                ]
+
+                result = evaluate_regions(
+                    root, document, metadata, status, write_sidecars=False
+                )
+                table = next(
+                    item for item in result["records"] if item["kind"] == "table"
+                )
+                self.assertIn("table_cell_occupancy_incomplete", table["reasons"])
+                geometry = table["signals"]["table_topology"][
+                    "independent_cell_geometry"
+                ]
+                self.assertEqual(0, geometry["explicit_blank_slot_count"])
+                self.assertEqual(1, geometry["unknown_slot_count"])
+
+    def test_partial_table_coverage_does_not_contaminate_verified_table(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            document, metadata, status = _fixture(root)
+            first_ref = "#/tables/0"
+            second_ref = "#/tables/1"
+
+            second_table = json.loads(json.dumps(document["tables"][0]))
+            second_table["self_ref"] = second_ref
+            document["tables"].append(second_table)
+            second_asset = root / "tables/table_2.png"
+            second_asset.write_bytes(b"evidence")
+
+            manifest = metadata["structural_visual_provenance_manifest"]
+            second_entry = json.loads(json.dumps(manifest["tables"][0]))
+            second_entry.update(
+                {
+                    "index": 2,
+                    "source_ref": second_ref,
+                    "self_ref": second_ref,
+                    "asset_path": "tables/table_2.png",
+                }
+            )
+            second_entry["source_node_bindings"][0].update(
+                {"source_ref": second_ref, "self_ref": second_ref}
+            )
+            manifest["tables"].append(second_entry)
+
+            quality = status["quality_signals"]
+            quality["primary_surface"]["counts"]["tables"] = 2
+            visuals = quality["final_source_visuals"]
+            visuals["table_source_expected_refs"] = [first_ref, second_ref]
+            visuals["table_source_body_identity_expected_refs"] = [
+                first_ref,
+                second_ref,
+            ]
+            visuals["table_source_html_bound_refs"] = [first_ref, second_ref]
+            visuals["table_source_markdown_bound_refs"] = [first_ref]
+            visuals["table_source_html_body_identity_verified_refs"] = [
+                first_ref,
+                second_ref,
+            ]
+            visuals["table_source_markdown_body_identity_verified_refs"] = [
+                first_ref
+            ]
+            visuals["table_source_markdown_body_identity_mismatch_refs"] = [
+                second_ref
+            ]
+            visuals["table_source_provenance_verified_refs"] = [
+                first_ref,
+                second_ref,
+            ]
+            visuals["table_source_exact_coverage"] = False
+            visuals["structured_table_source_renderings"]["candidates"].append(
+                _candidate(second_ref, "tables/table_2.png", index=2)
+            )
+
+            result = evaluate_regions(
+                root, document, metadata, status, write_sidecars=False
+            )
+            tables = {
+                record["source_ref"]: record
+                for record in result["records"]
+                if record["kind"] == "table"
+            }
+            self.assertEqual("verified_semantic", tables[first_ref]["status"])
+            self.assertNotIn(
+                "table_topology_unverified", tables[first_ref]["reasons"]
+            )
+            self.assertTrue(tables[first_ref]["signals"]["exact_coverage"])
+            self.assertFalse(
+                tables[first_ref]["signals"]["table_topology"][
+                    "global_exact_coverage"
+                ]
+            )
+            self.assertEqual("unresolved", tables[second_ref]["status"])
+            self.assertIn(
+                "table_topology_unverified", tables[second_ref]["reasons"]
+            )
+            self.assertFalse(tables[second_ref]["signals"]["exact_coverage"])
 
     def test_empty_table_requires_explicit_fallback_even_with_bad_dimensions(self):
         dimensions = (("2.0", 2), (None, 2), ("bad", None), (0, 2), (0, 0))

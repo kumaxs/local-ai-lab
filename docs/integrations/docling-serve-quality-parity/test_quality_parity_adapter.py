@@ -13159,6 +13159,21 @@ class PictureSurfaceInventoryTests(unittest.TestCase):
             )[0]
         )
 
+    def test_picture_asset_hash_rejects_symlinked_parent_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            outside = root / "outside"
+            outside.mkdir()
+            (outside / "picture_1.png").write_bytes(b"external-secret")
+            (root / "pictures").symlink_to(outside, target_is_directory=True)
+
+            digest, reason = adapter._picture_asset_sha256_bounded(
+                root / "pictures" / "picture_1.png"
+            )
+
+            self.assertIsNone(digest)
+            self.assertEqual("picture_asset_hash_failed", reason)
+
     def test_html_picture_parser_suppresses_inert_fallback_containers(self) -> None:
         asset = "pictures/picture_1.png"
         containers = (
@@ -13354,10 +13369,10 @@ class PictureSurfaceInventoryTests(unittest.TestCase):
             }
             (root / "document.json").write_text(json.dumps(document), encoding="utf-8")
             (root / "document.html").write_text(
-                '<img src="pictures/picture_1.png">', encoding="utf-8"
+                '<img data-source-ref="#/pictures/0" src="pictures/picture_1.png">', encoding="utf-8"
             )
             (root / "document.md").write_text(
-                "![Figure](pictures/picture_1.png)\n", encoding="utf-8"
+                "![Figure](pictures/picture_1.png)\n<!-- source-picture-ref:#/pictures/0 -->\n", encoding="utf-8"
             )
             record = {
                 "version": 1,
@@ -13411,12 +13426,14 @@ class PictureSurfaceInventoryTests(unittest.TestCase):
                     asset.write_bytes(b"tampered")
                 elif mutate == "html":
                     (root / "document.html").write_text(
-                        '<img src="pictures/picture_1.png"><img src="pictures/picture_1.png">',
+                        '<img data-source-ref="#/pictures/0" src="pictures/picture_1.png">'
+                        '<img data-source-ref="#/pictures/0" src="pictures/picture_1.png">',
                         encoding="utf-8",
                     )
                 elif mutate == "markdown":
                     (root / "document.md").write_text(
-                        "![Figure](pictures/picture_1.png)\n![Again](pictures/picture_1.png)\n",
+                        "![Figure](pictures/picture_1.png)\n<!-- source-picture-ref:#/pictures/0 -->\n"
+                        "![Again](pictures/picture_1.png)\n<!-- source-picture-ref:#/pictures/0 -->\n",
                         encoding="utf-8",
                     )
                 elif mutate == "sha":
@@ -13433,8 +13450,8 @@ class PictureSurfaceInventoryTests(unittest.TestCase):
                 record["asset_sha256"] = adapter.file_sha256(asset)
                 metadata["visual_evidence_input_sha256"] = source_sha
                 record["bbox"] = picture["prov"][0]["bbox"]
-                (root / "document.html").write_text('<img src="pictures/picture_1.png">', encoding="utf-8")
-                (root / "document.md").write_text("![Figure](pictures/picture_1.png)\n", encoding="utf-8")
+                (root / "document.html").write_text('<img data-source-ref="#/pictures/0" src="pictures/picture_1.png">', encoding="utf-8")
+                (root / "document.md").write_text("![Figure](pictures/picture_1.png)\n<!-- source-picture-ref:#/pictures/0 -->\n", encoding="utf-8")
 
     def _valid_picture_surface_fixture(
         self,
@@ -13460,10 +13477,10 @@ class PictureSurfaceInventoryTests(unittest.TestCase):
         }
         (root / "document.json").write_text(json.dumps(document), encoding="utf-8")
         (root / "document.html").write_text(
-            '<img src="pictures/picture_1.png">', encoding="utf-8"
+            '<img data-source-ref="#/pictures/0" src="pictures/picture_1.png">', encoding="utf-8"
         )
         (root / "document.md").write_text(
-            "![Figure](pictures/picture_1.png)\n", encoding="utf-8"
+            "![Figure](pictures/picture_1.png)\n<!-- source-picture-ref:#/pictures/0 -->\n", encoding="utf-8"
         )
         record: dict[str, object] = {
             "version": 1,
@@ -13522,7 +13539,7 @@ class PictureSurfaceInventoryTests(unittest.TestCase):
                 "pictures/picture_1.png\n"
                 '<!-- <img src="pictures/picture_1.png"> -->\n'
                 '<a href="pictures/picture_1.png">ordinary link</a>\n'
-                '<img src="./pictures/picture_1.png?cache=1#crop">\n',
+                '<img data-source-ref="#/pictures/0" src="./pictures/picture_1.png?cache=1#crop">\n',
                 encoding="utf-8",
             )
             (root / "document.md").write_text(
@@ -13531,7 +13548,8 @@ class PictureSurfaceInventoryTests(unittest.TestCase):
                 "`![inline](pictures/picture_1.png)`\n"
                 "```markdown\n![fenced](pictures/picture_1.png)\n```\n"
                 "<!-- ![comment](pictures/picture_1.png) -->\n"
-                "![Figure](<./pictures/picture_1.png?cache=1#crop>)\n",
+                "![Figure](<./pictures/picture_1.png?cache=1#crop>)\n"
+                "<!-- source-picture-ref:#/pictures/0 -->\n",
                 encoding="utf-8",
             )
             result = adapter.validate_final_picture_surfaces(root, metadata, status)
@@ -13556,6 +13574,138 @@ class PictureSurfaceInventoryTests(unittest.TestCase):
             self.assertFalse(noise_only["ok"])
             self.assertEqual(0, noise_only["records"][0]["html_reference_count"])
             self.assertEqual(0, noise_only["records"][0]["markdown_reference_count"])
+
+    def test_picture_surface_occurrence_binding_is_bidirectional_and_fail_closed(self) -> None:
+        """Canonical markers bind one source ref to one exact crop per surface."""
+
+        from PIL import Image
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            metadata, _status, record, source_sha = self._valid_picture_surface_fixture(root)
+            asset_two = root / "pictures/picture_2.png"
+            Image.new("RGB", (40, 40), "black").save(asset_two)
+            asset_two_sha = adapter.file_sha256(asset_two)
+            document = json.loads((root / "document.json").read_text(encoding="utf-8"))
+            picture_two = self._picture(
+                1,
+                bbox={"l": 50, "r": 90, "t": 40, "b": 0, "coord_origin": "TOPLEFT"},
+                caption=True,
+            )
+            document["pictures"].append(picture_two)
+            (root / "document.json").write_text(json.dumps(document), encoding="utf-8")
+            record_two = dict(record)
+            record_two.update(
+                {
+                    "index": 2,
+                    "global_index": 2,
+                    "self_ref": "#/pictures/1",
+                    "source_ref": "#/pictures/1",
+                    "bbox": picture_two["prov"][0]["bbox"],
+                    "source_asset": "pictures/picture_2.png",
+                    "asset_sha256": asset_two_sha,
+                }
+            )
+            metadata["structural_visual_provenance_manifest"]["pictures"].append(
+                record_two
+            )
+
+            def write_surfaces(html_text: str, markdown_text: str) -> None:
+                (root / "document.html").write_text(html_text, encoding="utf-8")
+                (root / "document.md").write_text(markdown_text, encoding="utf-8")
+
+            write_surfaces(
+                '<img data-source-ref="#/pictures/0" src="pictures/picture_1.png">'
+                '<img data-source-ref="#/pictures/1" src="pictures/picture_2.png">',
+                "![Figure 1](pictures/picture_1.png)\n"
+                "<!-- source-picture-ref:#/pictures/0 -->\n"
+                "![Figure 2](pictures/picture_2.png)\n"
+                "<!-- source-picture-ref:#/pictures/1 -->\n",
+            )
+            baseline = adapter.validate_final_picture_surfaces(
+                root, metadata, {"quality_signals": {}}
+            )
+            self.assertTrue(baseline["ok"])
+            self.assertEqual(
+                ["bound", "bound"],
+                [item["html_binding_status"] for item in baseline["records"]],
+            )
+            self.assertEqual(
+                ["bound", "bound"],
+                [item["markdown_binding_status"] for item in baseline["records"]],
+            )
+
+            # Swapping either the crop or the source marker is a binding
+            # failure even though global image counts remain unchanged.
+            write_surfaces(
+                '<img data-source-ref="#/pictures/0" src="pictures/picture_2.png">'
+                '<img data-source-ref="#/pictures/1" src="pictures/picture_1.png">',
+                "![Figure 1](pictures/picture_1.png)\n"
+                "<!-- source-picture-ref:#/pictures/1 -->\n"
+                "![Figure 2](pictures/picture_2.png)\n"
+                "<!-- source-picture-ref:#/pictures/0 -->\n",
+            )
+            swapped = adapter.validate_final_picture_surfaces(
+                root, metadata, {"quality_signals": {}}
+            )
+            self.assertFalse(swapped["ok"])
+            self.assertIn("picture_html_source_binding_mismatch", swapped["failure_reasons"])
+            self.assertIn("picture_markdown_source_binding_mismatch", swapped["failure_reasons"])
+
+            # Duplicate attributes/markers and wrong or detached identities
+            # cannot be hidden behind a valid crop count.
+            write_surfaces(
+                '<img data-source-ref="#/pictures/0" '
+                'data-source-ref="#/pictures/1" src="pictures/picture_1.png">'
+                '<img data-source-ref="#/pictures/1" src="pictures/picture_2.png">',
+                "![Figure 1](pictures/picture_1.png)\n"
+                "<!-- source-picture-ref:#/pictures/0 -->\n"
+                "<!-- source-picture-ref:#/pictures/0 -->\n"
+                "![Figure 2](pictures/picture_2.png)\n"
+                "<!-- source-picture-ref:#/pictures/1 -->\n",
+            )
+            malformed = adapter.validate_final_picture_surfaces(
+                root, metadata, {"quality_signals": {}}
+            )
+            self.assertFalse(malformed["ok"])
+            self.assertIn("picture_html_duplicate_attribute", malformed["failure_reasons"])
+            self.assertIn("picture_markdown_marker_detached", malformed["failure_reasons"])
+
+            # Literal examples in comments/code/inert containers are excluded
+            # and do not create false positive bindings when the real pair is
+            # present.
+            write_surfaces(
+                '<section class="source-evidence"><section>'
+                '<img data-source-ref="#/pictures/0" src="pictures/picture_2.png">'
+                '</section><section><img data-source-ref="#/pictures/1" '
+                'src="pictures/picture_1.png"></section></section>'
+                '<img data-source-ref="#/pictures/0" src="pictures/picture_1.png">'
+                '<img data-source-ref="#/pictures/1" src="pictures/picture_2.png">',
+                "```markdown\n![fake](pictures/picture_2.png)\n"
+                "<!-- source-picture-ref:#/pictures/0 -->\n```\n"
+                "![Figure 1](pictures/picture_1.png)\n"
+                "<!-- source-picture-ref:#/pictures/0 -->\n"
+                "![Figure 2](pictures/picture_2.png)\n"
+                "<!-- source-picture-ref:#/pictures/1 -->\n",
+            )
+            protected = adapter.validate_final_picture_surfaces(
+                root, metadata, {"quality_signals": {}}
+            )
+            self.assertTrue(protected["ok"])
+
+            # One missing surface is never a legacy downgrade.
+            (root / "document.html").write_text(
+                '<img data-source-ref="#/pictures/0" src="pictures/picture_1.png">',
+                encoding="utf-8",
+            )
+            single_surface = adapter.validate_final_picture_surfaces(
+                root, metadata, {"quality_signals": {}}
+            )
+            self.assertFalse(single_surface["ok"])
+            self.assertIn(
+                "picture_html_source_binding_mismatch",
+                single_surface["failure_reasons"],
+            )
 
     def test_picture_surface_manifest_and_derived_fields_fail_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -13777,6 +13927,15 @@ class PictureSurfaceInventoryTests(unittest.TestCase):
             (root / "document.json").write_text(
                 json.dumps(fallback_document), encoding="utf-8"
             )
+            (root / "document.html").write_text(
+                '<img data-source-ref="picture:0" src="pictures/picture_1.png">',
+                encoding="utf-8",
+            )
+            (root / "document.md").write_text(
+                "![Figure](pictures/picture_1.png)\n"
+                "<!-- source-picture-ref:picture:0 -->\n",
+                encoding="utf-8",
+            )
             fallback_status: dict[str, object] = {"quality_signals": {}}
             fallback_result = adapter.validate_final_picture_surfaces(
                 root, fallback_metadata, fallback_status
@@ -13837,6 +13996,15 @@ class PictureSurfaceInventoryTests(unittest.TestCase):
             manifest_record = metadata["structural_visual_provenance_manifest"]["pictures"][0]
             manifest_record["part_index"] = 3
             manifest_record["source_ref"] = "chunk:3:#/pictures/0"
+            (root / "document.html").write_text(
+                '<img data-source-ref="chunk:3:#/pictures/0" src="pictures/picture_1.png">',
+                encoding="utf-8",
+            )
+            (root / "document.md").write_text(
+                "![Figure](pictures/picture_1.png)\n"
+                "<!-- source-picture-ref:chunk:3:#/pictures/0 -->\n",
+                encoding="utf-8",
+            )
             result = adapter.validate_final_picture_surfaces(root, metadata, status)
             self.assertTrue(result["ok"])
 
@@ -13878,6 +14046,8 @@ class PictureSurfaceInventoryTests(unittest.TestCase):
             (root / "document.json").write_text(
                 json.dumps(advisory_document), encoding="utf-8"
             )
+            (root / "document.html").write_text("<p>Body</p>", encoding="utf-8")
+            (root / "document.md").write_text("Body\n", encoding="utf-8")
             advisory_result = adapter.validate_final_picture_surfaces(
                 root, advisory, {"quality_signals": {}}
             )
@@ -13993,11 +14163,11 @@ class PictureSurfaceInventoryTests(unittest.TestCase):
 
             (root / "document.json").write_text(json.dumps(document), encoding="utf-8")
             (root / "document.html").write_text(
-                '<figure><img src="pictures/picture_1.png"></figure>',
+                '<figure><img data-source-ref="#/pictures/0" src="pictures/picture_1.png"></figure>',
                 encoding="utf-8",
             )
             (root / "document.md").write_text(
-                "![Figure](pictures/picture_1.png)\n",
+                "![Figure](pictures/picture_1.png)\n<!-- source-picture-ref:#/pictures/0 -->\n",
                 encoding="utf-8",
             )
             record = {

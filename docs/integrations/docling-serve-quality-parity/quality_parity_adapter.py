@@ -4835,6 +4835,15 @@ _PICTURE_RENDER_FAILURE_REASONS = frozenset(
         "picture_crop_renderer_unavailable",
     }
 )
+_PICTURE_CLASSIFIER_FAILURE_REASONS = frozenset(
+    {
+        "missing_source_bbox",
+        "bbox_below_minimum_visual_area",
+    }
+)
+_PICTURE_SAFE_RAW_FAILURE_REASONS = (
+    _PICTURE_RENDER_FAILURE_REASONS | _PICTURE_CLASSIFIER_FAILURE_REASONS
+)
 
 
 def _structural_nodes_by_part_ref(
@@ -5049,6 +5058,340 @@ def _table_grid_body_identity(grid: list[list[Any]]) -> str:
         [[cell_identity(cell) for cell in row] for row in grid],
         ensure_ascii=False,
         separators=(",", ":"),
+    )
+
+
+# CJK preserve output can retain legacy unmarked tables.  Auto-binding those
+# tables requires a stricter identity than the historical grid-only checksum:
+# merged-cell topology, explicit empty slots, and every cell's normalized text
+# are all part of the identity.  Keep this path bounded because it runs before
+# any source marker is injected into the durable surfaces.
+_TABLE_IDENTITY_MAX_ROWS = 256
+_TABLE_IDENTITY_MAX_COLS = 256
+_TABLE_IDENTITY_MAX_CELLS = 65_536
+_TABLE_IDENTITY_MAX_TEXT_CHARS = 2_000_000
+
+
+def _strict_table_integer(value: Any, *, minimum: int = 0) -> int | None:
+    """Accept only JSON integers for source topology coordinates/dimensions.
+
+    ``int()`` is intentionally not used here: booleans, floating point values,
+    and strings such as ``"01"`` would otherwise be silently normalized and
+    could make a malformed source table appear equivalent to a rendered one.
+    """
+
+    if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+        return None
+    return value
+
+
+def _table_cell_body_identity(value: Any, *, html_markup: bool = False) -> str:
+    visible = re.sub(r"\s+", " ", str(value or "")).strip()
+    visible = re.sub(r"(?<=[A-Za-z])\s+(?=\d)", "", visible)
+    visible = re.sub(r"(?<=\d)\s+(?=[A-Za-z])", "", visible)
+    return _structural_body_identity(visible, html_markup=html_markup)
+
+
+def _table_topology_identity_from_descriptors(
+    rows: int,
+    cols: int,
+    descriptors: Iterable[dict[str, Any]],
+    *,
+    html_markup: bool = False,
+) -> str | None:
+    """Canonicalize table cells while retaining topology and explicit blanks."""
+
+    row_count = _strict_table_integer(rows, minimum=1)
+    col_count = _strict_table_integer(cols, minimum=1)
+    if (
+        row_count is None
+        or col_count is None
+        or row_count > _TABLE_IDENTITY_MAX_ROWS
+        or col_count > _TABLE_IDENTITY_MAX_COLS
+    ):
+        return None
+    normalized: list[dict[str, Any]] = []
+    total_text_chars = 0
+    # Bound materialization before appending from a potentially hostile
+    # iterable.  Source/HTML callers normally pass a list, but this keeps the
+    # helper safe when exercised directly as well.
+    descriptor_list: list[dict[str, Any]] = []
+    for descriptor in descriptors:
+        if len(descriptor_list) >= _TABLE_IDENTITY_MAX_CELLS:
+            return None
+        descriptor_list.append(descriptor)
+    for descriptor in descriptor_list:
+        if not isinstance(descriptor, dict):
+            return None
+        row = _strict_table_integer(descriptor.get("row"), minimum=0)
+        col = _strict_table_integer(descriptor.get("col"), minimum=0)
+        rowspan = _strict_table_integer(descriptor.get("rowspan", 1), minimum=1)
+        colspan = _strict_table_integer(descriptor.get("colspan", 1), minimum=1)
+        if row is None or col is None or rowspan is None or colspan is None:
+            return None
+        if row + rowspan > row_count or col + colspan > col_count:
+            return None
+        raw_text = str(descriptor.get("text") or "")
+        total_text_chars += len(raw_text)
+        if total_text_chars > _TABLE_IDENTITY_MAX_TEXT_CHARS:
+            return None
+        normalized.append(
+            {
+                "row": row,
+                "col": col,
+                "rowspan": rowspan,
+                "colspan": colspan,
+                "text": _table_cell_body_identity(
+                    raw_text,
+                    html_markup=html_markup,
+                ),
+            }
+        )
+    normalized.sort(
+        key=lambda cell: (
+            cell["row"],
+            cell["col"],
+            cell["rowspan"],
+            cell["colspan"],
+            cell["text"],
+        )
+    )
+    occupied: dict[tuple[int, int], int] = {}
+    for cell_index, cell in enumerate(normalized):
+        for row in range(cell["row"], cell["row"] + cell["rowspan"]):
+            for col in range(cell["col"], cell["col"] + cell["colspan"]):
+                slot = (row, col)
+                if slot in occupied:
+                    return None
+                occupied[slot] = cell_index
+    slots = [
+        occupied.get((row, col))
+        for row in range(row_count)
+        for col in range(col_count)
+    ]
+    return json.dumps(
+        {
+            "rows": row_count,
+            "cols": col_count,
+            "cells": normalized,
+            "slots": slots,
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+
+
+def _table_source_topology_identity(table: dict[str, Any]) -> str | None:
+    """Build a strict topology identity from a source document table node."""
+
+    data = table.get("data") if isinstance(table, dict) else None
+    if not isinstance(data, dict):
+        return None
+    cells = data.get("table_cells")
+    if not isinstance(cells, list) or not cells:
+        return None
+    declared_rows = _strict_table_integer(data.get("num_rows"), minimum=1)
+    declared_cols = _strict_table_integer(data.get("num_cols"), minimum=1)
+    if declared_rows is None or declared_cols is None:
+        return None
+    if (
+        declared_rows > _TABLE_IDENTITY_MAX_ROWS
+        or declared_cols > _TABLE_IDENTITY_MAX_COLS
+        or declared_rows * declared_cols > _TABLE_IDENTITY_MAX_CELLS
+    ):
+        return None
+    descriptors: list[dict[str, Any]] = []
+    max_row = declared_rows
+    max_col = declared_cols
+    if len(cells) > _TABLE_IDENTITY_MAX_CELLS:
+        return None
+    for cell in cells:
+        if not isinstance(cell, dict):
+            return None
+        required = ("start_row_offset_idx", "start_col_offset_idx")
+        if any(key not in cell for key in required):
+            # Without coordinates, positional placement is not source-grounded
+            # and can silently bind the wrong CJK table.
+            return None
+        row = _strict_table_integer(cell.get("start_row_offset_idx"), minimum=0)
+        col = _strict_table_integer(cell.get("start_col_offset_idx"), minimum=0)
+        if row is None or col is None:
+            return None
+        raw_rowspan = cell.get("row_span") if "row_span" in cell else None
+        raw_colspan = cell.get("col_span") if "col_span" in cell else None
+        raw_end_row = (
+            cell.get("end_row_offset_idx")
+            if "end_row_offset_idx" in cell
+            else None
+        )
+        raw_end_col = (
+            cell.get("end_col_offset_idx")
+            if "end_col_offset_idx" in cell
+            else None
+        )
+        rowspan = (
+            _strict_table_integer(raw_rowspan, minimum=1)
+            if raw_rowspan is not None
+            else None
+        )
+        colspan = (
+            _strict_table_integer(raw_colspan, minimum=1)
+            if raw_colspan is not None
+            else None
+        )
+        end_row = (
+            _strict_table_integer(raw_end_row, minimum=0)
+            if raw_end_row is not None
+            else None
+        )
+        end_col = (
+            _strict_table_integer(raw_end_col, minimum=0)
+            if raw_end_col is not None
+            else None
+        )
+        if raw_rowspan is not None and rowspan is None:
+            return None
+        if raw_colspan is not None and colspan is None:
+            return None
+        if raw_end_row is not None and end_row is None:
+            return None
+        if raw_end_col is not None and end_col is None:
+            return None
+        if rowspan is None and end_row is not None and end_row > row:
+            rowspan = end_row - row
+        if colspan is None and end_col is not None and end_col > col:
+            colspan = end_col - col
+        if rowspan is None or colspan is None:
+            return None
+        if end_row is not None and end_row != row + rowspan:
+            return None
+        if end_col is not None and end_col != col + colspan:
+            return None
+        max_row = max(max_row, row + rowspan)
+        max_col = max(max_col, col + colspan)
+        raw_text = cell.get("text")
+        if raw_text is not None and not isinstance(raw_text, str):
+            return None
+        descriptors.append(
+            {
+                "row": row,
+                "col": col,
+                "rowspan": rowspan,
+                "colspan": colspan,
+                "text": raw_text or "",
+            }
+        )
+    # A semantic ``grid`` is authoritative only when it is a complete
+    # rectangle.  Docling can omit intentionally empty cells from
+    # ``table_cells`` while retaining those slots in ``grid``; materialize
+    # only strict empty cells as explicit descriptors.  Any non-empty grid
+    # slot with no source cell is unknown (or a dropped semantic cell) and
+    # therefore fails closed.  Covered slots of merged cells remain owned by
+    # the merged descriptor and never become synthetic blanks.
+    raw_grid = data.get("grid") if "grid" in data else None
+    if "grid" in data:
+        if (
+            not isinstance(raw_grid, list)
+            or len(raw_grid) != declared_rows
+            or any(
+                not isinstance(row_values, list)
+                or len(row_values) != declared_cols
+                for row_values in raw_grid
+            )
+        ):
+            return None
+        occupied_slots: set[tuple[int, int]] = set()
+        for descriptor in descriptors:
+            row = descriptor["row"]
+            col = descriptor["col"]
+            for covered_row in range(row, row + descriptor["rowspan"]):
+                for covered_col in range(col, col + descriptor["colspan"]):
+                    occupied_slots.add((covered_row, covered_col))
+
+        def strict_grid_blank(
+            value: Any,
+            row_index: int,
+            col_index: int,
+        ) -> bool:
+            if isinstance(value, str):
+                return not value.strip()
+            if not isinstance(value, dict):
+                return False
+            required_fields = {
+                "bbox",
+                "row_span",
+                "col_span",
+                "start_row_offset_idx",
+                "end_row_offset_idx",
+                "start_col_offset_idx",
+                "end_col_offset_idx",
+                "text",
+            }
+            optional_flags = {
+                "column_header",
+                "row_header",
+                "row_section",
+                "fillable",
+            }
+            if not required_fields.issubset(value):
+                return False
+            if any(key not in required_fields | optional_flags for key in value):
+                return False
+            if any(
+                value.get(flag) is not False
+                for flag in optional_flags
+                if flag in value
+            ):
+                return False
+            return bool(
+                value.get("bbox") is None
+                and isinstance(value.get("text"), str)
+                and not value.get("text", "").strip()
+                and _strict_table_integer(value.get("row_span"), minimum=1) == 1
+                and _strict_table_integer(value.get("col_span"), minimum=1) == 1
+                and _strict_table_integer(
+                    value.get("start_row_offset_idx"), minimum=0
+                )
+                == row_index
+                and _strict_table_integer(
+                    value.get("end_row_offset_idx"), minimum=0
+                )
+                == row_index + 1
+                and _strict_table_integer(
+                    value.get("start_col_offset_idx"), minimum=0
+                )
+                == col_index
+                and _strict_table_integer(
+                    value.get("end_col_offset_idx"), minimum=0
+                )
+                == col_index + 1
+            )
+
+        for row_index, row_values in enumerate(raw_grid):
+            for col_index, grid_cell in enumerate(row_values):
+                if (row_index, col_index) in occupied_slots:
+                    continue
+                if not strict_grid_blank(grid_cell, row_index, col_index):
+                    return None
+                if len(descriptors) >= _TABLE_IDENTITY_MAX_CELLS:
+                    return None
+                descriptors.append(
+                    {
+                        "row": row_index,
+                        "col": col_index,
+                        "rowspan": 1,
+                        "colspan": 1,
+                        "text": "",
+                    }
+                )
+    if declared_rows > 0 and max_row > declared_rows:
+        return None
+    if declared_cols > 0 and max_col > declared_cols:
+        return None
+    return _table_topology_identity_from_descriptors(
+        max_row,
+        max_col,
+        descriptors,
     )
 
 
@@ -5653,6 +5996,808 @@ def _html_source_ref(attrs: str) -> str | None:
     return html.unescape(match.group("value")) if match else None
 
 
+# CJK preserve surfaces may retain tables without the semantic wrapper emitted
+# by the normal renderer.  The following scanner is intentionally local to the
+# source-binding adapter: it inventories only bounded, body-visible tables and
+# never attempts to rewrite arbitrary HTML.
+_TABLE_BIND_MAX_CANDIDATES = 256
+_TABLE_BIND_MAX_DOCUMENT_CHARS = 4_000_000
+_TABLE_BIND_MAX_NODES = 20_000
+_TABLE_BIND_MAX_STACK_DEPTH = 512
+
+
+class _CjkHtmlTableRecord:
+    __slots__ = (
+        "start_offset",
+        "start_tag_end",
+        "end_offset",
+        "attrs",
+        "marked_ref",
+        "invalid",
+    )
+
+    def __init__(
+        self,
+        *,
+        start_offset: int,
+        start_tag_end: int,
+        attrs: list[tuple[str, str | None]],
+        marked_ref: str | None,
+        invalid: bool,
+    ) -> None:
+        self.start_offset = start_offset
+        self.start_tag_end = start_tag_end
+        self.end_offset: int | None = None
+        self.attrs = attrs
+        self.marked_ref = marked_ref
+        self.invalid = invalid
+
+
+class _CjkHtmlTableNode:
+    __slots__ = (
+        "tag",
+        "parent",
+        "excluded",
+        "in_body",
+        "semantic_figure",
+        "record",
+        "closed",
+    )
+
+    def __init__(
+        self,
+        tag: str,
+        parent: "_CjkHtmlTableNode | None",
+        *,
+        excluded: bool,
+        in_body: bool,
+        semantic_figure: bool,
+        record: _CjkHtmlTableRecord | None,
+    ) -> None:
+        self.tag = tag
+        self.parent = parent
+        self.excluded = excluded
+        self.in_body = in_body
+        self.semantic_figure = semantic_figure
+        self.record = record
+        self.closed = False
+
+
+class _CjkHtmlTableInventoryParser(HTMLParser):
+    """Bounded stack-aware inventory of body table occurrences."""
+
+    _VOID_TAGS = {
+        "area",
+        "base",
+        "br",
+        "col",
+        "embed",
+        "hr",
+        "img",
+        "input",
+        "link",
+        "meta",
+        "param",
+        "source",
+        "track",
+        "wbr",
+    }
+    _SKIP_TAGS = {"pre", "code", "script", "style", "textarea"}
+
+    def __init__(self, document_html: str) -> None:
+        super().__init__(convert_charrefs=True)
+        self.document_html = document_html
+        self.stack: list[_CjkHtmlTableNode] = []
+        self.records: list[_CjkHtmlTableRecord] = []
+        self.node_count = 0
+        self.total_text_chars = 0
+        self.invalid_document = False
+        self.budget_exceeded = len(document_html) > _TABLE_BIND_MAX_DOCUMENT_CHARS
+        self.ignore_remaining = self.budget_exceeded
+        self._line_offsets = [0]
+        for match in re.finditer(r"\n", document_html):
+            self._line_offsets.append(match.end())
+        if not self.ignore_remaining:
+            self.feed(document_html)
+            self.close()
+            self._close_unfinished()
+
+    def _offset_from_position(self) -> int:
+        line, column = self.getpos()
+        if line <= 0 or line > len(self._line_offsets):
+            return len(self.document_html)
+        return min(
+            len(self.document_html),
+            self._line_offsets[line - 1] + max(0, column),
+        )
+
+    @staticmethod
+    def _class_tokens(attrs: list[tuple[str, str | None]]) -> set[str]:
+        return {
+            token.lower()
+            for name, value in attrs
+            if name.lower() == "class"
+            for token in str(value or "").split()
+            if token
+        }
+
+    @classmethod
+    def _excluded_container(cls, tag: str, classes: set[str]) -> bool:
+        if tag in cls._SKIP_TAGS or tag in {"header", "footer", "nav", "aside"}:
+            return True
+        if tag == "figure" and "semantic-table" not in classes:
+            return True
+        if "appendix" in classes or any("appendix" in token for token in classes):
+            return True
+        for token in classes:
+            if (
+                "source-disclosure" in token
+                or "source-evidence-appendix" in token
+                or token in {"docling-formula-inline-source", "docling-formula-source"}
+            ):
+                return True
+        return False
+
+    @staticmethod
+    def _source_ref_attrs(
+        attrs: list[tuple[str, str | None]],
+    ) -> tuple[str | None, bool]:
+        values = [
+            value
+            for name, value in attrs
+            if name.lower() == "data-source-ref"
+        ]
+        if len(values) > 1:
+            return None, True
+        if not values:
+            return None, False
+        value = str(values[0] or "").strip()
+        if not value:
+            return None, True
+        return html.unescape(value), False
+
+    def _invalidate_open_tables(self) -> None:
+        for node in self.stack:
+            if node.record is not None:
+                node.record.invalid = True
+        for record in self.records:
+            record.invalid = True
+
+    def handle_starttag(
+        self,
+        tag: str,
+        attrs: list[tuple[str, str | None]],
+    ) -> None:
+        if self.ignore_remaining:
+            return
+        if (
+            self.node_count >= _TABLE_BIND_MAX_NODES
+            or len(self.stack) >= _TABLE_BIND_MAX_STACK_DEPTH
+        ):
+            self.budget_exceeded = True
+            self.ignore_remaining = True
+            self._invalidate_open_tables()
+            return
+        self.node_count += 1
+        tag = tag.lower()
+        parent = self.stack[-1] if self.stack else None
+        classes = self._class_tokens(attrs)
+        excluded = bool(parent and parent.excluded) or self._excluded_container(
+            tag, classes
+        )
+        in_body = tag == "body" or bool(parent and parent.in_body)
+        semantic_figure = bool(parent and parent.semantic_figure) or (
+            tag == "figure" and "semantic-table" in classes
+        )
+        record: _CjkHtmlTableRecord | None = None
+        if tag == "table" and in_body and not excluded:
+            if len(self.records) >= _TABLE_BIND_MAX_CANDIDATES:
+                self.budget_exceeded = True
+                self.ignore_remaining = True
+                self._invalidate_open_tables()
+                return
+            marked_ref, marker_invalid = self._source_ref_attrs(attrs)
+            record = _CjkHtmlTableRecord(
+                start_offset=self._offset_from_position(),
+                start_tag_end=self._offset_from_position()
+                + len(self.get_starttag_text() or ""),
+                attrs=[(str(name).lower(), value) for name, value in attrs],
+                marked_ref=marked_ref,
+                invalid=marker_invalid,
+            )
+            self.records.append(record)
+            # Nested tables cannot be represented by the strict topology
+            # identity and must not make the parent appear bindable.
+            for ancestor in reversed(self.stack):
+                if ancestor.tag == "table":
+                    record.invalid = True
+                    if ancestor.record is not None:
+                        ancestor.record.invalid = True
+                    break
+        node = _CjkHtmlTableNode(
+            tag,
+            parent,
+            excluded=excluded,
+            in_body=in_body,
+            semantic_figure=semantic_figure,
+            record=record,
+        )
+        self.stack.append(node)
+        if tag in self._VOID_TAGS:
+            node.closed = True
+            self.stack.pop()
+
+    def handle_startendtag(
+        self,
+        tag: str,
+        attrs: list[tuple[str, str | None]],
+    ) -> None:
+        self.handle_starttag(tag, attrs)
+        # A self-closing table is not a usable occurrence.  The start handler
+        # leaves non-void tags on the stack so close it immediately here.
+        if (
+            not self.ignore_remaining
+            and tag.lower() not in self._VOID_TAGS
+            and self.stack
+            and self.stack[-1].tag == tag.lower()
+        ):
+            self.handle_endtag(tag)
+
+    def handle_endtag(self, tag: str) -> None:
+        if self.ignore_remaining:
+            return
+        tag = tag.lower()
+        if tag in self._VOID_TAGS:
+            return
+        if not self.stack:
+            self.invalid_document = True
+            return
+        match_at = -1
+        for position in range(len(self.stack) - 1, -1, -1):
+            if self.stack[position].tag == tag:
+                match_at = position
+                break
+        if match_at < 0:
+            self.invalid_document = True
+            self._invalidate_open_tables()
+            return
+        popped = self.stack[match_at:]
+        if match_at != len(self.stack) - 1:
+            self.invalid_document = True
+        self.stack = self.stack[:match_at]
+        close_start = self._offset_from_position()
+        close_end = self.document_html.find(">", close_start)
+        for node in popped:
+            node.closed = node is popped[0]
+            if node.record is not None:
+                if node is popped[0] and close_end >= 0:
+                    node.record.end_offset = close_end + 1
+                else:
+                    node.record.invalid = True
+                    if node.record.end_offset is None:
+                        node.record.end_offset = close_end + 1 if close_end >= 0 else len(self.document_html)
+
+    def handle_data(self, data: str) -> None:
+        if not data or self.ignore_remaining:
+            return
+        self.total_text_chars += len(data)
+        if self.total_text_chars > _TABLE_BIND_MAX_DOCUMENT_CHARS:
+            self.budget_exceeded = True
+            self.ignore_remaining = True
+            self._invalidate_open_tables()
+
+    def _close_unfinished(self) -> None:
+        if not self.stack:
+            return
+        self.invalid_document = True
+        self._invalidate_open_tables()
+        self.stack.clear()
+
+
+class _CjkHtmlTableMarkupParser(HTMLParser):
+    """Parse one table block into row/cell descriptors with strict spans."""
+
+    _VOID_TAGS = _CjkHtmlTableInventoryParser._VOID_TAGS
+    _CELL_TAGS = {"td", "th"}
+    # Text in inert, form-control, or code/preformatted containers is not part
+    # of the visible semantic cell value used for automatic source binding.
+    # Excluding it is deliberately conservative for ``pre``/``code``: those
+    # containers may render text, but accepting them would let code samples or
+    # hidden/raw-text payloads impersonate a source table cell.
+    _EXCLUDED_CONTENT_TAGS = {
+        "code",
+        "noscript",
+        "pre",
+        "script",
+        "style",
+        "template",
+        "textarea",
+    }
+
+    def __init__(self, table_markup: str) -> None:
+        super().__init__(convert_charrefs=True)
+        self.rows: list[list[dict[str, Any]]] = []
+        self.stack: list[str] = []
+        self.current_row: list[dict[str, Any]] | None = None
+        self.current_cell: dict[str, Any] | None = None
+        self.invalid = False
+        self.node_count = 0
+        self.text_chars = 0
+        self.excluded_content_depth = 0
+        self._table_seen = False
+        self.feed(table_markup)
+        self.close()
+        if self.stack or self.current_row is not None or self.current_cell is not None:
+            self.invalid = True
+
+    @staticmethod
+    def _span(attrs: list[tuple[str, str | None]], name: str) -> int | None:
+        values = [value for attr, value in attrs if attr.lower() == name]
+        if len(values) > 1:
+            return None
+        if not values:
+            return 1
+        value = str(values[0] or "")
+        if not re.fullmatch(r"[1-9]\d*", value):
+            return None
+        return int(value)
+
+    def handle_starttag(
+        self,
+        tag: str,
+        attrs: list[tuple[str, str | None]],
+    ) -> None:
+        if self.invalid:
+            return
+        self.node_count += 1
+        if self.node_count > _TABLE_BIND_MAX_NODES:
+            self.invalid = True
+            return
+        tag = tag.lower()
+        if tag == "table":
+            if self._table_seen:
+                self.invalid = True
+            self._table_seen = True
+        elif tag in self._CELL_TAGS:
+            if self.current_row is None or self.current_cell is not None:
+                self.invalid = True
+                return
+            rowspan = self._span(attrs, "rowspan")
+            colspan = self._span(attrs, "colspan")
+            if rowspan is None or colspan is None:
+                self.invalid = True
+                return
+            self.current_cell = {
+                "rowspan": rowspan,
+                "colspan": colspan,
+                "text_parts": [],
+            }
+        elif tag == "tr":
+            if self.current_row is not None or self.current_cell is not None:
+                self.invalid = True
+                return
+            self.current_row = []
+        elif tag == "br" and self.current_cell is not None:
+            # Preserve an explicit intra-cell line boundary.  The canonical
+            # identity later collapses it to one whitespace separator, making
+            # source ``alpha\nbeta`` equivalent to rendered ``alpha<br>beta``
+            # without ever merging adjacent tokens as ``alphabeta``.
+            self.current_cell["text_parts"].append("\n")
+        if tag in self._EXCLUDED_CONTENT_TAGS:
+            self.excluded_content_depth += 1
+        self.stack.append(tag)
+        if tag in self._VOID_TAGS:
+            self.stack.pop()
+
+    def handle_startendtag(
+        self,
+        tag: str,
+        attrs: list[tuple[str, str | None]],
+    ) -> None:
+        self.handle_starttag(tag, attrs)
+        if (
+            not self.invalid
+            and tag.lower() not in self._VOID_TAGS
+            and self.stack
+            and self.stack[-1] == tag.lower()
+        ):
+            self.handle_endtag(tag)
+
+    def handle_endtag(self, tag: str) -> None:
+        if self.invalid:
+            return
+        tag = tag.lower()
+        if tag in self._VOID_TAGS:
+            return
+        if not self.stack or self.stack[-1] != tag:
+            self.invalid = True
+            return
+        self.stack.pop()
+        if tag in self._EXCLUDED_CONTENT_TAGS:
+            if self.excluded_content_depth <= 0:
+                self.invalid = True
+                return
+            self.excluded_content_depth -= 1
+        if tag in self._CELL_TAGS:
+            if self.current_row is None or self.current_cell is None:
+                self.invalid = True
+                return
+            self.current_row.append(self.current_cell)
+            self.current_cell = None
+        elif tag == "tr":
+            if self.current_row is None or self.current_cell is not None:
+                self.invalid = True
+                return
+            self.rows.append(self.current_row)
+            self.current_row = None
+
+    def handle_data(self, data: str) -> None:
+        if not data or self.invalid:
+            return
+        self.text_chars += len(data)
+        if self.text_chars > _TABLE_IDENTITY_MAX_TEXT_CHARS:
+            self.invalid = True
+            return
+        if self.current_cell is not None and self.excluded_content_depth == 0:
+            self.current_cell["text_parts"].append(data)
+
+
+def _html_table_topology_identity(
+    document_html: str,
+    record: _CjkHtmlTableRecord,
+) -> str | None:
+    if (
+        record.invalid
+        or record.end_offset is None
+        or record.end_offset <= record.start_tag_end
+    ):
+        return None
+    markup = document_html[record.start_offset : record.end_offset]
+    parser = _CjkHtmlTableMarkupParser(markup)
+    if parser.invalid or not parser.rows:
+        return None
+    descriptors: list[dict[str, Any]] = []
+    occupied: set[tuple[int, int]] = set()
+    maximum_column = 0
+    row_count = len(parser.rows)
+    for row_index, row in enumerate(parser.rows):
+        column = 0
+        for cell in row:
+            while (row_index, column) in occupied:
+                column += 1
+            rowspan = int(cell["rowspan"])
+            colspan = int(cell["colspan"])
+            if row_index + rowspan > row_count:
+                return None
+            for covered_row in range(row_index, row_index + rowspan):
+                for covered_col in range(column, column + colspan):
+                    if (covered_row, covered_col) in occupied:
+                        return None
+                    occupied.add((covered_row, covered_col))
+            descriptors.append(
+                {
+                    "row": row_index,
+                    "col": column,
+                    "rowspan": rowspan,
+                    "colspan": colspan,
+                    "text": "".join(cell["text_parts"]),
+                }
+            )
+            column += colspan
+            maximum_column = max(maximum_column, column)
+    if maximum_column <= 0:
+        return None
+    return _table_topology_identity_from_descriptors(
+        row_count,
+        maximum_column,
+        descriptors,
+    )
+
+
+def _auto_bind_cjk_html_tables(
+    document_html: str,
+    source_topology_identity_by_ref: dict[str, str],
+) -> tuple[str, set[str]]:
+    """Inject refs only for bidirectionally unique exact table identities."""
+
+    parser = _CjkHtmlTableInventoryParser(document_html)
+    if parser.budget_exceeded or parser.invalid_document:
+        return document_html, set()
+    records = [
+        record
+        for record in parser.records
+        if not record.invalid and record.end_offset is not None
+    ]
+    identity_by_record: dict[int, str] = {}
+    for record in records:
+        identity = _html_table_topology_identity(document_html, record)
+        if identity is not None:
+            identity_by_record[id(record)] = identity
+    marked_ref_counts: dict[str, int] = {}
+    for record in records:
+        if record.marked_ref:
+            marked_ref_counts[record.marked_ref] = marked_ref_counts.get(record.marked_ref, 0) + 1
+    blocked_refs = {
+        ref for ref, count in marked_ref_counts.items() if count != 1
+    }
+    source_by_identity: dict[str, list[str]] = {}
+    for source_ref, identity in source_topology_identity_by_ref.items():
+        if not identity:
+            continue
+        source_by_identity.setdefault(identity, []).append(str(source_ref))
+    unmarked_by_identity: dict[str, list[_CjkHtmlTableRecord]] = {}
+    for record in records:
+        if record.marked_ref is not None:
+            continue
+        identity = identity_by_record.get(id(record))
+        if identity:
+            unmarked_by_identity.setdefault(identity, []).append(record)
+    edits: list[tuple[int, int, str]] = []
+    bound_refs: set[str] = set()
+    for identity, source_refs in source_by_identity.items():
+        table_records = unmarked_by_identity.get(identity, [])
+        if len(source_refs) != 1 or len(table_records) != 1:
+            continue
+        source_ref = source_refs[0]
+        if source_ref in blocked_refs or source_ref in marked_ref_counts:
+            continue
+        record = table_records[0]
+        if record.start_tag_end <= record.start_offset:
+            continue
+        raw_tag = document_html[record.start_offset : record.start_tag_end]
+        insert_at = raw_tag.rfind(">")
+        if insert_at < 0:
+            continue
+        if raw_tag[:insert_at].rstrip().endswith("/"):
+            continue
+        replacement = (
+            raw_tag[:insert_at]
+            + f' data-source-ref="{html.escape(source_ref, quote=True)}"'
+            + raw_tag[insert_at:]
+        )
+        edits.append((record.start_offset, record.start_tag_end, replacement))
+        bound_refs.add(source_ref)
+    for start, end, replacement in reversed(edits):
+        document_html = document_html[:start] + replacement + document_html[end:]
+    return document_html, bound_refs
+
+
+def _html_existing_marked_table_refs(
+    document_html: str,
+    source_topology_identity_by_ref: dict[str, str],
+) -> set[str]:
+    """Return unique, identity-verified plain markers for idempotent refresh."""
+
+    parser = _CjkHtmlTableInventoryParser(document_html)
+    if parser.budget_exceeded or parser.invalid_document:
+        return set()
+    records = [
+        record
+        for record in parser.records
+        if not record.invalid and record.end_offset is not None and record.marked_ref
+    ]
+    by_ref: dict[str, list[_CjkHtmlTableRecord]] = {}
+    for record in records:
+        by_ref.setdefault(str(record.marked_ref), []).append(record)
+    verified: set[str] = set()
+    for source_ref, expected_identity in source_topology_identity_by_ref.items():
+        candidates = by_ref.get(str(source_ref), [])
+        if len(candidates) != 1:
+            continue
+        if _html_table_topology_identity(document_html, candidates[0]) == expected_identity:
+            verified.add(str(source_ref))
+    return verified
+
+
+class _CjkMarkdownTableRecord:
+    __slots__ = (
+        "start_offset",
+        "end_offset",
+        "identity",
+        "marked_ref",
+        "invalid",
+    )
+
+    def __init__(
+        self,
+        *,
+        start_offset: int,
+        end_offset: int,
+        identity: str | None,
+        marked_ref: str | None,
+        invalid: bool,
+    ) -> None:
+        self.start_offset = start_offset
+        self.end_offset = end_offset
+        self.identity = identity
+        self.marked_ref = marked_ref
+        self.invalid = invalid
+
+
+def _markdown_line_offsets(document_markdown: str) -> tuple[list[str], list[int]]:
+    lines = document_markdown.splitlines(keepends=True)
+    if not lines and document_markdown:
+        lines = [document_markdown]
+    starts: list[int] = []
+    offset = 0
+    for line in lines:
+        starts.append(offset)
+        offset += len(line)
+    return lines, starts
+
+
+def _markdown_table_marker(line: str) -> tuple[str | None, bool]:
+    match = re.fullmatch(
+        r"\s*<!--\s*source-table-ref:(?P<ref>[^<>]*?)\s*-->\s*",
+        line,
+        flags=re.I,
+    )
+    if match is None:
+        return None, False
+    value = match.group("ref").strip()
+    return (value or None), not bool(value)
+
+
+def _markdown_cjk_table_inventory(
+    document_markdown: str,
+) -> tuple[list[_CjkMarkdownTableRecord], bool]:
+    if len(document_markdown) > _TABLE_BIND_MAX_DOCUMENT_CHARS:
+        return [], True
+    masked = _markdown_mask_code(document_markdown)
+    lines, starts = _markdown_line_offsets(document_markdown)
+    masked_lines = masked.splitlines(keepends=True)
+    if len(masked_lines) != len(lines):
+        return [], True
+    records: list[_CjkMarkdownTableRecord] = []
+    in_appendix = False
+    details_excluded_depth = 0
+    line_excluded: list[bool] = []
+    for line in lines:
+        masked_line = masked_lines[len(line_excluded)]
+        if re.match(r"^\s*#{1,2}\s+Original table renderings\b", masked_line, re.I):
+            in_appendix = True
+        elif in_appendix and re.match(r"^\s*#{1,2}\s+\S", masked_line):
+            in_appendix = False
+        opening_details = re.findall(
+            r"<details\b[^>]*class\s*=\s*([\"'])[^\"']*(?:docling-source-disclosure|source-evidence-appendix)[^\"']*\1",
+            line,
+            flags=re.I,
+        )
+        closing_details = len(re.findall(r"</details\s*>", line, flags=re.I))
+        line_excluded.append(
+            in_appendix or details_excluded_depth > 0 or bool(opening_details)
+        )
+        if opening_details:
+            details_excluded_depth += len(opening_details)
+        if closing_details:
+            details_excluded_depth = max(0, details_excluded_depth - closing_details)
+    if len(records) > _TABLE_BIND_MAX_CANDIDATES:
+        return [], True
+    index = 0
+    while index + 1 < len(lines):
+        if line_excluded[index] or "|" not in masked_lines[index]:
+            index += 1
+            continue
+        separator_cells = _split_markdown_table_row(masked_lines[index + 1])
+        if not separator_cells or not all(
+            re.fullmatch(r":?-{1,}:?", cell.strip()) for cell in separator_cells
+        ):
+            index += 1
+            continue
+        header_cells = _split_markdown_table_row(lines[index])
+        width = len(header_cells)
+        if width <= 0 or len(separator_cells) != width:
+            index += 1
+            continue
+        rows = [header_cells]
+        end_index = index + 2
+        malformed = False
+        while end_index < len(lines):
+            if line_excluded[end_index] or "|" not in masked_lines[end_index]:
+                break
+            body_cells = _split_markdown_table_row(lines[end_index])
+            if len(body_cells) != width:
+                malformed = True
+                break
+            rows.append(body_cells)
+            end_index += 1
+            if len(rows) * width > _TABLE_IDENTITY_MAX_CELLS:
+                malformed = True
+                break
+        marker_ref: str | None = None
+        marker_invalid = False
+        previous = index - 1
+        while previous >= 0 and not lines[previous].strip():
+            previous -= 1
+        if previous >= 0:
+            marker_ref, marker_invalid = _markdown_table_marker(lines[previous])
+            if marker_ref is not None or marker_invalid:
+                before_marker = previous - 1
+                while before_marker >= 0 and not lines[before_marker].strip():
+                    before_marker -= 1
+                duplicate_ref, duplicate_invalid = (
+                    _markdown_table_marker(lines[before_marker])
+                    if before_marker >= 0
+                    else (None, False)
+                )
+                if duplicate_ref is not None or duplicate_invalid:
+                    marker_invalid = True
+        body_end = starts[end_index] if end_index < len(lines) else len(document_markdown)
+        identity = None
+        if not malformed:
+            descriptors = [
+                {
+                    "row": row_index,
+                    "col": col_index,
+                    "rowspan": 1,
+                    "colspan": 1,
+                    "text": value,
+                }
+                for row_index, row in enumerate(rows)
+                for col_index, value in enumerate(row)
+            ]
+            identity = _table_topology_identity_from_descriptors(
+                len(rows), width, descriptors
+            )
+        records.append(
+            _CjkMarkdownTableRecord(
+                start_offset=starts[index],
+                end_offset=body_end,
+                identity=identity,
+                marked_ref=marker_ref,
+                invalid=malformed or marker_invalid,
+            )
+        )
+        if len(records) > _TABLE_BIND_MAX_CANDIDATES:
+            return [], True
+        index = max(end_index, index + 1)
+    return records, False
+
+
+def _auto_bind_cjk_markdown_tables(
+    document_markdown: str,
+    source_topology_identity_by_ref: dict[str, str],
+) -> tuple[str, set[str]]:
+    records, budget_exceeded = _markdown_cjk_table_inventory(document_markdown)
+    if budget_exceeded:
+        return document_markdown, set()
+    marked_ref_counts: dict[str, int] = {}
+    for record in records:
+        if record.marked_ref:
+            marked_ref_counts[record.marked_ref] = marked_ref_counts.get(record.marked_ref, 0) + 1
+    blocked_refs = {ref for ref, count in marked_ref_counts.items() if count != 1}
+    source_by_identity: dict[str, list[str]] = {}
+    for source_ref, identity in source_topology_identity_by_ref.items():
+        if identity:
+            source_by_identity.setdefault(identity, []).append(str(source_ref))
+    unmarked_by_identity: dict[str, list[_CjkMarkdownTableRecord]] = {}
+    for record in records:
+        if record.invalid or record.marked_ref is not None or not record.identity:
+            continue
+        unmarked_by_identity.setdefault(record.identity, []).append(record)
+    edits: list[tuple[int, int, str]] = []
+    bound_refs: set[str] = set()
+    for identity, source_refs in source_by_identity.items():
+        table_records = unmarked_by_identity.get(identity, [])
+        if len(source_refs) != 1 or len(table_records) != 1:
+            continue
+        source_ref = source_refs[0]
+        if source_ref in blocked_refs or source_ref in marked_ref_counts:
+            continue
+        record = table_records[0]
+        edits.append(
+            (
+                record.start_offset,
+                record.start_offset,
+                f"<!-- source-table-ref:{source_ref} -->\n",
+            )
+        )
+        bound_refs.add(source_ref)
+    for start, end, replacement in reversed(edits):
+        document_markdown = document_markdown[:start] + replacement + document_markdown[end:]
+    return document_markdown, bound_refs
+
+
 def _html_table_grid_for_source_ref(
     document_html: str,
     source_ref: str,
@@ -5996,6 +7141,7 @@ def append_structured_table_source_renderings(
     page_inventory = _document_page_size_inventory(document_json)
     candidates: list[dict[str, Any]] = []
     expected_body_identity_by_ref: dict[str, str] = {}
+    source_topology_identity_by_ref: dict[str, str] = {}
     provenance_verified_refs: list[str] = []
     provenance_mismatch_refs: list[str] = []
     provenance_diagnostics: dict[str, list[str]] = {}
@@ -6029,6 +7175,9 @@ def append_structured_table_source_renderings(
         )
         expected_identity = _table_grid_body_identity(source_grid)
         expected_body_identity_by_ref[source_ref] = expected_identity
+        topology_identity = _table_source_topology_identity(table)
+        if topology_identity:
+            source_topology_identity_by_ref[source_ref] = topology_identity
         page_no = _positive_page_number((first_prov(table) or {}).get("page_no"))
         page_size = (
             (
@@ -6077,6 +7226,8 @@ def append_structured_table_source_renderings(
         )
 
     html_applied = 0
+    html_auto_bound_refs: set[str] = set()
+    html_existing_marked_refs: set[str] = set()
     html_path = output_dir / "document.html"
     if candidates and html_path.exists():
         document_html = html_path.read_text(encoding="utf-8")
@@ -6089,6 +7240,14 @@ def append_structured_table_source_renderings(
             "",
             document_html,
             flags=re.I | re.S,
+        )
+        document_html, html_auto_bound_refs = _auto_bind_cjk_html_tables(
+            document_html,
+            source_topology_identity_by_ref,
+        )
+        html_existing_marked_refs = _html_existing_marked_table_refs(
+            document_html,
+            source_topology_identity_by_ref,
         )
         def evidence_figure(candidate: dict[str, Any]) -> str:
             figure = (
@@ -6130,7 +7289,35 @@ def append_structured_table_source_renderings(
             if applied:
                 html_bound_refs.append(source_ref)
             else:
-                unmatched_candidates.append(candidate)
+                # CJK preserve tables can be body-visible but lack the normal
+                # semantic figure wrapper.  The bounded auto-binding pass has
+                # already established a unique exact identity and injected a
+                # data-source-ref on that table; append evidence immediately
+                # after it without relying on document order.
+                if (
+                    source_ref in html_auto_bound_refs
+                    or source_ref in html_existing_marked_refs
+                ):
+                    table_re = re.compile(
+                        r'(?P<table><table\b[^>]*data-source-ref=["\']'
+                        + escaped_ref
+                        + r'["\'][^>]*>.*?</table>)',
+                        flags=re.I | re.S,
+                    )
+                    document_html, table_applied = table_re.subn(
+                        lambda match, candidate=candidate: (
+                            match.group("table")
+                            + evidence_figure(candidate)
+                        ),
+                        document_html,
+                        count=1,
+                    )
+                    if table_applied:
+                        html_bound_refs.append(source_ref)
+                    else:
+                        unmatched_candidates.append(candidate)
+                else:
+                    unmatched_candidates.append(candidate)
         figures = "\n".join(
             evidence_figure(candidate) for candidate in unmatched_candidates
         )
@@ -6154,6 +7341,7 @@ def append_structured_table_source_renderings(
         unmatched_candidates = []
 
     markdown_applied = 0
+    markdown_auto_bound_refs: set[str] = set()
     md_path = output_dir / "document.md"
     if candidates and md_path.exists():
         document_markdown = md_path.read_text(encoding="utf-8").rstrip()
@@ -6162,6 +7350,10 @@ def append_structured_table_source_renderings(
             "",
             document_markdown,
             flags=re.I | re.S,
+        )
+        document_markdown, markdown_auto_bound_refs = _auto_bind_cjk_markdown_tables(
+            document_markdown,
+            source_topology_identity_by_ref,
         )
         markdown_bound_refs: list[str] = []
         unmatched_markdown_candidates: list[dict[str, Any]] = []
@@ -6286,6 +7478,9 @@ def append_structured_table_source_renderings(
         "provenance_mismatch_refs": sorted(set(provenance_mismatch_refs)),
         "provenance_diagnostics": provenance_diagnostics,
         "candidates": candidates,
+        "html_auto_bound_source_refs": sorted(html_auto_bound_refs),
+        "html_existing_marked_source_refs": sorted(html_existing_marked_refs),
+        "markdown_auto_bound_source_refs": sorted(markdown_auto_bound_refs),
     }
 
 
@@ -7335,53 +8530,783 @@ def _refresh_formula_crop_content_identities(
     return refreshed
 
 
+class _FormulaHtmlNode:
+    """Small, bounded DOM surrogate used only for formula occurrence parsing.
+
+    ``HTMLParser`` deliberately does not build a tree for us.  Keeping the
+    relevant text on each open node lets us resolve a source marker that is
+    encountered after the MathML payload (the common CJK layout) without
+    slicing nested HTML with a non-nesting-aware regular expression.
+    """
+
+    __slots__ = (
+        "tag",
+        "attrs",
+        "parent",
+        "children",
+        "text_parts",
+        "text_chars",
+        "text_over_budget",
+        "excluded",
+        "skip_text",
+        "closed",
+        "occurrence",
+        "start_offset",
+        "end_offset",
+    )
+
+    def __init__(
+        self,
+        tag: str,
+        attrs: list[tuple[str, str | None]],
+        parent: "_FormulaHtmlNode | None",
+        *,
+        excluded: bool,
+        skip_text: bool,
+    ) -> None:
+        self.tag = tag
+        self.attrs = attrs
+        self.parent = parent
+        self.children: list[_FormulaHtmlNode] = []
+        self.text_parts: list[str] = []
+        self.text_chars = 0
+        self.text_over_budget = False
+        self.excluded = excluded
+        self.skip_text = skip_text
+        self.closed = False
+        self.occurrence: _FormulaHtmlOccurrence | None = None
+        self.start_offset: int | None = None
+        self.end_offset: int | None = None
+
+
+class _FormulaHtmlOccurrence:
+    __slots__ = (
+        "root",
+        "indexes",
+        "strong_indexes",
+        "equation_indexes",
+        "strong_marker_present",
+        "weak_marker_invalid",
+        "invalid",
+        "closed",
+        "anchor_indexes",
+    )
+
+    def __init__(self, root: _FormulaHtmlNode) -> None:
+        self.root = root
+        self.indexes: list[int] = []
+        self.strong_indexes: list[int] = []
+        self.equation_indexes: list[int] = []
+        self.strong_marker_present = False
+        self.weak_marker_invalid = False
+        self.invalid = False
+        self.closed = False
+        self.anchor_indexes: list[int] = []
+
+
+class _FormulaHtmlOccurrenceParser(HTMLParser):
+    """Parse body-bound formula identities without trusting nested HTML regexes.
+
+    This parser intentionally fails closed.  A duplicate marker attribute,
+    conflicting index attributes, an unclosed relevant node, or an ambiguous
+    payload contributes an invalid identity for that index, causing the
+    existing exact-one identity check to reject the occurrence.
+    """
+
+    _VOID_TAGS = {
+        "area",
+        "base",
+        "br",
+        "col",
+        "embed",
+        "hr",
+        "img",
+        "input",
+        "link",
+        "meta",
+        "param",
+        "source",
+        "track",
+        "wbr",
+    }
+    _MARKER_ATTRS = ("data-formula-index", "data-equation")
+    # The parser is used on generated HTML, not arbitrary web documents.  Keep
+    # explicit budgets so a hostile or accidentally-corrupt output cannot turn
+    # identity collection into unbounded memory/CPU work.  Exceeding any
+    # budget invalidates every occurrence collected in this document.
+    _MAX_NODES = 32_768
+    _MAX_STACK_DEPTH = 512
+    _MAX_TOTAL_TEXT_CHARS = 4_000_000
+    _MAX_NODE_TEXT_CHARS = 512_000
+    _MAX_STORED_TEXT_CHARS = 8_000_000
+    _MAX_OCCURRENCES = 4_096
+
+    def __init__(self, document_html: str) -> None:
+        super().__init__(convert_charrefs=True)
+        self.document_html = document_html
+        self.stack: list[_FormulaHtmlNode] = []
+        self.occurrences: list[_FormulaHtmlOccurrence] = []
+        self.parse_malformed = False
+        self._node_count = 0
+        self._total_text_chars = 0
+        self._stored_text_chars = 0
+        self._budget_exceeded = False
+        self._ignore_remaining = False
+        self._pending_anchor_occurrence: _FormulaHtmlOccurrence | None = None
+        self._line_offsets = [0]
+        for match in re.finditer(r"\n", document_html):
+            self._line_offsets.append(match.end())
+        self.feed(document_html)
+        self.close()
+        self._close_unfinished_nodes()
+
+    def _invalidate_all(self) -> None:
+        self._budget_exceeded = True
+        for occurrence in self.occurrences:
+            occurrence.invalid = True
+
+    def _offset_from_position(self) -> int:
+        line, column = self.getpos()
+        if line <= 0 or line > len(self._line_offsets):
+            return len(self.document_html)
+        return min(
+            len(self.document_html),
+            self._line_offsets[line - 1] + max(0, column),
+        )
+
+    def _clear_pending_anchor(self) -> None:
+        self._pending_anchor_occurrence = None
+
+    @staticmethod
+    def _class_tokens(node: _FormulaHtmlNode) -> set[str]:
+        value = next(
+            (str(raw_value or "") for name, raw_value in node.attrs if name == "class"),
+            "",
+        )
+        return {token.lower() for token in value.split() if token}
+
+    @classmethod
+    def _is_excluded_container(
+        cls,
+        tag: str,
+        class_tokens: set[str],
+    ) -> bool:
+        if tag == "figure":
+            # Formula crops in figures/appendices are review evidence, not a
+            # durable body occurrence.
+            return True
+        if tag == "section" and "appendix" in class_tokens:
+            return True
+        for token in class_tokens:
+            if token.startswith("docling-") and (
+                "source-disclosure" in token
+                or "source-evidence-appendix" in token
+                or "inline-source" in token
+            ):
+                return True
+        return False
+
+    @classmethod
+    def _is_source_text_container(
+        cls,
+        class_tokens: set[str],
+    ) -> bool:
+        # The body MathML marker itself carries the index, but its link text
+        # ("source image | context crop") must never become formula identity.
+        return any(
+            token in {
+                "docling-formula-source",
+                "docling-formula-source-link",
+            }
+            for token in class_tokens
+        )
+
+    @classmethod
+    def _has_formula_container_class(cls, class_tokens: set[str]) -> bool:
+        return bool(
+            "formula" in class_tokens
+            or "docling-formula-second-pass" in class_tokens
+        )
+
+    @staticmethod
+    def _marker_values(
+        attrs: list[tuple[str, str | None]],
+    ) -> tuple[dict[str, list[str]], bool]:
+        values: dict[str, list[str]] = {name: [] for name in _FormulaHtmlOccurrenceParser._MARKER_ATTRS}
+        malformed = False
+        for name, raw_value in attrs:
+            if name not in values:
+                continue
+            value = str(raw_value or "")
+            values[name].append(value)
+            # ``data-equation`` is a weak/display-number hint.  An empty
+            # value is common in generic semantic markup and is intentionally
+            # ignored; malformed non-empty values remain invalid when no
+            # stronger identity is present.  Strong formula indexes never
+            # accept an empty/non-numeric value.
+            if name == "data-formula-index" and not re.fullmatch(
+                r"[1-9]\d*", value
+            ):
+                malformed = True
+            elif name == "data-equation" and value and not re.fullmatch(
+                r"[1-9]\d*", value
+            ):
+                malformed = True
+        for raw_values in values.values():
+            if len(raw_values) > 1:
+                # HTMLParser preserves duplicate attributes; accepting the
+                # first one would make the body identity dependent on parser
+                # recovery order.
+                malformed = True
+        return values, malformed
+
+    def _new_occurrence(self, root: _FormulaHtmlNode) -> _FormulaHtmlOccurrence:
+        if root.occurrence is None:
+            if len(self.occurrences) >= self._MAX_OCCURRENCES:
+                self._invalidate_all()
+                occurrence = _FormulaHtmlOccurrence(root)
+                occurrence.invalid = True
+                root.occurrence = occurrence
+                return occurrence
+            root.occurrence = _FormulaHtmlOccurrence(root)
+            if self._budget_exceeded:
+                root.occurrence.invalid = True
+            self.occurrences.append(root.occurrence)
+        return root.occurrence
+
+    def _nearest_formula_root(
+        self,
+        node: _FormulaHtmlNode,
+    ) -> _FormulaHtmlNode:
+        # A source marker span is nested in annotation/MathML.  Bind it to the
+        # enclosing math node so text parsed before the marker remains visible.
+        if node.tag in {"span", "a"}:
+            ancestor = node.parent
+            nearest_math: _FormulaHtmlNode | None = None
+            nearest_annotation: _FormulaHtmlNode | None = None
+            while ancestor is not None:
+                if ancestor.tag == "math" and nearest_math is None:
+                    nearest_math = ancestor
+                if ancestor.tag == "annotation" and nearest_annotation is None:
+                    nearest_annotation = ancestor
+                ancestor = ancestor.parent
+            if nearest_math is not None:
+                return nearest_math
+            if nearest_annotation is not None:
+                return nearest_annotation
+        return node
+
+    def _record_marker_attrs(
+        self,
+        occurrence: _FormulaHtmlOccurrence,
+        attrs: list[tuple[str, str | None]],
+    ) -> None:
+        values, malformed = self._marker_values(attrs)
+        strong_values = values["data-formula-index"]
+        equation_values = values["data-equation"]
+        if strong_values:
+            # A strong marker takes precedence over any display equation
+            # number, including an empty or conflicting one.
+            strong_malformed = any(
+                not re.fullmatch(r"[1-9]\d*", value)
+                for value in strong_values
+            )
+            if strong_malformed:
+                occurrence.invalid = True
+            strong_indexes = [
+                int(value)
+                for value in strong_values
+                if re.fullmatch(r"[1-9]\d*", value)
+            ]
+            if len(strong_indexes) != 1:
+                occurrence.invalid = True
+            if occurrence.strong_marker_present:
+                # Two independently emitted strong markers on the same body
+                # occurrence are ambiguous even when they happen to agree.
+                # Retain every candidate index so all affected source regions
+                # fail closed instead of letting the later marker overwrite
+                # the earlier one.
+                occurrence.invalid = True
+                strong_indexes = [
+                    *occurrence.strong_indexes,
+                    *strong_indexes,
+                ]
+            occurrence.strong_marker_present = True
+            occurrence.strong_indexes = list(dict.fromkeys(strong_indexes))
+            occurrence.equation_indexes.clear()
+            occurrence.indexes = list(occurrence.strong_indexes)
+            return
+
+        # No strong marker on this node.  Once a strong marker has been seen
+        # elsewhere in the same occurrence, equation attributes are display
+        # metadata only and cannot create a phantom identity.
+        if occurrence.strong_marker_present:
+            return
+        if malformed:
+            # A display equation number (for example ``A.15``) is weak
+            # metadata.  It is invalid only when no later strong source
+            # identity is available; a trusted anchor must be able to replace
+            # it without clearing unrelated parse/payload failures.
+            occurrence.weak_marker_invalid = True
+        if len(equation_values) > 1:
+            occurrence.weak_marker_invalid = True
+        equation_indexes = [
+            int(value)
+            for value in equation_values
+            if re.fullmatch(r"[1-9]\d*", value)
+        ]
+        occurrence.equation_indexes = list(dict.fromkeys(equation_indexes))
+        occurrence.indexes = list(occurrence.equation_indexes)
+
+    def handle_starttag(
+        self,
+        tag: str,
+        attrs: list[tuple[str, str | None]],
+    ) -> None:
+        self._clear_pending_anchor()
+        if self._ignore_remaining:
+            return
+        if self._node_count >= self._MAX_NODES or len(self.stack) >= self._MAX_STACK_DEPTH:
+            self._invalidate_all()
+            self._ignore_remaining = True
+            return
+        self._node_count += 1
+        tag = tag.lower()
+        parent = self.stack[-1] if self.stack else None
+        parent_excluded = bool(parent and parent.excluded)
+        parent_skip_text = bool(parent and parent.skip_text)
+        class_tokens = {
+            str(raw_value or "").lower()
+            for name, raw_value in attrs
+            if name.lower() == "class"
+            for raw_value in str(raw_value or "").split()
+            if raw_value
+        }
+        excluded = parent_excluded or self._is_excluded_container(tag, class_tokens)
+        source_text = self._is_source_text_container(class_tokens)
+        skip_text = parent_skip_text or excluded or source_text
+        node = _FormulaHtmlNode(
+            tag,
+            [(str(name).lower(), value) for name, value in attrs],
+            parent,
+            excluded=excluded,
+            skip_text=skip_text,
+        )
+        node.start_offset = self._offset_from_position()
+        raw_start_tag = self.get_starttag_text() or ""
+        node.end_offset = min(
+            len(self.document_html),
+            node.start_offset + len(raw_start_tag),
+        )
+        if parent is not None:
+            parent.children.append(node)
+        self.stack.append(node)
+
+        marker_values, _marker_malformed = self._marker_values(node.attrs)
+        has_marker_attr = any(marker_values.values())
+        if not excluded and (has_marker_attr or self._has_formula_container_class(class_tokens)):
+            root = self._nearest_formula_root(node) if has_marker_attr else node
+            enclosing_occurrences: list[_FormulaHtmlOccurrence] = []
+            if root.occurrence is None:
+                ancestor = root.parent
+                seen_enclosing: set[int] = set()
+                while ancestor is not None:
+                    enclosing = ancestor.occurrence
+                    if enclosing is not None and id(enclosing) not in seen_enclosing:
+                        seen_enclosing.add(id(enclosing))
+                        enclosing_occurrences.append(enclosing)
+                    ancestor = ancestor.parent
+            occurrence = self._new_occurrence(root)
+            if enclosing_occurrences:
+                # Two distinct nested roots are not two formula occurrences:
+                # they share the same rendered body.  Reject both identities
+                # so nested markers cannot make one payload satisfy multiple
+                # source indexes.  A marker span resolved back to an existing
+                # MathML root remains a single occurrence and is allowed.
+                occurrence.invalid = True
+                for enclosing in enclosing_occurrences:
+                    enclosing.invalid = True
+            if has_marker_attr:
+                self._record_marker_attrs(occurrence, node.attrs)
+
+        if tag in self._VOID_TAGS:
+            node.closed = True
+            self.stack.pop()
+
+    def handle_startendtag(
+        self,
+        tag: str,
+        attrs: list[tuple[str, str | None]],
+    ) -> None:
+        self.handle_starttag(tag, attrs)
+        if (
+            not self._ignore_remaining
+            and tag.lower() not in self._VOID_TAGS
+            and self.stack
+            and self.stack[-1].tag == tag.lower()
+        ):
+            self.handle_endtag(tag)
+
+    def handle_endtag(self, tag: str) -> None:
+        self._clear_pending_anchor()
+        if self._ignore_remaining:
+            return
+        tag = tag.lower()
+        if tag in self._VOID_TAGS:
+            return
+        if not self.stack:
+            self.parse_malformed = True
+            return
+        match_at = -1
+        for position in range(len(self.stack) - 1, -1, -1):
+            if self.stack[position].tag == tag:
+                match_at = position
+                break
+        if match_at < 0:
+            self.parse_malformed = True
+            for node in self.stack:
+                if node.occurrence is not None:
+                    node.occurrence.invalid = True
+            return
+        if match_at != len(self.stack) - 1:
+            # HTMLParser tolerates some omitted end tags.  Relevant formula
+            # nodes above the matching tag are nevertheless ambiguous and are
+            # marked invalid; unrelated prose can still be recovered.
+            self.parse_malformed = True
+        popped = self.stack[match_at:]
+        matched_node = popped[0]
+        self.stack = self.stack[:match_at]
+        if len(popped) > 1:
+            # A relevant container closed while a descendant remained open.
+            # Even if the descendant is not itself a marker root, its text
+            # boundary is ambiguous; invalidate the enclosing occurrence.
+            if matched_node.occurrence is not None:
+                matched_node.occurrence.invalid = True
+            for ancestor in self.stack:
+                if ancestor.occurrence is not None:
+                    ancestor.occurrence.invalid = True
+        for node in popped:
+            node.closed = node is matched_node
+            if node is matched_node:
+                end_offset = self._offset_from_position()
+                close_end = self.document_html.find(">", end_offset)
+                node.end_offset = (
+                    close_end + 1
+                    if close_end >= 0
+                    else len(self.document_html)
+                )
+            if node.occurrence is not None:
+                node.occurrence.closed = node is matched_node
+                if node is not matched_node:
+                    node.occurrence.invalid = True
+        if matched_node.occurrence is not None and not matched_node.excluded:
+            self._pending_anchor_occurrence = matched_node.occurrence
+
+    def handle_data(self, data: str) -> None:
+        if not data:
+            return
+        if not data.isspace():
+            self._clear_pending_anchor()
+        self._total_text_chars += len(data)
+        if self._total_text_chars > self._MAX_TOTAL_TEXT_CHARS:
+            self._invalidate_all()
+            self._ignore_remaining = True
+            return
+        if not self.stack or self._ignore_remaining:
+            return
+        if any(node.skip_text for node in self.stack):
+            return
+        # Text is needed on candidate roots and on specialized payload nodes
+        # only.  Copying every data chunk to every ancestor made deeply nested
+        # malformed HTML quadratic in memory; the selected targets remain
+        # bounded by the candidate/payload count.
+        targets: list[_FormulaHtmlNode] = []
+        seen_targets: set[int] = set()
+        for node in self.stack:
+            is_payload = node.tag in {"pre", "annotation", "code", "summary"} or (
+                node.tag in {"div", "span"}
+                and "docling-formula-render" in self._class_tokens(node)
+            )
+            if node.occurrence is not None or is_payload:
+                marker = id(node)
+                if marker not in seen_targets and not node.skip_text and not node.excluded:
+                    seen_targets.add(marker)
+                    targets.append(node)
+        # Check the whole append operation before mutating any target so a
+        # single data chunk cannot partially exceed the aggregate storage
+        # budget (the same text may be retained by several nested payload
+        # nodes).  This count reflects actual stored characters, not merely
+        # source HTML size.
+        for node in targets:
+            if node.text_chars + len(data) > self._MAX_NODE_TEXT_CHARS:
+                node.text_over_budget = True
+                self._invalidate_all()
+                self._ignore_remaining = True
+                return
+        projected_stored_chars = self._stored_text_chars + len(data) * len(targets)
+        if projected_stored_chars > self._MAX_STORED_TEXT_CHARS:
+            self._invalidate_all()
+            self._ignore_remaining = True
+            return
+        for node in targets:
+            node.text_parts.append(data)
+            node.text_chars += len(data)
+        self._stored_text_chars = projected_stored_chars
+
+    def handle_comment(self, data: str) -> None:
+        match = re.fullmatch(r"\s*source-formula-anchor:(\d+)\s*", data, flags=re.I)
+        if match is None:
+            self._clear_pending_anchor()
+            return
+        if any(node.excluded for node in self.stack):
+            self._clear_pending_anchor()
+            return
+        index = int(match.group(1))
+        # The comment follows the visible formula block in the legacy output.
+        # Prefer the most recently created live occurrence, including a MathML
+        # occurrence whose source span marker was encountered just before the
+        # comment.  A repeated anchor on the same root is de-duplicated here;
+        # append_formula_source_renderings still tracks duplicate comments via
+        # its independent anchor count.
+        occurrence = self._pending_anchor_occurrence
+        if occurrence is None:
+            return
+        # Source-formula-anchor is a strong occurrence identity.  A strong
+        # data-formula-index must agree with it; a weak data-equation display
+        # number is replaced by the anchor and must never leak as a phantom
+        # index (for example equation=7 followed by anchor:1).
+        if occurrence.strong_marker_present:
+            if (
+                len(occurrence.strong_indexes) != 1
+                or occurrence.strong_indexes[0] != index
+            ):
+                occurrence.invalid = True
+                if index not in occurrence.indexes:
+                    occurrence.indexes.append(index)
+            else:
+                occurrence.indexes = [index]
+        else:
+            occurrence.strong_marker_present = True
+            occurrence.strong_indexes = [index]
+            occurrence.equation_indexes.clear()
+            occurrence.indexes = [index]
+        occurrence.anchor_indexes.append(index)
+        self._clear_pending_anchor()
+
+    def _close_unfinished_nodes(self) -> None:
+        if not self.stack:
+            return
+        self.parse_malformed = True
+        for node in self.stack:
+            node.closed = False
+            if node.occurrence is not None:
+                node.occurrence.closed = False
+                node.occurrence.invalid = True
+        self.stack.clear()
+
+    @staticmethod
+    def _descendants(root: _FormulaHtmlNode) -> Iterable[_FormulaHtmlNode]:
+        pending = list(reversed(root.children))
+        while pending:
+            node = pending.pop()
+            yield node
+            pending.extend(reversed(node.children))
+
+    @staticmethod
+    def _text(node: _FormulaHtmlNode) -> str:
+        return "".join(node.text_parts)
+
+    @classmethod
+    def _payload_identity(
+        cls,
+        occurrence: _FormulaHtmlOccurrence,
+    ) -> str:
+        root = occurrence.root
+        if (
+            occurrence.invalid
+            or (
+                occurrence.weak_marker_invalid
+                and not occurrence.strong_marker_present
+            )
+            or not occurrence.closed
+            or root.excluded
+        ):
+            return "__invalid_formula_occurrence__"
+
+        descendants = [root, *cls._descendants(root)]
+        groups: list[tuple[str, list[str]]] = []
+        pre_values = [
+            cls._text(node).strip()
+            for node in descendants
+            if node.tag == "pre"
+            and "docling-formula-tex" in cls._class_tokens(node)
+        ]
+        annotation_values = [
+            cls._text(node).strip()
+            for node in descendants
+            if node.tag == "annotation"
+            and "tex" in str(
+                next(
+                    (raw_value for name, raw_value in node.attrs if name == "encoding"),
+                    "",
+                )
+                ).lower()
+        ]
+        pre_nodes = {
+            id(node)
+            for node in descendants
+            if node.tag == "pre"
+            and "docling-formula-tex" in cls._class_tokens(node)
+        }
+
+        def inside_trusted_pre(node: _FormulaHtmlNode) -> bool:
+            ancestor = node.parent
+            while ancestor is not None and ancestor is not root:
+                if id(ancestor) in pre_nodes:
+                    return True
+                ancestor = ancestor.parent
+            return False
+
+        code_nodes = [
+            node
+            for node in descendants
+            if node.tag == "code" and not inside_trusted_pre(node)
+        ]
+
+        def latex_details_code(node: _FormulaHtmlNode) -> bool:
+            details: _FormulaHtmlNode | None = None
+            ancestor = node.parent
+            while ancestor is not None and ancestor is not root:
+                if ancestor.tag == "details":
+                    details = ancestor
+                    break
+                ancestor = ancestor.parent
+            if details is None:
+                return False
+            summaries = [
+                child
+                for child in [details, *cls._descendants(details)]
+                if child.tag == "summary"
+            ]
+            if len(summaries) != 1:
+                return False
+            summary_text = re.sub(r"\s+", " ", cls._text(summaries[0])).strip()
+            return bool(re.fullmatch(r"latex", summary_text, flags=re.I))
+
+        code_values = [
+            cls._text(node).strip()
+            for node in code_nodes
+            if latex_details_code(node)
+        ]
+        render_values = [
+            cls._text(node).strip()
+            for node in descendants
+            if node.tag in {"div", "span"}
+            and "docling-formula-render" in cls._class_tokens(node)
+        ]
+        if pre_values:
+            groups.append(("pre", pre_values))
+        if annotation_values:
+            groups.append(("annotation", annotation_values))
+        if code_values:
+            groups.append(("code", code_values))
+        if render_values:
+            groups.append(("render", render_values))
+
+        # A naked code block (or a details disclosure whose summary is not
+        # exactly "LaTeX") is not trusted formula payload.  Falling through to
+        # the root's plain text would otherwise allow an arbitrary code sample
+        # to satisfy the identity check.
+        if code_nodes and (
+            not code_values
+            or len(code_nodes) != len(code_values)
+        ):
+            return "__invalid_formula_occurrence__"
+
+        # A duplicate payload in one source channel is ambiguous even when the
+        # strings happen to be equal.  Different channels are allowed only
+        # when they agree exactly (e.g. MathML annotation + disclosure code).
+        identities: list[str] = []
+        for _kind, values in groups:
+            if len(values) != 1:
+                return "__invalid_formula_occurrence__"
+            value = re.sub(r"^\s*\\\[\s*|\s*\\\]\s*$", "", values[0], flags=re.S)
+            identity = _formula_content_identity(value)
+            if not identity:
+                return "__invalid_formula_occurrence__"
+            identities.append(identity)
+        if identities:
+            if len(set(identities)) != 1:
+                return "__invalid_formula_occurrence__"
+            return identities[0]
+
+        # Legacy anchored blocks may contain plain text rather than a MathML
+        # annotation.  Use it only when there is no specialized payload; a
+        # missing/empty body remains explicitly invalid.
+        plain = cls._text(root).strip()
+        if not plain:
+            return "__invalid_formula_occurrence__"
+        identity = _formula_content_identity(plain)
+        return identity or "__invalid_formula_occurrence__"
+
+    def identities(self) -> dict[int, list[str]]:
+        identities: dict[int, list[str]] = {}
+        for occurrence in self.occurrences:
+            if not occurrence.indexes:
+                continue
+            identity = self._payload_identity(occurrence)
+            for index in occurrence.indexes:
+                identities.setdefault(index, []).append(identity)
+        return identities
+
+    def mathml_occurrence_ranges(self) -> list[tuple[int, int, int]]:
+        """Return closed, non-excluded MathML occurrence ranges by index."""
+
+        ranges: list[tuple[int, int, int]] = []
+        for occurrence in self.occurrences:
+            root = occurrence.root
+            if (
+                occurrence.invalid
+                or not occurrence.closed
+                or root.tag != "math"
+                or root.start_offset is None
+                or root.end_offset is None
+                or root.end_offset <= root.start_offset
+                or len(occurrence.indexes) != 1
+            ):
+                continue
+            index = occurrence.indexes[0]
+            ranges.append((index, root.start_offset, root.end_offset))
+        return ranges
+
+
 def _html_formula_occurrence_identities(document_html: str) -> dict[int, list[str]]:
-    identities: dict[int, list[str]] = {}
+    """Return exact body formula identities using a stack-aware HTML parser.
 
-    def identity_from_block(block: str) -> str:
-        latex = re.search(
-            r"<details\b[^>]*>\s*<summary>\s*LaTeX\s*</summary>\s*"
-            r"<code>(?P<tex>.*?)</code>\s*</details>",
-            block,
-            flags=re.S | re.I,
-        )
-        if latex:
-            return _formula_content_identity(latex.group("tex"))
-        plain = re.sub(r"<[^>]+>", "", block)
-        return _formula_content_identity(plain)
+    The old implementation used ``.*?</div>`` and therefore truncated nested
+    ``docling-formula-second-pass`` blocks at their first child ``</div>``.
+    Parsing a bounded surrogate tree also lets us exclude appendix/figure
+    disclosures and keep malformed or conflicting occurrences fail-closed.
+    """
 
-    def add_identity(index: int, identity: str) -> None:
-        identities.setdefault(index, []).append(
-            identity or "__invalid_formula_occurrence__"
-        )
+    return _FormulaHtmlOccurrenceParser(document_html).identities()
 
-    # Both the normal `data-formula-index` surface and the CJK semantic
-    # surface's `data-equation` attribute identify an occurrence.  Keep the
-    # block body as the identity source so a matching number alone can never
-    # bind the wrong crop.
-    for match in re.finditer(
-        r"(?P<block><div\b[^>]*\b(?:data-formula-index|data-equation)="
-        r"[\"'](?P<index>\d+)[\"']"
-        r"[^>]*>.*?</div>)",
-        document_html,
-        flags=re.S | re.I,
-    ):
-        add_identity(
-            int(match.group("index")),
-            identity_from_block(match.group("block")),
-        )
-    for match in re.finditer(
-        r"(?P<block><div\b[^>]*class=[\"'][^\"']*\bformula\b[^\"']*[\"']"
-        r"[^>]*>.*?</div>)\s*"
-        r"<!--\s*source-formula-anchor:(?P<index>\d+)\s*-->",
-        document_html,
-        flags=re.S | re.I,
-    ):
-        index = int(match.group("index"))
-        identity = identity_from_block(match.group("block"))
-        if identity not in identities.setdefault(index, []):
-            identities[index].append(identity or "__invalid_formula_occurrence__")
-    return identities
+
+def _html_formula_mathml_occurrence_ranges(
+    document_html: str,
+) -> list[tuple[int, int, int]]:
+    """Expose parser-proven MathML ranges for occurrence-local evidence."""
+
+    parser = _FormulaHtmlOccurrenceParser(document_html)
+    identities = parser.identities()
+    ranges = parser.mathml_occurrence_ranges()
+    # A range is usable only when its index has exactly one parser identity;
+    # duplicate or conflicting MathML markers therefore fail closed.
+    return [
+        (index, start, end)
+        for index, start, end in ranges
+        if len(identities.get(index, [])) == 1
+    ]
 
 
 def _markdown_formula_occurrence_identities(document_markdown: str) -> dict[int, list[str]]:
@@ -7507,14 +9432,6 @@ def append_formula_source_renderings(
             flags=re.I,
         )
     ]
-    html_data_equation_occurrences = [
-        int(value)
-        for value in re.findall(
-            r"<div\b[^>]*\bdata-equation=[\"'](\d+)[\"']",
-            document_html,
-            flags=re.I,
-        )
-    ]
     markdown_anchor_spans = _markdown_source_formula_anchor_spans(
         document_markdown
     )
@@ -7524,23 +9441,27 @@ def append_formula_source_renderings(
     markdown_anchor_occurrences = [index for _start, _end, index in markdown_anchor_spans]
     html_anchor_indexes = set(html_anchor_occurrences)
     markdown_anchor_indexes = set(markdown_anchor_occurrences)
+    # Parse once before deriving the expected index set so MathML-only CJK
+    # occurrences (whose marker is on an inner span rather than a ``div``)
+    # participate in default index discovery.
+    html_identity_by_index = _html_formula_occurrence_identities(document_html)
     html_occurrence_counts = {
         index: max(
             html_data_index_occurrences.count(index),
-            html_data_equation_occurrences.count(index),
             html_anchor_occurrences.count(index),
+            len(html_identity_by_index.get(index, [])),
         )
         for index in (
             set(html_data_index_occurrences)
-            | set(html_data_equation_occurrences)
             | html_anchor_indexes
+            | set(html_identity_by_index)
         )
     }
     if expected_indexes is None:
         anchored = (
             html_anchor_indexes
             | set(html_data_index_occurrences)
-            | set(html_data_equation_occurrences)
+            | set(html_identity_by_index)
             | markdown_anchor_indexes
             | {
                 int(index)
@@ -7610,8 +9531,8 @@ def append_formula_source_renderings(
         )
         for index in (
             set(html_data_index_occurrences)
-            | set(html_data_equation_occurrences)
             | html_anchor_indexes
+            | set(html_identity_by_index)
         )
     }
     html_identity_mismatch_indexes: set[int] = set()
@@ -7686,6 +9607,38 @@ def append_formula_source_renderings(
             replace_html_anchor,
             document_html,
         )
+
+        # MathML occurrences in the CJK surface carry their stable index on an
+        # inner source span (or directly on ``math``), so the evidence must be
+        # inserted after that unique closed ``math`` node.  Recompute ranges
+        # after anchor replacements so offsets cannot drift.
+        mathml_ranges_by_index: dict[int, list[tuple[int, int]]] = {}
+        for formula_index, start, end in _html_formula_mathml_occurrence_ranges(
+            document_html
+        ):
+            mathml_ranges_by_index.setdefault(formula_index, []).append((start, end))
+        mathml_edits: list[tuple[int, str]] = []
+        for formula_index in sorted(expected_indexes - html_covered_indexes):
+            ranges = mathml_ranges_by_index.get(formula_index, [])
+            candidate = candidate_by_index.get(formula_index)
+            if candidate is None or not candidate.get("selected_image"):
+                continue
+            if len(ranges) != 1:
+                if ranges:
+                    html_identity_mismatch_indexes.add(formula_index)
+                continue
+            if not occurrence_identity_matches(
+                formula_index, html_identity_by_index
+            ):
+                html_identity_mismatch_indexes.add(formula_index)
+                continue
+            _start, end = ranges[0]
+            mathml_edits.append(
+                (end, "\n" + html_figure(candidate, occurrence=True))
+            )
+            html_covered_indexes.add(formula_index)
+        for end, replacement in sorted(mathml_edits, reverse=True):
+            document_html = document_html[:end] + replacement + document_html[end:]
 
         # CJK preserve mode has no semantic anchor comments, but the retained
         # blocks have stable data-formula-index attributes.
@@ -7840,19 +9793,45 @@ def append_formula_source_renderings(
         # intentionally bypasses this branch so it cannot silently bind wrong.
         elif expected_indexes and not markdown_anchor_indexes and not markdown_tag_marker_seen:
             display_spans = _markdown_display_math_spans(document_markdown)
-            display_edits: list[tuple[int, int, str]] = []
-            for formula_index, (start, end) in zip(
-                sorted(expected_indexes - set(diagnostic_only_indexes or set())),
-                display_spans,
+            # Legacy CJK Markdown may omit both anchors and ``\tag{N}``.  Do
+            # not zip source indexes with display order: repeated formulas or
+            # an inserted unrelated display block would otherwise bind a crop
+            # to the wrong occurrence.  An identity is eligible only when it
+            # is unique in both the source inventory and the rendered spans.
+            source_indexes_by_identity: dict[str, list[int]] = {}
+            for formula_index in sorted(
+                expected_indexes - set(diagnostic_only_indexes or set())
             ):
+                expected_identity = expected_identity_by_index.get(formula_index)
+                if expected_identity:
+                    source_indexes_by_identity.setdefault(expected_identity, []).append(
+                        formula_index
+                    )
+            display_spans_by_identity: dict[str, list[tuple[int, int]]] = {}
+            for start, end in display_spans:
+                actual_identity = _formula_content_identity(
+                    document_markdown[start:end]
+                )
+                if actual_identity:
+                    display_spans_by_identity.setdefault(actual_identity, []).append(
+                        (start, end)
+                    )
+            display_edits: list[tuple[int, int, str]] = []
+            for identity, source_indexes in source_indexes_by_identity.items():
+                spans = display_spans_by_identity.get(identity, [])
+                if len(source_indexes) != 1 or len(spans) != 1:
+                    if source_indexes and spans:
+                        markdown_identity_mismatch_indexes.update(source_indexes)
+                    continue
+                formula_index = source_indexes[0]
+                start, end = spans[0]
                 block = document_markdown[start:end]
-                actual_identity = _formula_content_identity(block)
                 candidate = candidate_by_index.get(formula_index)
                 if candidate is None or not candidate.get("selected_image"):
                     continue
                 if (
                     not expected_identity_by_index.get(formula_index)
-                    or actual_identity != expected_identity_by_index[formula_index]
+                    or identity != expected_identity_by_index[formula_index]
                 ):
                     markdown_identity_mismatch_indexes.add(formula_index)
                     continue
@@ -25619,6 +27598,39 @@ def reconcile_final_surface_status(
     return result
 
 
+def _formula_source_missing_indexes_by_surface(
+    expected_indexes: Iterable[int],
+    html_indexes: Iterable[int],
+    markdown_indexes: Iterable[int],
+) -> dict[str, list[int]]:
+    """Compute side-specific and union formula omissions deterministically."""
+
+    expected = {
+        int(index)
+        for index in expected_indexes
+        if isinstance(index, int) and not isinstance(index, bool) and index > 0
+    }
+    html_bound = {
+        int(index)
+        for index in html_indexes
+        if isinstance(index, int) and not isinstance(index, bool) and index > 0
+    }
+    markdown_bound = {
+        int(index)
+        for index in markdown_indexes
+        if isinstance(index, int) and not isinstance(index, bool) and index > 0
+    }
+    missing_html = sorted(expected - html_bound)
+    missing_markdown = sorted(expected - markdown_bound)
+    return {
+        "formula_source_missing_html_indexes": missing_html,
+        "formula_source_missing_markdown_indexes": missing_markdown,
+        "formula_source_missing_indexes": sorted(
+            set(missing_html) | set(missing_markdown)
+        ),
+    }
+
+
 def restore_final_delivery_visuals(
     output_dir: Path,
     document_json: dict[str, Any],
@@ -25919,10 +27931,24 @@ def restore_final_delivery_visuals(
         int(value)
         for value in formula_sources.get("markdown_covered_indexes") or []
     }
-    formula_missing_indexes = sorted(
-        (expected_formula_indexes - formula_html_indexes)
-        | (expected_formula_indexes - formula_markdown_indexes)
+    # Keep side-specific omissions alongside the historical union field.  A
+    # union alone cannot distinguish an HTML-only regression from a Markdown-
+    # only regression, and downstream gates need to report the affected
+    # delivery surface without inferring it from appendix counts.
+    formula_missing_by_surface = _formula_source_missing_indexes_by_surface(
+        expected_formula_indexes,
+        formula_html_indexes,
+        formula_markdown_indexes,
     )
+    formula_missing_html_indexes = formula_missing_by_surface[
+        "formula_source_missing_html_indexes"
+    ]
+    formula_missing_markdown_indexes = formula_missing_by_surface[
+        "formula_source_missing_markdown_indexes"
+    ]
+    formula_missing_indexes = formula_missing_by_surface[
+        "formula_source_missing_indexes"
+    ]
     formula_unexpected_indexes = sorted(
         (formula_html_indexes | formula_markdown_indexes) - expected_formula_indexes
     )
@@ -26166,6 +28192,8 @@ def restore_final_delivery_visuals(
         "formula_source_expected_indexes": sorted(expected_formula_indexes),
         "formula_source_html_indexes": sorted(formula_html_indexes),
         "formula_source_markdown_indexes": sorted(formula_markdown_indexes),
+        "formula_source_missing_html_indexes": formula_missing_html_indexes,
+        "formula_source_missing_markdown_indexes": formula_missing_markdown_indexes,
         "formula_source_missing_indexes": formula_missing_indexes,
         "formula_source_unexpected_indexes": formula_unexpected_indexes,
         "formula_source_duplicate_html_anchor_indexes": formula_sources.get(
@@ -27465,6 +29493,8 @@ class _PictureHTMLImageSourceParser(HTMLParser):
 
     _SUPPRESSED_CONTAINERS = frozenset(
         {
+            "pre",
+            "code",
             "template",
             "textarea",
             "title",
@@ -27476,6 +29506,24 @@ class _PictureHTMLImageSourceParser(HTMLParser):
             "noframes",
             "script",
             "style",
+        }
+    )
+    _VOID_TAGS = frozenset(
+        {
+            "area",
+            "base",
+            "br",
+            "col",
+            "embed",
+            "hr",
+            "img",
+            "input",
+            "link",
+            "meta",
+            "param",
+            "source",
+            "track",
+            "wbr",
         }
     )
 
@@ -27496,10 +29544,10 @@ class _PictureHTMLImageSourceParser(HTMLParser):
     ) -> None:
         normalized_tag = str(tag).lower()
         if self._is_suppressed():
-            if normalized_tag in self._SUPPRESSED_CONTAINERS:
+            if normalized_tag not in self._VOID_TAGS:
                 self._suppression_stack.append(normalized_tag)
             return
-        if normalized_tag in self._SUPPRESSED_CONTAINERS:
+        if normalized_tag in self._SUPPRESSED_CONTAINERS or _picture_surface_container_marker(attrs):
             self._suppression_stack.append(normalized_tag)
             return
         self._record_img(normalized_tag, attrs)
@@ -27514,11 +29562,12 @@ class _PictureHTMLImageSourceParser(HTMLParser):
         # suppression scope to EOF (or an eventual explicit close) rather
         # than allowing a later literal image to leak through.
         normalized_tag = str(tag).lower()
-        if normalized_tag in self._SUPPRESSED_CONTAINERS:
+        if self._is_suppressed():
+            return
+        if normalized_tag in self._SUPPRESSED_CONTAINERS or _picture_surface_container_marker(attrs):
             self._suppression_stack.append(normalized_tag)
             return
-        if not self._is_suppressed():
-            self._record_img(normalized_tag, attrs)
+        self._record_img(normalized_tag, attrs)
 
     def handle_endtag(self, tag: str) -> None:
         normalized_tag = str(tag).lower()
@@ -27542,6 +29591,301 @@ def _html_picture_image_sources(document_html: str) -> list[str]:
         # the exact-one binding check fail closed when appropriate.
         pass
     return parser.sources
+
+
+# The legacy ``_html_picture_image_sources`` scanner remains the source of
+# the compatibility reference counts below.  The final CJK binding gate uses
+# a separate occurrence inventory: a count of ``src`` strings cannot prove
+# that the source crop belongs to the source picture which produced it.
+_PICTURE_SURFACE_MAX_BYTES = 32 * 1024 * 1024
+_PICTURE_SURFACE_MAX_CHARS = 32 * 1024 * 1024
+_PICTURE_SURFACE_MAX_HTML_IMAGES = 4096
+_PICTURE_SURFACE_MAX_HTML_NODES = 65536
+_PICTURE_SURFACE_MAX_MARKDOWN_IMAGES = 4096
+_PICTURE_SURFACE_MAX_MARKERS = 4096
+_PICTURE_SURFACE_MAX_SOURCE_REF_CHARS = 180
+_PICTURE_SURFACE_MAX_ATTRS = 128
+_PICTURE_SURFACE_MAX_FAILURES = 32
+_PICTURE_SURFACE_MAX_MARKER_TEXT_CHARS = 512
+
+
+def _picture_surface_safe_source_ref(value: Any) -> str | None:
+    """Return one bounded source identity, never an untrusted diagnostic."""
+
+    if not isinstance(value, str):
+        return None
+    if (
+        not value
+        or value != value.strip()
+        or len(value) > _PICTURE_SURFACE_MAX_SOURCE_REF_CHARS
+        or any(char in value for char in ("\x00", "\r", "\n"))
+        or "--" in value
+    ):
+        return None
+    return value
+
+
+def _picture_surface_failure_add(failures: set[str], reason: str) -> None:
+    """Add only stable bounded reason codes to a surface inventory."""
+
+    if len(failures) < _PICTURE_SURFACE_MAX_FAILURES:
+        failures.add(str(reason))
+
+
+def _picture_surface_container_marker(attrs: list[tuple[str, str | None]]) -> bool:
+    """Recognise inert/source-evidence containers from safe metadata attrs."""
+
+    for name, value in attrs:
+        if str(name).casefold() not in {
+            "id",
+            "class",
+            "role",
+            "data-kind",
+            "data-section",
+            "aria-label",
+        }:
+            continue
+        text = str(value or "").casefold()
+        # Delimiters avoid making a normal word such as ``preview`` inert,
+        # while still catching ``docling-source-evidence`` and
+        # ``review-appendix`` producer containers.
+        normalized = re.sub(r"[^a-z0-9]+", " ", text)
+        tokens = set(normalized.split())
+        if (
+            "appendix" in tokens
+            or "review" in tokens
+            or "inert" in tokens
+            or "source" in tokens
+            and "evidence" in tokens
+            or "source-evidence" in text
+            or "source_evidence" in text
+        ):
+            return True
+    return False
+
+
+class _PictureHTMLBindingParser(HTMLParser):
+    """Bounded inventory of visible ``img`` occurrence-level bindings.
+
+    ``HTMLParser`` ignores comments and raw-text elements.  A suppression
+    stack is retained for inert/source-evidence containers so an unclosed
+    container cannot expose a later literal image and certify a partial parse.
+    """
+
+    _SUPPRESSED_TAGS = frozenset(
+        {
+            "pre",
+            "code",
+            "template",
+            "script",
+            "style",
+            "noscript",
+            "textarea",
+            "title",
+            "iframe",
+            "object",
+            "xmp",
+            "noembed",
+            "noframes",
+        }
+    )
+    _VOID_TAGS = frozenset(
+        {
+            "area",
+            "base",
+            "br",
+            "col",
+            "embed",
+            "hr",
+            "img",
+            "input",
+            "link",
+            "meta",
+            "param",
+            "source",
+            "track",
+            "wbr",
+        }
+    )
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.bindings: list[dict[str, Any]] = []
+        self.unmarked_assets: list[str] = []
+        self.image_count = 0
+        self.node_count = 0
+        self.marker_count = 0
+        self.failures: set[str] = set()
+        self._suppression_stack: list[str] = []
+        self._aborted = False
+
+    def _is_suppressed(self) -> bool:
+        return bool(self._suppression_stack)
+
+    def _suppression_for(
+        self,
+        tag: str,
+        attrs: list[tuple[str, str | None]],
+    ) -> bool:
+        normalized = str(tag).casefold()
+        return normalized in self._SUPPRESSED_TAGS or _picture_surface_container_marker(attrs)
+
+    def _record_image(
+        self,
+        attrs: list[tuple[str, str | None]],
+    ) -> None:
+        if self._aborted:
+            return
+        self.image_count += 1
+        if self.image_count > _PICTURE_SURFACE_MAX_HTML_IMAGES:
+            _picture_surface_failure_add(
+                self.failures, "picture_html_image_limit_exceeded"
+            )
+            self._aborted = True
+            return
+        if len(attrs) > _PICTURE_SURFACE_MAX_ATTRS:
+            _picture_surface_failure_add(
+                self.failures, "picture_html_attribute_limit_exceeded"
+            )
+            return
+        grouped: dict[str, list[str | None]] = {}
+        for name, value in attrs:
+            grouped.setdefault(str(name).casefold(), []).append(value)
+        src_values = grouped.get("src", [])
+        ref_values = grouped.get("data-source-ref", [])
+        if len(src_values) > 1 or len(ref_values) > 1:
+            _picture_surface_failure_add(
+                self.failures, "picture_html_duplicate_attribute"
+            )
+        # Unmarked images remain in the compatibility reference inventory, but
+        # only a complete single source-ref + src pair is a binding occurrence.
+        if len(src_values) == 1 and src_values[0] is not None:
+            normalized_asset = _normalize_picture_local_asset_reference(src_values[0])
+            if not ref_values:
+                if normalized_asset is not None:
+                    self.unmarked_assets.append(normalized_asset)
+                return
+        if len(ref_values) != 1 or len(src_values) != 1:
+            if ref_values:
+                self.marker_count += 1
+            return
+        self.marker_count += 1
+        raw_ref = ref_values[0]
+        raw_asset = src_values[0]
+        safe_ref = _picture_surface_safe_source_ref(raw_ref)
+        normalized_asset = _normalize_picture_local_asset_reference(raw_asset)
+        if safe_ref is None:
+            _picture_surface_failure_add(
+                self.failures, "picture_html_source_ref_invalid"
+            )
+            return
+        if normalized_asset is None:
+            _picture_surface_failure_add(
+                self.failures, "picture_html_asset_reference_invalid"
+            )
+            return
+        self.bindings.append(
+            {
+                "source_ref": safe_ref,
+                "asset": normalized_asset,
+            }
+        )
+
+    def _start(
+        self,
+        tag: str,
+        attrs: list[tuple[str, str | None]],
+    ) -> None:
+        if self._aborted:
+            return
+        self.node_count += 1
+        if self.node_count > _PICTURE_SURFACE_MAX_HTML_NODES:
+            _picture_surface_failure_add(
+                self.failures, "picture_html_node_limit_exceeded"
+            )
+            self._aborted = True
+            return
+        normalized = str(tag).casefold()
+        if self._is_suppressed():
+            # Preserve the complete open-tag nesting while suppressed.  Only
+            # tracking another inert tag would let ``</section>`` or a
+            # mismatched ordinary close pop the outer source-evidence scope.
+            if normalized not in self._VOID_TAGS:
+                self._suppression_stack.append(normalized)
+            return
+        if self._suppression_for(normalized, attrs):
+            self._suppression_stack.append(normalized)
+            return
+        if normalized == "img":
+            self._record_image(attrs)
+
+    def handle_starttag(
+        self,
+        tag: str,
+        attrs: list[tuple[str, str | None]],
+    ) -> None:
+        self._start(tag, attrs)
+
+    def handle_startendtag(
+        self,
+        tag: str,
+        attrs: list[tuple[str, str | None]],
+    ) -> None:
+        if self._aborted:
+            return
+        self.node_count += 1
+        if self.node_count > _PICTURE_SURFACE_MAX_HTML_NODES:
+            _picture_surface_failure_add(
+                self.failures, "picture_html_node_limit_exceeded"
+            )
+            self._aborted = True
+            return
+        normalized = str(tag).casefold()
+        if self._is_suppressed():
+            return
+        if self._suppression_for(normalized, attrs):
+            # A self-closing non-void inert element is malformed; retaining a
+            # suppression scope to EOF is deliberately fail-closed.
+            self._suppression_stack.append(normalized)
+            return
+        if not self._is_suppressed() and normalized == "img":
+            self._record_image(attrs)
+
+    def handle_endtag(self, tag: str) -> None:
+        if not self._suppression_stack:
+            return
+        normalized = str(tag).casefold()
+        if self._suppression_stack[-1] == normalized:
+            self._suppression_stack.pop()
+
+    def finish(self) -> dict[str, Any]:
+        if self._suppression_stack:
+            _picture_surface_failure_add(
+                self.failures, "picture_html_suppression_unclosed"
+            )
+        if len(self.bindings) > _PICTURE_SURFACE_MAX_MARKERS:
+            _picture_surface_failure_add(
+                self.failures, "picture_html_marker_limit_exceeded"
+            )
+            self.bindings = self.bindings[:_PICTURE_SURFACE_MAX_MARKERS]
+        return {
+            "bindings": list(self.bindings),
+            "unmarked_assets": list(self.unmarked_assets),
+            "image_count": self.image_count,
+            "node_count": self.node_count,
+            "marker_count": self.marker_count,
+            "failure_reasons": sorted(self.failures),
+        }
+
+
+def _inventory_picture_html_bindings(document_html: str) -> dict[str, Any]:
+    parser = _PictureHTMLBindingParser()
+    try:
+        parser.feed(str(document_html))
+        parser.close()
+    except Exception:
+        _picture_surface_failure_add(parser.failures, "picture_html_parse_failed")
+    return parser.finish()
 
 
 _PICTURE_HTML_COMMENT_RE = re.compile(r"<!--.*?(?:-->|\Z)", flags=re.S)
@@ -27945,6 +30289,332 @@ def _normalize_picture_local_asset_reference(value: Any) -> str | None:
     return normalized
 
 
+_PICTURE_MARKDOWN_BINDING_MARKER_RE = re.compile(
+    r"^<!-- source-picture-ref:(?P<ref>[^<>]*) -->$"
+)
+
+
+def _picture_markdown_line_spans(markdown: str) -> list[tuple[int, int, int]]:
+    """Return ``(start, content_end, full_end)`` spans for bounded lines."""
+
+    spans: list[tuple[int, int, int]] = []
+    offset = 0
+    for line in str(markdown).splitlines(keepends=True):
+        full_end = offset + len(line)
+        content_end = full_end
+        while content_end > offset and markdown[content_end - 1] in "\r\n":
+            content_end -= 1
+        spans.append((offset, content_end, full_end))
+        offset = full_end
+        if len(spans) > _PICTURE_SURFACE_MAX_MARKDOWN_IMAGES * 8:
+            break
+    if offset < len(markdown) and len(spans) <= _PICTURE_SURFACE_MAX_MARKDOWN_IMAGES * 8:
+        spans.append((offset, len(markdown), len(markdown)))
+    elif not spans and markdown:
+        spans.append((0, len(markdown), len(markdown)))
+    return spans
+
+
+def _picture_markdown_position_in_ranges(
+    start: int,
+    end: int,
+    ranges: list[tuple[int, int]],
+) -> bool:
+    """Check that one token is wholly inside a safe prose range."""
+
+    return any(range_start <= start and end <= range_end for range_start, range_end in ranges)
+
+
+def _picture_markdown_unclosed_raw_html(markdown: str) -> bool:
+    """Detect an unmatched Markdown raw-HTML block suppression container."""
+
+    original = str(markdown)
+    masked = _mask_picture_html_comments(_markdown_mask_code(original))
+    stack: list[str] = []
+    for match in _PICTURE_MARKDOWN_HTML_TAG_RE.finditer(masked):
+        tag = match.group("tag").casefold()
+        if tag not in _PICTURE_MARKDOWN_RAW_HTML_BLOCK_TAGS:
+            continue
+        if match.group("closing"):
+            if stack and stack[-1] == tag:
+                stack.pop()
+            continue
+        attrs = str(match.group("attrs") or "")
+        if tag in _PICTURE_MARKDOWN_VOID_HTML_TAGS or attrs.rstrip().endswith("/"):
+            continue
+        stack.append(tag)
+    return bool(stack)
+
+
+def _picture_markdown_comment_state(markdown: str) -> list[bool]:
+    """Return whether each physical line starts inside a non-marker comment."""
+
+    states: list[bool] = []
+    in_comment = False
+    for line in str(markdown).splitlines(keepends=True):
+        stripped = line.rstrip("\r\n")
+        # The canonical marker is itself a one-line HTML comment.  Handle it
+        # as a delivery token before updating the ordinary comment state.
+        is_marker = _PICTURE_MARKDOWN_BINDING_MARKER_RE.fullmatch(stripped)
+        states.append(in_comment)
+        if is_marker:
+            continue
+        position = 0
+        while position < len(line):
+            if in_comment:
+                close = line.find("-->", position)
+                if close < 0:
+                    position = len(line)
+                    break
+                in_comment = False
+                position = close + 3
+                continue
+            opening = line.find("<!--", position)
+            if opening < 0:
+                break
+            close = line.find("-->", opening + 4)
+            if close < 0:
+                in_comment = True
+                break
+            position = close + 3
+    return states
+
+
+def _inventory_picture_markdown_bindings(markdown: str) -> dict[str, Any]:
+    """Inventory canonical Markdown image-token/marker pairs.
+
+    A marker is valid only as the exact next physical line after one standard
+    Markdown image token.  Fenced/inline/indented code, raw inert blocks and
+    arbitrary HTML comments are excluded by the existing safe-range scanner.
+    """
+
+    original = str(markdown)
+    failures: set[str] = set()
+    if len(original) > _PICTURE_SURFACE_MAX_CHARS:
+        _picture_surface_failure_add(
+            failures, "picture_markdown_surface_size_limit_exceeded"
+        )
+    safe_ranges = _markdown_picture_non_code_ranges(original)
+    line_spans = _picture_markdown_line_spans(original)
+    if len(line_spans) > _PICTURE_SURFACE_MAX_MARKDOWN_IMAGES * 8:
+        _picture_surface_failure_add(failures, "picture_markdown_line_limit_exceeded")
+    line_starts = [start for start, _content_end, _full_end in line_spans]
+    comment_states = _picture_markdown_comment_state(original)
+    masked_comments = _mask_picture_html_comments(original)
+    images_by_line: dict[int, list[dict[str, Any]]] = {}
+    image_count = 0
+    for line_index, (start, content_end, _full_end) in enumerate(line_spans):
+        if line_index >= len(comment_states) or comment_states[line_index]:
+            continue
+        if not _picture_markdown_position_in_ranges(start, content_end, safe_ranges):
+            continue
+        segment = masked_comments[start:content_end]
+        position = 0
+        while position < len(segment):
+            marker = segment.find("![", position)
+            if marker < 0:
+                break
+            absolute_marker = start + marker
+            if _picture_markdown_unescaped_backslash(segment, marker):
+                position = marker + 2
+                continue
+            alt_end = _picture_markdown_matching_bracket(segment, marker + 2)
+            if alt_end is None:
+                position = marker + 2
+                continue
+            parsed = _picture_markdown_image_destination(segment, alt_end + 1)
+            if parsed is None:
+                position = marker + 2
+                continue
+            destination, consumed = parsed
+            image_count += 1
+            if image_count > _PICTURE_SURFACE_MAX_MARKDOWN_IMAGES:
+                _picture_surface_failure_add(
+                    failures, "picture_markdown_image_limit_exceeded"
+                )
+                break
+            images_by_line.setdefault(line_index, []).append(
+                {
+                    "start": absolute_marker,
+                    "end": start + consumed,
+                    "asset": _normalize_picture_local_asset_reference(destination),
+                }
+            )
+            position = consumed
+    bindings: list[dict[str, Any]] = []
+    marker_count = 0
+    marker_lines: set[int] = set()
+    for line_index, (start, content_end, _full_end) in enumerate(line_spans):
+        if line_index >= len(comment_states) or comment_states[line_index]:
+            continue
+        marker_text = original[start:content_end]
+        marker_match = _PICTURE_MARKDOWN_BINDING_MARKER_RE.fullmatch(marker_text)
+        if marker_match is None:
+            continue
+        if not _picture_markdown_position_in_ranges(start, content_end, safe_ranges):
+            continue
+        marker_count += 1
+        if marker_count > _PICTURE_SURFACE_MAX_MARKERS:
+            _picture_surface_failure_add(
+                failures, "picture_markdown_marker_limit_exceeded"
+            )
+            continue
+        marker_lines.add(line_index)
+        previous_line = line_index - 1
+        candidates = images_by_line.get(previous_line, [])
+        if len(candidates) != 1:
+            _picture_surface_failure_add(
+                failures,
+                "picture_markdown_marker_detached"
+                if not candidates
+                else "picture_markdown_marker_ambiguous",
+            )
+            continue
+        candidate = candidates[0]
+        safe_ref = _picture_surface_safe_source_ref(marker_match.group("ref"))
+        if safe_ref is None:
+            _picture_surface_failure_add(
+                failures, "picture_markdown_source_ref_invalid"
+            )
+            continue
+        if candidate.get("asset") is None:
+            _picture_surface_failure_add(
+                failures, "picture_markdown_asset_reference_invalid"
+            )
+            continue
+        bindings.append(
+            {
+                "source_ref": safe_ref,
+                "asset": candidate["asset"],
+            }
+        )
+    # A marker must be paired with exactly one image; conversely, an image
+    # carrying a canonical source crop marker cannot be silently detached.
+    # Unmarked ordinary images remain valid compatibility references.
+    return {
+        "bindings": bindings[:_PICTURE_SURFACE_MAX_MARKERS],
+        "image_count": image_count,
+        "marker_count": marker_count,
+        "failure_reasons": sorted(failures),
+        "unclosed_raw_html": _picture_markdown_unclosed_raw_html(original),
+    }
+
+
+def _read_picture_surface_for_validation(path: Path) -> tuple[str, str | None]:
+    """Read a final surface with an lstat/size/decode boundary."""
+
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return "", "picture_surface_missing"
+    except OSError:
+        return "", "picture_surface_stat_failed"
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        return "", "picture_surface_not_regular"
+    if info.st_size > _PICTURE_SURFACE_MAX_BYTES:
+        return "", "picture_surface_size_limit_exceeded"
+    # Open with ``O_NOFOLLOW`` where available and cap the read itself.  The
+    # initial lstat is only a preflight; a path can otherwise be swapped for a
+    # symlink between stat and read.
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+        with os.fdopen(descriptor, "rb") as handle:
+            descriptor = -1
+            current = os.fstat(handle.fileno())
+            if stat.S_ISLNK(current.st_mode) or not stat.S_ISREG(current.st_mode):
+                return "", "picture_surface_not_regular"
+            raw = handle.read(_PICTURE_SURFACE_MAX_BYTES + 1)
+    except OSError:
+        if descriptor >= 0:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        return "", "picture_surface_read_failed"
+    if len(raw) > _PICTURE_SURFACE_MAX_BYTES:
+        return "", "picture_surface_size_limit_exceeded"
+    try:
+        value = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return "", "picture_surface_decode_failed"
+    if len(value) > _PICTURE_SURFACE_MAX_CHARS:
+        return "", "picture_surface_char_limit_exceeded"
+    return value, None
+
+
+def _picture_asset_sha256_bounded(path: Path) -> tuple[str | None, str | None]:
+    """Hash one crop without following a symlink or reading past 16 MiB."""
+
+    maximum = 16 * 1024 * 1024
+    parent_descriptor = -1
+    descriptor = -1
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    directory_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    try:
+        # Anchor the leaf lookup to its already-open parent.  O_NOFOLLOW on
+        # ``path`` alone only protects the leaf and can still follow a parent
+        # directory replaced by a symlink between checks.
+        parent_descriptor = os.open(path.parent, directory_flags)
+        parent_info = os.fstat(parent_descriptor)
+        if not stat.S_ISDIR(parent_info.st_mode):
+            return None, "picture_asset_hash_failed"
+        descriptor = os.open(path.name, flags, dir_fd=parent_descriptor)
+        with os.fdopen(descriptor, "rb") as handle:
+            descriptor = -1
+            info = os.fstat(handle.fileno())
+            if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+                return None, "picture_asset_hash_failed"
+            if info.st_size > maximum:
+                return None, "picture_asset_size_limit_exceeded"
+            digest = hashlib.sha256()
+            remaining = maximum + 1
+            while remaining > 0:
+                chunk = handle.read(min(1024 * 1024, remaining))
+                if not chunk:
+                    break
+                digest.update(chunk)
+                remaining -= len(chunk)
+            if remaining == 0:
+                return None, "picture_asset_size_limit_exceeded"
+            # Ensure the relative asset path still names the exact directory
+            # and file that were hashed before accepting the digest.
+            current_parent = path.parent.lstat()
+            if (
+                stat.S_ISLNK(current_parent.st_mode)
+                or not stat.S_ISDIR(current_parent.st_mode)
+                or current_parent.st_dev != parent_info.st_dev
+                or current_parent.st_ino != parent_info.st_ino
+            ):
+                return None, "picture_asset_hash_failed"
+            current_asset = path.lstat()
+            if (
+                stat.S_ISLNK(current_asset.st_mode)
+                or not stat.S_ISREG(current_asset.st_mode)
+                or current_asset.st_dev != info.st_dev
+                or current_asset.st_ino != info.st_ino
+            ):
+                return None, "picture_asset_hash_failed"
+            return digest.hexdigest(), None
+    except OSError:
+        if descriptor >= 0:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        return None, "picture_asset_hash_failed"
+    finally:
+        if parent_descriptor >= 0:
+            try:
+                os.close(parent_descriptor)
+            except OSError:
+                pass
+
+
 def validate_final_picture_surfaces(
     output_dir: Path,
     metadata: dict[str, Any],
@@ -27975,16 +30645,16 @@ def validate_final_picture_surfaces(
             top_reasons.add("picture_manifest_records_invalid")
     elif manifest is not None:
         top_reasons.add("picture_manifest_invalid")
-    html_text = (
-        (output_dir / "document.html").read_text(encoding="utf-8")
-        if (output_dir / "document.html").is_file()
-        else ""
+    html_text, html_read_reason = _read_picture_surface_for_validation(
+        output_dir / "document.html"
     )
-    markdown_text = (
-        (output_dir / "document.md").read_text(encoding="utf-8")
-        if (output_dir / "document.md").is_file()
-        else ""
+    markdown_text, markdown_read_reason = _read_picture_surface_for_validation(
+        output_dir / "document.md"
     )
+    if html_read_reason:
+        top_reasons.add(html_read_reason)
+    if markdown_read_reason:
+        top_reasons.add(markdown_read_reason)
 
     expected_source_sha = str(
         _structural_expected_visual_pdf_sha256(metadata)
@@ -28057,6 +30727,12 @@ def validate_final_picture_surfaces(
 
     # Count only semantic image destinations.  Raw string counts are unsafe:
     # they also match prose, comments, ordinary links, and Markdown code.
+    html_binding_inventory = _inventory_picture_html_bindings(html_text)
+    markdown_binding_inventory = _inventory_picture_markdown_bindings(markdown_text)
+    top_reasons.update(html_binding_inventory.get("failure_reasons") or [])
+    top_reasons.update(markdown_binding_inventory.get("failure_reasons") or [])
+    if markdown_binding_inventory.get("unclosed_raw_html"):
+        top_reasons.add("picture_markdown_suppression_unclosed")
     html_surface_assets = [
         normalized
         for raw_reference in _html_picture_image_sources(html_text)
@@ -28072,6 +30748,87 @@ def validate_final_picture_surfaces(
         if (normalized := _normalize_picture_local_asset_reference(raw_reference))
         is not None
     ]
+
+    # Keep the occurrence-level source identity separate from compatibility
+    # asset counts.  Every observed canonical marker participates in the
+    # bidirectional comparison below, including markers for nonexpected or
+    # unknown pictures (which therefore become unexpected markers).
+    html_bindings = [
+        binding
+        for binding in html_binding_inventory.get("bindings") or []
+        if isinstance(binding, dict)
+    ]
+    markdown_bindings = [
+        binding
+        for binding in markdown_binding_inventory.get("bindings") or []
+        if isinstance(binding, dict)
+    ]
+    html_bindings_by_ref: dict[str, list[str]] = {}
+    markdown_bindings_by_ref: dict[str, list[str]] = {}
+    for binding in html_bindings:
+        source_ref = binding.get("source_ref")
+        asset = binding.get("asset")
+        if isinstance(source_ref, str) and isinstance(asset, str):
+            html_bindings_by_ref.setdefault(source_ref, []).append(asset)
+    for binding in markdown_bindings:
+        source_ref = binding.get("source_ref")
+        asset = binding.get("asset")
+        if isinstance(source_ref, str) and isinstance(asset, str):
+            markdown_bindings_by_ref.setdefault(source_ref, []).append(asset)
+
+    def binding_observation(
+        bindings_by_ref: dict[str, list[str]],
+        source_ref: str,
+        expected_asset: str | None,
+        *,
+        expected: bool,
+    ) -> tuple[str, int, str | None]:
+        if not expected or not source_ref:
+            values = bindings_by_ref.get(source_ref, []) if source_ref else []
+            return (
+                "unexpected" if values else "not_expected",
+                len(values),
+                values[0] if len(values) == 1 else None,
+            )
+        values = bindings_by_ref.get(source_ref, [])
+        if not values:
+            return "missing", 0, None
+        if len(values) != 1:
+            return "duplicate", len(values), None
+        if expected_asset is None or values[0] != expected_asset:
+            return "asset_mismatch", 1, values[0]
+        return "bound", 1, values[0]
+
+    expected_binding_pairs: list[tuple[str, str]] = []
+    expected_binding_refs: set[str] = set()
+    for candidate in records:
+        if not isinstance(candidate, dict) or candidate.get("machine_binding_expected") is not True:
+            continue
+        candidate_ref = candidate.get("source_ref")
+        candidate_asset = _normalize_picture_local_asset_reference(
+            candidate.get("source_asset")
+        )
+        safe_ref = _picture_surface_safe_source_ref(candidate_ref)
+        if safe_ref is None or candidate_asset is None:
+            continue
+        expected_binding_refs.add(safe_ref)
+        expected_binding_pairs.append((safe_ref, candidate_asset))
+    for surface_name, bindings_by_ref in (
+        ("html", html_bindings_by_ref),
+        ("markdown", markdown_bindings_by_ref),
+    ):
+        observed_pairs = sorted(
+            (source_ref, asset)
+            for source_ref, assets in bindings_by_ref.items()
+            for asset in assets
+        )
+        expected_pairs = sorted(expected_binding_pairs)
+        if any(source_ref not in expected_binding_refs for source_ref in bindings_by_ref):
+            top_reasons.add(f"picture_{surface_name}_unexpected_source_ref")
+        if any(len(assets) > 1 for assets in bindings_by_ref.values()):
+            top_reasons.add(f"picture_{surface_name}_source_ref_duplicate")
+        if observed_pairs != expected_pairs:
+            top_reasons.add(f"picture_{surface_name}_source_binding_mismatch")
 
     seen_indexes: set[int] = set()
     seen_refs: set[str] = set()
@@ -28093,22 +30850,33 @@ def validate_final_picture_surfaces(
         raw_failure_reason_items = (
             raw_failure_reasons if isinstance(raw_failure_reasons, list) else []
         )
-        reasons: set[str] = {
-            str(reason)
-            for reason in raw_failure_reason_items
-            if str(reason)
-        }
         raw_failure_reason_values = {
             reason
             for reason in raw_failure_reason_items
-            if isinstance(reason, str) and reason
+            if isinstance(reason, str)
+            and len(reason) <= 140
+            and reason in _PICTURE_SAFE_RAW_FAILURE_REASONS
+        }
+        raw_failure_reason_untrusted = any(
+            not isinstance(reason, str)
+            or len(reason) > 140
+            or reason not in _PICTURE_SAFE_RAW_FAILURE_REASONS
+            for reason in raw_failure_reason_items
+        )
+        reasons: set[str] = {
+            reason for reason in raw_failure_reason_values if reason
         }
         if raw_failure_reasons is not None and not isinstance(raw_failure_reasons, list):
             reasons.add("picture_manifest_failure_reasons_invalid")
+            integrity_failure = True
         elif isinstance(raw_failure_reasons, list) and any(
             not isinstance(reason, str) for reason in raw_failure_reasons
         ):
             reasons.add("picture_manifest_failure_reasons_invalid")
+            integrity_failure = True
+        if raw_failure_reason_untrusted:
+            reasons.add("picture_classification_failure_reasons_unexpected")
+            integrity_failure = True
         record_version = record.get("version")
         if (
             not isinstance(record_version, int)
@@ -28174,6 +30942,9 @@ def validate_final_picture_surfaces(
         source_ref = str(record.get("source_ref") or "").strip()
         if not source_ref:
             reasons.add("picture_manifest_source_ref_missing")
+            integrity_failure = True
+        elif _picture_surface_safe_source_ref(source_ref) is None:
+            reasons.add("picture_manifest_source_ref_invalid")
             integrity_failure = True
         elif source_ref in seen_refs:
             reasons.add("picture_manifest_duplicate_source_ref")
@@ -28304,11 +31075,13 @@ def validate_final_picture_surfaces(
             if not re.fullmatch(r"[0-9a-f]{64}", record_asset_sha):
                 reasons.add("picture_asset_sha256_missing")
             elif asset_path is not None:
-                try:
-                    if file_sha256(asset_path) != record_asset_sha:
-                        reasons.add("picture_asset_sha256_mismatch")
-                except OSError:
-                    reasons.add("picture_asset_hash_failed")
+                actual_asset_sha, asset_hash_reason = _picture_asset_sha256_bounded(
+                    asset_path
+                )
+                if asset_hash_reason:
+                    reasons.add(asset_hash_reason)
+                elif actual_asset_sha != record_asset_sha:
+                    reasons.add("picture_asset_sha256_mismatch")
         normalized_source_asset = _normalize_picture_local_asset_reference(
             source_asset
         )
@@ -28332,12 +31105,54 @@ def validate_final_picture_surfaces(
             if normalized_source_asset is not None
             else 0
         )
+        html_binding_status, html_binding_count, html_binding_asset = binding_observation(
+            html_bindings_by_ref,
+            source_ref,
+            normalized_source_asset,
+            expected=expected,
+        )
+        markdown_binding_status, markdown_binding_count, markdown_binding_asset = binding_observation(
+            markdown_bindings_by_ref,
+            source_ref,
+            normalized_source_asset,
+            expected=expected,
+        )
         raw_html_reference_count_present = "html_reference_count" in record
         raw_html_reference_count = record.get("html_reference_count")
         raw_markdown_reference_count_present = "markdown_reference_count" in record
         raw_markdown_reference_count = record.get("markdown_reference_count")
         record["html_reference_count"] = html_reference_count
         record["markdown_reference_count"] = markdown_reference_count
+        raw_binding_present = {
+            "html_binding_status": "html_binding_status" in record,
+            "html_binding_count": "html_binding_count" in record,
+            "html_binding_asset": "html_binding_asset" in record,
+            "markdown_binding_status": "markdown_binding_status" in record,
+            "markdown_binding_count": "markdown_binding_count" in record,
+            "markdown_binding_asset": "markdown_binding_asset" in record,
+        }
+        raw_binding_values = {
+            "html_binding_status": record.get("html_binding_status"),
+            "html_binding_count": record.get("html_binding_count"),
+            "html_binding_asset": record.get("html_binding_asset"),
+            "markdown_binding_status": record.get("markdown_binding_status"),
+            "markdown_binding_count": record.get("markdown_binding_count"),
+            "markdown_binding_asset": record.get("markdown_binding_asset"),
+        }
+        record["html_binding_status"] = html_binding_status
+        record["html_binding_count"] = html_binding_count
+        record["html_binding_asset"] = html_binding_asset
+        record["markdown_binding_status"] = markdown_binding_status
+        record["markdown_binding_count"] = markdown_binding_count
+        record["markdown_binding_asset"] = markdown_binding_asset
+        if expected:
+            if html_binding_status != "bound":
+                reasons.add(f"picture_html_binding_{html_binding_status}")
+            if markdown_binding_status != "bound":
+                reasons.add(f"picture_markdown_binding_{markdown_binding_status}")
+        elif html_binding_status == "unexpected" or markdown_binding_status == "unexpected":
+            reasons.add("picture_nonexpected_source_marker_unexpected")
+            integrity_failure = True
         if expected:
             if html_reference_count != 1:
                 reasons.add("picture_html_reference_count_mismatch")
@@ -28390,6 +31205,29 @@ def validate_final_picture_surfaces(
         ):
             reasons.add("picture_markdown_reference_count_derived_field_tampered")
             integrity_failure = True
+        expected_binding_values = {
+            "html_binding_status": html_binding_status,
+            "html_binding_count": html_binding_count,
+            "html_binding_asset": html_binding_asset,
+            "markdown_binding_status": markdown_binding_status,
+            "markdown_binding_count": markdown_binding_count,
+            "markdown_binding_asset": markdown_binding_asset,
+        }
+        for field, derived_value in expected_binding_values.items():
+            if not raw_binding_present[field]:
+                continue
+            raw_value = raw_binding_values[field]
+            if field.endswith("_count"):
+                if (
+                    isinstance(raw_value, bool)
+                    or not isinstance(raw_value, int)
+                    or raw_value != derived_value
+                ):
+                    reasons.add(f"picture_{field}_derived_field_tampered")
+                    integrity_failure = True
+            elif raw_value != derived_value:
+                reasons.add(f"picture_{field}_derived_field_tampered")
+                integrity_failure = True
         record["status"] = (
             "unresolved"
             if integrity_failure or (expected and reasons)

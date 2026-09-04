@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+from bisect import bisect_right
 import copy
 import hashlib
 import html
@@ -6331,10 +6332,15 @@ def _materialize_picture_assets(
     followed or replaced.
     """
 
-    pictures_dir = output_dir / "pictures"
     written = 0
     skipped = 0
     global_index = 0
+    directory_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    child_read_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
     extensions = {
         "image/png": "png",
         "image/jpeg": "jpg",
@@ -6342,47 +6348,217 @@ def _materialize_picture_assets(
         "image/gif": "gif",
     }
 
-    def safe_regular_file(path: Path) -> bool:
+    def open_safe_picture_dir(*, create: bool = False) -> int:
+        """Open ``output_dir/pictures`` through an anchored directory fd.
+
+        ``O_NOFOLLOW`` on a leaf file does not protect against replacing its
+        parent with a symlink between validation and open.  Resolve the
+        generated child names relative to this descriptor instead.
+        """
+
+        output_descriptor = -1
+        picture_descriptor = -1
         try:
-            info = path.lstat()
-        except (FileNotFoundError, OSError):
+            output_descriptor = os.open(output_dir, directory_flags)
+            output_info = os.fstat(output_descriptor)
+            if not stat.S_ISDIR(output_info.st_mode):
+                return -1
+            if create:
+                try:
+                    os.mkdir("pictures", 0o755, dir_fd=output_descriptor)
+                except FileExistsError:
+                    pass
+            picture_descriptor = os.open(
+                "pictures",
+                directory_flags,
+                dir_fd=output_descriptor,
+            )
+            picture_info = os.fstat(picture_descriptor)
+            if not stat.S_ISDIR(picture_info.st_mode):
+                os.close(picture_descriptor)
+                return -1
+            return picture_descriptor
+        except OSError:
+            if picture_descriptor >= 0:
+                try:
+                    os.close(picture_descriptor)
+                except OSError:
+                    pass
+            return -1
+        finally:
+            if output_descriptor >= 0:
+                try:
+                    os.close(output_descriptor)
+                except OSError:
+                    pass
+
+    def picture_dir_fd_is_current(picture_descriptor: int) -> bool:
+        output_descriptor = -1
+        try:
+            output_descriptor = os.open(output_dir, directory_flags)
+            current = os.stat(
+                "pictures",
+                dir_fd=output_descriptor,
+                follow_symlinks=False,
+            )
+            anchored = os.fstat(picture_descriptor)
+            return (
+                stat.S_ISDIR(current.st_mode)
+                and not stat.S_ISLNK(current.st_mode)
+                and current.st_dev == anchored.st_dev
+                and current.st_ino == anchored.st_ino
+            )
+        except OSError:
             return False
-        return stat.S_ISREG(info.st_mode) and not stat.S_ISLNK(info.st_mode)
+        finally:
+            if output_descriptor >= 0:
+                try:
+                    os.close(output_descriptor)
+                except OSError:
+                    pass
+
+    def safe_regular_file(path: Path) -> bool:
+        picture_descriptor = open_safe_picture_dir()
+        child_descriptor = -1
+        if picture_descriptor < 0:
+            return False
+        try:
+            child_descriptor = os.open(
+                path.name,
+                child_read_flags,
+                dir_fd=picture_descriptor,
+            )
+            info = os.fstat(child_descriptor)
+            return (
+                stat.S_ISREG(info.st_mode)
+                and not stat.S_ISLNK(info.st_mode)
+                and info.st_size <= int(_CJK_PICTURE_MAX_ASSET_BYTES)
+                and picture_dir_fd_is_current(picture_descriptor)
+            )
+        except OSError:
+            return False
+        finally:
+            if child_descriptor >= 0:
+                try:
+                    os.close(child_descriptor)
+                except OSError:
+                    pass
+            try:
+                os.close(picture_descriptor)
+            except OSError:
+                pass
 
     def path_exists_or_unsafe(path: Path) -> bool:
+        picture_descriptor = open_safe_picture_dir()
+        if picture_descriptor < 0:
+            return not picture_dir_is_safe_if_present()
         try:
-            path.lstat()
+            os.stat(
+                path.name,
+                dir_fd=picture_descriptor,
+                follow_symlinks=False,
+            )
         except FileNotFoundError:
             return False
         except OSError:
             # Treat an uninspectable path as occupied.  Never risk following
             # or replacing it on behalf of an embedded payload.
             return True
+        finally:
+            try:
+                os.close(picture_descriptor)
+            except OSError:
+                pass
         return True
 
     def picture_dir_is_safe_if_present() -> bool:
         """Reject a picture-root symlink before inspecting child assets."""
 
+        output_descriptor = -1
         try:
-            info = pictures_dir.lstat()
+            output_descriptor = os.open(output_dir, directory_flags)
+            info = os.stat(
+                "pictures",
+                dir_fd=output_descriptor,
+                follow_symlinks=False,
+            )
         except FileNotFoundError:
             return True
         except OSError:
             return False
+        finally:
+            if output_descriptor >= 0:
+                try:
+                    os.close(output_descriptor)
+                except OSError:
+                    pass
         return stat.S_ISDIR(info.st_mode) and not stat.S_ISLNK(info.st_mode)
 
     def ensure_safe_picture_dir() -> bool:
-        try:
-            if pictures_dir.is_symlink():
-                return False
-            if pictures_dir.exists():
-                info = pictures_dir.lstat()
-                return stat.S_ISDIR(info.st_mode) and not stat.S_ISLNK(info.st_mode)
-            pictures_dir.mkdir(parents=True, exist_ok=True)
-            info = pictures_dir.lstat()
-            return stat.S_ISDIR(info.st_mode) and not stat.S_ISLNK(info.st_mode)
-        except OSError:
+        picture_descriptor = open_safe_picture_dir(create=True)
+        if picture_descriptor < 0:
             return False
+        try:
+            return picture_dir_fd_is_current(picture_descriptor)
+        finally:
+            try:
+                os.close(picture_descriptor)
+            except OSError:
+                pass
+
+    def create_picture_asset(path: Path, payload: bytes) -> str:
+        """Create a generated child without following a replaced parent."""
+
+        picture_descriptor = open_safe_picture_dir(create=True)
+        child_descriptor = -1
+        created = False
+        if picture_descriptor < 0:
+            return "unsafe"
+        try:
+            child_descriptor = os.open(
+                path.name,
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_EXCL
+                | getattr(os, "O_NOFOLLOW", 0),
+                0o644,
+                dir_fd=picture_descriptor,
+            )
+            created = True
+            with os.fdopen(child_descriptor, "wb") as handle:
+                child_descriptor = -1
+                info = os.fstat(handle.fileno())
+                if not stat.S_ISREG(info.st_mode):
+                    raise OSError("picture destination is not a regular file")
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+            if not picture_dir_fd_is_current(picture_descriptor):
+                try:
+                    os.unlink(path.name, dir_fd=picture_descriptor)
+                except OSError:
+                    pass
+                return "unsafe"
+            return "created"
+        except FileExistsError:
+            return "exists"
+        except OSError:
+            if created:
+                try:
+                    os.unlink(path.name, dir_fd=picture_descriptor)
+                except OSError:
+                    pass
+            return "unsafe"
+        finally:
+            if child_descriptor >= 0:
+                try:
+                    os.close(child_descriptor)
+                except OSError:
+                    pass
+            try:
+                os.close(picture_descriptor)
+            except OSError:
+                pass
 
     for document in documents:
         for node in document.get("pictures") or []:
@@ -6424,12 +6600,47 @@ def _materialize_picture_assets(
             if not match:
                 skipped += 1
                 continue
+            encoded_payload = str(match.group(2) or "")
+            # Bound the encoded representation before invoking the decoder.
+            # ``b64decode`` allocates the complete output in one step, so an
+            # attacker-controlled data URI must not be allowed to turn a
+            # nominally bounded asset into an unbounded allocation.  The
+            # raw length check happens first so a huge whitespace-only value
+            # cannot force an equally huge normalization copy.
+            max_asset_bytes = int(_CJK_PICTURE_MAX_ASSET_BYTES)
+            max_encoded_chars = ((max_asset_bytes + 2) // 3) * 4
+            if len(encoded_payload) > max_encoded_chars:
+                skipped += 1
+                continue
+            compact_payload = re.sub(r"\s+", "", encoded_payload)
+            if len(compact_payload) > max_encoded_chars:
+                skipped += 1
+                continue
+            # Reject malformed padding/length up front.  For a valid compact
+            # base64 stream this computes an upper bound on the decoded byte
+            # count; invalid characters are conservatively included in the
+            # bound because the decoder below remains compatibility-tolerant.
+            padding = len(compact_payload) - len(compact_payload.rstrip("="))
+            if padding > 2 or ("=" in compact_payload[:-padding] if padding else "=" in compact_payload):
+                skipped += 1
+                continue
+            remainder = len(compact_payload) % 4
+            if remainder == 1:
+                skipped += 1
+                continue
+            if remainder == 0:
+                decoded_upper_bound = (len(compact_payload) // 4) * 3 - padding
+            else:
+                decoded_upper_bound = (len(compact_payload) // 4) * 3 + remainder - 1
+            if decoded_upper_bound > max_asset_bytes:
+                skipped += 1
+                continue
             try:
-                payload = base64.b64decode(match.group(2), validate=False)
+                payload = base64.b64decode(compact_payload, validate=False)
             except Exception:
                 skipped += 1
                 continue
-            if not payload:
+            if not payload or len(payload) > max_asset_bytes:
                 skipped += 1
                 continue
 
@@ -6443,15 +6654,8 @@ def _materialize_picture_assets(
                 skipped += 1
                 continue
 
-            try:
-                # Exclusive creation makes the fallback race-safe: a target
-                # appearing between the lstat above and open is never
-                # overwritten or followed.
-                with destination.open("xb") as handle:
-                    handle.write(payload)
-                    handle.flush()
-                    os.fsync(handle.fileno())
-            except FileExistsError:
+            create_result = create_picture_asset(destination, payload)
+            if create_result == "exists":
                 # A concurrent producer may have completed the same asset.
                 # Reuse it only if it is now a safe regular file; otherwise
                 # leave the target untouched and fail this binding closed.
@@ -6460,7 +6664,7 @@ def _materialize_picture_assets(
                 else:
                     skipped += 1
                 continue
-            except OSError:
+            if create_result != "created":
                 skipped += 1
                 continue
 
@@ -6470,6 +6674,801 @@ def _materialize_picture_assets(
             else:
                 skipped += 1
     return {"written": written, "skipped": skipped}
+
+
+_CJK_PICTURE_FIGURE_RE = re.compile(
+    r"(?is)<figure\b(?P<attrs>[^>]*)>(?P<body>.*?)</figure\s*>"
+)
+_CJK_PICTURE_CAPTION_RE = re.compile(
+    r"(?is)<figcaption\b[^>]*>(?P<body>.*?)</figcaption\s*>"
+)
+_CJK_PICTURE_IMG_RE = re.compile(r"(?is)<img\b(?P<attrs>[^>]*)/?>")
+_CJK_PICTURE_ATTR_RE = re.compile(
+    r"(?is)(?<![\w:-])(?P<name>[A-Za-z_:][\w:.-]*)\s*=\s*"
+    r"(?P<quote>[\"'])(?P<value>.*?)\2"
+)
+_CJK_PICTURE_MAX_NODES = 128
+_CJK_PICTURE_MAX_CAPTION_CHARS = 4096
+_CJK_PICTURE_MAX_SOURCE_REF_CHARS = 180
+_CJK_PICTURE_MAX_SURFACE_CHARS = 32 * 1024 * 1024
+_CJK_PICTURE_MAX_ASSET_BYTES = 16 * 1024 * 1024
+_CJK_PICTURE_MAX_HTML_DEPTH = 1
+_CJK_PICTURE_MAX_HTML_FIGURES = 512
+_CJK_PICTURE_HTML_COMMENT_RE = re.compile(
+    r"(?is)<!--.*?(?:-->|\Z)"
+)
+_CJK_PICTURE_HTML_CONTAINER_RE = re.compile(
+    r"(?is)<(?P<tag>template|script|style|noscript)\b[^>]*>"
+    r".*?(?:</(?P=tag)\s*>|\Z)"
+)
+_CJK_PICTURE_HTML_SECTION_RE = re.compile(
+    r"(?is)<section\b(?P<attrs>[^>]*)>.*?(?:</section\s*>|\Z)"
+)
+
+
+def _cjk_picture_caption_key(value: Any) -> str:
+    text = unicodedata.normalize("NFKC", str(value or ""))
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) > _CJK_PICTURE_MAX_CAPTION_CHARS:
+        return ""
+    return text.casefold()
+
+
+def _cjk_picture_caption_text(
+    document: dict[str, Any],
+    node: dict[str, Any],
+) -> str | None:
+    captions = node.get("captions")
+    if not isinstance(captions, (list, tuple)) or len(captions) != 1:
+        return None
+    item = captions[0]
+    if not isinstance(item, dict):
+        return None
+    reference = str(item.get("$ref") or "").strip()
+    if not reference:
+        return None
+    caption_node = _resolve(document, reference)
+    if not isinstance(caption_node, dict):
+        return None
+    text = str(caption_node.get("text") or "").strip()
+    if not text or len(text) > _CJK_PICTURE_MAX_CAPTION_CHARS:
+        return None
+    return text
+
+
+def _cjk_picture_caption_exceeds_limit(
+    document: dict[str, Any],
+    node: dict[str, Any],
+) -> bool:
+    """Identify a well-formed caption whose text is too large to bind safely."""
+
+    captions = node.get("captions")
+    if not isinstance(captions, (list, tuple)) or len(captions) != 1:
+        return False
+    item = captions[0]
+    if not isinstance(item, dict):
+        return False
+    reference = str(item.get("$ref") or "").strip()
+    if not reference:
+        return False
+    caption_node = _resolve(document, reference)
+    if not isinstance(caption_node, dict):
+        return False
+    text = str(caption_node.get("text") or "").strip()
+    return bool(text and len(text) > _CJK_PICTURE_MAX_CAPTION_CHARS)
+
+
+def _cjk_picture_source_ref(node: dict[str, Any]) -> str | None:
+    raw_value = node.get("self_ref")
+    if not isinstance(raw_value, str):
+        return None
+    raw = raw_value
+    if (
+        not raw
+        or raw != raw.strip()
+        or len(raw) > _CJK_PICTURE_MAX_SOURCE_REF_CHARS
+        or any(character in raw for character in ("\x00", "\r", "\n"))
+        or "--" in raw
+    ):
+        return None
+    part_present = "_local_ai_lab_chunk_part_index" in node
+    if not part_present:
+        return raw
+    part_index = node.get("_local_ai_lab_chunk_part_index")
+    if (
+        isinstance(part_index, bool)
+        or not isinstance(part_index, int)
+        or part_index < 0
+    ):
+        return None
+    return f"chunk:{part_index}:{raw}"
+
+
+def _cjk_picture_html_attrs(tag: str, name: str) -> list[str]:
+    wanted = str(name).casefold()
+    return [
+        str(match.group("value"))
+        for match in _CJK_PICTURE_ATTR_RE.finditer(str(tag))
+        if str(match.group("name")).casefold() == wanted
+    ]
+
+
+def _cjk_picture_html_set_attr(tag: str, name: str, value: str) -> str | None:
+    text = str(tag)
+    matches = [
+        match
+        for match in _CJK_PICTURE_ATTR_RE.finditer(text)
+        if str(match.group("name")).casefold() == str(name).casefold()
+    ]
+    escaped = html.escape(str(value), quote=True)
+    if len(matches) > 1:
+        return None
+    if matches:
+        match = matches[0]
+        quote = str(match.group("quote"))
+        replacement = (
+            f"{match.group('name')}={quote}{escaped}{quote}"
+        )
+        return text[: match.start()] + replacement + text[match.end() :]
+    close = re.search(r"\s*/?>\s*$", text)
+    if close is None:
+        return None
+    insertion = f' {name}="{escaped}"'
+    return text[: close.start()] + insertion + text[close.start() :]
+
+
+def _cjk_picture_html_protected_ranges(text: str) -> list[tuple[int, int]]:
+    """Return sorted comment/evidence ranges excluded from HTML matching."""
+
+    ranges: list[tuple[int, int]] = []
+    for pattern in (
+        _CJK_PICTURE_HTML_COMMENT_RE,
+        _CJK_PICTURE_HTML_CONTAINER_RE,
+    ):
+        ranges.extend(match.span() for match in pattern.finditer(text))
+    for match in _CJK_PICTURE_HTML_SECTION_RE.finditer(text):
+        attrs = str(match.group("attrs") or "")
+        if re.search(
+            r"(?i)(?:appendix|source-evidence|review|docling-(?:table|formula|inline)-source)",
+            attrs,
+        ):
+            ranges.append(match.span())
+    if not ranges:
+        return []
+    ranges.sort()
+    merged: list[tuple[int, int]] = []
+    for start, end in ranges:
+        if not merged or start > merged[-1][1]:
+            merged.append((start, end))
+        else:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+    return merged
+
+
+def _cjk_picture_html_range_is_protected(
+    start: int,
+    end: int,
+    ranges: list[tuple[int, int]],
+    starts: list[int] | None = None,
+) -> bool:
+    """Check one range against sorted protected spans."""
+
+    if not ranges:
+        return False
+    starts = starts if starts is not None else [item[0] for item in ranges]
+    candidate_index = bisect_right(starts, start) - 1
+    if candidate_index >= 0 and ranges[candidate_index][1] > start:
+        return True
+    next_index = candidate_index + 1
+    return next_index < len(ranges) and ranges[next_index][0] < end
+
+
+def _cjk_picture_markup_text(value: str) -> str:
+    text = re.sub(r"(?is)<!--.*?(?:-->|\Z)", " ", str(value or ""))
+    text = re.sub(r"(?is)<br\s*/?>", "\n", text)
+    text = re.sub(r"(?is)<[^>]+>", " ", text)
+    text = re.sub(r"^\s*(?:[*_`]+)\s*|\s*(?:[*_`]+)\s*$", "", text)
+    return text
+
+
+def _cjk_picture_is_local_reference(value: str) -> bool:
+    text = html.unescape(str(value or "")).strip()
+    if not text:
+        return False
+    return not bool(
+        re.match(r"(?i)^(?:data:|https?:|//|blob:|javascript:|mailto:)", text)
+    )
+
+
+def _cjk_picture_asset_is_safe(
+    output_dir: Path,
+    asset: str,
+) -> bool:
+    if not re.fullmatch(r"pictures/picture_\d+\.png", str(asset)):
+        return False
+    pictures_dir = output_dir / "pictures"
+    target = output_dir / asset
+    try:
+        directory_info = pictures_dir.lstat()
+        target_info = target.lstat()
+    except (FileNotFoundError, OSError):
+        return False
+    return bool(
+        stat.S_ISDIR(directory_info.st_mode)
+        and not stat.S_ISLNK(directory_info.st_mode)
+        and stat.S_ISREG(target_info.st_mode)
+        and not stat.S_ISLNK(target_info.st_mode)
+        and target_info.st_size <= _CJK_PICTURE_MAX_ASSET_BYTES
+    )
+
+
+def _cjk_picture_empty_result(reason: str) -> dict[str, Any]:
+    return {
+        "ok": False,
+        "materialization": {"written": 0, "skipped": 0},
+        "records": [],
+        "html_bound_count": 0,
+        "markdown_bound_count": 0,
+        "fully_bound_count": 0,
+        "unbound_count": 0,
+        "failure_reasons": [str(reason)],
+    }
+
+
+def _cjk_picture_read_surface(path: Path) -> tuple[str, str | None]:
+    """Read one optional surface only after a bounded, non-symlink preflight."""
+
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return "", None
+    except OSError as exc:
+        return "", f"cjk_picture_surface_read_failed:{type(exc).__name__}"
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        return "", "picture_surface_not_regular"
+    if info.st_size > _CJK_PICTURE_MAX_SURFACE_CHARS:
+        return "", "picture_surface_size_limit_exceeded"
+    try:
+        return path.read_text(encoding="utf-8"), None
+    except (OSError, UnicodeError) as exc:
+        return "", f"cjk_picture_surface_read_failed:{type(exc).__name__}"
+
+
+_CJK_PICTURE_FATAL_REASON_PREFIXES = (
+    "picture_self_ref_missing_or_invalid",
+    "picture_caption_ref_missing_or_ambiguous",
+    "picture_caption_size_limit_exceeded",
+    "picture_asset_materialization_failed",
+    "picture_asset_missing_or_unsafe",
+    "picture_self_ref_ambiguous",
+    "picture_caption_ambiguous",
+    "picture_source_marker_ambiguous",
+)
+
+
+def _cjk_picture_has_fatal_reason(reasons: Iterable[Any]) -> bool:
+    return any(
+        any(
+            str(reason) == prefix or str(reason).startswith(f"{prefix}:")
+            for prefix in _CJK_PICTURE_FATAL_REASON_PREFIXES
+        )
+        for reason in reasons
+    )
+
+
+def _cjk_picture_manifest_targets(
+    metadata: Any,
+    nodes: list[tuple[dict[str, Any], dict[str, Any]]],
+) -> tuple[
+    list[tuple[int, dict[str, Any], dict[str, Any], dict[str, Any]]],
+    list[tuple[dict[str, Any], dict[str, Any]]],
+    str | None,
+]:
+    """Validate adapter-owned picture identities and return expected targets."""
+
+    if not nodes:
+        return [], [], None
+    manifest = (
+        metadata.get("structural_visual_provenance_manifest")
+        if isinstance(metadata, dict)
+        else None
+    )
+    if not isinstance(manifest, dict):
+        return [], [], "picture_manifest_missing_or_invalid"
+    manifest_records = manifest.get("pictures")
+    if (
+        not isinstance(manifest_records, list)
+        or len(manifest_records) != len(nodes)
+        or len(manifest_records) > _CJK_PICTURE_MAX_NODES
+    ):
+        return [], [], "picture_manifest_missing_or_invalid"
+
+    nodes_by_source_ref: dict[str, tuple[dict[str, Any], dict[str, Any]]] = {}
+    for document, node in nodes:
+        source_ref = _cjk_picture_source_ref(node)
+        if source_ref is None or source_ref in nodes_by_source_ref:
+            return [], [], "picture_manifest_identity_mismatch"
+        nodes_by_source_ref[source_ref] = (document, node)
+    targets: list[tuple[int, dict[str, Any], dict[str, Any], dict[str, Any]]] = []
+    ordered_nodes: dict[int, tuple[dict[str, Any], dict[str, Any]]] = {}
+    seen_indexes: set[int] = set()
+    for candidate in manifest_records:
+        if not isinstance(candidate, dict):
+            return [], [], "picture_manifest_missing_or_invalid"
+        index = candidate.get("index")
+        candidate_global_index = candidate.get("global_index")
+        if (
+            isinstance(index, bool)
+            or not isinstance(index, int)
+            or index <= 0
+            or index in seen_indexes
+            or isinstance(candidate_global_index, bool)
+            or not isinstance(candidate_global_index, int)
+            or candidate_global_index != index
+            or index > len(nodes)
+        ):
+            return [], [], "picture_manifest_identity_mismatch"
+        seen_indexes.add(index)
+        source_ref = candidate.get("source_ref")
+        node_pair = nodes_by_source_ref.get(source_ref) if isinstance(source_ref, str) else None
+        if (
+            not isinstance(source_ref, str)
+            or node_pair is None
+        ):
+            return [], [], "picture_manifest_identity_mismatch"
+        document, node = node_pair
+        source_asset = candidate.get("source_asset")
+        expected_asset = f"pictures/picture_{index}.png"
+        if not isinstance(source_asset, str) or source_asset != expected_asset:
+            return [], [], "picture_manifest_identity_mismatch"
+        raw_self_ref = node.get("self_ref")
+        if (
+            not isinstance(raw_self_ref, str)
+            or candidate.get("self_ref") != raw_self_ref
+        ):
+            return [], [], "picture_manifest_identity_mismatch"
+        node_part_present = "_local_ai_lab_chunk_part_index" in node
+        node_part = node.get("_local_ai_lab_chunk_part_index")
+        if node_part_present and (
+            isinstance(node_part, bool)
+            or not isinstance(node_part, int)
+            or node_part < 0
+        ):
+            return [], [], "picture_manifest_identity_mismatch"
+        candidate_part = candidate.get("part_index")
+        if candidate_part is not None and (
+            isinstance(candidate_part, bool)
+            or not isinstance(candidate_part, int)
+            or candidate_part < 0
+        ):
+            return [], [], "picture_manifest_identity_mismatch"
+        if (node_part if node_part_present else None) != candidate_part:
+            return [], [], "picture_manifest_identity_mismatch"
+        expected_flag = candidate.get("machine_binding_expected")
+        if not isinstance(expected_flag, bool):
+            return [], [], "picture_manifest_missing_or_invalid"
+        ordered_nodes[index] = node_pair
+        if expected_flag:
+            targets.append((index, document, node, candidate))
+    if seen_indexes != set(range(1, len(nodes) + 1)):
+        return [], [], "picture_manifest_identity_mismatch"
+    return targets, [ordered_nodes[index] for index in sorted(ordered_nodes)], None
+
+
+def _bind_cjk_picture_source_assets(
+    output_dir: Path,
+    documents: list[dict[str, Any]],
+    metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    html_path = output_dir / "document.html"
+    markdown_path = output_dir / "document.md"
+    html_text, html_read_error = _cjk_picture_read_surface(html_path)
+    markdown_text, markdown_read_error = _cjk_picture_read_surface(markdown_path)
+    if html_read_error or markdown_read_error:
+        return _cjk_picture_empty_result(
+            html_read_error or markdown_read_error or "picture_surface_read_failed"
+        )
+    if (
+        len(html_text) > _CJK_PICTURE_MAX_SURFACE_CHARS
+        or len(markdown_text) > _CJK_PICTURE_MAX_SURFACE_CHARS
+    ):
+        return {
+            "ok": False,
+            "materialization": {"written": 0, "skipped": 0},
+            "records": [],
+            "html_bound_count": 0,
+            "markdown_bound_count": 0,
+            "fully_bound_count": 0,
+            "unbound_count": 0,
+            "failure_reasons": ["picture_surface_size_limit_exceeded"],
+        }
+
+    html_figure_matches: list[re.Match[str]] = []
+    for figure_match in _CJK_PICTURE_FIGURE_RE.finditer(html_text):
+        if len(html_figure_matches) >= _CJK_PICTURE_MAX_HTML_FIGURES:
+            return _cjk_picture_empty_result("picture_html_candidate_limit_exceeded")
+        html_figure_matches.append(figure_match)
+    html_protected_ranges = _cjk_picture_html_protected_ranges(html_text)
+    html_protected_starts = [start for start, _end in html_protected_ranges]
+
+    nodes: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    for document in documents:
+        if not isinstance(document, dict):
+            continue
+        for node in document.get("pictures") or []:
+            if not isinstance(node, dict):
+                continue
+            nodes.append((document, node))
+            if len(nodes) > _CJK_PICTURE_MAX_NODES:
+                return _cjk_picture_empty_result("picture_node_limit_exceeded")
+    target_nodes, ordered_nodes, manifest_error = _cjk_picture_manifest_targets(
+        metadata,
+        nodes,
+    )
+    if manifest_error:
+        return _cjk_picture_empty_result(manifest_error)
+    try:
+        materialization = _materialize_picture_assets(
+            output_dir,
+            [{"pictures": [node]} for _document, node in ordered_nodes],
+        )
+    except Exception as exc:  # pragma: no cover - defensive producer boundary
+        materialization = {"written": 0, "skipped": 0}
+        materialization_error = f"picture_asset_materialization_failed:{type(exc).__name__}"
+    else:
+        materialization_error = ""
+
+    records: list[dict[str, Any]] = []
+    for global_index, document, node, manifest_record in target_nodes:
+        raw_self_ref_value = node.get("self_ref")
+        raw_self_ref = (
+            raw_self_ref_value if isinstance(raw_self_ref_value, str) else ""
+        )
+        source_ref = _cjk_picture_source_ref(node)
+        caption_text = _cjk_picture_caption_text(document, node)
+        caption = _cjk_picture_caption_key(caption_text)
+        caption_exceeds_limit = _cjk_picture_caption_exceeds_limit(document, node)
+        record: dict[str, Any] = {
+            "index": global_index,
+            "self_ref": raw_self_ref,
+            "source_ref": str(manifest_record.get("source_ref") or source_ref or ""),
+            "caption": caption,
+            "caption_text": caption_text,
+            "asset": str(
+                manifest_record.get("source_asset")
+                or f"pictures/picture_{global_index}.png"
+            ),
+            "html_bound": False,
+            "markdown_bound": False,
+            "reasons": [],
+        }
+        if not raw_self_ref or source_ref is None:
+            record["reasons"].append("picture_self_ref_missing_or_invalid")
+        if caption_exceeds_limit:
+            record["reasons"].append("picture_caption_size_limit_exceeded")
+        elif not caption:
+            record["reasons"].append("picture_caption_ref_missing_or_ambiguous")
+        if materialization_error:
+            record["reasons"].append(materialization_error)
+        if not _cjk_picture_asset_is_safe(output_dir, record["asset"]):
+            record["reasons"].append("picture_asset_missing_or_unsafe")
+        records.append(record)
+
+    ref_counts: dict[str, int] = defaultdict(int)
+    caption_counts: dict[str, int] = defaultdict(int)
+    for record in records:
+        if record.get("source_ref"):
+            ref_counts[str(record["source_ref"])] += 1
+        if record.get("caption"):
+            caption_counts[str(record["caption"])] += 1
+    for record in records:
+        if record.get("source_ref") and ref_counts[str(record["source_ref"])] != 1:
+            record["reasons"].append("picture_self_ref_ambiguous")
+        if record.get("caption") and caption_counts[str(record["caption"])] != 1:
+            record["reasons"].append("picture_caption_ambiguous")
+    source_refs = {
+        str(record["source_ref"])
+        for record in records
+        if record.get("source_ref")
+    }
+    if len(source_refs) != len(
+        [record for record in records if record.get("source_ref")]
+    ):
+        for record in records:
+            if record.get("source_ref"):
+                record["reasons"].append("picture_source_marker_ambiguous")
+
+    html_candidates: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for match in html_figure_matches:
+        body = str(match.group("body") or "")
+        attrs = str(match.group("attrs") or "")
+        if _cjk_picture_html_range_is_protected(
+            match.start(),
+            match.end(),
+            html_protected_ranges,
+            html_protected_starts,
+        ):
+            continue
+        if re.search(r"(?i)(?:docling-|source-evidence|appendix|review)", attrs):
+            continue
+        if len(re.findall(r"(?is)<figure\b", body)) >= _CJK_PICTURE_MAX_HTML_DEPTH:
+            continue
+        captions = list(_CJK_PICTURE_CAPTION_RE.finditer(body))
+        images = list(_CJK_PICTURE_IMG_RE.finditer(body))
+        if len(captions) != 1 or len(images) != 1:
+            continue
+        caption_key = _cjk_picture_caption_key(
+            _cjk_picture_markup_text(captions[0].group("body") or "")
+        )
+        if not caption_key:
+            continue
+        html_candidates[caption_key].append(
+            {
+                "figure": match,
+                "image": images[0],
+                "figure_attrs": str(match.group("attrs") or ""),
+                "image_tag": str(images[0].group(0) or ""),
+            }
+        )
+
+    html_refs = [
+        html.unescape(values[0]).strip()
+        for image in _CJK_PICTURE_IMG_RE.finditer(html_text)
+        if not _cjk_picture_html_range_is_protected(
+            image.start(),
+            image.end(),
+            html_protected_ranges,
+            html_protected_starts,
+        )
+        and len(values := _cjk_picture_html_attrs(image.group(0), "src")) == 1
+    ]
+    html_replacements: list[tuple[int, int, str]] = []
+    for record in records:
+        caption_key = record.get("caption")
+        source_ref = record.get("source_ref")
+        asset = str(record.get("asset") or "")
+        reasons = record["reasons"]
+        if (
+            not caption_key
+            or not source_ref
+            or _cjk_picture_has_fatal_reason(reasons)
+        ):
+            continue
+        candidates = html_candidates.get(str(caption_key), [])
+        if len(candidates) != 1:
+            reasons.append(
+                "picture_html_caption_candidate_missing"
+                if not candidates
+                else "picture_html_caption_ambiguous"
+            )
+            continue
+        candidate = candidates[0]
+        image_tag = candidate["image_tag"]
+        src_values = _cjk_picture_html_attrs(image_tag, "src")
+        image_ref_values = _cjk_picture_html_attrs(image_tag, "data-source-ref")
+        figure_ref_values = _cjk_picture_html_attrs(
+            f"<figure{candidate['figure_attrs']}>", "data-source-ref"
+        )
+        if (
+            len(src_values) != 1
+            or len(image_ref_values) > 1
+            or len(figure_ref_values) > 1
+        ):
+            reasons.append("picture_html_image_attributes_ambiguous")
+            continue
+        current_src = html.unescape(src_values[0]).strip()
+        if not current_src:
+            reasons.append("picture_html_image_src_missing")
+            continue
+        if image_ref_values and html.unescape(image_ref_values[0]).strip() != str(
+            source_ref
+        ):
+            reasons.append("picture_html_source_ref_conflict")
+            continue
+        if figure_ref_values and html.unescape(figure_ref_values[0]).strip() != str(
+            source_ref
+        ):
+            reasons.append("picture_html_source_ref_conflict")
+            continue
+        if _cjk_picture_is_local_reference(current_src) and current_src != asset:
+            reasons.append("picture_html_local_ref_conflict")
+            continue
+        if html_refs.count(asset) > 1 or (
+            html_refs.count(asset) == 1 and current_src != asset
+        ):
+            reasons.append("picture_html_asset_ref_ambiguous")
+            continue
+        replacement = _cjk_picture_html_set_attr(image_tag, "src", asset)
+        if replacement is not None:
+            replacement = _cjk_picture_html_set_attr(
+                replacement,
+                "data-source-ref",
+                str(source_ref),
+            )
+        if replacement is None:
+            reasons.append("picture_html_image_attribute_update_failed")
+            continue
+        image_start = (
+            candidate["figure"].start("body") + candidate["image"].start()
+        )
+        image_end = candidate["figure"].start("body") + candidate["image"].end()
+        html_replacements.append((image_start, image_end, replacement))
+        record["html_bound"] = True
+
+    for start, end, replacement in reversed(html_replacements):
+        html_text = html_text[:start] + replacement + html_text[end:]
+    if html_replacements and html_path.is_file():
+        try:
+            html_path.write_text(html_text, encoding="utf-8")
+        except (OSError, UnicodeError):
+            for record in records:
+                if record.get("html_bound"):
+                    record["html_bound"] = False
+                    record["reasons"].append("picture_html_surface_write_failed")
+
+    markdown_candidates: dict[str, list[tuple[int, int]]] = defaultdict(list)
+    markdown_code_ranges = _markdown_code_ranges(markdown_text)
+    cursor = 0
+    for line in markdown_text.splitlines(keepends=True):
+        line_start = cursor
+        cursor += len(line)
+        line_end = line_start + len(line.rstrip("\r\n"))
+        if any(start <= line_start < end for start, end in markdown_code_ranges):
+            continue
+        raw_line = line[: line_end - line_start]
+        stripped_line = raw_line.strip()
+        leading_whitespace = raw_line[: len(raw_line) - len(raw_line.lstrip(" \t"))]
+        if (
+            not stripped_line
+            or stripped_line.startswith("|")
+            or "\t" in leading_whitespace
+            or len(leading_whitespace) >= 4
+            or re.search(r"(?is)<!--|<![A-Za-z]|</?[A-Za-z][^>]*>", stripped_line)
+        ):
+            continue
+        visible_key = _cjk_picture_caption_key(
+            _cjk_picture_markup_text(raw_line)
+        )
+        if visible_key:
+            markdown_candidates[visible_key].append((line_start, line_end))
+
+    markdown_refs: list[str] = []
+    markdown_image_re = re.compile(
+        r"!\[[^\]]*\]\(\s*(?:<([^>]+)>|([^\s)]+))"
+    )
+    for image in markdown_image_re.finditer(markdown_text):
+        if any(start <= image.start() < end for start, end in markdown_code_ranges):
+            continue
+        markdown_refs.append(
+            html.unescape(str(image.group(1) or image.group(2) or "")).strip()
+        )
+    for image in _CJK_PICTURE_IMG_RE.finditer(markdown_text):
+        if any(start <= image.start() < end for start, end in markdown_code_ranges):
+            continue
+        values = _cjk_picture_html_attrs(image.group(0), "src")
+        if len(values) == 1:
+            markdown_refs.append(html.unescape(values[0]).strip())
+    markdown_replacements: list[tuple[int, int, str]] = []
+    for record in records:
+        caption_key = record.get("caption")
+        source_ref = record.get("source_ref")
+        asset = str(record.get("asset") or "")
+        reasons = record["reasons"]
+        if (
+            not caption_key
+            or not source_ref
+            or _cjk_picture_has_fatal_reason(reasons)
+        ):
+            continue
+        candidates = markdown_candidates.get(str(caption_key), [])
+        marker = f"<!-- source-picture-ref:{source_ref} -->"
+        marker_count = markdown_text.count(marker)
+        if len(candidates) != 1:
+            reasons.append(
+                "picture_markdown_caption_candidate_missing"
+                if not candidates
+                else "picture_markdown_caption_ambiguous"
+            )
+            continue
+        line_start, line_end = candidates[0]
+        if marker_count > 1:
+            reasons.append("picture_markdown_source_ref_ambiguous")
+            continue
+        following = markdown_text[line_end:]
+        following_match = re.match(
+            r"(?:\r?\n){0,2}([^\r\n]*)(?:\r?\n)?", following
+        )
+        existing_line = (
+            str(following_match.group(1) or "") if following_match else ""
+        )
+        existing_destinations = re.findall(
+            r"!\[[^\]]*\]\(\s*(?:<([^>]+)>|([^\s)]+))",
+            existing_line,
+        )
+        adjacent_refs = [
+            html.unescape(str(first or second or "")).strip()
+            for first, second in existing_destinations
+        ]
+        if adjacent_refs:
+            if any(destination != asset for destination in adjacent_refs):
+                reasons.append("picture_markdown_local_ref_conflict")
+                continue
+            if markdown_refs.count(asset) > 1:
+                reasons.append("picture_markdown_asset_ref_ambiguous")
+                continue
+            if marker_count == 1:
+                marker_offset = following.find(marker)
+                image_offset = following.find(existing_line)
+                if (
+                    marker_offset >= 0
+                    and image_offset >= 0
+                    and marker_offset > image_offset
+                ):
+                    record["markdown_bound"] = True
+                    continue
+                reasons.append("picture_markdown_source_ref_not_adjacent")
+                continue
+            marker_at = (
+                line_end + following.find(existing_line) + len(existing_line)
+            )
+            markdown_replacements.append((marker_at, marker_at, f"\n{marker}"))
+            record["markdown_bound"] = True
+            continue
+        if markdown_refs.count(asset) > 0:
+            reasons.append("picture_markdown_asset_ref_conflict")
+            continue
+        if marker_count == 1:
+            reasons.append("picture_markdown_source_ref_without_image")
+            continue
+        insert = (
+            f"\n![Source picture {int(record.get('index') or 0)}]"
+            f"({asset})\n{marker}"
+        )
+        markdown_replacements.append((line_end, line_end, insert))
+        record["markdown_bound"] = True
+
+    for start, end, replacement in reversed(markdown_replacements):
+        markdown_text = markdown_text[:start] + replacement + markdown_text[end:]
+    if markdown_replacements and markdown_path.is_file():
+        try:
+            markdown_path.write_text(markdown_text, encoding="utf-8")
+        except (OSError, UnicodeError):
+            for record in records:
+                if record.get("markdown_bound"):
+                    record["markdown_bound"] = False
+                    record["reasons"].append("picture_markdown_surface_write_failed")
+
+    for record in records:
+        record["reasons"] = sorted(set(str(reason) for reason in record["reasons"]))
+        record["status"] = (
+            "bound"
+            if record.get("html_bound") and record.get("markdown_bound") and not record["reasons"]
+            else "unresolved"
+        )
+    html_bound_count = sum(1 for record in records if record.get("html_bound"))
+    markdown_bound_count = sum(
+        1 for record in records if record.get("markdown_bound")
+    )
+    fully_bound_count = sum(
+        1 for record in records if record.get("status") == "bound"
+    )
+    failure_reasons = sorted(
+        {
+            reason
+            for record in records
+            for reason in record.get("reasons") or []
+        }
+    )
+    return {
+        "ok": fully_bound_count == len(records),
+        "materialization": materialization,
+        "records": records,
+        "html_bound_count": html_bound_count,
+        "markdown_bound_count": markdown_bound_count,
+        "fully_bound_count": fully_bound_count,
+        "unbound_count": len(records) - fully_bound_count,
+        "failure_reasons": failure_reasons,
+    }
 
 
 _LEGACY_SECOND_PASS_FORMULA_RE = re.compile(
@@ -8596,10 +9595,14 @@ def _render(
             caption = _caption_text(document, node)
             if not re.match(r"(?i)^Figure\s+\d+\s*:", caption):
                 caption = _source_caption(source, item, kind="picture") or caption
+            source_ref = _structure_block_source_ref(item)
+            escaped_source_ref = html.escape(source_ref, quote=True)
             if image_path:
                 html_parts.append('<figure class="picture">')
                 html_parts.append(
-                    f'<img src="{image_path}" alt="{html.escape(caption or "Figure", quote=True)}">'
+                    f'<img src="{image_path}" '
+                    f'data-source-ref="{escaped_source_ref}" '
+                    f'alt="{html.escape(caption or "Figure", quote=True)}">'
                 )
                 if caption:
                     html_parts.append(
@@ -8626,6 +9629,7 @@ def _render(
                 md_parts.append(
                     f"![{caption or 'Figure'}]({image_path})"
                 )
+                md_parts.append(f"<!-- source-picture-ref:{source_ref} -->")
                 if caption:
                     md_parts.append(f"*{markdown_caption}*")
                 md_parts.append("")
@@ -8710,6 +9714,56 @@ def rebuild_semantic_surfaces(
     primary_counts = _primary_surface_count_from_document(normalized_document)
     cjk_semantic_fallback: dict[str, Any] | None = None
 
+    def apply_cjk_picture_binding() -> dict[str, Any]:
+        """Materialize and bind picture crops on the preserved CJK surfaces."""
+
+        try:
+            picture_documents = [
+                part
+                for _part_index, part in normalized_parts
+                if isinstance(part, dict)
+            ]
+            result = _bind_cjk_picture_source_assets(
+                output_dir,
+                picture_documents,
+                metadata,
+            )
+        except Exception as exc:  # pragma: no cover - defensive release boundary
+            result = {
+                "ok": False,
+                "materialization": {"written": 0, "skipped": 0},
+                "records": [],
+                "html_bound_count": 0,
+                "markdown_bound_count": 0,
+                "fully_bound_count": 0,
+                "unbound_count": 0,
+                "failure_reasons": [
+                    f"cjk_picture_binding_failed:{type(exc).__name__}"
+                ],
+            }
+        metadata["cjk_picture_source_binding"] = result
+        status.setdefault("quality_signals", {})[
+            "cjk_picture_source_binding"
+        ] = result
+        unbound_count = int(result.get("unbound_count") or 0)
+        if unbound_count:
+            warning = f"cjk_picture_source_unbound:{unbound_count}"
+            if warning not in status.setdefault("warnings", []):
+                status["warnings"].append(warning)
+        failure_reasons = [
+            str(reason)
+            for reason in result.get("failure_reasons") or []
+            if str(reason)
+        ]
+        if not bool(result.get("ok")):
+            for reason in failure_reasons or ["unspecified"]:
+                warning = f"cjk_picture_source_failure:{reason}"
+                if warning not in status.setdefault("warnings", []):
+                    status["warnings"].append(warning)
+            status["ok"] = False
+            status["success_class"] = "degraded_failure"
+        return result
+
     def preserve_cjk_surfaces(
         *,
         reason: str,
@@ -8749,9 +9803,10 @@ def rebuild_semantic_surfaces(
                     if missing_reasons
                     else ""
                 )
-            )
+                )
+        picture_source_binding = apply_cjk_picture_binding()
         result = {
-            "ok": not cjk_missing,
+            "ok": not cjk_missing and bool(picture_source_binding.get("ok")),
             "applied": False,
             "machine_surface_ok": False,
             "mode": "preserve_existing_cjk_body_source_visual_authoritative",
@@ -8769,6 +9824,7 @@ def rebuild_semantic_surfaces(
             "inline_math_source_appendix_anchor_count": cjk_inline_source.get(
                 "appendix_anchor_count", 0
             ),
+            "picture_source_binding": picture_source_binding,
         }
         metadata["primary_surface"] = result
         status["quality_signals"]["primary_surface"] = result
@@ -8804,6 +9860,7 @@ def rebuild_semantic_surfaces(
                 cjk_inline_source=cjk_inline_source,
             )
         else:
+            picture_source_binding = apply_cjk_picture_binding()
             inline_math_source_regions = list(cjk_inline_source.get("regions") or [])
             inline_math_source_missing = list(cjk_inline_source.get("missing") or [])
             cjk_binding_diagnostics = list(
@@ -8838,7 +9895,8 @@ def rebuild_semantic_surfaces(
                 )
             normalized = bool(formula_normalization["applied"])
             result = {
-                "ok": not inline_math_source_missing,
+                "ok": not inline_math_source_missing
+                and bool(picture_source_binding.get("ok")),
                 "applied": normalized,
                 "machine_surface_ok": not bool(cjk_binding_diagnostics),
                 "mode": (
@@ -8861,6 +9919,7 @@ def rebuild_semantic_surfaces(
                 "inline_math_source_appendix_anchor_count": cjk_inline_source.get(
                     "appendix_anchor_count", 0
                 ),
+                "picture_source_binding": picture_source_binding,
             }
             metadata["primary_surface"] = result
             status["quality_signals"]["primary_surface"] = result

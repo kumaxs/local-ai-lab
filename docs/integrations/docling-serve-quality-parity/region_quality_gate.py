@@ -2072,6 +2072,8 @@ def _table_topology_diagnostics(document_json: Any) -> dict[str, dict[str, Any]]
         invalid_span_count = 0
         overlap_count = 0
         occupied: set[tuple[int, int]] = set()
+        explicit_blank_slots: set[tuple[int, int]] = set()
+        merged_covered_slots: set[tuple[int, int]] = set()
         occupancy_work_count = 0
         geometry_work_limited = False
         for raw in raw_cells[:MAX_TABLE_CELLS]:
@@ -2113,6 +2115,8 @@ def _table_topology_diagnostics(document_json: Any) -> dict[str, dict[str, Any]]
                         if cell_key in occupied:
                             overlap_count += 1
                         occupied.add(cell_key)
+                        if row_index != start_row or col_index != start_col:
+                            merged_covered_slots.add(cell_key)
             low, high = sorted((float(bbox["t"]), float(bbox["b"])))
             cells.append(
                 {
@@ -2125,6 +2129,76 @@ def _table_topology_diagnostics(document_json: Any) -> dict[str, dict[str, Any]]
                     "number_count": _table_numeric_signal(raw.get("text")),
                 }
             )
+
+        # Docling may omit intentionally empty cells from ``table_cells`` while
+        # retaining an explicit rectangular ``grid`` entry for them.  Count
+        # only a strict, source-declared blank (empty text and no bbox) as
+        # covered.  A non-empty grid entry whose semantic cell disappeared
+        # must still fail closed as incomplete occupancy.
+        raw_grid = data.get("grid") if isinstance(data, dict) else None
+        grid_shape_valid = bool(
+            isinstance(raw_grid, list)
+            and declared_rows is not None
+            and declared_cols is not None
+            and len(raw_grid) == declared_rows
+            and all(
+                isinstance(row, list) and len(row) == declared_cols
+                for row in raw_grid
+            )
+        )
+        def strict_grid_blank(
+            value: Any,
+            row_index: int,
+            col_index: int,
+        ) -> bool:
+            if isinstance(value, str):
+                return not value.strip()
+            if not isinstance(value, dict):
+                return False
+            required_fields = {
+                "bbox",
+                "row_span",
+                "col_span",
+                "start_row_offset_idx",
+                "end_row_offset_idx",
+                "start_col_offset_idx",
+                "end_col_offset_idx",
+                "text",
+            }
+            optional_flags = {
+                "column_header",
+                "row_header",
+                "row_section",
+                "fillable",
+            }
+            if not required_fields.issubset(value):
+                return False
+            if any(key not in required_fields | optional_flags for key in value):
+                return False
+            if any(value.get(flag) is not False for flag in optional_flags if flag in value):
+                return False
+            return bool(
+                value.get("bbox") is None
+                and not _structural_visible_body_text(value.get("text")).strip()
+                and type(value.get("row_span")) is int
+                and value.get("row_span") == 1
+                and type(value.get("col_span")) is int
+                and value.get("col_span") == 1
+                and type(value.get("start_row_offset_idx")) is int
+                and value.get("start_row_offset_idx") == row_index
+                and type(value.get("end_row_offset_idx")) is int
+                and value.get("end_row_offset_idx") == row_index + 1
+                and type(value.get("start_col_offset_idx")) is int
+                and value.get("start_col_offset_idx") == col_index
+                and type(value.get("end_col_offset_idx")) is int
+                and value.get("end_col_offset_idx") == col_index + 1
+            )
+
+        if grid_shape_valid:
+            for row_index, row in enumerate(raw_grid):
+                for col_index, grid_cell in enumerate(row):
+                    if strict_grid_blank(grid_cell, row_index, col_index):
+                        explicit_blank_slots.add((row_index, col_index))
 
         positive_heights = sorted(
             cell["height"] for cell in cells if cell["height"] > 0
@@ -2198,19 +2272,24 @@ def _table_topology_diagnostics(document_json: Any) -> dict[str, dict[str, Any]]
             reasons.append("table_dimensions_exceed_limit")
         if geometry_work_limited:
             reasons.append("table_geometry_work_limit")
+        in_bounds_covered: set[tuple[int, int]] = set()
+        unknown_slot_count: int | None = None
         if (
             raw_cells
             and declared_rows is not None
             and declared_cols is not None
             and declared_rows * declared_cols <= MAX_TABLE_CELLS
         ):
-            in_bounds_occupied = {
+            in_bounds_covered = {
                 (row_index, col_index)
-                for row_index, col_index in occupied
+                for row_index, col_index in occupied | explicit_blank_slots
                 if 0 <= row_index < declared_rows
                 and 0 <= col_index < declared_cols
             }
-            if len(in_bounds_occupied) != declared_rows * declared_cols:
+            unknown_slot_count = (
+                declared_rows * declared_cols - len(in_bounds_covered)
+            )
+            if unknown_slot_count:
                 reasons.append("table_cell_occupancy_incomplete")
         if cross_row_cell_count:
             reasons.append("table_cell_crosses_semantic_row_boundary")
@@ -2230,6 +2309,12 @@ def _table_topology_diagnostics(document_json: Any) -> dict[str, dict[str, Any]]
             "geometry_work_limited": geometry_work_limited,
             "occupancy_work_count": occupancy_work_count,
             "occupied_slot_count": len(occupied),
+            "explicit_blank_slot_count": len(explicit_blank_slots),
+            "covered_slot_count": len(in_bounds_covered),
+            "legal_empty_slot_count": len(explicit_blank_slots - occupied),
+            "unknown_slot_count": unknown_slot_count,
+            "merged_covered_slot_count": len(merged_covered_slots),
+            "grid_shape_valid": grid_shape_valid,
             "baseline_line_height": (
                 round(baseline_height, 4) if baseline_height is not None else None
             ),
@@ -2581,8 +2666,24 @@ def _structural_region_records(
         if kind == "table":
             is_empty_fallback = ref in empty_fallback_refs
             independent = (table_diagnostics or {}).get(ref) or {}
+            record_exact_coverage = bool(
+                ref in html_bound
+                and ref in markdown_bound
+                and ref in provenance_verified
+                and ref not in provenance_mismatch
+                and (
+                    is_empty_fallback
+                    or (
+                        ref in expected_body
+                        and ref in html_verified
+                        and ref in markdown_verified
+                        and ref not in (html_mismatch | markdown_mismatch)
+                    )
+                )
+            )
             topology = {
-                "exact_coverage": exact_coverage,
+                "exact_coverage": record_exact_coverage,
+                "global_exact_coverage": exact_coverage,
                 "body_identity_expected": ref in expected_body,
                 "html_body_identity_verified": ref in html_verified,
                 "markdown_body_identity_verified": ref in markdown_verified,
@@ -2595,13 +2696,24 @@ def _structural_region_records(
                         "cell_count",
                         "valid_cell_geometry_count",
                         "invalid_cell_geometry_count",
+                        "occupied_slot_count",
+                        "explicit_blank_slot_count",
+                        "covered_slot_count",
+                        "legal_empty_slot_count",
+                        "unknown_slot_count",
+                        "merged_covered_slot_count",
+                        "grid_shape_valid",
                         "baseline_line_height",
                         "cross_row_cell_count",
                         "multiline_row_ambiguity_indexes",
                     )
                 },
             }
-            if exact_coverage is not True:
+            # The aggregate flag describes the whole table inventory.  One
+            # unresolved merged table must not contaminate a different table
+            # whose own occurrence, body identity, provenance and crop are all
+            # verified.  Recompute the disposition from ref-local evidence.
+            if not record_exact_coverage:
                 reasons.append("table_topology_unverified")
             if ref not in expected_body and not is_empty_fallback:
                 reasons.append("table_body_identity_missing")
@@ -2641,7 +2753,9 @@ def _structural_region_records(
             "html_body_identity_verified": ref in html_verified,
             "markdown_body_identity_verified": ref in markdown_verified,
             "provenance_verified": ref in provenance_verified and ref not in provenance_mismatch,
-            "exact_coverage": exact_coverage,
+            "exact_coverage": (
+                topology["exact_coverage"] if topology is not None else exact_coverage
+            ),
         }
         if topology is not None:
             signals["table_topology"] = topology
@@ -2804,6 +2918,12 @@ def _formula_region_records(
     missing_indexes = _positive_index_set(
         source_visuals.get("formula_source_missing_indexes")
     )
+    missing_html_indexes = _positive_index_set(
+        source_visuals.get("formula_source_missing_html_indexes")
+    )
+    missing_markdown_indexes = _positive_index_set(
+        source_visuals.get("formula_source_missing_markdown_indexes")
+    )
     unexpected_indexes = _positive_index_set(
         source_visuals.get("formula_source_unexpected_indexes")
     )
@@ -2822,6 +2942,8 @@ def _formula_region_records(
         "formula_source_html_indexes",
         "formula_source_markdown_indexes",
         "formula_source_missing_indexes",
+        "formula_source_missing_html_indexes",
+        "formula_source_missing_markdown_indexes",
         "formula_source_unexpected_indexes",
         "formula_source_duplicate_html_anchor_indexes",
         "formula_source_duplicate_markdown_anchor_indexes",
@@ -2848,6 +2970,24 @@ def _formula_region_records(
         ]
         if len(normalized_indexes) != len(set(normalized_indexes)):
             global_reasons.append("formula_surface_indexes_duplicate")
+    expected_missing_html = semantic_expected - html_indexes
+    expected_missing_markdown = semantic_expected - markdown_indexes
+    if (
+        "formula_source_missing_html_indexes" in source_visuals
+        and missing_html_indexes != expected_missing_html
+    ):
+        global_reasons.append("formula_html_missing_index_set_mismatch")
+    if (
+        "formula_source_missing_markdown_indexes" in source_visuals
+        and missing_markdown_indexes != expected_missing_markdown
+    ):
+        global_reasons.append("formula_markdown_missing_index_set_mismatch")
+    if (
+        "formula_source_missing_indexes" in source_visuals
+        and missing_indexes
+        != (expected_missing_html | expected_missing_markdown)
+    ):
+        global_reasons.append("formula_missing_index_set_mismatch")
     crop_metrics = metadata.get("formula_crop_diagnostics") if isinstance(metadata, dict) else None
     bounded_crop_metrics: list[Any] = []
     diagnostic_indexes: set[int] = set()
@@ -2916,11 +3056,9 @@ def _formula_region_records(
         if count_mismatch:
             reasons.append("formula_expected_index_count_mismatch")
         is_approved_appendix = index in approved_drops and index in appendix_indexes
-        if not is_approved_appendix and (index in missing_indexes or index not in html_indexes):
+        if not is_approved_appendix and index not in html_indexes:
             reasons.append("formula_html_occurrence_unbound")
-        if not is_approved_appendix and (
-            index in missing_indexes or index not in markdown_indexes
-        ):
+        if not is_approved_appendix and index not in markdown_indexes:
             reasons.append("formula_markdown_occurrence_unbound")
         if index in duplicate_html:
             reasons.append("formula_html_occurrence_duplicate")
