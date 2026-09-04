@@ -5,6 +5,7 @@ from __future__ import annotations
 import errno
 import hashlib
 import json
+import logging
 import mimetypes
 import os
 import platform
@@ -42,6 +43,17 @@ from .webhook import WebhookDispatcher, validate_callback_url
 
 RELEASE_VERSION = "1.1.1"
 TERMINAL_STATES = {"succeeded", "failed", "interrupted"}
+LOGGER = logging.getLogger(__name__)
+
+# Restarted queued jobs wait for both conversion dependencies instead of
+# immediately replaying an adapter request while the backend is still
+# starting.  Keep this policy private and bounded: the public API does not
+# expose a second retry queue, and a process restart is the durable retry
+# boundary for a job that remains queued.
+_QUEUE_RESUME_INITIAL_BACKOFF_SECONDS = 0.25
+_QUEUE_RESUME_MAX_BACKOFF_SECONDS = 30.0
+_QUEUE_RESUME_HEALTH_TIMEOUT_SECONDS = 1.0
+_RECOVERY_INTERRUPTING_STAGE = "recovery_interrupting"
 
 
 class OutputExpiredError(FileNotFoundError):
@@ -880,6 +892,17 @@ class JobManager:
             persisted_runtime.get("overrides", {})
         )
         self.config = replace(self._environment_config, **self._runtime_overrides)
+        # In-process submission claims keep the normal API path and restart
+        # recovery path from enqueueing the same future twice.  The set is
+        # deliberately ephemeral: SQLite remains authoritative across
+        # process restarts, while a fresh process reconstructs its claims from
+        # queued/running state during recovery.
+        self._inflight_job_ids: set[str] = set()
+        self._resume_pending_ids: set[str] = set()
+        self._resume_stop = threading.Event()
+        self._resume_wake = threading.Event()
+        self._resume_thread: threading.Thread | None = None
+        self._stopping = False
         self._pending_input_ids: set[str] = set()
         self._active_temp_names: set[str] = set()
         self.store.import_legacy_state_jobs(
@@ -946,6 +969,7 @@ class JobManager:
                 max_age_seconds=config.webhook_delivery_ttl_seconds,
             )
             self._dispatcher.start()
+        self._start_queued_resume_worker()
 
     def _state_path(self, job_id: str) -> Path:
         return self.config.state_root / "jobs" / f"{job_id}.json"
@@ -1153,6 +1177,316 @@ class JobManager:
         with self._lock:
             self._active_temp_names.discard(path.name)
 
+    def _submit_job_once(self, job_id: str) -> bool:
+        """Submit one queued job through the shared in-process claim set.
+
+        A queued row is intentionally not transitioned here.  ``_run`` owns
+        the durable queued→running transition, so a submit failure leaves the
+        row replayable on the next health-gated retry or process restart.
+        Holding the manager lock while registering the future closes the race
+        between the API submit path, the restart resumer, and shutdown.
+        """
+        with self._lock:
+            if self._stopping or job_id in self._inflight_job_ids:
+                return False
+            current = self.store.get_job(job_id)
+            if not current or current.get("state") != "queued":
+                return False
+            self._inflight_job_ids.add(job_id)
+            try:
+                self._executor.submit(self._run_tracked, job_id)
+            except BaseException:
+                self._inflight_job_ids.discard(job_id)
+                raise
+            return True
+
+    def _run_tracked(self, job_id: str) -> None:
+        """Run a claimed future and release its in-process claim."""
+        run_failed = False
+        requeue = False
+        try:
+            self._run(job_id)
+        except BaseException:
+            # ``_run`` can commit a terminal SQLite state and then fail while
+            # writing the legacy mirror.  Keep the original future failure
+            # visible to the executor while letting the finally block retry
+            # that compatibility write below.
+            run_failed = True
+            raise
+        finally:
+            with self._lock:
+                self._inflight_job_ids.discard(job_id)
+                try:
+                    current = self.store.get_job(job_id)
+                except Exception:
+                    current = None
+                if run_failed and current and current.get("state") in TERMINAL_STATES:
+                    # The immediate mirror retry is safe even while shutdown
+                    # is draining the executor: SQLite has already committed
+                    # the terminal state, and no new work is submitted here.
+                    # Only retaining a long-lived pending marker is gated by
+                    # ``_stopping``.
+                    mirror_retry_failed = False
+                    try:
+                        self._mirror_job(job_id)
+                    except Exception:
+                        mirror_retry_failed = True
+                        LOGGER.warning(
+                            "legacy mirror retry failed for terminal job %s",
+                            job_id,
+                            exc_info=True,
+                        )
+                    if mirror_retry_failed and not self._stopping:
+                        self._resume_pending_ids.add(job_id)
+                        self._resume_wake.set()
+                        requeue = True
+                elif not self._stopping and current and current.get("state") == "queued":
+                    self._resume_pending_ids.add(job_id)
+                    self._resume_wake.set()
+                    requeue = True
+            if requeue:
+                self._start_queued_resume_worker()
+
+    def _dependencies_ready_for_resume(self) -> bool:
+        """Return whether both conversion dependencies pass their health probes."""
+        try:
+            backend = probe_backend(
+                self.config,
+                timeout=_QUEUE_RESUME_HEALTH_TIMEOUT_SECONDS,
+            )
+            if not bool(backend.get("ok")):
+                return False
+            formula = probe_formula_service(
+                self.config,
+                timeout=_QUEUE_RESUME_HEALTH_TIMEOUT_SECONDS,
+            )
+            return bool(formula.get("ok"))
+        except Exception:
+            # Health probes are advisory and must never terminate the restart
+            # worker.  The next bounded-backoff iteration retries them.
+            return False
+
+    def _resume_loop(self) -> None:
+        delay = _QUEUE_RESUME_INITIAL_BACKOFF_SECONDS
+        while not self._resume_stop.is_set():
+            try:
+                with self._lock:
+                    pending_markers: list[tuple[int, int, str, str]] = []
+                    for job_id in self._resume_pending_ids:
+                        record = self.store.get_job(job_id) or {}
+                        queue_position = record.get("queue_position")
+                        if (
+                            record.get("state") == "queued"
+                            and isinstance(queue_position, int)
+                            and not isinstance(queue_position, bool)
+                            and queue_position > 0
+                        ):
+                            # ``queue_position`` is derived from the durable,
+                            # monotonic queue_order.  Timestamps and UUIDs can
+                            # tie or disagree with submission order, so they
+                            # must not be used to dispatch queued work.
+                            pending_markers.append((0, queue_position, "", job_id))
+                        else:
+                            # Terminal mirror retries and malformed legacy
+                            # rows have no queue position.  Keep their order
+                            # deterministic without placing them ahead of
+                            # valid queued work.
+                            pending_markers.append(
+                                (
+                                    1,
+                                    0,
+                                    str(record.get("created_at") or ""),
+                                    job_id,
+                                )
+                            )
+                    pending = tuple(
+                        job_id
+                        for _kind, _position, _created_at, job_id in sorted(
+                            pending_markers
+                        )
+                    )
+                    stopping = self._stopping
+            except Exception:
+                # A transient SQLite/I/O failure while ordering the pending
+                # set must not kill the daemon thread and strand queued work.
+                LOGGER.warning("queued resume scan failed", exc_info=True)
+                self._resume_wake.wait(delay)
+                self._resume_wake.clear()
+                delay = min(
+                    _QUEUE_RESUME_MAX_BACKOFF_SECONDS,
+                    max(_QUEUE_RESUME_INITIAL_BACKOFF_SECONDS, delay * 2),
+                )
+                continue
+            if stopping:
+                return
+            if not pending:
+                # Keep an already-started worker alive while idle.  A submit
+                # failure can add a new pending id in the tiny interval where
+                # a worker would otherwise observe an empty set and exit; the
+                # wake event lets that producer hand the work back without a
+                # stranded queued row.
+                self._resume_wake.wait(_QUEUE_RESUME_MAX_BACKOFF_SECONDS)
+                self._resume_wake.clear()
+                continue
+
+            if not self._dependencies_ready_for_resume():
+                self._resume_wake.wait(delay)
+                self._resume_wake.clear()
+                delay = min(
+                    _QUEUE_RESUME_MAX_BACKOFF_SECONDS,
+                    max(_QUEUE_RESUME_INITIAL_BACKOFF_SECONDS, delay * 2),
+                )
+                continue
+
+            retry_needed = False
+            for job_id in pending:
+                if self._resume_stop.is_set():
+                    return
+                try:
+                    with self._lock:
+                        if job_id not in self._resume_pending_ids:
+                            continue
+                        current = self.store.get_job(job_id)
+                except Exception:
+                    LOGGER.warning(
+                        "queued resume job lookup failed for %s",
+                        job_id,
+                        exc_info=True,
+                    )
+                    retry_needed = True
+                    continue
+                if not current:
+                    with self._lock:
+                        self._resume_pending_ids.discard(job_id)
+                    continue
+                if current.get("state") != "queued":
+                    # Finalization is durable in SQLite, while the legacy
+                    # state JSON is a compatibility mirror.  A mirror write
+                    # can fail after the terminal transition has committed;
+                    # retry it before dropping the pending marker so a
+                    # transient filesystem error cannot leave a stale queued
+                    # mirror forever.
+                    if current.get("state") in TERMINAL_STATES:
+                        try:
+                            self._mirror_job(job_id)
+                        except Exception:
+                            retry_needed = True
+                            continue
+                    with self._lock:
+                        self._resume_pending_ids.discard(job_id)
+                    continue
+
+                # Re-check the clean-input contract immediately before
+                # dispatch.  This closes the window in which another process
+                # or operator could create a partial staging/output tree while
+                # this process was waiting for dependencies to become ready.
+                try:
+                    expected_input_sha256 = _normalize_hex_sha256(
+                        current.get("input_sha256")
+                    )
+                    recovered_source, recovered_manifest, partial = (
+                        self._inspect_recovery_artifacts(
+                            job_id,
+                            expected_input_sha256=expected_input_sha256,
+                        )
+                    )
+                except Exception:
+                    LOGGER.warning(
+                        "queued resume artifact inspection failed for %s",
+                        job_id,
+                        exc_info=True,
+                    )
+                    retry_needed = True
+                    continue
+                if recovered_source is not None and not partial:
+                    try:
+                        assert recovered_manifest is not None
+                        self._finalize_recovered_success(
+                            current,
+                            recovered_source,
+                            recovered_manifest,
+                        )
+                        self._mirror_job(job_id)
+                    except Exception:
+                        retry_needed = True
+                        continue
+                    else:
+                        with self._lock:
+                            self._resume_pending_ids.discard(job_id)
+                    continue
+
+                try:
+                    replayable = self._queued_job_is_replayable(current)
+                except Exception:
+                    LOGGER.warning(
+                        "queued resume input validation failed for %s",
+                        job_id,
+                        exc_info=True,
+                    )
+                    retry_needed = True
+                    continue
+                if partial or not replayable:
+                    try:
+                        self._finalize_recovered_interrupted(current)
+                        self._mirror_job(job_id)
+                    except Exception:
+                        # Keep the queued id for a later bounded retry if a
+                        # transient SQLite/filesystem error prevents the
+                        # interruption record from converging.
+                        retry_needed = True
+                        continue
+                    else:
+                        with self._lock:
+                            self._resume_pending_ids.discard(job_id)
+                    continue
+
+                try:
+                    submitted = self._submit_job_once(job_id)
+                except Exception:
+                    # Keep the durable queued row and retry after a bounded
+                    # delay.  This covers a transient executor submission
+                    # failure without creating a second future.
+                    submitted = False
+                    retry_needed = True
+                    # Preserve FIFO when the oldest pending job cannot yet
+                    # acquire a future; later jobs must not leapfrog it.
+                    break
+                if submitted:
+                    with self._lock:
+                        self._resume_pending_ids.discard(job_id)
+                else:
+                    retry_needed = True
+                    break
+
+            with self._lock:
+                still_pending = bool(self._resume_pending_ids)
+            if still_pending:
+                if retry_needed:
+                    delay = min(
+                        _QUEUE_RESUME_MAX_BACKOFF_SECONDS,
+                        max(_QUEUE_RESUME_INITIAL_BACKOFF_SECONDS, delay * 2),
+                    )
+                else:
+                    delay = _QUEUE_RESUME_INITIAL_BACKOFF_SECONDS
+                self._resume_wake.wait(delay)
+                self._resume_wake.clear()
+
+    def _start_queued_resume_worker(self) -> None:
+        with self._lock:
+            if self._stopping or not self._resume_pending_ids:
+                return
+            if self._resume_thread is not None and self._resume_thread.is_alive():
+                self._resume_wake.set()
+                return
+            self._resume_stop.clear()
+            self._resume_wake.clear()
+            self._resume_thread = threading.Thread(
+                target=self._resume_loop,
+                daemon=True,
+                name="docling-queued-resume",
+            )
+            self._resume_thread.start()
+
     def _write_record(self, record: JobRecord) -> None:
         _atomic_json(self._state_path(record.job_id), asdict(record))
 
@@ -1181,83 +1515,265 @@ class JobManager:
             return value
         return fallback
 
+    @staticmethod
+    def _recovery_directory_is_absent(path: Path) -> bool:
+        """Return True only when a recovery root has no directory entry."""
+        try:
+            path.lstat()
+        except FileNotFoundError:
+            return True
+        except OSError:
+            return False
+        return False
+
+    def _recovery_outputs_are_absent(self, job_id: str) -> bool:
+        # Existing empty directories are treated as unsafe/partial state.  The
+        # adapter's fresh-output contract requires both per-job paths to be
+        # absent before a queued task can be replayed.
+        return self._recovery_directory_is_absent(self.config.output_root / job_id) and (
+            self._recovery_directory_is_absent(self.config.staging_root / job_id)
+        )
+
+    def _inspect_recovery_artifacts(
+        self,
+        job_id: str,
+        *,
+        expected_input_sha256: str | None,
+    ) -> tuple[Path | None, list[dict[str, Any]] | None, bool]:
+        """Classify output/staging roots without mutating them.
+
+        A complete root can be promoted only when no sibling root contains a
+        partial or unsafe artifact.  This avoids treating a complete staging
+        tree as authoritative while silently discarding a conflicting output
+        tree left by an interrupted prior conversion.
+        """
+        output = self.config.output_root / job_id
+        staging = self.config.staging_root / job_id
+        complete: list[tuple[Path, list[dict[str, Any]]]] = []
+        partial = False
+        for root in (output, staging):
+            if self._recovery_directory_is_absent(root):
+                continue
+            if expected_input_sha256 is None:
+                partial = True
+                continue
+            try:
+                manifest = self._validate_success_outputs(
+                    root,
+                    expected_input_sha256=expected_input_sha256,
+                )
+            except (OSError, ValueError):
+                partial = True
+            else:
+                complete.append((root, manifest))
+
+        if complete and not partial:
+            # Preserve the historical output-first preference when both roots
+            # happen to contain independently valid generations.
+            for root, manifest in complete:
+                if root == output:
+                    return root, manifest, False
+            return complete[0][0], complete[0][1], False
+        return None, None, partial
+
+    def _queued_job_is_replayable(self, record: Mapping[str, Any]) -> bool:
+        """Validate the durable input and clean output boundary for replay."""
+        job_id = str(record.get("job_id") or "")
+        expected_input_sha256 = _normalize_hex_sha256(record.get("input_sha256"))
+        if not job_id or expected_input_sha256 is None:
+            return False
+        # Once recovery has durably classified a queued row as unsafe, later
+        # cleanup must never make the now-empty roots look replayable.  This
+        # marker is committed before any partial publication is moved or
+        # removed and survives a process crash or transient finalization error.
+        if record.get("progress_stage") == _RECOVERY_INTERRUPTING_STAGE:
+            return False
+        if not self._recovery_outputs_are_absent(job_id):
+            return False
+
+        raw_input_path = record.get("input_path")
+        if not isinstance(raw_input_path, str) or not raw_input_path:
+            return False
+        input_path = Path(raw_input_path)
+        expected_input_path = self.config.input_root / job_id / "source.pdf"
+        try:
+            # Do not allow a queued record to replay another job's input (even
+            # when that file happens to have the same digest).  Require the
+            # exact canonical lexical path emitted by submit_job, then run the
+            # symlink-aware resolver over every parent component.
+            if input_path.absolute() != expected_input_path:
+                return False
+            safe_resolve(self.config.input_root, expected_input_path)
+            if input_path.is_symlink() or not input_path.is_file():
+                return False
+            return _sha256_nofollow_path(input_path) == expected_input_sha256
+        except (OSError, ValueError):
+            return False
+
+    def _finalize_recovered_interrupted(self, record: Mapping[str, Any]) -> None:
+        job_id = str(record["job_id"])
+        current_state = str(record.get("state") or "")
+        if current_state not in {"queued", "running"}:
+            raise RuntimeError("recovery interruption requires a nonterminal job")
+        marker = self.store.update_job(
+            job_id,
+            state=current_state,
+            progress_stage=_RECOVERY_INTERRUPTING_STAGE,
+            progress_message="restart recovery classified artifacts as unsafe",
+        )
+        if marker.get("job_id") != job_id:
+            raise RuntimeError(
+                f"could not persist recovery interruption marker: {marker.get('error') or 'unknown_error'}"
+            )
+        manifest = self._publish_partial(job_id)
+        updated = self.store.update_job(
+            job_id,
+            output_expires_at=self._expiry(
+                self._job_policy_ttl(
+                    record,
+                    "failed_output_ttl_seconds",
+                    self.config.failed_output_ttl_seconds,
+                )
+            ),
+            tombstone_expires_at=self._expiry(
+                self._job_policy_ttl(
+                    record,
+                    "job_ttl_seconds",
+                    self.config.job_ttl_seconds,
+                )
+            ),
+        )
+        if updated.get("job_id") != job_id:
+            raise RuntimeError(
+                f"could not persist recovery retention policy: {updated.get('error') or 'unknown_error'}"
+            )
+        finalized = self.store.finalize_job(
+            job_id,
+            state="interrupted",
+            manifest=manifest,
+            error="service restarted before the job reached a terminal state",
+            webhook_event_type="docling.job.interrupted",
+            webhook_payload=self._webhook_payload(record, "interrupted"),
+        )
+        if finalized.get("error"):
+            raise RuntimeError(
+                f"could not finalize recovered interruption: {finalized['error']}"
+            )
+
+    def _finalize_recovered_success(
+        self,
+        record: Mapping[str, Any],
+        source: Path,
+        manifest: list[dict[str, Any]],
+    ) -> None:
+        job_id = str(record["job_id"])
+        if source == self.config.staging_root / job_id:
+            self._publish_staging(job_id)
+        updated = self.store.update_job(
+            job_id,
+            output_expires_at=self._expiry(
+                self._job_policy_ttl(
+                    record,
+                    "success_output_ttl_seconds",
+                    self.config.success_output_ttl_seconds,
+                )
+            ),
+            tombstone_expires_at=self._expiry(
+                self._job_policy_ttl(
+                    record,
+                    "job_ttl_seconds",
+                    self.config.job_ttl_seconds,
+                )
+            ),
+        )
+        if updated.get("job_id") != job_id:
+            raise RuntimeError(
+                f"could not persist recovered success policy: {updated.get('error') or 'unknown_error'}"
+            )
+        finalized = self.store.finalize_job(
+            job_id,
+            state="succeeded",
+            manifest=manifest,
+            exit_code=0,
+            error=None,
+            webhook_event_type="docling.job.succeeded",
+            webhook_payload=self._webhook_payload(record, "succeeded"),
+        )
+        if finalized.get("error"):
+            raise RuntimeError(
+                f"could not finalize recovered success: {finalized['error']}"
+            )
+
     def _recover_interrupted_jobs(self) -> None:
         for state in ("queued", "running"):
-            page = self.store.list_jobs(state=state, limit=1000, include_tombstoned=True)
-            for record in page.get("items", []):
-                job_id = str(record["job_id"])
-                candidate = self.config.output_root / job_id
-                staging = self.config.staging_root / job_id
-                try:
-                    source = candidate if candidate.is_dir() else staging
-                    recovered_record = self._record_from_mapping(record)
+            cursor: str | None = None
+            while True:
+                page = self.store.list_jobs(
+                    state=state,
+                    cursor=cursor,
+                    limit=1000,
+                    include_tombstoned=True,
+                )
+                for record in page.get("items", []):
+                    job_id = str(record["job_id"])
                     expected_input_sha256 = _normalize_hex_sha256(
-                        recovered_record.input_sha256
+                        record.get("input_sha256")
                     )
-                    if expected_input_sha256 is None:
-                        raise ValueError(
-                            "missing or invalid input_sha256 on production recovery job record"
-                        )
-                    manifest = self._validate_success_outputs(
-                        source,
+                    source, manifest, partial = self._inspect_recovery_artifacts(
+                        job_id,
                         expected_input_sha256=expected_input_sha256,
                     )
-                    if source == staging:
-                        self._publish_staging(job_id)
-                    self.store.update_job(
-                        job_id,
-                        output_expires_at=self._expiry(
-                            self._job_policy_ttl(
-                                record,
-                                "success_output_ttl_seconds",
-                                self.config.success_output_ttl_seconds,
+
+                    # A queued job that never started is safe to replay only when
+                    # both output roots are absent and its persisted
+                    # source snapshot still matches the recorded digest.  Leave
+                    # it queued until dependencies are healthy; no async adapter
+                    # request is replayed during constructor recovery.
+                    if (
+                        state == "queued"
+                        and source is None
+                        and not partial
+                        and self._queued_job_is_replayable(record)
+                    ):
+                        self._resume_pending_ids.add(job_id)
+                        try:
+                            self._mirror_job(job_id)
+                        except Exception:
+                            # Keep the queued marker for the health-gated
+                            # worker even when the compatibility mirror is
+                            # temporarily unavailable during startup.
+                            LOGGER.warning(
+                                "legacy mirror write failed during queued recovery for job %s",
+                                job_id,
+                                exc_info=True,
                             )
-                        ),
-                        tombstone_expires_at=self._expiry(
-                            self._job_policy_ttl(
-                                record,
-                                "job_ttl_seconds",
-                                self.config.job_ttl_seconds,
+                        continue
+
+                    try:
+                        if source is None or manifest is None or partial:
+                            raise ValueError(
+                                "no complete recovery artifact is available"
                             )
-                        ),
-                    )
-                    self.store.finalize_job(
-                        job_id,
-                        state="succeeded",
-                        manifest=manifest,
-                        exit_code=0,
-                        error=None,
-                        webhook_event_type="docling.job.succeeded",
-                        webhook_payload=self._webhook_payload(record, "succeeded"),
-                    )
-                except (OSError, ValueError):
-                    manifest = self._publish_partial(job_id)
-                    self.store.update_job(
-                        job_id,
-                        output_expires_at=self._expiry(
-                            self._job_policy_ttl(
-                                record,
-                                "failed_output_ttl_seconds",
-                                self.config.failed_output_ttl_seconds,
-                            )
-                        ),
-                        tombstone_expires_at=self._expiry(
-                            self._job_policy_ttl(
-                                record,
-                                "job_ttl_seconds",
-                                self.config.job_ttl_seconds,
-                            )
-                        ),
-                    )
-                    self.store.finalize_job(
-                        job_id,
-                        state="interrupted",
-                        manifest=manifest,
-                        error="service restarted before the job reached a terminal state",
-                        webhook_event_type="docling.job.interrupted",
-                        webhook_payload=self._webhook_payload(record, "interrupted"),
-                    )
-                self._mirror_job(job_id)
+                        self._finalize_recovered_success(record, source, manifest)
+                    except (OSError, ValueError):
+                        self._finalize_recovered_interrupted(record)
+                    try:
+                        self._mirror_job(job_id)
+                    except Exception:
+                        # SQLite finalization remains authoritative; retry the
+                        # mirror from the same daemon worker rather than
+                        # aborting startup or leaving a stale legacy state.
+                        LOGGER.warning(
+                            "legacy mirror write failed during terminal recovery for job %s",
+                            job_id,
+                            exc_info=True,
+                        )
+                        with self._lock:
+                            self._resume_pending_ids.add(job_id)
+                            self._resume_wake.set()
+                cursor = page.get("next_cursor")
+                if not cursor:
+                    break
 
     def submit_job(
         self,
@@ -1374,10 +1890,39 @@ class JobManager:
         if replayed:
             safe_delete_tree(self.config.input_root, final_input.parent)
         record = self._record_from_mapping(result)
-        self._mirror_job(record.job_id)
+        try:
+            self._mirror_job(record.job_id)
+        except Exception:
+            # The SQLite row is already durable and remains the source of
+            # truth.  Do not turn a successful enqueue into an API 500 just
+            # because the rollback mirror is temporarily unwritable; the
+            # worker/recovery path will retry terminal mirroring.
+            LOGGER.warning(
+                "legacy mirror write failed after enqueue for job %s",
+                record.job_id,
+                exc_info=True,
+            )
         if replayed:
             return record, True
-        self._executor.submit(self._run, job_id)
+        try:
+            submitted = self._submit_job_once(job_id)
+        except Exception:
+            # The durable row remains queued when executor submission fails.
+            # Treat dispatch as an internal delayed operation: the accepted
+            # request still returns its stable job id, while the same
+            # health-gated worker (or the next process restart) retries it.
+            with self._lock:
+                self._resume_pending_ids.add(job_id)
+            self._resume_wake.set()
+            self._start_queued_resume_worker()
+            return record, False
+        if not submitted:
+            with self._lock:
+                current = self.store.get_job(job_id)
+                if current and current.get("state") == "queued":
+                    self._resume_pending_ids.add(job_id)
+            self._resume_wake.set()
+            self._start_queued_resume_worker()
         return record, False
 
     def create_job(self, input_path: Path, original_name: str) -> JobRecord:
@@ -1511,9 +2056,11 @@ class JobManager:
         if staging.is_symlink() or target.is_symlink():
             raise ValueError("staging and output job directories cannot be symlinks")
         if target.exists():
-            if staging.exists():
-                safe_delete_tree(self.config.staging_root, staging)
-            return target
+            # A fresh conversion must never discard a validated staging tree
+            # in favor of an already-existing target.  Treat any target entry
+            # (including an empty directory created during a TOCTOU window)
+            # as a publication conflict and let the caller fail closed.
+            raise ValueError("output job directory already exists")
         if not staging.is_dir():
             raise ValueError("staging output is missing")
         os.replace(staging, target)
@@ -1530,6 +2077,13 @@ class JobManager:
                 target.unlink(missing_ok=True)
                 if staging.exists():
                     safe_delete_tree(self.config.staging_root, staging)
+                return []
+            if target.exists():
+                # The final target was not published by this invocation.  It
+                # may belong to a concurrent or hostile writer, so never
+                # advertise its files as this job's failed output.  Preserve
+                # our staging tree for bounded retention/forensics rather
+                # than overwriting or deleting either tree.
                 return []
             if staging.is_dir() and not target.exists():
                 os.replace(staging, target)
@@ -1675,7 +2229,18 @@ class JobManager:
             )
             if updated.get("error"):
                 return
-            self._mirror_job(job_id)
+            try:
+                self._mirror_job(job_id)
+            except Exception:
+                # SQLite is authoritative.  A transient legacy-mirror write
+                # failure must not strand a durable running job before the
+                # adapter has even started; terminal mirroring below (and its
+                # tracked retry) will converge the compatibility file.
+                LOGGER.warning(
+                    "legacy mirror write failed at conversion start for job %s",
+                    job_id,
+                    exc_info=True,
+                )
         record = self._record_from_mapping(updated)
         state = "failed"
         exit_code: int | None = None
@@ -1690,6 +2255,10 @@ class JobManager:
             expected_input_sha256 = _normalize_hex_sha256(record.input_sha256)
             if expected_input_sha256 is None:
                 raise ValueError("missing or invalid input_sha256 on production job record")
+            if not self._recovery_outputs_are_absent(job_id):
+                raise ValueError(
+                    "output job directory already exists before conversion"
+                )
             if self._runner is subprocess.run:
                 completed = self._run_production_adapter(command, job_id=job_id)
             else:
@@ -2024,6 +2593,12 @@ class JobManager:
         )
 
     def shutdown(self) -> None:
+        with self._lock:
+            self._stopping = True
+        self._resume_stop.set()
+        self._resume_wake.set()
+        if self._resume_thread is not None:
+            self._resume_thread.join(timeout=None)
         self._janitor.stop(wait=None)
         if self._dispatcher is not None:
             self._dispatcher.close()

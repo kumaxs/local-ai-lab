@@ -8,6 +8,7 @@ import json
 import os
 import subprocess
 import tempfile
+import threading
 import time
 import unittest
 import uuid
@@ -310,6 +311,358 @@ class ReleaseConfigTests(unittest.TestCase):
                 self.assertAlmostEqual(config.failed_output_ttl_seconds, before_output_ttl, delta=2)
                 self.assertAlmostEqual(240, after_output_ttl, delta=2)
             finally:
+                manager.shutdown()
+
+    def test_executor_submit_failure_keeps_new_job_replayable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = make_config(root)
+            calls: list[list[str]] = []
+            runner_started = threading.Event()
+
+            def runner(command, **_kwargs):
+                calls.append(list(command))
+                runner_started.set()
+                job_id = command[command.index("--job-id") + 1]
+                output_root = Path(command[command.index("--output-root") + 1])
+                input_file = Path(command[command.index("--input-file") + 1])
+                source_pdf_bytes = input_file.read_bytes()
+                source_pdf_sha256 = hashlib.sha256(source_pdf_bytes).hexdigest()
+                write_success_outputs(
+                    output_root / job_id,
+                    original_input_sha256=source_pdf_sha256,
+                    visual_evidence_input_sha256=source_pdf_sha256,
+                    conversion_input_sha256=source_pdf_sha256,
+                    source_pdf_bytes=source_pdf_bytes,
+                )
+                return subprocess.CompletedProcess(command, 0, "", "")
+
+            manager = JobManager(config, runner=runner)
+            original_submit = manager._executor.submit
+            submit_calls = 0
+
+            def fail_once_then_submit(*args, **kwargs):
+                nonlocal submit_calls
+                submit_calls += 1
+                if submit_calls == 1:
+                    raise RuntimeError("synthetic executor failure")
+                return original_submit(*args, **kwargs)
+
+            upload = root / "executor-submit-failure.pdf"
+            upload.write_bytes(b"%PDF-1.7\nexecutor-submit-failure\n%%EOF\n")
+            backend_patch = patch(
+                "docling_service.release.probe_backend",
+                return_value={"ok": True},
+            )
+            formula_patch = patch(
+                "docling_service.release.probe_formula_service",
+                return_value={"ok": True},
+            )
+            backend_patch.start()
+            formula_patch.start()
+            try:
+                with patch.object(
+                    manager._executor,
+                    "submit",
+                    side_effect=fail_once_then_submit,
+                ):
+                    record, replayed = manager.submit_job(
+                        upload,
+                        "executor-submit-failure.pdf",
+                    )
+                    self.assertFalse(replayed)
+                    self.assertEqual("queued", record.state)
+                    job_id = record.job_id
+                    self.assertTrue(runner_started.wait(timeout=2.0))
+                    for _attempt in range(100):
+                        current = manager.get_job(job_id)
+                        if current and current.state == "succeeded":
+                            break
+                        time.sleep(0.01)
+                    else:
+                        self.fail("job was stranded after executor submit failure")
+                self.assertEqual("succeeded", current.state)
+                self.assertEqual(1, len(calls))
+                self.assertEqual(2, submit_calls)
+            finally:
+                formula_patch.stop()
+                backend_patch.stop()
+                manager.shutdown()
+
+    def test_running_mirror_failure_does_not_skip_conversion(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = make_config(root)
+            calls: list[list[str]] = []
+            runner_started = threading.Event()
+
+            def runner(command, **_kwargs):
+                calls.append(list(command))
+                runner_started.set()
+                job_id = command[command.index("--job-id") + 1]
+                output_root = Path(command[command.index("--output-root") + 1])
+                input_file = Path(command[command.index("--input-file") + 1])
+                source_pdf_bytes = input_file.read_bytes()
+                source_pdf_sha256 = hashlib.sha256(source_pdf_bytes).hexdigest()
+                write_success_outputs(
+                    output_root / job_id,
+                    original_input_sha256=source_pdf_sha256,
+                    visual_evidence_input_sha256=source_pdf_sha256,
+                    conversion_input_sha256=source_pdf_sha256,
+                    source_pdf_bytes=source_pdf_bytes,
+                )
+                return subprocess.CompletedProcess(command, 0, "", "")
+
+            manager = JobManager(config, runner=runner)
+            original_mirror = manager._mirror_job
+            mirror_attempts = 0
+
+            def allow_then_fail_once(retry_job_id: str) -> None:
+                nonlocal mirror_attempts
+                mirror_attempts += 1
+                # submit_job mirrors once before dispatch; fail the running
+                # transition mirror, then let the terminal mirror succeed.
+                if mirror_attempts == 2:
+                    raise OSError("synthetic running mirror write failure")
+                original_mirror(retry_job_id)
+
+            upload = root / "running-mirror-failure.pdf"
+            upload.write_bytes(b"%PDF-1.7\nrunning-mirror-failure\n%%EOF\n")
+            try:
+                with patch.object(
+                    manager,
+                    "_mirror_job",
+                    side_effect=allow_then_fail_once,
+                ):
+                    record, replayed = manager.submit_job(
+                        upload,
+                        "running-mirror-failure.pdf",
+                    )
+                    self.assertFalse(replayed)
+                    self.assertTrue(runner_started.wait(timeout=2.0))
+                    for _attempt in range(100):
+                        current = manager.get_job(record.job_id)
+                        if current and current.state == "succeeded":
+                            break
+                        time.sleep(0.01)
+                    else:
+                        self.fail("running mirror failure stranded the conversion")
+                self.assertEqual("succeeded", current.state)
+                self.assertEqual(1, len(calls))
+                self.assertGreaterEqual(mirror_attempts, 3)
+                mirrored = json.loads(
+                    manager._state_path(record.job_id).read_text(encoding="utf-8")
+                )
+                self.assertEqual("succeeded", mirrored["state"])
+            finally:
+                manager.shutdown()
+
+    def test_submit_mirror_failure_does_not_block_dispatch(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = make_config(root)
+            calls: list[list[str]] = []
+            runner_started = threading.Event()
+
+            def runner(command, **_kwargs):
+                calls.append(list(command))
+                runner_started.set()
+                job_id = command[command.index("--job-id") + 1]
+                output_root = Path(command[command.index("--output-root") + 1])
+                input_file = Path(command[command.index("--input-file") + 1])
+                source_pdf_bytes = input_file.read_bytes()
+                source_pdf_sha256 = hashlib.sha256(source_pdf_bytes).hexdigest()
+                write_success_outputs(
+                    output_root / job_id,
+                    original_input_sha256=source_pdf_sha256,
+                    visual_evidence_input_sha256=source_pdf_sha256,
+                    conversion_input_sha256=source_pdf_sha256,
+                    source_pdf_bytes=source_pdf_bytes,
+                )
+                return subprocess.CompletedProcess(command, 0, "", "")
+
+            manager = JobManager(config, runner=runner)
+            original_mirror = manager._mirror_job
+            mirror_attempts = 0
+
+            def fail_once_then_mirror(retry_job_id: str) -> None:
+                nonlocal mirror_attempts
+                mirror_attempts += 1
+                if mirror_attempts == 1:
+                    raise OSError("synthetic enqueue mirror write failure")
+                original_mirror(retry_job_id)
+
+            upload = root / "submit-mirror-failure.pdf"
+            upload.write_bytes(b"%PDF-1.7\nsubmit-mirror-failure\n%%EOF\n")
+            try:
+                with patch.object(
+                    manager,
+                    "_mirror_job",
+                    side_effect=fail_once_then_mirror,
+                ):
+                    record, replayed = manager.submit_job(
+                        upload,
+                        "submit-mirror-failure.pdf",
+                    )
+                    self.assertFalse(replayed)
+                    self.assertEqual("queued", record.state)
+                    self.assertTrue(runner_started.wait(timeout=2.0))
+                    for _attempt in range(100):
+                        current = manager.get_job(record.job_id)
+                        if current and current.state == "succeeded":
+                            break
+                        time.sleep(0.01)
+                    else:
+                        self.fail("enqueue mirror failure blocked dispatch")
+                self.assertEqual("succeeded", current.state)
+                self.assertEqual(1, len(calls))
+                self.assertGreaterEqual(mirror_attempts, 2)
+            finally:
+                manager.shutdown()
+
+    def test_terminal_mirror_retry_runs_during_shutdown_drain(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = make_config(root)
+            runner_started = threading.Event()
+            release_runner = threading.Event()
+
+            def runner(command, **_kwargs):
+                runner_started.set()
+                self.assertTrue(release_runner.wait(timeout=2.0))
+                job_id = command[command.index("--job-id") + 1]
+                output_root = Path(command[command.index("--output-root") + 1])
+                input_file = Path(command[command.index("--input-file") + 1])
+                source_pdf_bytes = input_file.read_bytes()
+                source_pdf_sha256 = hashlib.sha256(source_pdf_bytes).hexdigest()
+                write_success_outputs(
+                    output_root / job_id,
+                    original_input_sha256=source_pdf_sha256,
+                    visual_evidence_input_sha256=source_pdf_sha256,
+                    conversion_input_sha256=source_pdf_sha256,
+                    source_pdf_bytes=source_pdf_bytes,
+                )
+                return subprocess.CompletedProcess(command, 0, "", "")
+
+            manager = JobManager(config, runner=runner)
+            upload = root / "shutdown-mirror-failure.pdf"
+            upload.write_bytes(b"%PDF-1.7\nshutdown-mirror-failure\n%%EOF\n")
+            try:
+                record = manager.create_job(upload, "shutdown-mirror-failure.pdf")
+                self.assertTrue(runner_started.wait(timeout=2.0))
+                original_mirror = manager._mirror_job
+                mirror_attempts = 0
+
+                def fail_once_then_mirror(retry_job_id: str) -> None:
+                    nonlocal mirror_attempts
+                    mirror_attempts += 1
+                    if mirror_attempts == 1:
+                        raise OSError("synthetic terminal mirror failure")
+                    original_mirror(retry_job_id)
+
+                with patch.object(
+                    manager,
+                    "_mirror_job",
+                    side_effect=fail_once_then_mirror,
+                ):
+                    shutdown_thread = threading.Thread(target=manager.shutdown)
+                    shutdown_thread.start()
+                    for _attempt in range(100):
+                        with manager._lock:
+                            if manager._stopping:
+                                break
+                        time.sleep(0.01)
+                    else:
+                        self.fail("shutdown did not enter stopping state")
+                    release_runner.set()
+                    shutdown_thread.join(timeout=3.0)
+                    self.assertFalse(shutdown_thread.is_alive())
+
+                self.assertGreaterEqual(mirror_attempts, 2)
+                mirrored = json.loads(
+                    manager._state_path(record.job_id).read_text(encoding="utf-8")
+                )
+                self.assertEqual("succeeded", mirrored["state"])
+            finally:
+                # shutdown_thread owns shutdown when the test reaches the
+                # normal path; this is idempotent protection for assertion
+                # failures before it starts.
+                if not manager._stopping:
+                    manager.shutdown()
+
+    def test_worker_requeues_job_when_durable_start_transition_temporarily_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = make_config(root)
+            calls: list[list[str]] = []
+            runner_started = threading.Event()
+
+            def runner(command, **_kwargs):
+                calls.append(list(command))
+                runner_started.set()
+                job_id = command[command.index("--job-id") + 1]
+                output_root = Path(command[command.index("--output-root") + 1])
+                input_file = Path(command[command.index("--input-file") + 1])
+                source_pdf_bytes = input_file.read_bytes()
+                source_pdf_sha256 = hashlib.sha256(source_pdf_bytes).hexdigest()
+                write_success_outputs(
+                    output_root / job_id,
+                    original_input_sha256=source_pdf_sha256,
+                    visual_evidence_input_sha256=source_pdf_sha256,
+                    conversion_input_sha256=source_pdf_sha256,
+                    source_pdf_bytes=source_pdf_bytes,
+                )
+                return subprocess.CompletedProcess(command, 0, "", "")
+
+            manager = JobManager(config, runner=runner)
+            original_update_job = manager.store.update_job
+            failed_once = False
+
+            def fail_start_transition_once(job_id, **fields):
+                nonlocal failed_once
+                if not failed_once and fields.get("state") == "running":
+                    failed_once = True
+                    raise RuntimeError("synthetic state transition failure")
+                return original_update_job(job_id, **fields)
+
+            upload = root / "state-transition-failure.pdf"
+            upload.write_bytes(b"%PDF-1.7\nstate-transition-failure\n%%EOF\n")
+            backend_patch = patch(
+                "docling_service.release.probe_backend",
+                return_value={"ok": True},
+            )
+            formula_patch = patch(
+                "docling_service.release.probe_formula_service",
+                return_value={"ok": True},
+            )
+            backend_patch.start()
+            formula_patch.start()
+            try:
+                with patch.object(
+                    manager.store,
+                    "update_job",
+                    side_effect=fail_start_transition_once,
+                ):
+                    record, replayed = manager.submit_job(
+                        upload,
+                        "state-transition-failure.pdf",
+                    )
+                    self.assertFalse(replayed)
+                    self.assertEqual("queued", record.state)
+                    self.assertTrue(runner_started.wait(timeout=2.0))
+                    for _attempt in range(100):
+                        current = manager.get_job(record.job_id)
+                        if current and current.state == "succeeded":
+                            break
+                        time.sleep(0.01)
+                    else:
+                        self.fail("job was stranded after start transition failure")
+                self.assertEqual("succeeded", current.state)
+                self.assertEqual(1, len(calls))
+                self.assertTrue(failed_once)
+            finally:
+                formula_patch.stop()
+                backend_patch.stop()
                 manager.shutdown()
 
     def test_delete_does_not_tombstone_when_download_wins_cleanup_race(self) -> None:
@@ -1193,6 +1546,90 @@ class JobManagerTests(unittest.TestCase):
             finally:
                 manager.shutdown()
 
+    def test_publish_staging_refuses_existing_output_target(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = make_config(root)
+            job_id = "d11d1111-1111-4111-9111-d11111111111"
+            manager = JobManager(config, runner=lambda *_args, **_kwargs: None)
+            try:
+                staging = config.staging_root / job_id
+                target = config.output_root / job_id
+                staging.mkdir(parents=True)
+                (staging / "validated.marker").write_text("staging", encoding="utf-8")
+                target.mkdir(parents=True)
+                (target / "unknown.marker").write_text("target", encoding="utf-8")
+
+                with self.assertRaisesRegex(
+                    ValueError, "output job directory already exists"
+                ):
+                    manager._publish_staging(job_id)
+                self.assertTrue((staging / "validated.marker").is_file())
+                self.assertTrue((target / "unknown.marker").is_file())
+            finally:
+                manager.shutdown()
+
+    def test_conversion_fails_closed_when_output_target_appears_before_publish(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = make_config(root)
+
+            def runner(command, **_kwargs):
+                job_id = command[command.index("--job-id") + 1]
+                output_root = Path(command[command.index("--output-root") + 1])
+                input_file = Path(command[command.index("--input-file") + 1])
+                source_pdf_bytes = input_file.read_bytes()
+                source_pdf_sha256 = hashlib.sha256(source_pdf_bytes).hexdigest()
+                write_success_outputs(
+                    output_root / job_id,
+                    original_input_sha256=source_pdf_sha256,
+                    visual_evidence_input_sha256=source_pdf_sha256,
+                    conversion_input_sha256=source_pdf_sha256,
+                    source_pdf_bytes=source_pdf_bytes,
+                )
+                # Simulate a concurrent writer creating the final target after
+                # staging validation but before atomic publication.  Make it
+                # look complete so a failed job must not accidentally publish
+                # or expose files bound to a different input.
+                foreign_source = b"%PDF-1.7\nforeign-output\n%%EOF\n"
+                foreign_sha256 = hashlib.sha256(foreign_source).hexdigest()
+                write_success_outputs(
+                    config.output_root / job_id,
+                    original_input_sha256=foreign_sha256,
+                    visual_evidence_input_sha256=foreign_sha256,
+                    conversion_input_sha256=foreign_sha256,
+                    source_pdf_bytes=foreign_source,
+                )
+                return subprocess.CompletedProcess(command, 0, "", "")
+
+            manager = JobManager(config, runner=runner)
+            try:
+                upload = root / "publish-race.pdf"
+                upload.write_bytes(b"%PDF-1.7\npublish-race\n%%EOF\n")
+                record = manager.create_job(upload, "publish-race.pdf")
+                for _attempt in range(100):
+                    current = manager.get_job(record.job_id)
+                    if current and current.state == "failed":
+                        break
+                    time.sleep(0.01)
+                else:
+                    self.fail("publication race did not fail closed")
+                self.assertIn(
+                    "output job directory already exists",
+                    current.error or "",
+                )
+                self.assertTrue((config.output_root / record.job_id).is_dir())
+                self.assertTrue((config.staging_root / record.job_id).is_dir())
+                self.assertEqual([], manager.output_files(record.job_id))
+                with self.assertRaises(FileNotFoundError):
+                    manager.resolve_output_file(record.job_id, "document.html")
+                self.assertEqual(
+                    b"%PDF-1.7\nforeign-output\n%%EOF\n",
+                    (config.output_root / record.job_id / "source.pdf").read_bytes(),
+                )
+            finally:
+                manager.shutdown()
+
     def test_cross_filesystem_upload_copy_is_atomic_and_removes_source(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1868,6 +2305,954 @@ while True:
                         expected_input_sha256=expected_input_sha256,
                     )
             manager.shutdown()
+
+    def test_restart_keeps_clean_queued_job_until_dependencies_are_healthy(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = make_config(root)
+            job_id = "a22a2222-2222-4222-9222-a22222222222"
+            source_pdf_bytes = b"%PDF-1.7\nqueued-resume\n%%EOF\n"
+            source_pdf_sha256 = hashlib.sha256(source_pdf_bytes).hexdigest()
+            input_path = config.input_root / job_id / "source.pdf"
+            input_path.parent.mkdir(parents=True)
+            input_path.write_bytes(source_pdf_bytes)
+
+            first = JobManager(config, runner=lambda *_args, **_kwargs: None)
+            try:
+                created = first.store.create_job(
+                    job_id=job_id,
+                    original_name="queued-resume.pdf",
+                    input_path=str(input_path),
+                    output_dir=str(config.output_root / job_id),
+                    state="queued",
+                    input_sha256=source_pdf_sha256,
+                    input_size_bytes=len(source_pdf_bytes),
+                    reserved_output_bytes=config.max_output_bytes,
+                )
+                self.assertFalse(created.get("error"))
+            finally:
+                first.shutdown()
+
+            runner_started = threading.Event()
+            calls: list[list[str]] = []
+
+            def runner(command, **_kwargs):
+                calls.append(list(command))
+                runner_started.set()
+                resumed_job_id = command[command.index("--job-id") + 1]
+                output_root = Path(command[command.index("--output-root") + 1])
+                input_file = Path(command[command.index("--input-file") + 1])
+                write_success_outputs(
+                    output_root / resumed_job_id,
+                    original_input_sha256=source_pdf_sha256,
+                    visual_evidence_input_sha256=source_pdf_sha256,
+                    conversion_input_sha256=source_pdf_sha256,
+                    source_pdf_bytes=input_file.read_bytes(),
+                )
+                return subprocess.CompletedProcess(command, 0, "", "")
+
+            backend_patch = patch(
+                "docling_service.release.probe_backend",
+                return_value={"ok": True},
+            )
+            formula_patch = patch(
+                "docling_service.release.probe_formula_service",
+                return_value={"ok": True},
+            )
+            backend_patch.start()
+            formula_patch.start()
+            recovering = JobManager(config, runner=runner)
+            try:
+                self.assertTrue(runner_started.wait(timeout=2.0))
+                for _attempt in range(100):
+                    current = recovering.get_job(job_id)
+                    if current and current.state == "succeeded":
+                        break
+                    time.sleep(0.01)
+                else:
+                    self.fail("queued recovery job did not finish")
+                self.assertEqual("succeeded", current.state)
+                self.assertEqual(1, len(calls))
+                self.assertIsNotNone(recovering._resume_thread)
+                self.assertTrue(recovering._resume_thread.is_alive())
+            finally:
+                recovering.shutdown()
+                formula_patch.stop()
+                backend_patch.stop()
+
+    def test_restart_backoff_keeps_queued_job_and_dispatches_once_when_health_recovers(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = make_config(root)
+            job_id = "a33a3333-3333-4333-9333-a33333333333"
+            source_pdf_bytes = b"%PDF-1.7\nhealth-gated\n%%EOF\n"
+            source_pdf_sha256 = hashlib.sha256(source_pdf_bytes).hexdigest()
+            input_path = config.input_root / job_id / "source.pdf"
+            input_path.parent.mkdir(parents=True)
+            input_path.write_bytes(source_pdf_bytes)
+
+            first = JobManager(config, runner=lambda *_args, **_kwargs: None)
+            try:
+                first.store.create_job(
+                    job_id=job_id,
+                    original_name="health-gated.pdf",
+                    input_path=str(input_path),
+                    output_dir=str(config.output_root / job_id),
+                    state="queued",
+                    input_sha256=source_pdf_sha256,
+                    input_size_bytes=len(source_pdf_bytes),
+                    reserved_output_bytes=config.max_output_bytes,
+                )
+            finally:
+                first.shutdown()
+
+            ready = False
+            calls: list[list[str]] = []
+            runner_started = threading.Event()
+
+            def backend_probe(*_args, **_kwargs):
+                return {"ok": ready}
+
+            def formula_probe(*_args, **_kwargs):
+                return {"ok": ready}
+
+            def runner(command, **_kwargs):
+                calls.append(list(command))
+                runner_started.set()
+                resumed_job_id = command[command.index("--job-id") + 1]
+                output_root = Path(command[command.index("--output-root") + 1])
+                write_success_outputs(
+                    output_root / resumed_job_id,
+                    original_input_sha256=source_pdf_sha256,
+                    visual_evidence_input_sha256=source_pdf_sha256,
+                    conversion_input_sha256=source_pdf_sha256,
+                    source_pdf_bytes=source_pdf_bytes,
+                )
+                return subprocess.CompletedProcess(command, 0, "", "")
+
+            backend_patch = patch(
+                "docling_service.release.probe_backend",
+                side_effect=backend_probe,
+            )
+            formula_patch = patch(
+                "docling_service.release.probe_formula_service",
+                side_effect=formula_probe,
+            )
+            backend_patch.start()
+            formula_patch.start()
+            recovering = JobManager(config, runner=runner)
+            try:
+                time.sleep(0.35)
+                self.assertEqual([], calls)
+                self.assertEqual("queued", recovering.get_job(job_id).state)
+
+                ready = True
+                self.assertTrue(runner_started.wait(timeout=2.0))
+                for _attempt in range(100):
+                    current = recovering.get_job(job_id)
+                    if current and current.state == "succeeded":
+                        break
+                    time.sleep(0.01)
+                else:
+                    self.fail("health-gated recovery job did not finish")
+                self.assertEqual("succeeded", current.state)
+                self.assertEqual(1, len(calls))
+            finally:
+                recovering.shutdown()
+                formula_patch.stop()
+                backend_patch.stop()
+
+    def test_resume_worker_retries_after_transient_store_lookup_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = make_config(root)
+            job_id = "a34a3434-3434-4343-9343-a34343434343"
+            source_pdf_bytes = b"%PDF-1.7\nstore-lookup-retry\n%%EOF\n"
+            source_pdf_sha256 = hashlib.sha256(source_pdf_bytes).hexdigest()
+            input_path = config.input_root / job_id / "source.pdf"
+            input_path.parent.mkdir(parents=True)
+            input_path.write_bytes(source_pdf_bytes)
+
+            calls: list[list[str]] = []
+            runner_started = threading.Event()
+
+            def runner(command, **_kwargs):
+                calls.append(list(command))
+                runner_started.set()
+                resumed_job_id = command[command.index("--job-id") + 1]
+                output_root = Path(command[command.index("--output-root") + 1])
+                write_success_outputs(
+                    output_root / resumed_job_id,
+                    original_input_sha256=source_pdf_sha256,
+                    visual_evidence_input_sha256=source_pdf_sha256,
+                    conversion_input_sha256=source_pdf_sha256,
+                    source_pdf_bytes=source_pdf_bytes,
+                )
+                return subprocess.CompletedProcess(command, 0, "", "")
+
+            manager = JobManager(config, runner=runner)
+            try:
+                created = manager.store.create_job(
+                    job_id=job_id,
+                    original_name="store-lookup-retry.pdf",
+                    input_path=str(input_path),
+                    output_dir=str(config.output_root / job_id),
+                    state="queued",
+                    input_sha256=source_pdf_sha256,
+                    input_size_bytes=len(source_pdf_bytes),
+                    reserved_output_bytes=config.max_output_bytes,
+                )
+                self.assertFalse(created.get("error"))
+                original_get_job = manager.store.get_job
+                lookup_failures = 0
+                lookup_failed = threading.Event()
+
+                def fail_once_then_get(retry_job_id: str):
+                    nonlocal lookup_failures
+                    lookup_failures += 1
+                    if lookup_failures == 1:
+                        lookup_failed.set()
+                        raise RuntimeError("synthetic transient store lookup failure")
+                    return original_get_job(retry_job_id)
+
+                backend_patch = patch(
+                    "docling_service.release.probe_backend",
+                    return_value={"ok": True},
+                )
+                formula_patch = patch(
+                    "docling_service.release.probe_formula_service",
+                    return_value={"ok": True},
+                )
+                backend_patch.start()
+                formula_patch.start()
+                try:
+                    with patch.object(
+                        manager.store,
+                        "get_job",
+                        side_effect=fail_once_then_get,
+                    ):
+                        with manager._lock:
+                            manager._resume_pending_ids.add(job_id)
+                        manager._resume_wake.set()
+                        manager._start_queued_resume_worker()
+                        self.assertTrue(lookup_failed.wait(timeout=2.0))
+                        self.assertTrue(runner_started.wait(timeout=3.0))
+                        for _attempt in range(200):
+                            current = original_get_job(job_id)
+                            if current and current.get("state") == "succeeded":
+                                break
+                            time.sleep(0.01)
+                        else:
+                            self.fail("worker did not recover after store lookup failure")
+                    self.assertEqual("succeeded", current.get("state"))
+                    self.assertEqual(1, len(calls))
+                    self.assertGreaterEqual(lookup_failures, 2)
+                finally:
+                    formula_patch.stop()
+                    backend_patch.stop()
+            finally:
+                manager.shutdown()
+
+    def test_resume_worker_retries_after_transient_artifact_inspection_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = make_config(root)
+            job_id = "a35a3535-3535-4353-9353-a35353535353"
+            source_pdf_bytes = b"%PDF-1.7\nartifact-inspection-retry\n%%EOF\n"
+            source_pdf_sha256 = hashlib.sha256(source_pdf_bytes).hexdigest()
+            input_path = config.input_root / job_id / "source.pdf"
+            input_path.parent.mkdir(parents=True)
+            input_path.write_bytes(source_pdf_bytes)
+
+            calls: list[list[str]] = []
+            runner_started = threading.Event()
+
+            def runner(command, **_kwargs):
+                calls.append(list(command))
+                runner_started.set()
+                resumed_job_id = command[command.index("--job-id") + 1]
+                output_root = Path(command[command.index("--output-root") + 1])
+                write_success_outputs(
+                    output_root / resumed_job_id,
+                    original_input_sha256=source_pdf_sha256,
+                    visual_evidence_input_sha256=source_pdf_sha256,
+                    conversion_input_sha256=source_pdf_sha256,
+                    source_pdf_bytes=source_pdf_bytes,
+                )
+                return subprocess.CompletedProcess(command, 0, "", "")
+
+            manager = JobManager(config, runner=runner)
+            try:
+                created = manager.store.create_job(
+                    job_id=job_id,
+                    original_name="artifact-inspection-retry.pdf",
+                    input_path=str(input_path),
+                    output_dir=str(config.output_root / job_id),
+                    state="queued",
+                    input_sha256=source_pdf_sha256,
+                    input_size_bytes=len(source_pdf_bytes),
+                    reserved_output_bytes=config.max_output_bytes,
+                )
+                self.assertFalse(created.get("error"))
+                original_inspect = manager._inspect_recovery_artifacts
+                inspection_failures = 0
+                inspection_failed = threading.Event()
+
+                def fail_once_then_inspect(*args, **kwargs):
+                    nonlocal inspection_failures
+                    inspection_failures += 1
+                    if inspection_failures == 1:
+                        inspection_failed.set()
+                        raise RuntimeError(
+                            "synthetic transient artifact inspection failure"
+                        )
+                    return original_inspect(*args, **kwargs)
+
+                backend_patch = patch(
+                    "docling_service.release.probe_backend",
+                    return_value={"ok": True},
+                )
+                formula_patch = patch(
+                    "docling_service.release.probe_formula_service",
+                    return_value={"ok": True},
+                )
+                backend_patch.start()
+                formula_patch.start()
+                try:
+                    with patch.object(
+                        manager,
+                        "_inspect_recovery_artifacts",
+                        side_effect=fail_once_then_inspect,
+                    ):
+                        with manager._lock:
+                            manager._resume_pending_ids.add(job_id)
+                        manager._resume_wake.set()
+                        manager._start_queued_resume_worker()
+                        self.assertTrue(inspection_failed.wait(timeout=2.0))
+                        self.assertTrue(runner_started.wait(timeout=3.0))
+                        for _attempt in range(200):
+                            current = manager.store.get_job(job_id)
+                            if current and current.get("state") == "succeeded":
+                                break
+                            time.sleep(0.01)
+                        else:
+                            self.fail(
+                                "worker did not recover after artifact inspection failure"
+                            )
+                    self.assertEqual("succeeded", current.get("state"))
+                    self.assertEqual(1, len(calls))
+                    self.assertGreaterEqual(inspection_failures, 2)
+                finally:
+                    formula_patch.stop()
+                    backend_patch.stop()
+            finally:
+                manager.shutdown()
+
+    def test_restart_resumes_queued_jobs_in_persisted_fifo_order(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = make_config(root)
+            first_job_id = "f11f1111-1111-4111-9111-f11111111111"
+            second_job_id = "11111111-1111-4111-9111-111111111111"
+            common_created_at = "2026-08-01T00:00:00+00:00"
+            jobs = (
+                (
+                    first_job_id,
+                    common_created_at,
+                    b"%PDF-1.7\nfirst-queued\n%%EOF\n",
+                ),
+                (
+                    second_job_id,
+                    common_created_at,
+                    b"%PDF-1.7\nsecond-queued\n%%EOF\n",
+                ),
+            )
+
+            first = JobManager(config, runner=lambda *_args, **_kwargs: None)
+            try:
+                for job_id, created_at, source_pdf_bytes in jobs:
+                    input_path = config.input_root / job_id / "source.pdf"
+                    input_path.parent.mkdir(parents=True)
+                    input_path.write_bytes(source_pdf_bytes)
+                    first.store.create_job(
+                        job_id=job_id,
+                        original_name=f"{job_id}.pdf",
+                        input_path=str(input_path),
+                        output_dir=str(config.output_root / job_id),
+                        state="queued",
+                        input_sha256=hashlib.sha256(source_pdf_bytes).hexdigest(),
+                        input_size_bytes=len(source_pdf_bytes),
+                        reserved_output_bytes=config.max_output_bytes,
+                        created_at=created_at,
+                    )
+            finally:
+                first.shutdown()
+
+            calls: list[str] = []
+            first_started = threading.Event()
+            release_first = threading.Event()
+            source_by_job = {
+                job_id: source_pdf_bytes for job_id, _created_at, source_pdf_bytes in jobs
+            }
+
+            def runner(command, **_kwargs):
+                job_id = command[command.index("--job-id") + 1]
+                calls.append(job_id)
+                if job_id == first_job_id:
+                    first_started.set()
+                    self.assertTrue(release_first.wait(timeout=2.0))
+                output_root = Path(command[command.index("--output-root") + 1])
+                source_pdf_bytes = source_by_job[job_id]
+                source_pdf_sha256 = hashlib.sha256(source_pdf_bytes).hexdigest()
+                write_success_outputs(
+                    output_root / job_id,
+                    original_input_sha256=source_pdf_sha256,
+                    visual_evidence_input_sha256=source_pdf_sha256,
+                    conversion_input_sha256=source_pdf_sha256,
+                    source_pdf_bytes=source_pdf_bytes,
+                )
+                return subprocess.CompletedProcess(command, 0, "", "")
+
+            backend_patch = patch(
+                "docling_service.release.probe_backend",
+                return_value={"ok": True},
+            )
+            formula_patch = patch(
+                "docling_service.release.probe_formula_service",
+                return_value={"ok": True},
+            )
+            backend_patch.start()
+            formula_patch.start()
+            recovering = JobManager(config, runner=runner)
+            try:
+                self.assertTrue(first_started.wait(timeout=2.0))
+                time.sleep(0.1)
+                self.assertEqual([first_job_id], calls)
+                release_first.set()
+                for _attempt in range(200):
+                    first_current = recovering.get_job(first_job_id)
+                    second_current = recovering.get_job(second_job_id)
+                    if (
+                        first_current
+                        and second_current
+                        and first_current.state == "succeeded"
+                        and second_current.state == "succeeded"
+                    ):
+                        break
+                    time.sleep(0.01)
+                else:
+                    self.fail("FIFO queued recovery jobs did not finish")
+                self.assertEqual([first_job_id, second_job_id], calls)
+            finally:
+                recovering.shutdown()
+                formula_patch.stop()
+                backend_patch.stop()
+
+    def test_restart_marks_queued_job_with_partial_output_interrupted(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = make_config(root)
+            job_id = "a44a4444-4444-4444-9444-a44444444444"
+            source_pdf_bytes = b"%PDF-1.7\npartial-output\n%%EOF\n"
+            source_pdf_sha256 = hashlib.sha256(source_pdf_bytes).hexdigest()
+            input_path = config.input_root / job_id / "source.pdf"
+            input_path.parent.mkdir(parents=True)
+            input_path.write_bytes(source_pdf_bytes)
+
+            first = JobManager(config, runner=lambda *_args, **_kwargs: None)
+            try:
+                first.store.create_job(
+                    job_id=job_id,
+                    original_name="partial-output.pdf",
+                    input_path=str(input_path),
+                    output_dir=str(config.output_root / job_id),
+                    state="queued",
+                    input_sha256=source_pdf_sha256,
+                    input_size_bytes=len(source_pdf_bytes),
+                    reserved_output_bytes=config.max_output_bytes,
+                )
+                output_dir = config.output_root / job_id
+                output_dir.mkdir(parents=True)
+                (output_dir / "document.md").write_text("partial", encoding="utf-8")
+            finally:
+                first.shutdown()
+
+            calls: list[list[str]] = []
+
+            def runner(command, **_kwargs):
+                calls.append(list(command))
+                return subprocess.CompletedProcess(command, 0, "", "")
+
+            recovering = JobManager(config, runner=runner)
+            try:
+                current = recovering.get_job(job_id)
+                self.assertIsNotNone(current)
+                self.assertEqual("interrupted", current.state)
+                self.assertEqual([], calls)
+            finally:
+                recovering.shutdown()
+
+    @unittest.skipIf(os.name == "nt", "symlink recovery requires POSIX")
+    def test_partial_recovery_finalize_retry_never_replays_cleaned_job(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = make_config(root)
+            job_id = "a76a7676-7676-4676-9676-a76767676767"
+            source_pdf_bytes = b"%PDF-1.7\npartial-finalize-retry\n%%EOF\n"
+            source_pdf_sha256 = hashlib.sha256(source_pdf_bytes).hexdigest()
+            input_path = config.input_root / job_id / "source.pdf"
+            input_path.parent.mkdir(parents=True)
+            input_path.write_bytes(source_pdf_bytes)
+
+            runner_calls: list[list[str]] = []
+            manager = JobManager(
+                config,
+                runner=lambda command, **_kwargs: runner_calls.append(list(command)),
+            )
+            try:
+                created = manager.store.create_job(
+                    job_id=job_id,
+                    original_name="partial-finalize-retry.pdf",
+                    input_path=str(input_path),
+                    output_dir=str(config.output_root / job_id),
+                    state="queued",
+                    input_sha256=source_pdf_sha256,
+                    input_size_bytes=len(source_pdf_bytes),
+                    reserved_output_bytes=config.max_output_bytes,
+                )
+                self.assertFalse(created.get("error"))
+                external = root / "external-partial"
+                external.mkdir()
+                sentinel = external / "sentinel.txt"
+                sentinel.write_text("preserve", encoding="utf-8")
+                (config.output_root / job_id).symlink_to(
+                    external,
+                    target_is_directory=True,
+                )
+
+                original_finalize = manager.store.finalize_job
+                finalize_attempts = 0
+
+                def fail_once_then_finalize(retry_job_id, **kwargs):
+                    nonlocal finalize_attempts
+                    if retry_job_id == job_id:
+                        finalize_attempts += 1
+                        if finalize_attempts == 1:
+                            raise RuntimeError("synthetic transient finalize failure")
+                    return original_finalize(retry_job_id, **kwargs)
+
+                with patch(
+                    "docling_service.release.probe_backend",
+                    return_value={"ok": True},
+                ), patch(
+                    "docling_service.release.probe_formula_service",
+                    return_value={"ok": True},
+                ), patch.object(
+                    manager.store,
+                    "finalize_job",
+                    side_effect=fail_once_then_finalize,
+                ):
+                    with manager._lock:
+                        manager._resume_pending_ids.add(job_id)
+                    manager._resume_wake.set()
+                    manager._start_queued_resume_worker()
+                    for _attempt in range(200):
+                        current = manager.store.get_job(job_id)
+                        if current.get("state") == "interrupted":
+                            break
+                        time.sleep(0.01)
+                    else:
+                        self.fail("unsafe queued recovery did not converge")
+
+                self.assertGreaterEqual(finalize_attempts, 2)
+                self.assertEqual([], runner_calls)
+                self.assertEqual("interrupted", current["state"])
+                self.assertFalse((config.output_root / job_id).exists())
+                self.assertEqual("preserve", sentinel.read_text(encoding="utf-8"))
+            finally:
+                manager.shutdown()
+
+    def test_restart_marks_queued_job_with_empty_output_directory_interrupted(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = make_config(root)
+            job_id = "a77a7777-7777-4777-9777-a77777777777"
+            source_pdf_bytes = b"%PDF-1.7\nempty-output\n%%EOF\n"
+            source_pdf_sha256 = hashlib.sha256(source_pdf_bytes).hexdigest()
+            input_path = config.input_root / job_id / "source.pdf"
+            input_path.parent.mkdir(parents=True)
+            input_path.write_bytes(source_pdf_bytes)
+
+            first = JobManager(config, runner=lambda *_args, **_kwargs: None)
+            try:
+                first.store.create_job(
+                    job_id=job_id,
+                    original_name="empty-output.pdf",
+                    input_path=str(input_path),
+                    output_dir=str(config.output_root / job_id),
+                    state="queued",
+                    input_sha256=source_pdf_sha256,
+                    input_size_bytes=len(source_pdf_bytes),
+                    reserved_output_bytes=config.max_output_bytes,
+                )
+                (config.output_root / job_id).mkdir(parents=True)
+            finally:
+                first.shutdown()
+
+            calls: list[list[str]] = []
+            recovering = JobManager(
+                config,
+                runner=lambda command, **_kwargs: calls.append(list(command)),
+            )
+            try:
+                current = recovering.get_job(job_id)
+                self.assertIsNotNone(current)
+                self.assertEqual("interrupted", current.state)
+                self.assertEqual([], calls)
+            finally:
+                recovering.shutdown()
+
+    def test_restart_marks_queued_job_with_empty_staging_directory_interrupted(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = make_config(root)
+            job_id = "a88a8888-8888-4888-9888-a88888888888"
+            source_pdf_bytes = b"%PDF-1.7\nempty-staging\n%%EOF\n"
+            source_pdf_sha256 = hashlib.sha256(source_pdf_bytes).hexdigest()
+            input_path = config.input_root / job_id / "source.pdf"
+            input_path.parent.mkdir(parents=True)
+            input_path.write_bytes(source_pdf_bytes)
+
+            first = JobManager(config, runner=lambda *_args, **_kwargs: None)
+            try:
+                first.store.create_job(
+                    job_id=job_id,
+                    original_name="empty-staging.pdf",
+                    input_path=str(input_path),
+                    output_dir=str(config.output_root / job_id),
+                    state="queued",
+                    input_sha256=source_pdf_sha256,
+                    input_size_bytes=len(source_pdf_bytes),
+                    reserved_output_bytes=config.max_output_bytes,
+                )
+                (config.staging_root / job_id).mkdir(parents=True)
+            finally:
+                first.shutdown()
+
+            calls: list[list[str]] = []
+            recovering = JobManager(
+                config,
+                runner=lambda command, **_kwargs: calls.append(list(command)),
+            )
+            try:
+                current = recovering.get_job(job_id)
+                self.assertIsNotNone(current)
+                self.assertEqual("interrupted", current.state)
+                self.assertEqual([], calls)
+            finally:
+                recovering.shutdown()
+
+    def test_restart_finalizes_complete_staging_for_queued_job(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = make_config(root)
+            job_id = "a66a6666-6666-4666-9666-a66666666666"
+            source_pdf_bytes = b"%PDF-1.7\ncomplete-staging\n%%EOF\n"
+            source_pdf_sha256 = hashlib.sha256(source_pdf_bytes).hexdigest()
+            input_path = config.input_root / job_id / "source.pdf"
+            input_path.parent.mkdir(parents=True)
+            input_path.write_bytes(source_pdf_bytes)
+
+            first = JobManager(config, runner=lambda *_args, **_kwargs: None)
+            try:
+                first.store.create_job(
+                    job_id=job_id,
+                    original_name="complete-staging.pdf",
+                    input_path=str(input_path),
+                    output_dir=str(config.output_root / job_id),
+                    state="queued",
+                    input_sha256=source_pdf_sha256,
+                    input_size_bytes=len(source_pdf_bytes),
+                    reserved_output_bytes=config.max_output_bytes,
+                )
+                write_success_outputs(
+                    config.staging_root / job_id,
+                    original_input_sha256=source_pdf_sha256,
+                    visual_evidence_input_sha256=source_pdf_sha256,
+                    conversion_input_sha256=source_pdf_sha256,
+                    source_pdf_bytes=source_pdf_bytes,
+                )
+            finally:
+                first.shutdown()
+
+            recovering = JobManager(
+                config,
+                runner=lambda *_args, **_kwargs: self.fail(
+                    "complete queued job was replayed"
+                ),
+            )
+            try:
+                current = recovering.get_job(job_id)
+                self.assertIsNotNone(current)
+                self.assertEqual("succeeded", current.state)
+                self.assertTrue((config.output_root / job_id).is_dir())
+                self.assertFalse((config.staging_root / job_id).exists())
+            finally:
+                recovering.shutdown()
+
+    def test_queued_resume_retries_legacy_mirror_after_terminal_commit(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = make_config(root)
+            job_id = "a67a6666-6666-4666-9666-a66666666666"
+
+            manager = JobManager(config, runner=lambda *_args, **_kwargs: None)
+            try:
+                created = manager.store.create_job(
+                    job_id=job_id,
+                    original_name="mirror-retry.pdf",
+                    input_path=str(config.input_root / job_id / "source.pdf"),
+                    output_dir=str(config.output_root / job_id),
+                    state="succeeded",
+                )
+                self.assertFalse(created.get("error"))
+                # Model a stale legacy mirror left behind by a failed write
+                # after SQLite had already committed the terminal state.
+                manager._state_path(job_id).write_text(
+                    json.dumps({"job_id": job_id, "state": "queued"}),
+                    encoding="utf-8",
+                )
+                original_mirror = manager._mirror_job
+                mirror_attempts = 0
+
+                def fail_once_then_mirror(retry_job_id: str) -> None:
+                    nonlocal mirror_attempts
+                    mirror_attempts += 1
+                    if mirror_attempts == 1:
+                        raise OSError("synthetic mirror write failure")
+                    original_mirror(retry_job_id)
+
+                backend_patch = patch(
+                    "docling_service.release.probe_backend",
+                    return_value={"ok": True},
+                )
+                formula_patch = patch(
+                    "docling_service.release.probe_formula_service",
+                    return_value={"ok": True},
+                )
+                backend_patch.start()
+                formula_patch.start()
+                try:
+                    with patch.object(
+                        manager,
+                        "_mirror_job",
+                        side_effect=fail_once_then_mirror,
+                    ):
+                        with manager._lock:
+                            manager._resume_pending_ids.add(job_id)
+                        manager._resume_wake.set()
+                        manager._start_queued_resume_worker()
+                        for _attempt in range(200):
+                            if mirror_attempts >= 2 and manager._state_path(job_id).exists():
+                                try:
+                                    if (
+                                        json.loads(
+                                            manager._state_path(job_id).read_text(
+                                                encoding="utf-8"
+                                            )
+                                        ).get("state")
+                                        == "succeeded"
+                                    ):
+                                        break
+                                except (OSError, json.JSONDecodeError):
+                                    pass
+                            time.sleep(0.01)
+                        else:
+                            self.fail("terminal legacy mirror write was not retried")
+                    self.assertGreaterEqual(mirror_attempts, 2)
+                    self.assertEqual(
+                        "succeeded",
+                        json.loads(manager._state_path(job_id).read_text())["state"],
+                    )
+                    with manager._lock:
+                        self.assertNotIn(job_id, manager._resume_pending_ids)
+                finally:
+                    formula_patch.stop()
+                    backend_patch.stop()
+            finally:
+                manager.shutdown()
+
+    def test_restart_recovery_paginates_all_nonterminal_jobs(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manager = JobManager(make_config(root), runner=lambda *_args, **_kwargs: None)
+            try:
+                records = [
+                    {
+                        "job_id": str(uuid.uuid4()),
+                        "input_sha256": None,
+                    }
+                    for _index in range(1001)
+                ]
+                queued_calls: list[str | None] = []
+                finalized: list[str] = []
+
+                def paged_list_jobs(*, state, cursor=None, **_kwargs):
+                    if state == "running":
+                        return {"items": [], "next_cursor": None}
+                    queued_calls.append(cursor)
+                    if cursor is None:
+                        return {
+                            "items": records[:1000],
+                            "next_cursor": "page-2",
+                        }
+                    self.assertEqual("page-2", cursor)
+                    return {"items": records[1000:], "next_cursor": None}
+
+                with patch.object(
+                    manager.store,
+                    "list_jobs",
+                    side_effect=paged_list_jobs,
+                ), patch.object(
+                    manager,
+                    "_inspect_recovery_artifacts",
+                    return_value=(None, None, False),
+                ), patch.object(
+                    manager,
+                    "_queued_job_is_replayable",
+                    return_value=False,
+                ), patch.object(
+                    manager,
+                    "_finalize_recovered_interrupted",
+                    side_effect=lambda record: finalized.append(str(record["job_id"])),
+                ), patch.object(manager, "_mirror_job"):
+                    manager._recover_interrupted_jobs()
+
+                self.assertEqual([None, "page-2"], queued_calls)
+                self.assertEqual(1001, len(finalized))
+                self.assertEqual({item["job_id"] for item in records}, set(finalized))
+            finally:
+                manager.shutdown()
+
+    def test_restart_marks_queued_job_with_invalid_source_interrupted(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = make_config(root)
+            job_id = "a55a5555-5555-4555-9555-a55555555555"
+            source_pdf_bytes = b"%PDF-1.7\ninvalid-source\n%%EOF\n"
+            source_pdf_sha256 = hashlib.sha256(source_pdf_bytes).hexdigest()
+            input_path = config.input_root / job_id / "source.pdf"
+
+            first = JobManager(config, runner=lambda *_args, **_kwargs: None)
+            try:
+                first.store.create_job(
+                    job_id=job_id,
+                    original_name="invalid-source.pdf",
+                    input_path=str(input_path),
+                    output_dir=str(config.output_root / job_id),
+                    state="queued",
+                    input_sha256=source_pdf_sha256,
+                    input_size_bytes=len(source_pdf_bytes),
+                    reserved_output_bytes=config.max_output_bytes,
+                )
+            finally:
+                first.shutdown()
+
+            recovering = JobManager(
+                config,
+                runner=lambda *_args, **_kwargs: self.fail("invalid source was replayed"),
+            )
+            try:
+                current = recovering.get_job(job_id)
+                self.assertIsNotNone(current)
+                self.assertEqual("interrupted", current.state)
+            finally:
+                recovering.shutdown()
+
+    def test_restart_rejects_queued_job_pointing_to_another_job_input(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = make_config(root)
+            job_id = "a99a9999-9999-4999-9999-a99999999999"
+            other_job_id = "b00b0000-0000-4000-9000-b00000000000"
+            source_pdf_bytes = b"%PDF-1.7\nother-job-input\n%%EOF\n"
+            source_pdf_sha256 = hashlib.sha256(source_pdf_bytes).hexdigest()
+            other_input_path = config.input_root / other_job_id / "source.pdf"
+            other_input_path.parent.mkdir(parents=True)
+            other_input_path.write_bytes(source_pdf_bytes)
+
+            first = JobManager(config, runner=lambda *_args, **_kwargs: None)
+            try:
+                first.store.create_job(
+                    job_id=job_id,
+                    original_name="cross-job-input.pdf",
+                    input_path=str(other_input_path),
+                    output_dir=str(config.output_root / job_id),
+                    state="queued",
+                    input_sha256=source_pdf_sha256,
+                    input_size_bytes=len(source_pdf_bytes),
+                    reserved_output_bytes=config.max_output_bytes,
+                )
+            finally:
+                first.shutdown()
+
+            calls: list[list[str]] = []
+            recovering = JobManager(
+                config,
+                runner=lambda command, **_kwargs: calls.append(list(command)),
+            )
+            try:
+                current = recovering.get_job(job_id)
+                self.assertIsNotNone(current)
+                self.assertEqual("interrupted", current.state)
+                self.assertEqual([], calls)
+            finally:
+                recovering.shutdown()
+
+    @unittest.skipIf(os.name == "nt", "symlink recovery requires POSIX")
+    def test_restart_rejects_queued_job_with_symlinked_input_parent(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = make_config(root)
+            job_id = "b11b1111-1111-4111-9111-b11111111111"
+            source_pdf_bytes = b"%PDF-1.7\nsymlinked-parent\n%%EOF\n"
+            source_pdf_sha256 = hashlib.sha256(source_pdf_bytes).hexdigest()
+            real_input_dir = config.input_root / "real-source"
+            real_input_dir.mkdir(parents=True)
+            (real_input_dir / "source.pdf").write_bytes(source_pdf_bytes)
+            (config.input_root / job_id).symlink_to(
+                real_input_dir,
+                target_is_directory=True,
+            )
+            input_path = config.input_root / job_id / "source.pdf"
+
+            first = JobManager(config, runner=lambda *_args, **_kwargs: None)
+            try:
+                first.store.create_job(
+                    job_id=job_id,
+                    original_name="symlinked-parent.pdf",
+                    input_path=str(input_path),
+                    output_dir=str(config.output_root / job_id),
+                    state="queued",
+                    input_sha256=source_pdf_sha256,
+                    input_size_bytes=len(source_pdf_bytes),
+                    reserved_output_bytes=config.max_output_bytes,
+                )
+            finally:
+                first.shutdown()
+
+            calls: list[list[str]] = []
+            recovering = JobManager(
+                config,
+                runner=lambda command, **_kwargs: calls.append(list(command)),
+            )
+            try:
+                current = recovering.get_job(job_id)
+                self.assertIsNotNone(current)
+                self.assertEqual("interrupted", current.state)
+                self.assertEqual([], calls)
+            finally:
+                recovering.shutdown()
 
     def test_restart_marks_nonterminal_jobs_interrupted(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

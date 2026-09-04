@@ -9,7 +9,9 @@ rewrite document surfaces.
 ``regions.json`` is the detailed bounded inventory.  ``quality_signals.json``
 is a compact summary suitable for callers that do not need to load every
 record.  The public :func:`evaluate_regions` function is also usable by a
-stand-alone post-publish validator and by the production adapter.
+stand-alone post-publish validator and by the production adapter.  Callers
+must serialize writers for a given output directory; the production path does
+this with its persistent per-job lock and fresh-output guard.
 """
 
 from __future__ import annotations
@@ -30,7 +32,7 @@ from typing import Any, Iterable
 
 
 SCHEMA_VERSION = 1
-DEFAULT_MAX_RECORDS = 1000
+DEFAULT_MAX_RECORDS = 10_000
 REGION_STATUSES = ("verified_semantic", "visual_only", "unresolved")
 STRUCTURAL_KINDS = ("table", "algorithm", "code", "formula", "inline_math")
 
@@ -43,8 +45,13 @@ MAX_SOURCE_PDF_BYTES = 4 * 1024 * 1024 * 1024
 MAX_DOCUMENT_NODES = 100_000
 MAX_TABLE_CELLS = 65_536
 MAX_RESIDUAL_SURFACES = 32
-MAX_LIST_ITEMS = DEFAULT_MAX_RECORDS + 1
+# Producer-owned lists remain tightly bounded even though the aggregate
+# diagnostic sidecar can retain records collected across several categories.
+MAX_LIST_ITEMS = 1001
 MAX_BINDING_TEXT_CHARS = 100_000
+# Keep regions sidecar payloads within an explicit byte limit.  The validator
+# remains stdlib-only, fail-closed, and side-effect deterministic on overflow.
+MAX_REGIONS_JSON_BYTES = 128 * 1024 * 1024
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _SAFE_SOURCE_REF_RE = re.compile(r"[^A-Za-z0-9_.:/#@+\-]+")
@@ -241,6 +248,40 @@ def _first_bbox(node: Any) -> dict[str, Any] | None:
     return _safe_bbox(node.get("bbox"))
 
 
+def _page_provenance_bbox_union(
+    node: Any, page_no: int | None
+) -> dict[str, Any] | None:
+    """Return one fail-closed union for all provenance on *page_no*."""
+
+    if not isinstance(node, dict) or page_no is None:
+        return None
+    prov = node.get("prov")
+    if not isinstance(prov, list) or len(prov) > MAX_LIST_ITEMS:
+        return None
+    page_bboxes: list[dict[str, Any]] = []
+    for provenance in prov[:MAX_LIST_ITEMS]:
+        if not isinstance(provenance, dict):
+            return None
+        provenance_page = _safe_page(provenance.get("page_no"))
+        if provenance_page is None:
+            return None
+        if provenance_page != page_no:
+            continue
+        bbox = _safe_bbox(provenance.get("bbox"))
+        if bbox is None:
+            return None
+        page_bboxes.append(bbox)
+    if not page_bboxes:
+        return None
+    # A multi-line paragraph stays in one column.  Refuse to turn unrelated
+    # same-page boxes into one large acceptance area across column gutters.
+    common_left = max(float(bbox["l"]) for bbox in page_bboxes)
+    common_right = min(float(bbox["r"]) for bbox in page_bboxes)
+    if common_right <= common_left:
+        return None
+    return _bbox_union(page_bboxes)
+
+
 def _first_page(node: Any) -> int | None:
     if not isinstance(node, dict):
         return None
@@ -401,6 +442,26 @@ def _document_nodes(document_json: Any, labels: set[str] | None = None) -> list[
     return records
 
 
+def _node_bbox_for_page(
+    node_item: dict[str, Any], page_no: int | None
+) -> dict[str, Any] | None:
+    """Resolve a node bbox for one page without weakening provenance checks."""
+
+    # Preserve the existing one-final-node/one-occurrence contract for nodes
+    # that span pages.  This helper only repairs fragmented physical boxes on
+    # the node's already-selected page; cross-page binding still fails closed.
+    if page_no is None or node_item.get("page_no") != page_no:
+        return None
+    node = node_item.get("node")
+    if isinstance(node, dict):
+        provenance = node.get("prov")
+        if isinstance(provenance, list) and provenance:
+            return _page_provenance_bbox_union(node, page_no)
+        if provenance is not None and not isinstance(provenance, list):
+            return None
+    return _safe_bbox(node_item.get("bbox"))
+
+
 def _safe_asset(output_dir: Path, value: Any) -> str | None:
     """Return a safe relative asset path only when the file is regular."""
 
@@ -526,7 +587,12 @@ def _read_json(path: Path) -> tuple[Any, str | None]:
         return None, f"json_read_failed:{type(exc).__name__}"
 
 
-def _atomic_json(path: Path, payload: Any) -> str | None:
+def _atomic_json(
+    path: Path,
+    payload: Any,
+    *,
+    max_bytes: int | None = None,
+) -> str | None:
     """Write a sidecar through the evaluation's pinned root directory fd.
 
     A path-based ``mkstemp``/``replace`` pair is vulnerable when the output
@@ -575,6 +641,8 @@ def _atomic_json(path: Path, payload: Any) -> str | None:
             json.dump(payload, handle, indent=2, ensure_ascii=False, sort_keys=True)
             handle.write("\n")
             handle.flush()
+            if max_bytes is not None and os.fstat(handle.fileno()).st_size > max_bytes:
+                return "sidecar_payload_exceeds_max_bytes"
             os.fsync(handle.fileno())
         # Re-check the destination entry immediately before replacement; a
         # newly-created symlink is never replaced by this writer.
@@ -610,6 +678,61 @@ def _atomic_json(path: Path, payload: Any) -> str | None:
             except OSError:
                 pass
     return None
+
+
+def _remove_stale_published_file(path: Path) -> str | None:
+    """Remove a failed output's previous regular-file generation safely.
+
+    A failed replacement must not leave an older file that looks like the
+    result of the current evaluation.  Use the same pinned directory inode as
+    :func:`_atomic_json`; refuse links and non-regular entries rather than
+    following or replacing them.
+    """
+
+    context = _root_context_for(path.parent)
+    if context is None:
+        return "sidecar_root_context_missing"
+    if not _root_path_matches_context(path.parent, context):
+        return "output_root_changed"
+    root_fd: int | None = None
+    try:
+        root_fd = os.dup(context[1])
+        try:
+            existing = os.lstat(path.name, dir_fd=root_fd)
+        except FileNotFoundError:
+            return None
+        if not stat.S_ISREG(existing.st_mode):
+            return "stale_output_path_not_regular"
+        os.unlink(path.name, dir_fd=root_fd)
+        if not _root_path_matches_context(path.parent, context):
+            return "output_root_changed_after_cleanup"
+    except OSError as exc:
+        return f"stale_output_cleanup_failed:{type(exc).__name__}"
+    finally:
+        if root_fd is not None:
+            try:
+                os.close(root_fd)
+            except OSError:
+                pass
+    return None
+
+
+def _prune_advertised_outputs(state: Any, names: Iterable[str]) -> None:
+    """Remove failed sidecar names from known persisted output inventories."""
+
+    if not isinstance(state, dict):
+        return
+    failed = set(names)
+    if not failed:
+        return
+    for key in ("generated_outputs", "outputs_written"):
+        values = state.get(key)
+        if isinstance(values, list):
+            values[:] = [
+                value
+                for value in values
+                if not (isinstance(value, str) and value in failed)
+            ]
 
 
 def _unique(values: Iterable[Any], limit: int = 8) -> list[str]:
@@ -740,14 +863,33 @@ def _record(
 
 
 def _source_signals(status: dict[str, Any], metadata: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
-    quality = status.get("quality_signals") if isinstance(status, dict) else None
-    if not isinstance(quality, dict):
-        quality = {}
+    status_quality = status.get("quality_signals") if isinstance(status, dict) else None
+    quality = status_quality if isinstance(status_quality, dict) else {}
     metadata_quality = metadata.get("quality_signals") if isinstance(metadata, dict) else None
+    quality_inventory_declared = (
+        isinstance(status_quality, dict)
+        and "picture_surface_inventory" in status_quality
+    ) or (
+        isinstance(metadata_quality, dict)
+        and "picture_surface_inventory" in metadata_quality
+    )
     if isinstance(metadata_quality, dict):
         merged = dict(metadata_quality)
         merged.update(quality)
         quality = merged
+    # The adapter historically wrote the picture ledger at metadata top level
+    # while newer paths mirror it under quality_signals.  Use the top-level
+    # value only when neither quality-signals namespace declares the key; a
+    # malformed declared value must remain authoritative and fail closed.
+    if (
+        not quality_inventory_declared
+        and isinstance(metadata, dict)
+        and "picture_surface_inventory" in metadata
+    ):
+        quality = dict(quality)
+        quality["picture_surface_inventory"] = metadata.get(
+            "picture_surface_inventory"
+        )
     source_visuals = quality.get("final_source_visuals")
     if not isinstance(source_visuals, dict):
         source_visuals = metadata.get("final_source_visuals") if isinstance(metadata, dict) else None
@@ -1443,6 +1585,52 @@ def _bbox_contains(outer: Any, inner: Any, *, tolerance: float = 1.0) -> bool:
     )
 
 
+def _bbox_intersects(left: Any, right: Any) -> bool:
+    lhs = _safe_bbox(left)
+    rhs = _safe_bbox(right)
+    if (
+        lhs is None
+        or rhs is None
+        or lhs.get("coord_origin") != rhs.get("coord_origin")
+    ):
+        return False
+    lhs_low, lhs_high = sorted((lhs["t"], lhs["b"]))
+    rhs_low, rhs_high = sorted((rhs["t"], rhs["b"]))
+    return bool(
+        min(lhs["r"], rhs["r"]) > max(lhs["l"], rhs["l"])
+        and min(lhs_high, rhs_high) > max(lhs_low, rhs_low)
+    )
+
+
+def _node_page_provenance_intersects(
+    node_item: dict[str, Any], page_no: int | None, bbox: Any
+) -> bool:
+    """Require a contained crop to touch real provenance, not a union gap."""
+
+    if page_no is None:
+        return False
+    node = node_item.get("node")
+    if isinstance(node, dict):
+        provenance = node.get("prov")
+        if isinstance(provenance, list) and provenance:
+            if len(provenance) > MAX_LIST_ITEMS:
+                return False
+            intersects = False
+            for item in provenance[:MAX_LIST_ITEMS]:
+                if not isinstance(item, dict):
+                    return False
+                item_page = _safe_page(item.get("page_no"))
+                item_bbox = _safe_bbox(item.get("bbox"))
+                if item_page is None or item_bbox is None:
+                    return False
+                if item_page == page_no and _bbox_intersects(item_bbox, bbox):
+                    intersects = True
+            return intersects
+        if provenance is not None and not isinstance(provenance, list):
+            return False
+    return _bbox_intersects(node_item.get("bbox"), bbox)
+
+
 def _bbox_union(values: Iterable[Any]) -> dict[str, Any] | None:
     boxes = [_safe_bbox(value) for value in values]
     safe_boxes = [box for box in boxes if box is not None]
@@ -1835,7 +2023,8 @@ def _table_numeric_signal(value: Any) -> int:
 
     A cell such as ``[1, 2]``, ``(3, 4)``, ``1–2`` or ``4 ± 0.2`` is one
     semantic value/range, not evidence that a source row was flattened.  The
-    collapsed-row heuristic therefore opts out for these explicit forms.
+    multiline-row ambiguity heuristic therefore opts out for these explicit
+    forms.
     """
 
     text = _text(value, 500)
@@ -1849,13 +2038,13 @@ def _table_numeric_signal(value: Any) -> int:
 
 
 def _table_topology_diagnostics(document_json: Any) -> dict[str, dict[str, Any]]:
-    """Independently flag semantic cells that collapse source row geometry.
+    """Independently flag semantic cells with multiline row ambiguity.
 
     The source-visual producer can prove that a crop is bound to the right
     table while still accepting a wrong grid.  These checks use only the final
     document's cell offsets and bboxes: a one-row cell may not span another
     semantic row center, and repeated tall multi-number cells in one body row
-    indicate that several visual rows were flattened into one semantic row.
+    indicate that one semantic row may encode multiple visual row values.
     """
 
     diagnostics: dict[str, dict[str, Any]] = {}
@@ -1961,7 +2150,7 @@ def _table_topology_diagnostics(document_json: Any) -> dict[str, dict[str, Any]]
                     row_centers[row_index] = float(statistics.median(compact_centers))
 
         cross_row_cell_count = 0
-        collapsed_rows: list[int] = []
+        multiline_row_ambiguity_rows: list[int] = []
         if baseline_height and baseline_height > 0:
             for cell in cells:
                 if (
@@ -1990,7 +2179,7 @@ def _table_topology_diagnostics(document_json: Any) -> dict[str, dict[str, Any]]
                     count = int(cell["number_count"])
                     repeated_counts[count] = repeated_counts.get(count, 0) + 1
                 if any(count >= 2 for count in repeated_counts.values()):
-                    collapsed_rows.append(row_index)
+                    multiline_row_ambiguity_rows.append(row_index)
 
         reasons: list[str] = []
         if not raw_cells:
@@ -2025,8 +2214,8 @@ def _table_topology_diagnostics(document_json: Any) -> dict[str, dict[str, Any]]
                 reasons.append("table_cell_occupancy_incomplete")
         if cross_row_cell_count:
             reasons.append("table_cell_crosses_semantic_row_boundary")
-        if collapsed_rows:
-            reasons.append("table_row_likely_collapsed")
+        if multiline_row_ambiguity_rows:
+            reasons.append("table_multiline_row_ambiguity")
         diagnostics[source_ref] = {
             "geometry_checked": bool(cells and baseline_height),
             "cell_count": raw_cell_count,
@@ -2045,7 +2234,7 @@ def _table_topology_diagnostics(document_json: Any) -> dict[str, dict[str, Any]]
                 round(baseline_height, 4) if baseline_height is not None else None
             ),
             "cross_row_cell_count": cross_row_cell_count,
-            "collapsed_row_indexes": collapsed_rows[:32],
+            "multiline_row_ambiguity_indexes": multiline_row_ambiguity_rows[:32],
             "reasons": reasons,
         }
     return diagnostics
@@ -2408,7 +2597,7 @@ def _structural_region_records(
                         "invalid_cell_geometry_count",
                         "baseline_line_height",
                         "cross_row_cell_count",
-                        "collapsed_row_indexes",
+                        "multiline_row_ambiguity_indexes",
                     )
                 },
             }
@@ -3224,13 +3413,13 @@ def _inline_math_records(
                     region.get("page_no") or candidate.get("page_no")
                 )
                 declared_bbox = region.get("bbox") or candidate.get("bbox")
-                if (
-                    declared_page is not None
-                    and body_node_item.get("page_no") != declared_page
-                ):
+                final_node_bbox = _node_bbox_for_page(
+                    body_node_item, declared_page
+                )
+                if declared_page is not None and final_node_bbox is None:
                     reasons.append("inline_math_final_node_page_mismatch")
                 if declared_bbox is not None and not _bbox_equal(
-                    declared_bbox, body_node_item.get("bbox")
+                    declared_bbox, final_node_bbox
                 ):
                     reasons.append("inline_math_final_node_bbox_mismatch")
                 expected_body_sha = _sha256(
@@ -3287,7 +3476,8 @@ def _inline_math_records(
                 for node_item in candidate_nodes:
                     if node_item.get("label") not in {"text", "paragraph", "list_item"}:
                         continue
-                    if node_item.get("page_no") != region_page:
+                    final_node_bbox = _node_bbox_for_page(node_item, region_page)
+                    if final_node_bbox is None:
                         continue
                     node_part_index = node_item.get("part_index")
                     if (
@@ -3297,9 +3487,12 @@ def _inline_math_records(
                     ):
                         continue
                     bbox_bound = (
-                        _bbox_contains(node_item.get("bbox"), safe_region_bbox)
+                        _bbox_contains(final_node_bbox, safe_region_bbox)
+                        and _node_page_provenance_intersects(
+                            node_item, region_page, safe_region_bbox
+                        )
                         if collection_bound
-                        else _bbox_equal(safe_region_bbox, node_item.get("bbox"))
+                        else _bbox_equal(safe_region_bbox, final_node_bbox)
                     )
                     if not bbox_bound:
                         continue
@@ -3651,33 +3844,655 @@ def _quarantine_records(output_dir: Path, quality: dict[str, Any]) -> list[dict[
     return records
 
 
-def _bare_picture_records(output_dir: Path, document_json: Any) -> list[dict[str, Any]]:
+def _picture_has_caption(node: dict[str, Any]) -> bool:
+    """Mirror the adapter's conservative caption-presence signal."""
+
+    captions = node.get("captions")
+    if isinstance(captions, (list, tuple, set)):
+        if any(
+            (
+                isinstance(item, str)
+                and bool(item.strip())
+            )
+            or (
+                isinstance(item, dict)
+                and bool(
+                    str(item.get("$ref") or "").strip()
+                    or str(item.get("text") or "").strip()
+                )
+            )
+            or (
+                not isinstance(item, (str, dict))
+                and item not in (None, "")
+            )
+            for item in captions
+        ):
+            return True
+    elif isinstance(captions, str) and captions.strip():
+        return True
+    elif isinstance(captions, dict) and (
+        str(captions.get("$ref") or "").strip()
+        or str(captions.get("text") or "").strip()
+    ):
+        return True
+    for key in ("caption", "caption_text"):
+        value = node.get(key)
+        if isinstance(value, str) and value.strip():
+            return True
+        if isinstance(value, dict) and (
+            str(value.get("$ref") or "").strip()
+            or str(value.get("text") or "").strip()
+        ):
+            return True
+    return False
+
+
+def _picture_is_formula_child(node: dict[str, Any]) -> bool:
+    parent = node.get("parent")
+    parent_ref = parent.get("$ref") if isinstance(parent, dict) else parent
+    if str(parent_ref or "").strip().startswith("#/formulas/"):
+        return True
+    parent_self_ref = parent.get("self_ref") if isinstance(parent, dict) else None
+    return str(parent_self_ref or "").strip().startswith("#/formulas/")
+
+
+def _picture_is_quarantined_or_furniture(node: dict[str, Any]) -> bool:
+    label = str(node.get("label") or "").casefold()
+    if label.startswith("quarantined_"):
+        return True
+    if str(node.get("content_layer") or "").casefold() == "furniture":
+        return True
+    qc = node.get("local_ai_lab_qc")
+    if isinstance(qc, dict):
+        for key in ("structural_quarantine", "structural_fragment_quarantine"):
+            value = qc.get(key)
+            if isinstance(value, dict):
+                action = str(value.get("action") or "").casefold()
+                if action == "quarantine_from_main_text_flow" or value:
+                    return True
+            elif value:
+                return True
+    return False
+
+
+def _picture_machine_binding_required(item: dict[str, Any]) -> bool:
+    """Classify source pictures without trusting the adapter inventory.
+
+    This intentionally follows the adapter's conservative contract: a
+    caption makes a picture required regardless of geometry; otherwise both
+    dimensions and area must clear the visual threshold.  Formula children,
+    quarantined/furniture nodes, and tiny/decorative pictures remain advisory.
+    """
+
+    node = item.get("node")
+    if not isinstance(node, dict):
+        return False
+    if _picture_is_quarantined_or_furniture(node) or _picture_is_formula_child(node):
+        return False
+    if _picture_has_caption(node):
+        return True
+    bbox = _safe_bbox(item.get("bbox"))
+    if bbox is None:
+        return False
+    width = abs(float(bbox["r"]) - float(bbox["l"]))
+    height = abs(float(bbox["t"]) - float(bbox["b"]))
+    return width >= 32.0 and height >= 32.0 and width * height >= 1500.0
+
+
+_PICTURE_INVENTORY_REQUIRED_FIELDS = {
+    "index",
+    "version",
+    "global_index",
+    "source_ref",
+    "self_ref",
+    "part_index",
+    "source_asset",
+    "source_pdf_sha256",
+    "asset_present",
+    "asset_sha256",
+    "machine_binding_expected",
+    "html_reference_count",
+    "markdown_reference_count",
+    "status",
+    "critical",
+    "reasons",
+}
+_PICTURE_INVENTORY_EXPECTED_GEOMETRY_FIELDS = {"page_no", "bbox"}
+
+
+def _picture_inventory_schema_record(
+    output_dir: Path,
+    reasons: Iterable[Any],
+    *,
+    signals: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build one hard-gated marker for a declared malformed inventory."""
+
+    return _record(
+        output_dir=output_dir,
+        kind="picture",
+        index="picture-surface-inventory-schema",
+        source_ref="picture_surface_inventory:schema",
+        status="unresolved",
+        critical=True,
+        reasons=reasons,
+        signals={"picture_surface_inventory": True, **(signals or {})},
+    )
+
+
+def _strict_inventory_int(value: Any, *, positive: bool = False) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    if positive and value <= 0:
+        return None
+    if not positive and value < 0:
+        return None
+    return value
+
+
+def _picture_inventory_record_complete(record: dict[str, Any]) -> bool:
+    return bool(
+        record.get("machine_binding_expected") is True
+        and record.get("status") == "visual_only"
+        and record.get("critical") is False
+        and not record.get("reasons")
+        and record.get("asset_present") is True
+        and record.get("html_reference_count") == 1
+        and record.get("markdown_reference_count") == 1
+        and _sha256(record.get("source_pdf_sha256")) is not None
+        and _sha256(record.get("asset_sha256")) is not None
+    )
+
+
+def _validate_picture_surface_inventory(
+    inventory: Any,
+) -> tuple[dict[str, Any] | None, list[str]]:
+    """Validate the adapter-owned picture binding ledger without coercion."""
+
+    if not isinstance(inventory, dict):
+        return None, ["picture_surface_inventory_schema_invalid"]
+    errors: list[str] = []
+    required_top_level = {
+        "version",
+        "ok",
+        "expected_count",
+        "bound_count",
+        "records",
+        "failure_reasons",
+    }
+    missing = sorted(required_top_level - inventory.keys())
+    if missing:
+        errors.append("picture_surface_inventory_fields_missing")
+    version = _strict_inventory_int(inventory.get("version"), positive=True)
+    if version != SCHEMA_VERSION:
+        errors.append("picture_surface_inventory_version_invalid")
+    if not isinstance(inventory.get("ok"), bool):
+        errors.append("picture_surface_inventory_ok_invalid")
+    expected_count = _strict_inventory_int(inventory.get("expected_count"))
+    bound_count = _strict_inventory_int(inventory.get("bound_count"))
+    if expected_count is None:
+        errors.append("picture_surface_inventory_expected_count_invalid")
+    elif expected_count > MAX_LIST_ITEMS:
+        errors.append("picture_surface_inventory_expected_count_exceeded")
+    if bound_count is None:
+        errors.append("picture_surface_inventory_bound_count_invalid")
+    elif bound_count > MAX_LIST_ITEMS:
+        errors.append("picture_surface_inventory_bound_count_exceeded")
+    raw_records = inventory.get("records")
+    if not isinstance(raw_records, list):
+        errors.append("picture_surface_inventory_records_invalid")
+        raw_records = []
+    elif len(raw_records) > MAX_LIST_ITEMS:
+        errors.append("picture_surface_inventory_records_exceeded")
+    raw_failures = inventory.get("failure_reasons")
+    if not isinstance(raw_failures, list) or len(raw_failures) > MAX_LIST_ITEMS:
+        errors.append("picture_surface_inventory_failure_reasons_invalid")
+    elif any(not isinstance(reason, str) or not _text(reason, 140) for reason in raw_failures):
+        errors.append("picture_surface_inventory_failure_reasons_invalid")
+    record_count = inventory.get("record_count")
+    if record_count is not None and _strict_inventory_int(record_count) is None:
+        errors.append("picture_surface_inventory_record_count_invalid")
+    if (
+        record_count is not None
+        and _strict_inventory_int(record_count) is not None
+        and isinstance(raw_records, list)
+        and record_count != len(raw_records)
+    ):
+        errors.append("picture_surface_inventory_record_count_mismatch")
+
+    records: list[dict[str, Any]] = []
+    seen_indexes: set[int] = set()
+    seen_refs: set[str] = set()
+    for ordinal, candidate in enumerate(raw_records, start=1):
+        if not isinstance(candidate, dict):
+            errors.append("picture_surface_inventory_record_invalid")
+            continue
+        expected = candidate.get("machine_binding_expected") is True
+        required_fields = set(_PICTURE_INVENTORY_REQUIRED_FIELDS)
+        if expected:
+            required_fields.update(_PICTURE_INVENTORY_EXPECTED_GEOMETRY_FIELDS)
+        missing_fields = required_fields - candidate.keys()
+        if missing_fields:
+            errors.append("picture_surface_inventory_record_fields_missing")
+        version = _strict_inventory_int(candidate.get("version"), positive=True)
+        if version != SCHEMA_VERSION:
+            errors.append("picture_surface_inventory_record_version_invalid")
+        index = _strict_inventory_int(candidate.get("index"), positive=True)
+        if index is None or index > MAX_LIST_ITEMS:
+            errors.append("picture_surface_inventory_record_index_invalid")
+        elif index in seen_indexes:
+            errors.append("picture_surface_inventory_duplicate_index")
+        else:
+            seen_indexes.add(index)
+        source_ref = candidate.get("source_ref")
+        if source_ref is not None:
+            safe_ref, invalid_ref = _strict_exact_source_ref(source_ref, limit=180)
+            if invalid_ref or safe_ref is None:
+                errors.append("picture_surface_inventory_source_ref_invalid")
+            elif safe_ref in seen_refs:
+                errors.append("picture_surface_inventory_duplicate_source_ref")
+            else:
+                seen_refs.add(safe_ref)
+        self_ref = candidate.get("self_ref")
+        if not isinstance(self_ref, str):
+            errors.append("picture_surface_inventory_self_ref_invalid")
+        part_index = candidate.get("part_index")
+        if (
+            part_index is not None
+            and (
+                isinstance(part_index, bool)
+                or not isinstance(part_index, int)
+                or part_index < 0
+            )
+        ):
+            errors.append("picture_surface_inventory_part_index_invalid")
+        for field in ("asset_present", "machine_binding_expected", "critical"):
+            if not isinstance(candidate.get(field), bool):
+                errors.append(f"picture_surface_inventory_{field}_invalid")
+        page_no = _strict_inventory_int(candidate.get("page_no"), positive=True)
+        if page_no is None and expected:
+            errors.append("picture_surface_inventory_page_no_invalid")
+        if _safe_bbox(candidate.get("bbox")) is None and expected:
+            errors.append("picture_surface_inventory_bbox_invalid")
+        # Geometry is optional for deliberately nonexpected/advisory records,
+        # but a producer that supplies it must still use the contract types.
+        # ``None`` is treated like omission for those records so a diagnostic
+        # record can explicitly carry an unknown geometry without becoming a
+        # hard schema failure.
+        if not expected and candidate.get("page_no") is not None and page_no is None:
+            errors.append("picture_surface_inventory_page_no_invalid")
+        if (
+            not expected
+            and candidate.get("bbox") is not None
+            and _safe_bbox(candidate.get("bbox")) is None
+        ):
+            errors.append("picture_surface_inventory_bbox_invalid")
+        global_index = _strict_inventory_int(
+            candidate.get("global_index"), positive=True
+        )
+        if global_index is None or global_index > MAX_LIST_ITEMS:
+            errors.append("picture_surface_inventory_global_index_invalid")
+        elif index is not None and global_index != index:
+            errors.append("picture_surface_inventory_global_index_mismatch")
+        source_asset = candidate.get("source_asset")
+        expected_asset = (
+            f"pictures/picture_{index}.png" if index is not None else None
+        )
+        if not isinstance(source_asset, str) or not source_asset:
+            errors.append("picture_surface_inventory_source_asset_invalid")
+        elif expected_asset is None or source_asset != expected_asset:
+            errors.append("picture_surface_inventory_source_asset_path_invalid")
+        for field in ("source_asset", "source_pdf_sha256", "asset_sha256"):
+            value = candidate.get(field)
+            if value is not None and not isinstance(value, str):
+                errors.append(f"picture_surface_inventory_{field}_invalid")
+        for field in ("source_pdf_sha256", "asset_sha256"):
+            value = candidate.get(field)
+            if value is not None and _sha256(value) is None:
+                errors.append(f"picture_surface_inventory_{field}_invalid")
+        for field in ("html_reference_count", "markdown_reference_count"):
+            if _strict_inventory_int(candidate.get(field)) is None:
+                errors.append(f"picture_surface_inventory_{field}_invalid")
+        if candidate.get("status") not in REGION_STATUSES:
+            errors.append("picture_surface_inventory_status_invalid")
+        reasons_value = candidate.get("reasons")
+        if not isinstance(reasons_value, list) or len(reasons_value) > MAX_LIST_ITEMS:
+            errors.append("picture_surface_inventory_record_reasons_invalid")
+        elif any(not isinstance(reason, str) or not _text(reason, 140) for reason in reasons_value):
+            errors.append("picture_surface_inventory_record_reasons_invalid")
+        # Retain only validated records.  A malformed declared ledger is
+        # handled by the caller as one critical schema marker, never as bare
+        # advisory picture evidence.
+        records.append(dict(candidate))
+
+    if not errors and isinstance(raw_records, list):
+        derived_expected = sum(
+            1 for record in records if record.get("machine_binding_expected") is True
+        )
+        derived_bound = sum(1 for record in records if _picture_inventory_record_complete(record))
+        if expected_count != derived_expected:
+            errors.append("picture_surface_inventory_expected_count_mismatch")
+        if bound_count != derived_bound:
+            errors.append("picture_surface_inventory_bound_count_mismatch")
+        # A non-deliverable tiny/furniture picture may retain bounded advisory
+        # reasons while the inventory remains healthy.  Only expected or
+        # explicitly critical records participate in top-level failure
+        # accounting; otherwise the adapter's conservative classification
+        # would make every intentionally omitted decoration a schema error.
+        visible_failure = any(
+            record.get("critical") is True
+            or (
+                record.get("machine_binding_expected") is True
+                and (
+                    record.get("status") == "unresolved"
+                    or bool(record.get("reasons"))
+                )
+            )
+            for record in records
+        )
+        inventory_ok = inventory.get("ok")
+        if inventory_ok is False and not visible_failure:
+            errors.append("picture_surface_inventory_ok_without_failure_record")
+        if inventory_ok is True and (raw_failures or visible_failure):
+            errors.append("picture_surface_inventory_ok_accounting_mismatch")
+    if errors:
+        return None, _unique(errors, limit=80)
+    return {
+        "version": version,
+        "ok": inventory["ok"],
+        "expected_count": expected_count,
+        "bound_count": bound_count,
+        "records": records,
+        "failure_reasons": list(raw_failures),
+        "record_count": len(records),
+    }, []
+
+
+def _bare_picture_records(
+    output_dir: Path,
+    document_json: Any,
+    quality: dict[str, Any] | None = None,
+    *,
+    source_pdf_sha256: str | None = None,
+    actual_source_pdf_sha256: str | None = None,
+) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
     pictures = _document_nodes(document_json, {"picture"})
-    for index, item in enumerate(pictures[:MAX_LIST_ITEMS], start=1):
-        source_asset = f"pictures/picture_{index}.png"
-        asset_present = _safe_asset(output_dir, source_asset) is not None
+    inventory_declared = isinstance(quality, dict) and "picture_surface_inventory" in quality
+    if not inventory_declared:
+        for index, item in enumerate(pictures[:MAX_LIST_ITEMS], start=1):
+            source_asset = f"pictures/picture_{index}.png"
+            asset_present = _safe_asset(output_dir, source_asset) is not None
+            records.append(
+                _record(
+                    output_dir=output_dir,
+                    kind="picture",
+                    index=index,
+                    page_no=item.get("raw_page_no", item.get("page_no")),
+                    bbox=item.get("bbox"),
+                    source_ref=item.get("source_ref") or f"picture:{index}",
+                    source_asset=source_asset,
+                    signals={
+                        "machine_binding_expected": False,
+                        "visual_evidence_present": asset_present,
+                    },
+                    status="visual_only" if asset_present else "unresolved",
+                    critical=False,
+                    reasons=(
+                        ["bare_picture_visual_evidence"]
+                        if asset_present
+                        else ["picture_visual_evidence_missing"]
+                    ),
+                    text_preview=item.get("text"),
+                )
+            )
+        if len(pictures) > MAX_LIST_ITEMS:
+            records.append(
+                _record(
+                    output_dir=output_dir,
+                    kind="picture",
+                    index="picture-limit",
+                    source_ref="picture:limit",
+                    status="unresolved",
+                    critical=True,
+                    reasons=["picture_record_limit_exceeded"],
+                )
+            )
+        return records
+
+    inventory, schema_errors = _validate_picture_surface_inventory(
+        quality.get("picture_surface_inventory") if isinstance(quality, dict) else None
+    )
+    if schema_errors or inventory is None:
+        return [
+            _picture_inventory_schema_record(
+                output_dir,
+                schema_errors or ["picture_surface_inventory_schema_invalid"],
+            )
+        ]
+    if actual_source_pdf_sha256 is None:
+        actual_source_pdf_sha256 = _hash_root_file(
+            output_dir, "source.pdf", max_bytes=MAX_SOURCE_PDF_BYTES
+        )
+    actual_source_pdf_sha256 = _sha256(actual_source_pdf_sha256)
+    inventory_records = inventory["records"]
+    by_ref = {
+        safe_ref: record
+        for record in inventory_records
+        if (safe_ref := _strict_exact_source_ref(record.get("source_ref"), limit=180)[0])
+    }
+    by_index = {
+        record["index"]: record
+        for record in inventory_records
+        if isinstance(record.get("index"), int)
+    }
+    matched_inventory_indexes: set[int] = set()
+    raw_ref_counts: dict[str, int] = {}
+    for item in pictures:
+        item_ref = item.get("source_ref")
+        if isinstance(item_ref, str):
+            raw_ref_counts[item_ref] = raw_ref_counts.get(item_ref, 0) + 1
+    duplicate_raw_refs = {
+        ref for ref, count in raw_ref_counts.items() if count > 1
+    }
+    for raw_index, item in enumerate(pictures[:MAX_LIST_ITEMS], start=1):
+        raw_ref = item.get("source_ref") if isinstance(item.get("source_ref"), str) else None
+        raw_ref_invalid = bool(item.get("source_ref_invalid"))
+        raw_machine_binding_required = _picture_machine_binding_required(item)
+        inventory_record = by_ref.get(raw_ref) if raw_ref else None
+        binding_mode = "source_ref" if inventory_record is not None else None
+        if inventory_record is None:
+            candidate = by_index.get(raw_index)
+            # An expected source picture must be bound by one exact, unique
+            # source_ref.  In particular, never let a missing/invalid producer
+            # ref pass by accidentally matching the inventory's ordinal index.
+            # Keep the legacy index fallback only for explicitly nonexpected
+            # advisory records with a genuinely absent (not malformed) ref.
+            if (
+                candidate is not None
+                and raw_ref is None
+                and not raw_ref_invalid
+                and not raw_machine_binding_required
+                and candidate.get("machine_binding_expected") is not True
+            ):
+                inventory_record = candidate
+                binding_mode = "index"
+        if inventory_record is None:
+            fallback_asset = f"pictures/picture_{raw_index}.png"
+            reasons = ["picture_surface_inventory_raw_picture_unbound"]
+            if raw_ref in duplicate_raw_refs:
+                reasons.append("picture_surface_inventory_duplicate_raw_source_ref")
+            if raw_ref_invalid:
+                reasons.append("picture_surface_inventory_raw_source_ref_invalid")
+            elif raw_ref is None:
+                reasons.append("picture_surface_inventory_raw_source_ref_missing")
+            records.append(
+                _record(
+                    output_dir=output_dir,
+                    kind="picture",
+                    index=raw_index,
+                    page_no=item.get("raw_page_no", item.get("page_no")),
+                    bbox=item.get("bbox"),
+                    source_ref=raw_ref or f"picture:{raw_index}",
+                    source_asset=fallback_asset,
+                    signals={
+                        "picture_surface_inventory": True,
+                        "machine_binding_expected": None,
+                        "raw_machine_binding_required": raw_machine_binding_required,
+                        "binding_mode": None,
+                    },
+                    status="unresolved",
+                    critical=True,
+                    reasons=reasons,
+                    text_preview=item.get("text"),
+                    id_namespace=("picture-inventory-unbound" if raw_ref in duplicate_raw_refs else None),
+                    id_source_ref=(f"raw:{raw_index}" if raw_ref in duplicate_raw_refs else None),
+                )
+            )
+            continue
+        matched_inventory_indexes.add(inventory_record["index"])
+        expected = inventory_record["machine_binding_expected"] is True
+        source_asset = inventory_record.get("source_asset")
+        declared_asset_present = inventory_record.get("asset_present") is True
+        declared_critical = inventory_record.get("critical") is True
+        safe_asset = _safe_asset(output_dir, source_asset)
+        actual_asset_sha = _hash_relative_asset(output_dir, safe_asset) if safe_asset else None
+        declared_asset_sha = _sha256(inventory_record.get("asset_sha256"))
+        reasons = list(inventory_record.get("reasons") or [])
+        severe = False
+        if inventory_record.get("status") != "visual_only":
+            reasons.append("picture_surface_inventory_status_not_visual_only")
+        if inventory_record.get("critical") is True:
+            reasons.append("picture_surface_inventory_declared_critical")
+        if declared_asset_present and safe_asset is None:
+            reasons.append("picture_surface_inventory_asset_missing_or_unsafe")
+            severe = True
+        elif declared_asset_present and actual_asset_sha is None:
+            reasons.append("picture_surface_inventory_asset_missing_or_unsafe")
+            severe = True
+        if declared_asset_present and declared_asset_sha is None:
+            reasons.append("picture_surface_inventory_asset_hash_missing")
+            severe = True
+        elif declared_asset_present and actual_asset_sha != declared_asset_sha:
+            reasons.append("picture_surface_inventory_asset_hash_mismatch")
+            severe = True
+        if not declared_asset_present:
+            reasons.append("picture_surface_inventory_asset_presence_false")
+        if inventory_record.get("html_reference_count") != 1:
+            reasons.append("picture_surface_inventory_html_reference_unverified")
+        if inventory_record.get("markdown_reference_count") != 1:
+            reasons.append("picture_surface_inventory_markdown_reference_unverified")
+        declared_source_sha = _sha256(inventory_record.get("source_pdf_sha256"))
+        if declared_source_sha is None:
+            reasons.append("picture_surface_inventory_source_pdf_hash_missing")
+        elif actual_source_pdf_sha256 is None or declared_source_sha != actual_source_pdf_sha256:
+            reasons.append("picture_surface_inventory_source_pdf_hash_mismatch")
+        if raw_ref in duplicate_raw_refs:
+            reasons.append("picture_surface_inventory_duplicate_raw_source_ref")
+            severe = True
+        if raw_machine_binding_required and not expected:
+            reasons.append("picture_surface_inventory_expected_binding_downgrade")
+            severe = True
+        inventory_page_no = _strict_inventory_int(
+            inventory_record.get("page_no"), positive=True
+        )
+        raw_page_no = _safe_page(item.get("page_no"))
+        if "page_no" in inventory_record and inventory_page_no is not None:
+            if raw_page_no is None or inventory_page_no != raw_page_no:
+                reasons.append("picture_surface_inventory_page_no_mismatch")
+        inventory_bbox = _safe_bbox(inventory_record.get("bbox"))
+        raw_bbox = _safe_bbox(item.get("bbox"))
+        if "bbox" in inventory_record and inventory_bbox is not None:
+            if raw_bbox is None or inventory_bbox != raw_bbox:
+                reasons.append("picture_surface_inventory_bbox_mismatch")
+        raw_node = item.get("node")
+        raw_self_ref = raw_node.get("self_ref") if isinstance(raw_node, dict) else None
+        if inventory_record.get("self_ref") != raw_self_ref:
+            reasons.append("picture_surface_inventory_self_ref_mismatch")
+        if inventory_record.get("part_index") != item.get("part_index"):
+            reasons.append("picture_surface_inventory_part_index_mismatch")
+        if "global_index" in inventory_record:
+            inventory_global_index = _strict_inventory_int(
+                inventory_record.get("global_index"), positive=True
+            )
+            if inventory_global_index is not None and inventory_global_index != raw_index:
+                reasons.append("picture_surface_inventory_global_index_mismatch")
+        complete = expected and not reasons and not severe
+        # Preserve an adapter-declared critical disposition even when the
+        # record is intentionally nonexpected.  Otherwise a malformed
+        # nonexpected record could be silently downgraded to advisory merely
+        # by passing through this region-side projection.
+        critical = bool(declared_critical or (expected and not complete) or severe)
+        status = "visual_only" if complete else "unresolved"
+        signals = {
+            "picture_surface_inventory": True,
+            "inventory_version": inventory["version"],
+            "inventory_index": inventory_record["index"],
+            "binding_mode": binding_mode,
+            "machine_binding_expected": expected,
+            "raw_machine_binding_required": raw_machine_binding_required,
+            "inventory_source_ref": inventory_record.get("source_ref"),
+            "inventory_self_ref": inventory_record.get("self_ref"),
+            "inventory_part_index": inventory_record.get("part_index"),
+            "inventory_page_no": inventory_record.get("page_no"),
+            "inventory_bbox": inventory_record.get("bbox"),
+            "inventory_source_asset": source_asset,
+            "inventory_source_pdf_sha256": inventory_record.get("source_pdf_sha256"),
+            "inventory_asset_present": inventory_record.get("asset_present"),
+            "inventory_asset_sha256": inventory_record.get("asset_sha256"),
+            "html_reference_count": inventory_record.get("html_reference_count"),
+            "markdown_reference_count": inventory_record.get("markdown_reference_count"),
+            "inventory_status": inventory_record.get("status"),
+            "inventory_critical": inventory_record.get("critical"),
+            "asset_present_actual": safe_asset is not None,
+            "asset_sha256_actual": actual_asset_sha,
+            "source_pdf_sha256_actual": actual_source_pdf_sha256,
+        }
         records.append(
             _record(
                 output_dir=output_dir,
                 kind="picture",
-                index=index,
-                page_no=item.get("raw_page_no", item.get("page_no")),
-                bbox=item.get("bbox"),
-                source_ref=item.get("source_ref") or f"picture:{index}",
+                index=raw_index,
+                page_no=inventory_record.get("page_no"),
+                bbox=inventory_record.get("bbox"),
+                source_ref=inventory_record.get("source_ref") or f"picture:{raw_index}",
                 source_asset=source_asset,
-                signals={
-                    "machine_binding_expected": False,
-                    "visual_evidence_present": asset_present,
-                },
-                status="visual_only" if asset_present else "unresolved",
-                critical=False,
-                reasons=(
-                    ["bare_picture_visual_evidence"]
-                    if asset_present
-                    else ["picture_visual_evidence_missing"]
-                ),
+                signals=signals,
+                status=status,
+                critical=critical,
+                reasons=reasons,
                 text_preview=item.get("text"),
+                id_namespace=("picture-inventory-duplicate-raw" if raw_ref in duplicate_raw_refs else None),
+                id_source_ref=(f"raw:{raw_index}" if raw_ref in duplicate_raw_refs else None),
+            )
+        )
+    for inventory_record in inventory_records:
+        if inventory_record["index"] in matched_inventory_indexes:
+            continue
+        expected = inventory_record["machine_binding_expected"] is True
+        reasons = ["picture_surface_inventory_record_unbound"]
+        if inventory_record.get("reasons"):
+            reasons.extend(inventory_record["reasons"])
+        records.append(
+            _record(
+                output_dir=output_dir,
+                kind="picture",
+                index=f"inventory-{inventory_record['index']}",
+                page_no=inventory_record.get("page_no"),
+                bbox=inventory_record.get("bbox"),
+                source_ref=inventory_record.get("source_ref") or f"picture:{inventory_record['index']}",
+                source_asset=inventory_record.get("source_asset"),
+                signals={
+                    "picture_surface_inventory": True,
+                    "inventory_index": inventory_record["index"],
+                    "machine_binding_expected": expected,
+                    "binding_mode": None,
+                },
+                status="unresolved",
+                critical=bool(expected or inventory_record.get("critical") is True),
+                reasons=reasons,
+                id_namespace="picture-inventory-unbound-record",
+                id_source_ref=f"inventory:{inventory_record['index']}",
             )
         )
     if len(pictures) > MAX_LIST_ITEMS:
@@ -3918,7 +4733,17 @@ def _evaluate_regions_impl(
     primary_counts = primary_counts if isinstance(primary_counts, dict) else {}
     records: list[dict[str, Any]] = []
     records.extend(_quarantine_records(root, quality))
-    records.extend(_bare_picture_records(root, document_json))
+    records.extend(
+        _bare_picture_records(
+            root,
+            document_json,
+            quality,
+            source_pdf_sha256=source_sha,
+            actual_source_pdf_sha256=source_identity_diagnostics.get(
+                "actual_source_pdf_sha256"
+            ),
+        )
+    )
     table_diagnostics = _table_topology_diagnostics(document_json)
     for kind in ("table", "algorithm", "code"):
         records.extend(
@@ -4035,12 +4860,26 @@ def _evaluate_regions_impl(
             "quality_signals.json": signals,
         }
         sidecar_errors: list[str] = []
+        failed_sidecar_names: set[str] = set()
         for name in sidecar_names:
-            write_error = _atomic_json(root / name, sidecar_payloads[name])
+            max_bytes = (
+                MAX_REGIONS_JSON_BYTES if name == "regions.json" else None
+            )
+            write_error = _atomic_json(
+                root / name,
+                sidecar_payloads[name],
+                max_bytes=max_bytes,
+            )
             if write_error:
+                failed_sidecar_names.add(name)
                 sidecar_errors.append(f"{name}:{write_error}")
+                cleanup_error = _remove_stale_published_file(root / name)
+                if cleanup_error:
+                    sidecar_errors.append(f"{name}:{cleanup_error}")
             else:
                 written_payloads[name] = sidecar_payloads[name]
+        _prune_advertised_outputs(metadata, failed_sidecar_names)
+        _prune_advertised_outputs(status, failed_sidecar_names)
         if sidecar_errors:
             mark_write_failure(sidecar_errors)
 
@@ -4087,6 +4926,11 @@ def _evaluate_regions_impl(
             write_error = _atomic_json(root / name, state_payload)
             if write_error:
                 state_errors.append(f"{name}:{write_error}")
+                cleanup_error = _remove_stale_published_file(root / name)
+                if cleanup_error:
+                    state_errors.append(f"{name}:{cleanup_error}")
+                _prune_advertised_outputs(metadata, (name,))
+                _prune_advertised_outputs(status, (name,))
             else:
                 written_payloads[name] = state_payload
         if state_errors:
@@ -4097,12 +4941,68 @@ def _evaluate_regions_impl(
         # the gate passed while its companion/state file failed to publish.
         if sidecar_errors or state_errors:
             rewrite_errors: list[str] = []
-            for name, state_payload in written_payloads.items():
-                write_error = _atomic_json(root / name, state_payload)
+            rewrite_failed_outputs: set[str] = set()
+            for name, state_payload in list(written_payloads.items()):
+                max_bytes = (
+                    MAX_REGIONS_JSON_BYTES if name == "regions.json" else None
+                )
+                write_error = _atomic_json(
+                    root / name,
+                    state_payload,
+                    max_bytes=max_bytes,
+                )
                 if write_error:
                     rewrite_errors.append(f"{name}:failure_state_{write_error}")
+                    rewrite_failed_outputs.add(name)
+                    cleanup_error = _remove_stale_published_file(root / name)
+                    if cleanup_error:
+                        rewrite_errors.append(f"{name}:{cleanup_error}")
+                    # Sidecars and metadata are inserted before status in
+                    # ``written_payloads``.  Prune immediately so subsequent
+                    # state rewrites cannot persist a stale advertisement.
+                    _prune_advertised_outputs(metadata, (name,))
+                    _prune_advertised_outputs(status, (name,))
+            for name in rewrite_failed_outputs:
+                written_payloads.pop(name, None)
+            _prune_advertised_outputs(metadata, rewrite_failed_outputs)
+            _prune_advertised_outputs(status, rewrite_failed_outputs)
             if rewrite_errors:
                 mark_write_failure(rewrite_errors)
+                # A late failure (especially status.json, which is normally
+                # last) can change an output inventory after an earlier state
+                # file was rewritten.  Re-publish surviving targets until one
+                # complete pass succeeds.  Permanently failing targets are
+                # removed from the set, so this converges in a bounded number
+                # of passes and never leaves an older regular generation.
+                for _attempt in range(len(written_payloads) + 1):
+                    reconciliation_errors: list[str] = []
+                    for name, state_payload in list(written_payloads.items()):
+                        max_bytes = (
+                            MAX_REGIONS_JSON_BYTES
+                            if name == "regions.json"
+                            else None
+                        )
+                        write_error = _atomic_json(
+                            root / name,
+                            state_payload,
+                            max_bytes=max_bytes,
+                        )
+                        if not write_error:
+                            continue
+                        reconciliation_errors.append(
+                            f"{name}:failure_state_reconcile_{write_error}"
+                        )
+                        cleanup_error = _remove_stale_published_file(root / name)
+                        if cleanup_error:
+                            reconciliation_errors.append(
+                                f"{name}:{cleanup_error}"
+                            )
+                        written_payloads.pop(name, None)
+                        _prune_advertised_outputs(metadata, (name,))
+                        _prune_advertised_outputs(status, (name,))
+                    if not reconciliation_errors:
+                        break
+                    mark_write_failure(reconciliation_errors)
     return {
         **payload,
         "quality_signals": signals,
@@ -4121,7 +5021,10 @@ def evaluate_regions(
     max_records: int = DEFAULT_MAX_RECORDS,
     write_sidecars: bool = True,
 ) -> dict[str, Any]:
-    """Pin *output_dir* for one evaluation and release it on every exit path."""
+    """Pin *output_dir* for one evaluation and release it on every exit path.
+
+    Calls that write sidecars must be serialized per output directory.
+    """
 
     root = Path(output_dir)
     root_fd: int | None = None

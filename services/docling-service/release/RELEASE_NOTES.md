@@ -4,9 +4,16 @@
 
 - the quality adapter now writes bounded, deterministic `regions.json` and
   `quality_signals.json` sidecars covering picture OCR, header/footer,
-  pictures, tables, algorithms, code, display formulas, and inline math;
+  pictures, tables, algorithms, code, display formulas, and inline math.
+  Region sidecar output is request-bounded up to a 10,000-record hard cap
+  (input untrusted traversal cap remains 1,001); `regions.json` itself is also
+  fail-closed on explicit byte overflow.
 - critical regions use explicit `verified_semantic` / `unresolved` outcomes;
-  bare pictures may be `visual_only` only when their regular crop exists.
+  each machine-binding-expected source picture must preserve source identity,
+  crop hash, and one real image reference on both HTML and Markdown surfaces.
+  Missing or tampered expected pictures fail closed; deliberately omitted
+  tiny/decorative, furniture, quarantined, and formula-child pictures remain
+  noncritical advisory records.
   Truncation, unsafe/missing evidence, or a sidecar write failure is fail-closed;
 - structural evidence is rebound to the final document node/body, source-PDF
   digest, page/bbox, and a kind-specific source asset. Multi-page algorithms
@@ -20,9 +27,15 @@
   fallback;
 - inline-math binding preserves operators, relations, punctuation, and Unicode
   math symbols while normalizing presentation-only subscript separators, and
-  rejects truncated candidate expressions;
+  rejects truncated candidate expressions. Final-node binding unions all valid
+  same-page provenance boxes, so a multi-line paragraph is not rejected merely
+  because its inline region extends beyond the first physical text box;
+- display-equation numbers are recovered from unique, source-adjacent PDF
+  geometry in either column. Page-wide guesses and formula-body parentheses are
+  rejected, so HTML and Markdown keep real labels without promoting `y(0)`;
 - picture-contained OCR can no longer re-enter the main body through the
-  algorithm-grouping path, and the PDF inventory recognizes strict
+  algorithm-grouping path or become code/algorithm evidence candidates, and
+  the PDF inventory recognizes strict
   definition/procedure-style algorithms whose numbered steps continue on the
   next page;
 - the Docker API image and release bundle include the new stdlib-only region
@@ -55,6 +68,11 @@
 - unauthenticated downloads use the browser's native streaming path. Bearer-
   protected browser downloads are capped at 256 MiB; use a streaming API
   client for larger protected artifacts.
+- after an API restart, a queued job is resumed once dependencies are healthy
+  only when its exact immutable input still matches its digest and neither
+  output path exists. Running jobs and any partial/ambiguous publication state
+  remain fail-closed as `interrupted`; a validated staging tree is never
+  discarded for a concurrently created target.
 
 This section describes the current source tree and the next release. The
 published `v1.1.1` archives and container images do not contain this Web UI.

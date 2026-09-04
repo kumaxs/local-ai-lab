@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import copy
+import os
 import re
 import sys
 import tempfile
@@ -80,6 +82,845 @@ def _table_item(cells, *, rows, cols):
 
 
 class SemanticReadabilityRegressionTests(unittest.TestCase):
+    @staticmethod
+    def _simple_fraction_fixture() -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        runs = [
+            {
+                "text": "1",
+                "size": 7.0,
+                "fontname": "CMR7",
+                "bbox": {"l": 10.0, "r": 13.0, "t": 60.0, "b": 55.0},
+            },
+            {
+                "text": "N",
+                "size": 7.0,
+                "fontname": "CMMI7",
+                "bbox": {"l": 9.0, "r": 14.0, "t": 45.0, "b": 40.0},
+            },
+        ]
+        spans = [
+            {
+                "name": "geometry_math_span-fraction_rule-p1-occ0-x9",
+                "reason": "fraction_rule",
+                "rule_y": 50.0,
+                "bbox": {"l": 8.0, "r": 15.0, "t": 61.0, "b": 39.0},
+                "repair_bbox": {"l": 8.0, "r": 15.0, "t": 61.0, "b": 39.0},
+                "source_text": "1N",
+            }
+        ]
+        return runs, spans
+
+    def _cross_row_hole_fixture(
+        self,
+        *,
+        candidate_text: str = "2144 2764",
+        target_text: str | None = None,
+        row_centers: tuple[tuple[float, float], ...] | None = None,
+        rows: int = 2,
+        cols: int = 4,
+        chunked: bool = False,
+    ) -> tuple[dict[str, Any], Any]:
+        class HoleSource:
+            def __init__(self) -> None:
+                self.calls = 0
+                self.closed = False
+
+            def lines(self, _prov: dict[str, Any], *, padding: float = 0.0) -> list[dict[str, Any]]:
+                self.calls += 1
+                return [
+                    {"text": "2144", "top": 10.0, "bottom": 20.0, "x0": 61.0, "x1": 74.0},
+                    {"text": "2764", "top": 30.0, "bottom": 40.0, "x0": 61.0, "x1": 74.0},
+                ]
+
+            def close(self) -> None:
+                self.closed = True
+
+        source = HoleSource()
+        if row_centers is None:
+            row_centers = tuple((15.0, 35.0) for _ in range(max(cols - 1, 0)))
+        cells: list[dict[str, Any]] = []
+        for row in range(rows):
+            for col in range(cols):
+                if row == 1 and col == 3 and target_text is None:
+                    continue
+                text = f"r{row}c{col}"
+                top = 10.0 + row * 20.0
+                bottom = 20.0 + row * 20.0
+                if col < len(row_centers):
+                    current_center, next_center = row_centers[col]
+                    center = current_center if row == 0 else next_center
+                    top, bottom = center - 5.0, center + 5.0
+                if row == 0 and col == 3:
+                    text = candidate_text
+                    top, bottom = 10.0, 40.0
+                if row == 1 and col == 3:
+                    text = target_text or ""
+                cells.append(
+                    {
+                        "start_row_offset_idx": row,
+                        "end_row_offset_idx": row + 1,
+                        "start_col_offset_idx": col,
+                        "end_col_offset_idx": col + 1,
+                        "text": text,
+                        "bbox": {
+                            "l": col * 20.0,
+                            "r": col * 20.0 + 15.0,
+                            "t": top,
+                            "b": bottom,
+                            "coord_origin": "TOPLEFT",
+                        },
+                    }
+                )
+        table = {
+            "self_ref": "#/tables/0",
+            "label": "table",
+            "prov": [{"page_no": 1}],
+            "data": {
+                "num_rows": rows,
+                "num_cols": cols,
+                "table_cells": cells,
+                "grid": [
+                    [
+                        (candidate_text if row == 0 and col == 3 else "" if row == 1 and col == 3 else f"r{row}c{col}")
+                        for col in range(cols)
+                    ]
+                    for row in range(rows)
+                ],
+            },
+        }
+        document: dict[str, Any] = {
+            "schema_name": "local_ai_lab_docling_serve_chunked" if chunked else "docling_document",
+            "tables": [table],
+        }
+        if chunked:
+            document["chunks"] = [{"page_range": [1, 1], "document": {"tables": [table]}}]
+        return document, source
+
+    def test_table_cross_row_hole_repair_splits_numeric_cell_and_updates_grid(self):
+        document, source = self._cross_row_hole_fixture()
+        original = copy.deepcopy(document)
+        metadata: dict[str, Any] = {}
+        status: dict[str, Any] = {"ok": True, "quality_signals": {}}
+        with tempfile.NamedTemporaryFile(suffix=".pdf") as handle:
+            handle.write(b"source")
+            handle.flush()
+            diagnostic = semantic_reflow.repair_table_cross_row_holes(
+                document,
+                Path(handle.name),
+                metadata=metadata,
+                status=status,
+                source_reader=source,
+            )
+        self.assertTrue(diagnostic["applied"])
+        self.assertEqual(1, diagnostic["accepted_count"])
+        self.assertFalse(source.closed)
+        data = document["tables"][0]["data"]
+        by_slot = {
+            (cell["start_row_offset_idx"], cell["start_col_offset_idx"]): cell["text"]
+            for cell in data["table_cells"]
+        }
+        self.assertEqual("2144", by_slot[(0, 3)])
+        self.assertEqual("2764", by_slot[(1, 3)])
+        self.assertEqual("2144", data["grid"][0][3])
+        self.assertEqual("2764", data["grid"][1][3])
+        self.assertNotEqual(original, document)
+        self.assertEqual(diagnostic, metadata["table_cross_row_hole_repair"])
+        self.assertEqual(diagnostic, status["quality_signals"]["table_cross_row_hole_repair"])
+        self.assertRegex(diagnostic["source_pdf_sha256"], r"^[0-9a-f]{64}$")
+        self.assertNotIn("/private/", repr(diagnostic))
+
+    def test_table_cross_row_hole_repair_normalizes_malformed_quality_signals(self):
+        document, source = self._cross_row_hole_fixture()
+        status: dict[str, Any] = {"ok": True, "quality_signals": []}
+        diagnostic = semantic_reflow.repair_table_cross_row_holes(
+            document,
+            None,
+            status=status,
+            source_reader=source,
+        )
+        self.assertTrue(diagnostic["applied"])
+        self.assertIsInstance(status["quality_signals"], dict)
+        self.assertEqual(
+            diagnostic,
+            status["quality_signals"]["table_cross_row_hole_repair"],
+        )
+        slots = {
+            (cell["start_row_offset_idx"], cell["start_col_offset_idx"]): cell["text"]
+            for cell in document["tables"][0]["data"]["table_cells"]
+        }
+        self.assertEqual("2144", slots[(0, 3)])
+        self.assertEqual("2764", slots[(1, 3)])
+
+    def test_table_cross_row_hole_repair_rejects_non_lossless_source_text(self):
+        document, source = self._cross_row_hole_fixture(candidate_text="2144 9999")
+        original = copy.deepcopy(document)
+        diagnostic = semantic_reflow.repair_table_cross_row_holes(
+            document,
+            None,
+            source_reader=source,
+        )
+        self.assertFalse(diagnostic["applied"])
+        self.assertTrue(any(item["reason"] == "source_text_not_lossless" for item in diagnostic["rejected"]))
+        self.assertEqual(original, document)
+
+    def test_table_cross_row_hole_repair_updates_dictionary_grid_cells(self):
+        document, source = self._cross_row_hole_fixture()
+        grid = document["tables"][0]["data"]["grid"]
+        grid[0][3] = {"text": "2144 2764", "start_row_offset_idx": 0, "start_col_offset_idx": 3}
+        grid[1][3] = {"text": ""}
+        diagnostic = semantic_reflow.repair_table_cross_row_holes(document, None, source_reader=source)
+        self.assertTrue(diagnostic["applied"])
+        grid = document["tables"][0]["data"]["grid"]
+        self.assertEqual("2144", grid[0][3]["text"])
+        self.assertEqual("2764", grid[1][3]["text"])
+        self.assertEqual(1, grid[1][3]["start_row_offset_idx"])
+        self.assertEqual(3, grid[1][3]["start_col_offset_idx"])
+        self.assertEqual("TOPLEFT", grid[1][3]["bbox"]["coord_origin"])
+
+    def test_table_cross_row_hole_repair_rejects_invalid_grid_geometry(self):
+        cases = (
+            (0, {"text": "2144 2764", "row_span": "garbage"}),
+            (1, {"text": "", "start_row_offset_idx": 99}),
+        )
+        for grid_row, grid_value in cases:
+            with self.subTest(grid_row=grid_row):
+                document, source = self._cross_row_hole_fixture()
+                document["tables"][0]["data"]["grid"][grid_row][3] = grid_value
+                original = copy.deepcopy(document)
+                diagnostic = semantic_reflow.repair_table_cross_row_holes(
+                    document,
+                    None,
+                    source_reader=source,
+                )
+                self.assertFalse(diagnostic["applied"])
+                self.assertEqual(original, document)
+                self.assertTrue(
+                    any("grid" in item["reason"] for item in diagnostic["rejected"])
+                )
+
+    def test_table_cross_row_hole_repair_rejects_fractional_cell_offsets(self):
+        document, source = self._cross_row_hole_fixture()
+        candidate = document["tables"][0]["data"]["table_cells"][3]
+        candidate["start_row_offset_idx"] = 0.2
+        candidate["end_row_offset_idx"] = 1.2
+        original = copy.deepcopy(document)
+        diagnostic = semantic_reflow.repair_table_cross_row_holes(
+            document,
+            None,
+            source_reader=source,
+        )
+        self.assertFalse(diagnostic["applied"])
+        self.assertEqual(original, document)
+        self.assertEqual(0, source.calls)
+
+    @unittest.skipIf(os.name == "nt", "FIFO safety probe requires POSIX")
+    def test_table_cross_row_hole_repair_rejects_non_regular_source(self):
+        document, _source = self._cross_row_hole_fixture()
+        original = copy.deepcopy(document)
+        with tempfile.TemporaryDirectory() as directory:
+            fifo = Path(directory) / "source.pdf"
+            os.mkfifo(fifo)
+            diagnostic = semantic_reflow.repair_table_cross_row_holes(document, fifo)
+        self.assertFalse(diagnostic["applied"])
+        self.assertEqual("source_pdf_unavailable", diagnostic["reason"])
+        self.assertEqual(original, document)
+
+    def test_inline_fraction_rule_inserts_unique_division_boundary(self):
+        runs, spans = self._simple_fraction_fixture()
+        repaired, names = semantic_reflow._repair_inline_fraction_rule(
+            "x = 1 N + r",
+            runs,
+            spans,
+        )
+        self.assertEqual("x = 1/N + r", repaired)
+        self.assertEqual({spans[0]["name"]}, names)
+
+    def test_inline_fraction_rule_rejects_ambiguous_fallback_alignment(self):
+        runs, spans = self._simple_fraction_fixture()
+        fallback = "left 1 N and right 1 N"
+        repaired, names = semantic_reflow._repair_inline_fraction_rule(
+            fallback,
+            runs,
+            spans,
+        )
+        self.assertEqual(fallback, repaired)
+        self.assertEqual(set(), names)
+
+        runs[1]["text"] = "1"
+        overlapping = "1 1 1"
+        repaired, names = semantic_reflow._repair_inline_fraction_rule(
+            overlapping,
+            runs,
+            spans,
+        )
+        self.assertEqual(overlapping, repaired)
+        self.assertEqual(set(), names)
+
+    def test_inline_fraction_rule_rejects_private_control_glyph(self):
+        for glyph in ("\x10", "\uf8eb", "\U000f0000"):
+            with self.subTest(glyph=repr(glyph)):
+                runs, spans = self._simple_fraction_fixture()
+                runs.append(
+                    {
+                        "text": glyph,
+                        "size": 7.0,
+                        "fontname": "CMEX10",
+                        "bbox": {"l": 11.0, "r": 12.0, "t": 59.0, "b": 56.0},
+                    }
+                )
+                fallback = "x = 1 N"
+                repaired, names = semantic_reflow._repair_inline_fraction_rule(
+                    fallback,
+                    runs,
+                    spans,
+                )
+                self.assertEqual(fallback, repaired)
+                self.assertEqual(set(), names)
+
+    def test_inline_fraction_rule_rejects_cross_word_alignment(self):
+        runs, spans = self._simple_fraction_fixture()
+        runs[0]["text"] = "a"
+        runs[1]["text"] = "b"
+        for fallback in ("a big", "data a big", "plain ab token"):
+            with self.subTest(fallback=fallback):
+                repaired, names = semantic_reflow._repair_inline_fraction_rule(
+                    fallback,
+                    runs,
+                    spans,
+                )
+                self.assertEqual(fallback, repaired)
+                self.assertEqual(set(), names)
+
+    def test_inline_fraction_rule_ignores_adjacent_line_bbox_edge_overlap(self):
+        def run(
+            text: str,
+            left: float,
+            right: float,
+            center: float,
+            *,
+            size: float = 8.0,
+            font: str = "CMR8",
+            half_height: float = 3.0,
+        ) -> dict[str, Any]:
+            return {
+                "text": text,
+                "size": size,
+                "fontname": font,
+                "bbox": {
+                    "l": left,
+                    "r": right,
+                    "t": center + half_height,
+                    "b": center - half_height,
+                },
+            }
+
+        runs = [
+            run("d", 133.4, 137.5, 92.6),
+            run("e", 138.1, 141.3, 91.6),
+            run("t", 141.7, 144.4, 92.3),
+            run("B", 146.7, 152.6, 92.6, font="CMMI8"),
+            run("′", 153.4, 155.0, 94.4, size=6.0, font="CMSY6"),
+            run("d", 134.7, 138.9, 84.5),
+            run("e", 139.4, 142.7, 83.5),
+            run("t", 143.1, 145.7, 84.2),
+            run("B", 148.1, 154.0, 84.5, font="CMMI8"),
+            # This glyph belongs to the line above.  Its box overlaps the
+            # repair box edge, but its center is outside the fraction.
+            run("ℓ", 147.4, 150.7, 100.1, font="CMMI8", half_height=4.0),
+        ]
+        spans = [
+            {
+                "name": "geometry_math_span-fraction_rule-p9-occ0-x124",
+                "reason": "fraction_rule",
+                "rule_y": 88.3,
+                "bbox": {"l": 124.5, "r": 175.5, "t": 104.1, "b": 76.2},
+                "repair_bbox": {
+                    "l": 133.1,
+                    "r": 155.8,
+                    "t": 97.4,
+                    "b": 81.5,
+                },
+            }
+        ]
+
+        repaired, names = semantic_reflow._repair_inline_fraction_rule(
+            "det B ′ det B",
+            runs,
+            spans,
+        )
+
+        self.assertEqual("det B ′/det B", repaired)
+        self.assertEqual({spans[0]["name"]}, names)
+
+    def test_inline_fraction_rule_keeps_printable_cmex_operator_in_denominator(self):
+        def run(text: str, font: str, left: float, right: float, center: float) -> dict[str, Any]:
+            return {
+                "text": text,
+                "size": 7.0,
+                "fontname": font,
+                "bbox": {
+                    "l": left,
+                    "r": right,
+                    "t": center + 2.0,
+                    "b": center - 2.0,
+                },
+            }
+
+        runs = [
+            run("e", "CMMI8", 10.0, 14.0, 57.0),
+            run("S", "CMMI6", 14.1, 17.0, 59.0),
+            run("T", "CMMI6", 17.1, 21.0, 59.0),
+            run("i", "CMMI6", 20.0, 22.0, 56.0),
+            run("P", "CMEX8", 8.0, 12.0, 43.0),
+            run("j", "CMMI6", 11.5, 14.0, 41.0),
+            run("e", "CMMI8", 14.1, 18.0, 43.0),
+            run("S", "CMMI6", 18.1, 21.0, 45.0),
+            run("T", "CMMI6", 21.1, 25.0, 45.0),
+            run("j", "CMMI6", 24.0, 26.0, 42.0),
+        ]
+        spans = [
+            {
+                "name": "geometry_math_span-fraction_rule-p1-occ0-x8",
+                "reason": "fraction_rule",
+                "rule_y": 50.0,
+                "bbox": {"l": 7.0, "r": 27.0, "t": 62.0, "b": 38.0},
+                "repair_bbox": {"l": 7.0, "r": 27.0, "t": 62.0, "b": 38.0},
+            }
+        ]
+        repaired, names = semantic_reflow._repair_inline_fraction_rule(
+            "P_i = e S T i ∑ j e S T j .",
+            runs,
+            spans,
+        )
+        self.assertEqual("P_i = e S T i/∑ j e S T j .", repaired)
+        self.assertEqual({spans[0]["name"]}, names)
+
+    def test_inline_math_run_normalizes_only_known_cmex_operator_slots(self):
+        self.assertEqual(
+            "∑",
+            semantic_reflow._normalize_inline_math_run_text(
+                {"text": "P", "fontname": "CMEX10"}
+            ),
+        )
+        self.assertFalse(
+            semantic_reflow._inline_math_control_character(
+                {"text": "P", "fontname": "CMEX10"}
+            )
+        )
+        self.assertTrue(
+            semantic_reflow._inline_math_control_character(
+                {"text": "+", "fontname": "CMEX10"}
+            )
+        )
+
+    def test_math_aware_text_does_not_duplicate_raw_cmex_sum_slot(self):
+        def run(
+            text: str,
+            font: str,
+            size: float,
+            left: float,
+            right: float,
+            top: float,
+            bottom: float,
+        ) -> dict[str, Any]:
+            return {
+                "text": text,
+                "fontname": font,
+                "size": size,
+                "bbox": {"l": left, "r": right, "t": top, "b": bottom},
+            }
+
+        runs = [
+            run("P", "CMEX10", 9.96, 236.45, 245.84, 488.07, 478.11),
+            run("N", "CMMI7", 6.97, 246.89, 252.50, 491.00, 484.90),
+            run("i", "CMMI7", 6.97, 246.73, 249.60, 483.00, 476.80),
+            run("=", "CMR7", 6.97, 249.71, 256.00, 482.50, 476.20),
+            run("1", "CMR7", 6.97, 256.10, 259.30, 483.10, 476.70),
+            run("r", "CMMI10", 9.96, 261.76, 266.20, 487.70, 477.80),
+            run("i", "CMMI7", 6.97, 266.29, 269.30, 484.50, 478.20),
+        ]
+        reader = semantic_reflow.SourceReader.__new__(semantic_reflow.SourceReader)
+        reader._math_aware_diagnostics = {}
+        reader._pypdfium_characters = lambda _page_no, _bbox: runs
+        reader._inline_math_span_evidence = lambda _prov, _runs: []
+        prov = {
+            "page_no": 1,
+            "bbox": {"l": 230.0, "r": 275.0, "t": 495.0, "b": 470.0},
+        }
+        repaired = reader.math_aware_text(
+            prov,
+            "∑ N i =1 r i",
+            similarity_threshold=0.0,
+        )
+        self.assertEqual("∑_{i=1}^N r_i", repaired)
+        self.assertNotIn("∑ P", repaired)
+
+    def test_inline_fraction_rule_rejects_wrong_cmex_operator_or_punctuation(self):
+        def run(text: str, font: str, center: float) -> dict[str, Any]:
+            return {
+                "text": text,
+                "size": 7.0,
+                "fontname": font,
+                "bbox": {
+                    "l": 10.0,
+                    "r": 14.0,
+                    "t": center + 2.0,
+                    "b": center - 2.0,
+                },
+            }
+
+        runs = [
+            run("e", "CMMI8", 57.0),
+            run("P", "CMEX8", 43.0),
+        ]
+        spans = [
+            {
+                "name": "geometry_math_span-fraction_rule-p1-occ0-x8",
+                "reason": "fraction_rule",
+                "rule_y": 50.0,
+                "bbox": {"l": 7.0, "r": 17.0, "t": 62.0, "b": 38.0},
+                "repair_bbox": {"l": 7.0, "r": 17.0, "t": 62.0, "b": 38.0},
+            }
+        ]
+        for fallback in ("e + text", "e ∏ text"):
+            with self.subTest(fallback=fallback):
+                repaired, names = semantic_reflow._repair_inline_fraction_rule(
+                    fallback,
+                    runs,
+                    spans,
+                )
+                self.assertEqual(fallback, repaired)
+                self.assertEqual(set(), names)
+
+    @staticmethod
+    def _solidus_run(
+        text: str,
+        left: float,
+        right: float,
+        center: float,
+        *,
+        font: str = "CMMI10",
+        size: float = 10.0,
+    ) -> dict[str, Any]:
+        return {
+            "text": text,
+            "size": size,
+            "fontname": font,
+            "bbox": {
+                "l": left,
+                "r": right,
+                "t": center + 3.0,
+                "b": center - 3.0,
+            },
+        }
+
+    def test_inline_solidus_glyph_restores_unique_math_gap(self):
+        runs = [
+            self._solidus_run("x", 10.0, 14.0, 50.0),
+            self._solidus_run("/", 15.0, 18.0, 50.0),
+            self._solidus_run("y", 19.0, 23.0, 50.0),
+        ]
+        repaired, names = semantic_reflow._repair_inline_solidus_glyph(
+            "x y",
+            runs,
+        )
+        self.assertEqual("x/y", repaired)
+        self.assertEqual(1, len(names))
+        self.assertTrue(next(iter(names)).startswith("geometry_solidus-"))
+
+    def test_inline_solidus_glyph_ignores_ordinary_font_slash(self):
+        runs = [
+            self._solidus_run("x", 10.0, 14.0, 50.0, font="CMR10"),
+            self._solidus_run("/", 15.0, 18.0, 50.0, font="CMR10"),
+            self._solidus_run("y", 19.0, 23.0, 50.0, font="CMR10"),
+        ]
+        fallback = "x y"
+        repaired, names = semantic_reflow._repair_inline_solidus_glyph(
+            fallback,
+            runs,
+        )
+        self.assertEqual(fallback, repaired)
+        self.assertEqual(set(), names)
+
+    def test_inline_solidus_glyph_rejects_repeated_context(self):
+        runs = [
+            self._solidus_run("a", 1.0, 4.0, 50.0),
+            self._solidus_run("x", 5.0, 8.0, 50.0),
+            self._solidus_run("/", 9.0, 12.0, 50.0),
+            self._solidus_run("y", 13.0, 16.0, 50.0),
+            self._solidus_run("b", 17.0, 20.0, 50.0),
+        ]
+        fallback = "a x y b; a x y b"
+        repaired, names = semantic_reflow._repair_inline_solidus_glyph(
+            fallback,
+            runs,
+        )
+        self.assertEqual(fallback, repaired)
+        self.assertEqual(set(), names)
+
+    def test_inline_solidus_glyph_is_idempotent_when_fallback_has_slash(self):
+        runs = [
+            self._solidus_run("x", 10.0, 14.0, 50.0),
+            self._solidus_run("/", 15.0, 18.0, 50.0),
+            self._solidus_run("y", 19.0, 23.0, 50.0),
+        ]
+        fallback = "x / y"
+        repaired, names = semantic_reflow._repair_inline_solidus_glyph(
+            fallback,
+            runs,
+        )
+        self.assertEqual(fallback, repaired)
+        self.assertEqual(1, len(names))
+        self.assertEqual(1, repaired.count("/"))
+
+    def test_short_fraction_rule_is_detected_with_small_bar(self):
+        class FakePage:
+            height = 100.0
+            lines = [
+                {
+                    "x0": 50.0,
+                    "x1": 54.234,
+                    "top": 48.0,
+                    "bottom": 48.0,
+                }
+            ]
+
+        reader = semantic_reflow.SourceReader.__new__(semantic_reflow.SourceReader)
+        reader._pdf = SimpleNamespace(pages=[FakePage()])
+        runs = [
+            self._solidus_run("q", 44.0, 48.0, 52.0, font="CMMI10", size=10.0),
+            self._solidus_run("1", 50.0, 52.0, 56.0, font="CMR6", size=6.0),
+            self._solidus_run("2", 50.0, 52.0, 48.0, font="CMR6", size=6.0),
+        ]
+        spans = reader._inline_math_span_evidence(
+            {
+                "page_no": 1,
+                "bbox": {
+                    "l": 40.0,
+                    "r": 70.0,
+                    "t": 70.0,
+                    "b": 30.0,
+                    "coord_origin": "BOTTOMLEFT",
+                },
+            },
+            runs,
+        )
+        self.assertEqual(1, len(spans))
+        self.assertEqual("fraction_rule", spans[0]["reason"])
+
+    def test_short_fraction_rule_rejects_overbar_and_underline(self):
+        class FakePage:
+            height = 100.0
+
+            def __init__(self, runs_on_one_side):
+                self.lines = [
+                    {
+                        "x0": 50.0,
+                        "x1": 54.234,
+                        "top": 48.0,
+                        "bottom": 48.0,
+                    }
+                ]
+
+        for label, runs in (
+            (
+                "overbar",
+                [self._solidus_run("x", 50.0, 53.0, 56.0, font="CMMI10")],
+            ),
+            (
+                "underline",
+                [self._solidus_run("x", 50.0, 53.0, 48.0, font="CMMI10")],
+            ),
+        ):
+            with self.subTest(label=label):
+                reader = semantic_reflow.SourceReader.__new__(semantic_reflow.SourceReader)
+                reader._pdf = SimpleNamespace(pages=[FakePage(runs)])
+                spans = reader._inline_math_span_evidence(
+                    {
+                        "page_no": 1,
+                        "bbox": {
+                            "l": 40.0,
+                            "r": 70.0,
+                            "t": 70.0,
+                            "b": 30.0,
+                            "coord_origin": "BOTTOMLEFT",
+                        },
+                    },
+                    runs,
+                )
+                self.assertEqual([], spans)
+
+    def test_inline_fraction_rule_repairs_disjoint_unique_multi_spans(self):
+        def run(text: str, left: float, right: float, center: float) -> dict[str, Any]:
+            return {
+                "text": text,
+                "size": 7.0,
+                "fontname": "CMR7",
+                "bbox": {
+                    "l": left,
+                    "r": right,
+                    "t": center + 2.0,
+                    "b": center - 2.0,
+                },
+            }
+
+        runs = [
+            run("1", 10.0, 13.0, 55.0),
+            run("N", 10.0, 14.0, 45.0),
+            run("3", 30.0, 33.0, 55.0),
+            run("M", 30.0, 34.0, 45.0),
+        ]
+        spans = [
+            {
+                "name": "fraction-one",
+                "reason": "fraction_rule",
+                "rule_y": 50.0,
+                "repair_bbox": {"l": 9.0, "r": 15.0, "t": 58.0, "b": 42.0},
+            },
+            {
+                "name": "fraction-two",
+                "reason": "fraction_rule",
+                "rule_y": 50.0,
+                "repair_bbox": {"l": 29.0, "r": 35.0, "t": 58.0, "b": 42.0},
+            },
+        ]
+        repaired, names = semantic_reflow._repair_inline_fraction_rule(
+            "x = 1 N ; y = 3 M",
+            runs,
+            spans,
+        )
+        self.assertEqual("x = 1/N ; y = 3/M", repaired)
+        self.assertEqual({"fraction-one", "fraction-two"}, names)
+
+    def test_inline_fraction_rule_rejects_overlapping_or_ambiguous_multi_spans(self):
+        runs = [
+            {
+                "text": "1",
+                "size": 7.0,
+                "fontname": "CMR7",
+                "bbox": {"l": 10.0, "r": 13.0, "t": 57.0, "b": 53.0},
+            },
+            {
+                "text": "N",
+                "size": 7.0,
+                "fontname": "CMR7",
+                "bbox": {"l": 10.0, "r": 14.0, "t": 47.0, "b": 43.0},
+            },
+        ]
+        overlapping = [
+            {
+                "name": "first",
+                "reason": "fraction_rule",
+                "rule_y": 50.0,
+                "repair_bbox": {"l": 9.0, "r": 15.0, "t": 58.0, "b": 42.0},
+            },
+            {
+                "name": "second",
+                "reason": "fraction_rule",
+                "rule_y": 50.0,
+                "repair_bbox": {"l": 12.0, "r": 18.0, "t": 58.0, "b": 42.0},
+            },
+        ]
+        fallback = "x = 1 N"
+        repaired, names = semantic_reflow._repair_inline_fraction_rule(
+            fallback,
+            runs,
+            overlapping,
+        )
+        self.assertEqual(fallback, repaired)
+        self.assertEqual(set(), names)
+
+        disjoint = [
+            {
+                "name": "first",
+                "reason": "fraction_rule",
+                "rule_y": 50.0,
+                "repair_bbox": {"l": 9.0, "r": 15.0, "t": 58.0, "b": 42.0},
+            },
+            {
+                "name": "second",
+                "reason": "fraction_rule",
+                "rule_y": 50.0,
+                "repair_bbox": {"l": 19.0, "r": 25.0, "t": 58.0, "b": 42.0},
+            },
+        ]
+        repaired, names = semantic_reflow._repair_inline_fraction_rule(
+            "x = 1 N ; y = 1 N",
+            runs,
+            disjoint,
+        )
+        self.assertEqual("x = 1 N ; y = 1 N", repaired)
+        self.assertEqual(set(), names)
+
+    def test_math_aware_text_marks_repaired_fraction_resolved(self):
+        runs, spans = self._simple_fraction_fixture()
+        reader = semantic_reflow.SourceReader.__new__(semantic_reflow.SourceReader)
+        reader._math_aware_diagnostics = {}
+        reader._pypdfium_characters = lambda _page_no, _bbox: runs
+        reader._inline_math_span_evidence = lambda _prov, _runs: spans
+        prov = {
+            "page_no": 1,
+            "bbox": {"l": 0.0, "r": 20.0, "t": 70.0, "b": 30.0},
+        }
+        repaired = reader.math_aware_text(
+            prov,
+            "x = 1 N",
+            similarity_threshold=0.0,
+        )
+        self.assertEqual("x = 1/N", repaired)
+        diagnostic = reader._math_aware_diagnostics[reader._math_diagnostic_key(prov)]
+        self.assertEqual([], diagnostic["unresolved_clusters"])
+        self.assertEqual([spans[0]["name"]], diagnostic["repaired_names"])
+        self.assertTrue(diagnostic["math_span_regions"][0]["resolved"])
+
+    def test_table_cross_row_hole_repair_rejects_occupied_target(self):
+        document, source = self._cross_row_hole_fixture(target_text="1234")
+        original = copy.deepcopy(document)
+        diagnostic = semantic_reflow.repair_table_cross_row_holes(document, None, source_reader=source)
+        self.assertFalse(diagnostic["applied"])
+        self.assertEqual(original, document)
+        self.assertTrue(any(item["reason"] == "target_occupied_or_merged" for item in diagnostic["rejected"]))
+
+    def test_table_cross_row_hole_repair_rejects_inconsistent_peer_centers(self):
+        document, source = self._cross_row_hole_fixture(
+            row_centers=((15.0, 35.0), (15.0, 35.0), (24.0, 44.0), (15.0, 35.0))
+        )
+        original = copy.deepcopy(document)
+        diagnostic = semantic_reflow.repair_table_cross_row_holes(document, None, source_reader=source)
+        self.assertFalse(diagnostic["applied"])
+        self.assertEqual(original, document)
+        self.assertTrue(any(item["reason"] == "peer_row_centers_inconsistent" for item in diagnostic["rejected"]))
+
+    def test_table_cross_row_hole_repair_skips_valid_two_by_two_multiline_cell(self):
+        document, source = self._cross_row_hole_fixture(rows=2, cols=2, candidate_text="left one left two")
+        original = copy.deepcopy(document)
+        diagnostic = semantic_reflow.repair_table_cross_row_holes(document, None, source_reader=source)
+        self.assertFalse(diagnostic["applied"])
+        self.assertEqual("no_eligible_candidate", diagnostic["reason"])
+        self.assertEqual(0, source.calls)
+        self.assertEqual(original, document)
+
+    def test_table_cross_row_hole_repair_skips_chunked_document(self):
+        document, source = self._cross_row_hole_fixture(chunked=True)
+        original = copy.deepcopy(document)
+        diagnostic = semantic_reflow.repair_table_cross_row_holes(document, None, source_reader=source)
+        self.assertFalse(diagnostic["applied"])
+        self.assertEqual("chunked_document_skipped", diagnostic["reason"])
+        self.assertEqual(0, source.calls)
+        self.assertEqual(original, document)
+
+    def test_table_cross_row_hole_repair_no_tables_and_bounds_are_noops(self):
+        no_tables: dict[str, Any] = {"schema_name": "docling_document", "tables": []}
+        diagnostic = semantic_reflow.repair_table_cross_row_holes(no_tables, None)
+        self.assertTrue(diagnostic["ok"])
+        self.assertEqual("no_tables", diagnostic["reason"])
+        bounded, source = self._cross_row_hole_fixture(rows=257, cols=4)
+        original = copy.deepcopy(bounded)
+        diagnostic = semantic_reflow.repair_table_cross_row_holes(bounded, None, source_reader=source)
+        self.assertFalse(diagnostic["applied"])
+        self.assertEqual(original, bounded)
+        self.assertEqual(0, source.calls)
+
     def test_algorithm_grouping_cannot_promote_picture_contained_ocr(self):
         def prov(left: float, right: float, top: float, bottom: float) -> list[dict[str, Any]]:
             return [
@@ -951,6 +1792,68 @@ class SemanticReadabilityRegressionTests(unittest.TestCase):
         self.assertEqual(right_region["source_text"], right)
         self.assertEqual(len({region["anchor"] for region in regions}), 2)
 
+    def test_grouped_inline_math_prioritizes_unresolved_member_diagnostic(self):
+        node = {"label": "text", "text": "Evidence Unresolved"}
+        evidence = semantic_reflow.FlowItem(
+            kind="text",
+            node=node,
+            rank=1.0,
+            page_no=1,
+            bbox={"l": 40.0, "r": 140.0, "t": 700.0, "b": 680.0},
+            prov={"page_no": 1},
+            source_text="Evidence",
+            collection_index=0,
+            inline_math_source_anchor="evidence-anchor",
+            inline_math_source_scope="inline_math_evidence",
+            inline_math_source_reason="inline_math_evidence",
+            inline_math_source_unresolved=False,
+            inline_math_unresolved_regions=[{"reason": "inline_math_evidence"}],
+        )
+        unresolved = semantic_reflow.FlowItem(
+            kind="text",
+            node=node,
+            rank=1.5,
+            page_no=1,
+            bbox={"l": 40.0, "r": 150.0, "t": 660.0, "b": 640.0},
+            prov={"page_no": 1},
+            source_text="Unresolved",
+            collection_index=0,
+            inline_math_source_anchor="unresolved-anchor",
+            inline_math_source_scope="inline_math_unresolved",
+            inline_math_source_reason="inline_math_unresolved",
+            inline_math_source_unresolved=True,
+            inline_math_unresolved_regions=[
+                {
+                    "name": "geometry_script-x-sup-empty-run1",
+                    "bbox": {"l": 80.0, "r": 90.0, "t": 660.0, "b": 650.0},
+                    "reason": "inline_math_unresolved",
+                }
+            ],
+        )
+        document = {
+            "pages": {"1": {"size": {"width": 600.0, "height": 800.0}}}
+        }
+
+        grouped = semantic_reflow._group_text_node_paragraph_items(
+            document,
+            [evidence, unresolved],
+        )
+
+        self.assertEqual(1, len(grouped))
+        item = grouped[0]
+        self.assertTrue(item.inline_math_source_unresolved)
+        self.assertEqual("unresolved-anchor", item.inline_math_source_anchor)
+        self.assertEqual("inline_math_unresolved", item.inline_math_source_scope)
+        self.assertEqual("inline_math_unresolved", item.inline_math_source_reason)
+        self.assertEqual(
+            "geometry_script-x-sup-empty-run1",
+            item.inline_math_unresolved_regions[0]["name"],
+        )
+        self.assertEqual(
+            "inline_math_unresolved",
+            item.inline_math_unresolved_regions[0]["reason"],
+        )
+
     def test_same_text_node_same_column_multiple_provs_without_inline_math_stay_unmerged(self):
         class _PlainSource:
             _pypdf = None
@@ -1360,6 +2263,218 @@ class SemanticReadabilityRegressionTests(unittest.TestCase):
         self.assertEqual(r"f(1)", body_tex)
         self.assertIsNone(labelled_number)
         self.assertEqual(r"x+y", labelled_tex)
+
+    def test_equation_number_prefers_formula_adjacent_label_geometry(self):
+        class FakeCrop:
+            def __init__(self, lines):
+                self._lines = lines
+
+            def extract_text_lines(self, **_kwargs):
+                return self._lines
+
+        class FakePage:
+            width = 612.0
+            height = 792.0
+
+            def __init__(self, lines):
+                self._lines = lines
+
+            def crop(self, *_args, **_kwargs):
+                return FakeCrop(self._lines)
+
+        def make_char(text, left, right, top, bottom):
+            return {
+                "text": text,
+                "x0": left,
+                "x1": right,
+                "top": top,
+                "bottom": bottom,
+            }
+
+        lines = [
+            {
+                "x0": 430.0,
+                "x1": 556.73,
+                "top": 196.0,
+                "bottom": 186.0,
+                "text": "a+b=(4)",
+                "chars": [
+                    make_char("a", 430.0, 438.0, 196.0, 186.0),
+                    make_char("+", 441.0, 445.0, 196.0, 186.0),
+                    make_char("b", 449.0, 458.0, 196.0, 186.0),
+                    make_char("=", 460.0, 464.0, 196.0, 186.0),
+                    make_char("(", 543.99, 548.2, 196.0, 186.0),
+                    make_char("4", 548.2, 552.0, 196.0, 186.0),
+                    make_char(")", 552.0, 556.73, 196.0, 186.0),
+                ],
+            },
+            {
+                "x0": 240.0,
+                "x1": 291.0,
+                "top": 150.0,
+                "bottom": 140.0,
+                "text": "x=(6)",
+                "chars": [
+                    make_char("x", 240.0, 246.0, 150.0, 140.0),
+                    make_char("=", 250.0, 253.0, 150.0, 140.0),
+                    make_char("(", 278.0, 282.0, 150.0, 140.0),
+                    make_char("6", 282.0, 286.0, 150.0, 140.0),
+                    make_char(")", 286.0, 291.0, 150.0, 140.0),
+                ],
+            },
+            {
+                "x0": 360.0,
+                "x1": 386.0,
+                "top": 100.0,
+                "bottom": 90.0,
+                "text": "f(0)",
+                "chars": [
+                    make_char("f", 360.0, 365.0, 100.0, 90.0),
+                    make_char("(", 372.0, 376.0, 100.0, 90.0),
+                    make_char("0", 376.0, 381.0, 100.0, 90.0),
+                    make_char(")", 381.0, 386.0, 100.0, 90.0),
+                ],
+            },
+            {
+                "x0": 100.0,
+                "x1": 176.0,
+                "top": 60.0,
+                "bottom": 50.0,
+                "text": "v=(4)(7)",
+                "chars": [
+                    make_char("v", 100.0, 107.0, 60.0, 50.0),
+                    make_char("=", 108.0, 111.0, 60.0, 50.0),
+                    make_char("(", 140.0, 143.0, 60.0, 50.0),
+                    make_char("4", 143.0, 146.0, 60.0, 50.0),
+                    make_char(")", 146.0, 150.0, 60.0, 50.0),
+                    make_char("(", 160.0, 163.0, 60.0, 50.0),
+                    make_char("7", 163.0, 167.0, 60.0, 50.0),
+                    make_char(")", 167.0, 176.0, 60.0, 50.0),
+                ],
+            },
+            {
+                "x0": 543.99,
+                "x1": 556.73,
+                "top": 30.0,
+                "bottom": 20.0,
+                "text": "(9)",
+                "chars": [
+                    make_char("(", 543.99, 548.2, 30.0, 20.0),
+                    make_char("9", 548.2, 552.0, 30.0, 20.0),
+                    make_char(")", 552.0, 556.73, 30.0, 20.0),
+                ],
+            },
+            {
+                "x0": 543.99,
+                "x1": 556.73,
+                "top": 682.0,
+                "bottom": 692.0,
+                "text": "(9)",
+                "chars": [
+                    make_char("(", 543.99, 548.2, 682.0, 692.0),
+                    make_char("9", 548.2, 552.0, 682.0, 692.0),
+                    make_char(")", 552.0, 556.73, 682.0, 692.0),
+                ],
+            },
+        ]
+        reader = semantic_reflow.SourceReader.__new__(semantic_reflow.SourceReader)
+        reader._pdf = SimpleNamespace(pages=[FakePage(lines)])
+        reader._pypdf = None
+
+        self.assertEqual(
+            4,
+            reader.equation_number(
+                {
+                    "page_no": 1,
+                    "bbox": {
+                        "l": 452.0,
+                        "r": 556.73,
+                        "t": 606.0,
+                        "b": 596.0,
+                        "coord_origin": "BOTTOMLEFT",
+                    },
+                },
+            ),
+        )
+        self.assertEqual(
+            6,
+            reader.equation_number(
+                {
+                    "page_no": 1,
+                    "bbox": {
+                        "l": 240.0,
+                        "r": 291.0,
+                        "t": 150.0,
+                        "b": 140.0,
+                        "coord_origin": "TOPLEFT",
+                    },
+                },
+            ),
+        )
+        self.assertIsNone(
+            reader.equation_number(
+                {
+                    "page_no": 1,
+                    "bbox": {
+                        "l": 360.0,
+                        "r": 386.0,
+                        "t": 100.0,
+                        "b": 90.0,
+                        "coord_origin": "TOPLEFT",
+                    },
+                },
+            ),
+        )
+        self.assertIsNone(
+            reader.equation_number(
+                {
+                    "page_no": 1,
+                    "bbox": {
+                        "l": 240.0,
+                        "r": 268.0,
+                        "t": 30.0,
+                        "b": 20.0,
+                        "coord_origin": "TOPLEFT",
+                    },
+                },
+            ),
+        )
+        self.assertIsNone(
+            reader.equation_number(
+                {
+                    "page_no": 1,
+                    "bbox": {"l": 240.0, "r": "invalid", "t": 30.0, "b": 20.0},
+                },
+            ),
+        )
+        self.assertIsNone(
+            reader.equation_number(
+                {
+                    "page_no": 1,
+                    "bbox": {
+                        "l": 100.0,
+                        "r": 140.0,
+                        "t": 60.0,
+                        "b": 50.0,
+                        "coord_origin": "TOPLEFT",
+                    },
+                },
+            ),
+        )
+        self.assertIsNone(
+            reader.equation_number(
+                {
+                    "page_no": 1,
+                    "bbox": {
+                        "l": 543.99,
+                        "r": 556.73,
+                        "t": 100.0,
+                        "b": 110.0,
+                        "coord_origin": "TOPLEFT",
+                    },
+                },
+            ),
+        )
 
     def test_fraction_span_excludes_adjacent_script_layers(self):
         reader = semantic_reflow.SourceReader.__new__(semantic_reflow.SourceReader)

@@ -29,6 +29,27 @@ SOURCE_BYTES = b"source"
 SOURCE_SHA = hashlib.sha256(SOURCE_BYTES).hexdigest()
 EVIDENCE_SHA = hashlib.sha256(b"evidence").hexdigest()
 BBOX = {"l": 10, "r": 110, "t": 120, "b": 180, "coord_origin": "TOPLEFT"}
+BBOX_BOTTOMLEFT_A = {
+    "l": 20,
+    "r": 170,
+    "t": 200,
+    "b": 180,
+    "coord_origin": "BOTTOMLEFT",
+}
+BBOX_BOTTOMLEFT_B = {
+    "l": 25,
+    "r": 165,
+    "t": 175,
+    "b": 150,
+    "coord_origin": "BOTTOMLEFT",
+}
+BBOX_BOTTOMLEFT_UNION = {
+    "l": 20,
+    "r": 170,
+    "t": 200,
+    "b": 150,
+    "coord_origin": "BOTTOMLEFT",
+}
 
 
 def _candidate(source_ref: str, image: str, *, index: int = 1) -> dict[str, object]:
@@ -432,6 +453,109 @@ def _fixture(root: Path) -> tuple[dict[str, object], dict[str, object], dict[str
     return document, metadata, status
 
 
+def _picture_inventory(
+    *,
+    expected: bool = True,
+    source_ref: str | None = "#/pictures/0",
+    source_asset: str | None = "pictures/picture_1.png",
+    asset_present: bool = True,
+    asset_sha256: str | None = EVIDENCE_SHA,
+    source_pdf_sha256: str | None = SOURCE_SHA,
+    html_reference_count: int = 1,
+    markdown_reference_count: int = 1,
+    status: str = "visual_only",
+    critical: bool = False,
+    reasons: list[str] | None = None,
+    ok: bool = True,
+    expected_count: int | None = None,
+    bound_count: int | None = None,
+    records: list[dict[str, object]] | None = None,
+) -> dict[str, object]:
+    record = {
+        "version": 1,
+        "index": 1,
+        "global_index": 1,
+        "source_ref": source_ref,
+        "self_ref": "#/pictures/0",
+        "part_index": None,
+        "page_no": 1,
+        "bbox": BBOX,
+        "source_asset": source_asset,
+        "source_pdf_sha256": source_pdf_sha256,
+        "asset_present": asset_present,
+        "asset_sha256": asset_sha256,
+        "machine_binding_expected": expected,
+        "html_reference_count": html_reference_count,
+        "markdown_reference_count": markdown_reference_count,
+        "status": status,
+        "critical": critical,
+        "reasons": list(reasons or []),
+    }
+    values = records if records is not None else [record]
+    expected_value = expected_count if expected_count is not None else int(expected)
+    bound_value = (
+        bound_count
+        if bound_count is not None
+        else int(
+            expected
+            and status == "visual_only"
+            and not critical
+            and not reasons
+            and asset_present
+            and asset_sha256 is not None
+            and source_pdf_sha256 is not None
+            and html_reference_count == 1
+            and markdown_reference_count == 1
+        )
+    )
+    return {
+        "version": 1,
+        "ok": ok,
+        "expected_count": expected_value,
+        "bound_count": bound_value,
+        "records": values,
+        "failure_reasons": list(reasons or []) if not ok else [],
+    }
+
+
+def _chunk_picture_fixture(root: Path) -> tuple[dict[str, object], dict[str, object], dict[str, object]]:
+    (root / "source.pdf").write_bytes(SOURCE_BYTES)
+    asset = root / "pictures/picture_1.png"
+    asset.parent.mkdir(parents=True, exist_ok=True)
+    asset.write_bytes(b"evidence")
+    document = {
+        "chunks": [
+            {
+                "page_range": [1, 1],
+                "document": {
+                    "pictures": [
+                        {
+                            "label": "picture",
+                            "self_ref": "#/pictures/0",
+                            "prov": [{"page_no": 1, "bbox": BBOX}],
+                        }
+                    ]
+                },
+            }
+        ]
+    }
+    metadata = {"generated_outputs": [], "input_sha256": SOURCE_SHA}
+    inventory = _picture_inventory()
+    inventory["records"][0].update(
+        {
+            "source_ref": "chunk:0:#/pictures/0",
+            "self_ref": "#/pictures/0",
+            "part_index": 0,
+        }
+    )
+    status = {
+        "ok": True,
+        "quality_signals": {"picture_surface_inventory": inventory},
+        "warnings": [],
+    }
+    return document, metadata, status
+
+
 class RegionQualityGateTests(unittest.TestCase):
     def test_default_record_id_digest_remains_backward_compatible(self):
         self.assertEqual(
@@ -467,7 +591,7 @@ class RegionQualityGateTests(unittest.TestCase):
                 {record["status"] for record in first["records"]}
                 <= set(REGION_STATUSES)
             )
-            self.assertLessEqual(first["record_count"], 1000)
+            self.assertLessEqual(first["record_count"], gate.DEFAULT_MAX_RECORDS)
             self.assertTrue((root / "regions.json").is_file())
             self.assertTrue((root / "quality_signals.json").is_file())
             self.assertIn("regions.json", metadata["generated_outputs"])
@@ -905,7 +1029,7 @@ class RegionQualityGateTests(unittest.TestCase):
             self.assertEqual(table_records[0]["status"], "verified_semantic")
             self.assertTrue(table_records[0]["signals"]["table_topology"]["empty_visual_fallback"])
 
-    def test_repeated_tall_numeric_cells_flag_collapsed_visual_rows(self):
+    def test_repeated_tall_numeric_cells_flag_multiline_row_ambiguity(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             document, metadata, status = _fixture(root)
@@ -935,7 +1059,13 @@ class RegionQualityGateTests(unittest.TestCase):
             table = next(record for record in result["records"] if record["kind"] == "table")
 
             self.assertEqual("unresolved", table["status"])
-            self.assertIn("table_row_likely_collapsed", table["reasons"])
+            self.assertIn("table_multiline_row_ambiguity", table["reasons"])
+            self.assertEqual(
+                [1],
+                table["signals"]["table_topology"]["independent_cell_geometry"][
+                    "multiline_row_ambiguity_indexes"
+                ],
+            )
             self.assertFalse(result["ok"])
 
     def test_single_row_cell_spanning_next_row_center_fails_closed(self):
@@ -964,6 +1094,7 @@ class RegionQualityGateTests(unittest.TestCase):
                 "table_cell_crosses_semantic_row_boundary",
                 table["reasons"],
             )
+            self.assertNotIn("table_multiline_row_ambiguity", table["reasons"])
             self.assertFalse(result["ok"])
 
     def test_record_limit_fails_even_for_noncritical_picture_evidence(self):
@@ -992,6 +1123,123 @@ class RegionQualityGateTests(unittest.TestCase):
             self.assertFalse(result["ok"])
             self.assertIn("region_record_limit_exceeded", result["failure_reasons"])
 
+    def test_default_record_capacity_retains_donut_class_inventory(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "source.pdf").write_bytes(SOURCE_BYTES)
+            document = {
+                "pictures": [
+                    {
+                        "label": "picture",
+                        "self_ref": f"#/pictures/{index}",
+                        "prov": [{"page_no": 1, "bbox": BBOX}],
+                    }
+                    for index in range(1001)
+                ]
+            }
+
+            result = evaluate_regions(
+                root,
+                document,
+                {"generated_outputs": [], "input_sha256": SOURCE_SHA},
+                {"ok": True, "quality_signals": {}, "warnings": []},
+                write_sidecars=False,
+            )
+
+            self.assertEqual(result["max_records"], gate.DEFAULT_MAX_RECORDS)
+            self.assertEqual(result["record_count"], 1001)
+            self.assertEqual(result["total_record_count"], 1001)
+            self.assertFalse(result["truncated"])
+            self.assertTrue(result["ok"])
+            self.assertNotIn(
+                "region_record_limit_exceeded", result["failure_reasons"]
+            )
+
+    def test_input_list_limit_marker_is_retained_without_output_truncation(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "source.pdf").write_bytes(SOURCE_BYTES)
+            document = {
+                "pictures": [
+                    {
+                        "label": "picture",
+                        "self_ref": f"#/pictures/{index}",
+                        "prov": [{"page_no": 1, "bbox": BBOX}],
+                    }
+                    for index in range(1002)
+                ]
+            }
+
+            result = evaluate_regions(
+                root,
+                document,
+                {"generated_outputs": [], "input_sha256": SOURCE_SHA},
+                {"ok": True, "quality_signals": {}, "warnings": []},
+                write_sidecars=False,
+            )
+
+            self.assertEqual(result["record_count"], 1002)
+            self.assertFalse(result["truncated"])
+            self.assertFalse(result["ok"])
+            self.assertIn(
+                "picture_record_limit_exceeded", result["failure_reasons"]
+            )
+            marker = next(
+                record
+                for record in result["records"]
+                if record["source_ref"] == "picture:limit"
+            )
+            self.assertTrue(marker["critical"])
+            self.assertEqual(marker["status"], "unresolved")
+
+    def test_requested_record_capacity_is_clamped_to_hard_limit(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "source.pdf").write_bytes(SOURCE_BYTES)
+
+            result = evaluate_regions(
+                root,
+                {"pictures": []},
+                {"generated_outputs": [], "input_sha256": SOURCE_SHA},
+                {"ok": True, "quality_signals": {}, "warnings": []},
+                max_records=gate.DEFAULT_MAX_RECORDS + 1,
+                write_sidecars=False,
+            )
+
+            self.assertEqual(result["max_records"], gate.DEFAULT_MAX_RECORDS)
+
+    def test_regions_sidecar_byte_limit_fails_closed_atomically(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            document, metadata, status = _fixture(root)
+            (root / "regions.json").write_text(
+                '{"ok": true, "stale": true}\n', encoding="utf-8"
+            )
+            metadata["generated_outputs"].append("regions.json")
+            status["generated_outputs"] = ["regions.json"]
+            status["outputs_written"] = ["regions.json"]
+            original_limit = gate.MAX_REGIONS_JSON_BYTES
+            gate.MAX_REGIONS_JSON_BYTES = 128
+            try:
+                result = evaluate_regions(root, document, metadata, status)
+            finally:
+                gate.MAX_REGIONS_JSON_BYTES = original_limit
+
+            self.assertFalse(result["ok"])
+            self.assertFalse(status["ok"])
+            self.assertTrue(
+                any(
+                    reason
+                    == "regions.json:sidecar_payload_exceeds_max_bytes"
+                    for reason in result["failure_reasons"]
+                )
+            )
+            self.assertFalse((root / "regions.json").exists())
+            self.assertNotIn("regions.json", metadata["generated_outputs"])
+            self.assertNotIn("regions.json", status["generated_outputs"])
+            self.assertNotIn("regions.json", status["outputs_written"])
+            self.assertTrue((root / "quality_signals.json").is_file())
+
     def test_missing_bare_picture_asset_is_advisory_unresolved_not_visual_only(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -1017,6 +1265,638 @@ class RegionQualityGateTests(unittest.TestCase):
             self.assertFalse(picture["critical"])
             self.assertFalse(picture["signals"]["visual_evidence_present"])
             self.assertTrue(result["ok"])
+
+    def test_picture_inventory_complete_expected_binding_is_visual_only(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            document, metadata, status = _fixture(root)
+            status["quality_signals"]["picture_surface_inventory"] = _picture_inventory()
+            result = evaluate_regions(root, document, metadata, status, write_sidecars=False)
+            picture = next(record for record in result["records"] if record["kind"] == "picture")
+            self.assertTrue(result["ok"])
+            self.assertEqual(picture["source_ref"], "#/pictures/0")
+            self.assertEqual(picture["evidence"]["source_asset"], "pictures/picture_1.png")
+            self.assertEqual(picture["status"], "visual_only")
+            self.assertFalse(picture["critical"])
+            self.assertEqual(picture["signals"]["html_reference_count"], 1)
+
+    def test_picture_inventory_metadata_top_level_fallback_is_honored(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            document, metadata, status = _fixture(root)
+            metadata["picture_surface_inventory"] = _picture_inventory()
+            status["quality_signals"].pop("picture_surface_inventory", None)
+            result = evaluate_regions(root, document, metadata, status, write_sidecars=False)
+            picture = next(record for record in result["records"] if record["kind"] == "picture")
+            self.assertTrue(result["ok"])
+            self.assertEqual(picture["status"], "visual_only")
+            self.assertFalse(picture["critical"])
+
+    def test_picture_inventory_required_raw_picture_cannot_be_downgraded_by_index_fallback(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            document, metadata, status = _fixture(root)
+            picture_node = document["pictures"][0]
+            picture_node.pop("self_ref")
+            picture_node["captions"] = [{"$ref": "#/texts/caption-0"}]
+            inventory = _picture_inventory(expected=False, source_ref="picture:1")
+            status["quality_signals"]["picture_surface_inventory"] = inventory
+            result = evaluate_regions(root, document, metadata, status, write_sidecars=False)
+            pictures = [record for record in result["records"] if record["kind"] == "picture"]
+            self.assertFalse(result["ok"])
+            self.assertTrue(
+                any(
+                    record["critical"]
+                    and "picture_surface_inventory_raw_source_ref_missing" in record["reasons"]
+                    and record["signals"].get("binding_mode") is None
+                    for record in pictures
+                )
+            )
+
+    def test_picture_inventory_nonexpected_exact_binding_cannot_downgrade_required_picture(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            document, metadata, status = _fixture(root)
+            document["pictures"][0]["captions"] = [{"$ref": "#/texts/caption-0"}]
+            inventory = _picture_inventory(expected=False)
+            status["quality_signals"]["picture_surface_inventory"] = inventory
+            result = evaluate_regions(root, document, metadata, status, write_sidecars=False)
+            picture = next(record for record in result["records"] if record["kind"] == "picture")
+            self.assertFalse(result["ok"])
+            self.assertTrue(picture["critical"])
+            self.assertIn(
+                "picture_surface_inventory_expected_binding_downgrade", picture["reasons"]
+            )
+
+    def test_picture_inventory_tiny_nonexpected_picture_remains_advisory(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            document, metadata, status = _fixture(root)
+            tiny_bbox = {
+                "l": 10,
+                "r": 20,
+                "t": 120,
+                "b": 130,
+                "coord_origin": "TOPLEFT",
+            }
+            document["pictures"][0]["prov"] = [{"page_no": 1, "bbox": tiny_bbox}]
+            inventory = _picture_inventory(expected=False)
+            inventory["records"][0]["bbox"] = tiny_bbox
+            status["quality_signals"]["picture_surface_inventory"] = inventory
+            result = evaluate_regions(root, document, metadata, status, write_sidecars=False)
+            picture = next(record for record in result["records"] if record["kind"] == "picture")
+            self.assertTrue(result["ok"])
+            self.assertFalse(picture["critical"])
+
+    def test_picture_without_inventory_missing_ref_remains_legacy_advisory(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            document, metadata, status = _fixture(root)
+            document["pictures"][0].pop("self_ref")
+            result = evaluate_regions(root, document, metadata, status, write_sidecars=False)
+            picture = next(record for record in result["records"] if record["kind"] == "picture")
+            self.assertTrue(result["ok"])
+            self.assertFalse(picture["critical"])
+
+    def test_picture_inventory_quality_signal_precedence_is_fail_closed(self):
+        for namespace in ("status", "metadata"):
+            with self.subTest(namespace=namespace), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                document, metadata, status = _fixture(root)
+                metadata["picture_surface_inventory"] = _picture_inventory()
+                malformed = {"records": []}
+                if namespace == "status":
+                    status["quality_signals"]["picture_surface_inventory"] = malformed
+                else:
+                    metadata["quality_signals"] = {
+                        "picture_surface_inventory": malformed
+                    }
+                result = evaluate_regions(
+                    root, document, metadata, status, write_sidecars=False
+                )
+                schema = next(
+                    record
+                    for record in result["records"]
+                    if record["source_ref"] == "picture_surface_inventory:schema"
+                )
+                self.assertFalse(result["ok"])
+                self.assertTrue(schema["critical"])
+                self.assertIn(
+                    "picture_surface_inventory_fields_missing", schema["reasons"]
+                )
+
+    def test_picture_inventory_complete_expected_binding_with_global_index_is_visual_only(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            document, metadata, status = _fixture(root)
+            inventory = _picture_inventory()
+            inventory["records"][0]["global_index"] = 1
+            status["quality_signals"]["picture_surface_inventory"] = inventory
+            result = evaluate_regions(root, document, metadata, status, write_sidecars=False)
+            picture = next(record for record in result["records"] if record["kind"] == "picture")
+            self.assertTrue(result["ok"])
+            self.assertEqual(picture["status"], "visual_only")
+            self.assertFalse(picture["critical"])
+
+    def test_picture_inventory_valid_chunk_identity_is_visual_only(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            document, metadata, status = _chunk_picture_fixture(root)
+            result = evaluate_regions(root, document, metadata, status, write_sidecars=False)
+            picture = next(record for record in result["records"] if record["kind"] == "picture")
+            self.assertTrue(result["ok"])
+            self.assertEqual(picture["status"], "visual_only")
+            self.assertFalse(picture["critical"])
+            self.assertEqual(picture["signals"]["inventory_self_ref"], "#/pictures/0")
+            self.assertEqual(picture["signals"]["inventory_part_index"], 0)
+
+    def test_picture_inventory_record_requires_self_ref_and_part_index(self):
+        for field in ("self_ref", "part_index"):
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                document, metadata, status = _fixture(root)
+                inventory = _picture_inventory()
+                inventory["records"][0].pop(field)
+                status["quality_signals"]["picture_surface_inventory"] = inventory
+                result = evaluate_regions(
+                    root, document, metadata, status, write_sidecars=False
+                )
+                schema = next(
+                    record
+                    for record in result["records"]
+                    if record["source_ref"] == "picture_surface_inventory:schema"
+                )
+                self.assertFalse(result["ok"])
+                self.assertTrue(schema["critical"])
+                self.assertIn(
+                    "picture_surface_inventory_record_fields_missing",
+                    schema["reasons"],
+                )
+
+    def test_picture_inventory_chunk_self_ref_tamper_is_critical(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            document, metadata, status = _chunk_picture_fixture(root)
+            status["quality_signals"]["picture_surface_inventory"]["records"][0][
+                "self_ref"
+            ] = "#/pictures/tampered"
+            result = evaluate_regions(root, document, metadata, status, write_sidecars=False)
+            picture = next(record for record in result["records"] if record["kind"] == "picture")
+            self.assertFalse(result["ok"])
+            self.assertTrue(picture["critical"])
+            self.assertIn("picture_surface_inventory_self_ref_mismatch", picture["reasons"])
+
+    def test_picture_inventory_chunk_part_index_tamper_is_critical(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            document, metadata, status = _chunk_picture_fixture(root)
+            status["quality_signals"]["picture_surface_inventory"]["records"][0][
+                "part_index"
+            ] = 1
+            result = evaluate_regions(root, document, metadata, status, write_sidecars=False)
+            picture = next(record for record in result["records"] if record["kind"] == "picture")
+            self.assertFalse(result["ok"])
+            self.assertTrue(picture["critical"])
+            self.assertIn(
+                "picture_surface_inventory_part_index_mismatch", picture["reasons"]
+            )
+
+    def test_picture_inventory_nonexpected_chunk_identity_mismatch_stays_advisory(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            document, metadata, status = _chunk_picture_fixture(root)
+            tiny_bbox = {
+                "l": 10,
+                "r": 20,
+                "t": 120,
+                "b": 130,
+                "coord_origin": "TOPLEFT",
+            }
+            document["chunks"][0]["document"]["pictures"][0]["prov"] = [
+                {"page_no": 1, "bbox": tiny_bbox}
+            ]
+            inventory = status["quality_signals"]["picture_surface_inventory"]
+            inventory["records"][0].update(
+                {
+                    "machine_binding_expected": False,
+                    "self_ref": "#/pictures/tampered",
+                    "part_index": 1,
+                    "bbox": tiny_bbox,
+                }
+            )
+            inventory["expected_count"] = 0
+            inventory["bound_count"] = 0
+            status["quality_signals"]["picture_surface_inventory"] = inventory
+            result = evaluate_regions(root, document, metadata, status, write_sidecars=False)
+            picture = next(record for record in result["records"] if record["kind"] == "picture")
+            self.assertTrue(result["ok"])
+            self.assertFalse(picture["critical"])
+            self.assertIn("picture_surface_inventory_self_ref_mismatch", picture["reasons"])
+            self.assertIn("picture_surface_inventory_part_index_mismatch", picture["reasons"])
+
+    def test_picture_inventory_record_requires_version_and_global_index(self):
+        for field in ("version", "global_index"):
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                document, metadata, status = _fixture(root)
+                inventory = _picture_inventory()
+                inventory["records"][0].pop(field)
+                status["quality_signals"]["picture_surface_inventory"] = inventory
+                result = evaluate_regions(
+                    root, document, metadata, status, write_sidecars=False
+                )
+                schema = next(
+                    record
+                    for record in result["records"]
+                    if record["source_ref"] == "picture_surface_inventory:schema"
+                )
+                self.assertFalse(result["ok"])
+                self.assertTrue(schema["critical"])
+                self.assertIn(
+                    "picture_surface_inventory_record_fields_missing",
+                    schema["reasons"],
+                )
+
+    def test_picture_inventory_record_version_must_be_v1(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            document, metadata, status = _fixture(root)
+            inventory = _picture_inventory()
+            inventory["records"][0]["version"] = 2
+            status["quality_signals"]["picture_surface_inventory"] = inventory
+            result = evaluate_regions(root, document, metadata, status, write_sidecars=False)
+            schema = next(
+                record
+                for record in result["records"]
+                if record["source_ref"] == "picture_surface_inventory:schema"
+            )
+            self.assertFalse(result["ok"])
+            self.assertIn(
+                "picture_surface_inventory_record_version_invalid", schema["reasons"]
+            )
+
+    def test_picture_inventory_global_index_must_match_record_index(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            document, metadata, status = _fixture(root)
+            inventory = _picture_inventory()
+            inventory["records"][0]["global_index"] = 2
+            status["quality_signals"]["picture_surface_inventory"] = inventory
+            result = evaluate_regions(root, document, metadata, status, write_sidecars=False)
+            schema = next(
+                record
+                for record in result["records"]
+                if record["source_ref"] == "picture_surface_inventory:schema"
+            )
+            self.assertFalse(result["ok"])
+            self.assertIn(
+                "picture_surface_inventory_global_index_mismatch", schema["reasons"]
+            )
+
+    def test_picture_inventory_source_asset_must_match_indexed_picture_path(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            document, metadata, status = _fixture(root)
+            inventory = _picture_inventory()
+            inventory["records"][0]["source_asset"] = "pictures/picture_2.png"
+            status["quality_signals"]["picture_surface_inventory"] = inventory
+            result = evaluate_regions(root, document, metadata, status, write_sidecars=False)
+            schema = next(
+                record
+                for record in result["records"]
+                if record["source_ref"] == "picture_surface_inventory:schema"
+            )
+            self.assertFalse(result["ok"])
+            self.assertIn(
+                "picture_surface_inventory_source_asset_path_invalid",
+                schema["reasons"],
+            )
+
+    def test_picture_inventory_index_and_asset_rebind_still_fails_global_identity(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            document, metadata, status = _fixture(root)
+            second_asset = root / "pictures/picture_2.png"
+            second_asset.write_bytes(b"evidence")
+            inventory = _picture_inventory()
+            inventory["records"][0].update(
+                {
+                    "index": 2,
+                    "global_index": 2,
+                    "source_asset": "pictures/picture_2.png",
+                }
+            )
+            status["quality_signals"]["picture_surface_inventory"] = inventory
+            result = evaluate_regions(root, document, metadata, status, write_sidecars=False)
+            picture = next(record for record in result["records"] if record["kind"] == "picture")
+            self.assertFalse(result["ok"])
+            self.assertTrue(picture["critical"])
+            self.assertIn(
+                "picture_surface_inventory_global_index_mismatch", picture["reasons"]
+            )
+
+    def test_picture_inventory_nonexpected_record_may_omit_geometry(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            document, metadata, status = _fixture(root)
+            tiny_bbox = {
+                "l": 10,
+                "r": 20,
+                "t": 120,
+                "b": 130,
+                "coord_origin": "TOPLEFT",
+            }
+            document["pictures"][0]["prov"] = [{"page_no": 1, "bbox": tiny_bbox}]
+            inventory = _picture_inventory(expected=False)
+            inventory["records"][0].pop("page_no")
+            inventory["records"][0].pop("bbox")
+            status["quality_signals"]["picture_surface_inventory"] = inventory
+            result = evaluate_regions(root, document, metadata, status, write_sidecars=False)
+            picture = next(record for record in result["records"] if record["kind"] == "picture")
+            self.assertTrue(result["ok"])
+            self.assertFalse(picture["critical"])
+            self.assertEqual(picture["signals"]["machine_binding_expected"], False)
+
+    def test_picture_inventory_nonexpected_declared_critical_cannot_be_downgraded(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            document, metadata, status = _fixture(root)
+            inventory = _picture_inventory(
+                expected=False,
+                status="unresolved",
+                critical=True,
+                reasons=["picture_visual_evidence_missing"],
+                ok=False,
+            )
+            status["quality_signals"]["picture_surface_inventory"] = inventory
+            result = evaluate_regions(root, document, metadata, status, write_sidecars=False)
+            picture = next(record for record in result["records"] if record["kind"] == "picture")
+            self.assertFalse(result["ok"])
+            self.assertEqual(picture["status"], "unresolved")
+            self.assertTrue(picture["critical"])
+            self.assertIn("picture_surface_inventory_declared_critical", picture["reasons"])
+
+    def test_picture_inventory_unmatched_nonexpected_declared_critical_stays_critical(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            document, metadata, status = _fixture(root)
+            document["pictures"] = []
+            inventory = _picture_inventory(
+                expected=False,
+                status="unresolved",
+                critical=True,
+                reasons=["picture_visual_evidence_missing"],
+                ok=False,
+            )
+            status["quality_signals"]["picture_surface_inventory"] = inventory
+            result = evaluate_regions(root, document, metadata, status, write_sidecars=False)
+            picture = next(
+                record
+                for record in result["records"]
+                if record["source_ref"] == "#/pictures/0"
+            )
+            self.assertFalse(result["ok"])
+            self.assertEqual(picture["status"], "unresolved")
+            self.assertTrue(picture["critical"])
+
+    def test_picture_inventory_nonmatching_source_ref_declared_critical_stays_critical(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            document, metadata, status = _fixture(root)
+            inventory = _picture_inventory(
+                expected=False,
+                source_ref="#/pictures/other",
+                status="unresolved",
+                critical=True,
+                reasons=["picture_visual_evidence_missing"],
+                ok=False,
+            )
+            status["quality_signals"]["picture_surface_inventory"] = inventory
+            result = evaluate_regions(root, document, metadata, status, write_sidecars=False)
+            picture = next(
+                record
+                for record in result["records"]
+                if record["source_ref"] == "#/pictures/other"
+            )
+            self.assertFalse(result["ok"])
+            self.assertEqual(picture["status"], "unresolved")
+            self.assertTrue(picture["critical"])
+
+    def test_picture_inventory_expected_record_requires_geometry(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            document, metadata, status = _fixture(root)
+            inventory = _picture_inventory()
+            inventory["records"][0].pop("page_no")
+            inventory["records"][0].pop("bbox")
+            status["quality_signals"]["picture_surface_inventory"] = inventory
+            result = evaluate_regions(root, document, metadata, status, write_sidecars=False)
+            schema = next(
+                record
+                for record in result["records"]
+                if record["source_ref"] == "picture_surface_inventory:schema"
+            )
+            self.assertFalse(result["ok"])
+            self.assertTrue(schema["critical"])
+            self.assertIn("picture_surface_inventory_record_fields_missing", schema["reasons"])
+
+    def test_picture_inventory_expected_binding_rejects_invalid_raw_source_ref_index_fallback(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            document, metadata, status = _fixture(root)
+            document["pictures"][0]["self_ref"] = "not a safe ref"
+            status["quality_signals"]["picture_surface_inventory"] = _picture_inventory()
+            result = evaluate_regions(root, document, metadata, status, write_sidecars=False)
+            pictures = [record for record in result["records"] if record["kind"] == "picture"]
+            self.assertFalse(result["ok"])
+            self.assertTrue(
+                any(
+                    record["critical"]
+                    and "picture_surface_inventory_raw_source_ref_invalid" in record["reasons"]
+                    for record in pictures
+                )
+            )
+
+    def test_picture_inventory_expected_binding_rejects_missing_raw_source_ref_index_fallback(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            document, metadata, status = _fixture(root)
+            document["pictures"][0].pop("self_ref")
+            status["quality_signals"]["picture_surface_inventory"] = _picture_inventory()
+            result = evaluate_regions(root, document, metadata, status, write_sidecars=False)
+            pictures = [record for record in result["records"] if record["kind"] == "picture"]
+            self.assertFalse(result["ok"])
+            self.assertTrue(
+                any(
+                    record["critical"]
+                    and "picture_surface_inventory_raw_source_ref_missing" in record["reasons"]
+                    for record in pictures
+                )
+            )
+
+    def test_picture_inventory_page_tamper_is_critical(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            document, metadata, status = _fixture(root)
+            inventory = _picture_inventory()
+            inventory["records"][0]["page_no"] = 2
+            status["quality_signals"]["picture_surface_inventory"] = inventory
+            result = evaluate_regions(root, document, metadata, status, write_sidecars=False)
+            picture = next(record for record in result["records"] if record["kind"] == "picture")
+            self.assertFalse(result["ok"])
+            self.assertTrue(picture["critical"])
+            self.assertIn("picture_surface_inventory_page_no_mismatch", picture["reasons"])
+
+    def test_picture_inventory_bbox_tamper_is_critical(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            document, metadata, status = _fixture(root)
+            inventory = _picture_inventory()
+            inventory["records"][0]["bbox"] = dict(BBOX, r=111)
+            status["quality_signals"]["picture_surface_inventory"] = inventory
+            result = evaluate_regions(root, document, metadata, status, write_sidecars=False)
+            picture = next(record for record in result["records"] if record["kind"] == "picture")
+            self.assertFalse(result["ok"])
+            self.assertTrue(picture["critical"])
+            self.assertIn("picture_surface_inventory_bbox_mismatch", picture["reasons"])
+
+    def test_picture_inventory_global_index_tamper_is_critical(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            document, metadata, status = _fixture(root)
+            inventory = _picture_inventory()
+            inventory["records"][0]["global_index"] = 2
+            status["quality_signals"]["picture_surface_inventory"] = inventory
+            result = evaluate_regions(root, document, metadata, status, write_sidecars=False)
+            picture = next(record for record in result["records"] if record["kind"] == "picture")
+            self.assertFalse(result["ok"])
+            self.assertTrue(picture["critical"])
+            self.assertIn(
+                "picture_surface_inventory_global_index_mismatch", picture["reasons"]
+            )
+
+    def test_picture_inventory_expected_missing_binding_is_critical(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            document, metadata, status = _fixture(root)
+            status["quality_signals"]["picture_surface_inventory"] = _picture_inventory(
+                asset_present=False,
+                asset_sha256=None,
+            )
+            result = evaluate_regions(root, document, metadata, status, write_sidecars=False)
+            picture = next(record for record in result["records"] if record["kind"] == "picture")
+            self.assertFalse(result["ok"])
+            self.assertEqual(picture["status"], "unresolved")
+            self.assertTrue(picture["critical"])
+            self.assertIn("picture_surface_inventory_asset_presence_false", picture["reasons"])
+
+    def test_picture_inventory_asset_tamper_is_critical(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            document, metadata, status = _fixture(root)
+            status["quality_signals"]["picture_surface_inventory"] = _picture_inventory()
+            (root / "pictures/picture_1.png").write_bytes(b"tampered")
+            result = evaluate_regions(root, document, metadata, status, write_sidecars=False)
+            picture = next(record for record in result["records"] if record["kind"] == "picture")
+            self.assertFalse(result["ok"])
+            self.assertTrue(picture["critical"])
+            self.assertIn("picture_surface_inventory_asset_hash_mismatch", picture["reasons"])
+
+    def test_picture_inventory_duplicate_source_ref_is_schema_failure(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            document, metadata, status = _fixture(root)
+            duplicate = _picture_inventory()
+            duplicate["records"] = [
+                dict(duplicate["records"][0]),
+                dict(duplicate["records"][0], index=2),
+            ]
+            duplicate["expected_count"] = 2
+            duplicate["bound_count"] = 2
+            status["quality_signals"]["picture_surface_inventory"] = duplicate
+            result = evaluate_regions(root, document, metadata, status, write_sidecars=False)
+            schema = next(
+                record
+                for record in result["records"]
+                if record["source_ref"] == "picture_surface_inventory:schema"
+            )
+            self.assertFalse(result["ok"])
+            self.assertTrue(schema["critical"])
+            self.assertIn("picture_surface_inventory_duplicate_source_ref", schema["reasons"])
+
+    def test_picture_inventory_malformed_declared_value_does_not_fallback_to_advisory(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            document, metadata, status = _fixture(root)
+            status["quality_signals"]["picture_surface_inventory"] = {"records": []}
+            result = evaluate_regions(root, document, metadata, status, write_sidecars=False)
+            pictures = [record for record in result["records"] if record["kind"] == "picture"]
+            self.assertEqual(len(pictures), 1)
+            self.assertTrue(pictures[0]["critical"])
+            self.assertEqual(pictures[0]["status"], "unresolved")
+            self.assertFalse(result["ok"])
+
+    def test_picture_inventory_summary_accounting_mismatch_is_schema_failure(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            document, metadata, status = _fixture(root)
+            inventory = _picture_inventory(bound_count=0)
+            status["quality_signals"]["picture_surface_inventory"] = inventory
+            result = evaluate_regions(root, document, metadata, status, write_sidecars=False)
+            schema = next(
+                record
+                for record in result["records"]
+                if record["source_ref"] == "picture_surface_inventory:schema"
+            )
+            self.assertFalse(result["ok"])
+            self.assertIn("picture_surface_inventory_bound_count_mismatch", schema["reasons"])
+
+    def test_picture_inventory_nonexpected_missing_asset_remains_advisory(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            document, metadata, status = _fixture(root)
+            tiny_bbox = {
+                "l": 10,
+                "r": 20,
+                "t": 120,
+                "b": 130,
+                "coord_origin": "TOPLEFT",
+            }
+            document["pictures"][0]["prov"] = [{"page_no": 1, "bbox": tiny_bbox}]
+            inventory = _picture_inventory(
+                expected=False,
+                asset_present=False,
+                asset_sha256=None,
+                reasons=["bbox_below_minimum_visual_area"],
+            )
+            inventory["records"][0]["bbox"] = tiny_bbox
+            status["quality_signals"]["picture_surface_inventory"] = inventory
+            result = evaluate_regions(root, document, metadata, status, write_sidecars=False)
+            picture = next(record for record in result["records"] if record["kind"] == "picture")
+            self.assertTrue(result["ok"])
+            self.assertEqual(picture["status"], "unresolved")
+            self.assertFalse(picture["critical"])
+
+    def test_picture_inventory_record_cap_is_hard_failure(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            document, metadata, status = _fixture(root)
+            inventory = _picture_inventory()
+            inventory["records"] = [
+                dict(inventory["records"][0], index=index, source_ref=f"#/pictures/{index}")
+                for index in range(1, gate.MAX_LIST_ITEMS + 2)
+            ]
+            inventory["expected_count"] = gate.MAX_LIST_ITEMS
+            inventory["bound_count"] = gate.MAX_LIST_ITEMS
+            status["quality_signals"]["picture_surface_inventory"] = inventory
+            result = evaluate_regions(root, document, metadata, status, write_sidecars=False)
+            schema = next(
+                record
+                for record in result["records"]
+                if record["source_ref"] == "picture_surface_inventory:schema"
+            )
+            self.assertTrue(schema["critical"])
+            self.assertIn("picture_surface_inventory_records_exceeded", schema["reasons"])
 
     def test_dry_run_does_not_advertise_unwritten_sidecars(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -1800,6 +2680,240 @@ class RegionQualityGateTests(unittest.TestCase):
             self.assertEqual("verified_semantic", inline["status"])
             self.assertTrue(result["ok"])
 
+    def test_inline_collection_index_binding_uses_union_of_same_page_bottomleft_provenance(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            document, metadata, status = _fixture(root)
+            node = document["texts"][3]
+            node["self_ref"] = "#/texts/3"
+            node["prov"] = [
+                {"page_no": 1, "bbox": BBOX_BOTTOMLEFT_A},
+                {"page_no": 1, "bbox": BBOX_BOTTOMLEFT_B},
+            ]
+            region = status["quality_signals"]["primary_surface"][
+                "inline_math_source_regions"
+            ][0]
+            region.update(
+                {
+                    "collection_index": 3,
+                    "bbox": BBOX_BOTTOMLEFT_UNION,
+                    "source_text": "x_i",
+                    "part_index": None,
+                    "unresolved": False,
+                }
+            )
+            candidate = status["quality_signals"]["final_source_visuals"][
+                "inline_math_source_renderings"
+            ]["candidates"][0]
+            candidate.update({"source_text": "x_i", "bbox": BBOX_BOTTOMLEFT_UNION})
+
+            result = evaluate_regions(root, document, metadata, status, write_sidecars=False)
+
+            inline = next(item for item in result["records"] if item["kind"] == "inline_math")
+            self.assertEqual("verified_semantic", inline["status"])
+            self.assertNotIn(
+                "inline_math_final_node_binding_missing_or_ambiguous",
+                inline["reasons"],
+            )
+            self.assertTrue(result["ok"])
+
+    def test_inline_explicit_source_ref_binding_uses_union_of_same_page_bottomleft_provenance(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            document, metadata, status = _fixture(root)
+            node = document["texts"][3]
+            node["prov"] = [
+                {"page_no": 1, "bbox": BBOX_BOTTOMLEFT_A},
+                {"page_no": 1, "bbox": BBOX_BOTTOMLEFT_B},
+            ]
+            region = status["quality_signals"]["primary_surface"][
+                "inline_math_source_regions"
+            ][0]
+            region.update(
+                {
+                    "source_ref": "#/texts/inline-0",
+                    "bbox": BBOX_BOTTOMLEFT_UNION,
+                    "source_text": "x_i",
+                    "part_index": None,
+                    "unresolved": False,
+                }
+            )
+            candidate = status["quality_signals"]["final_source_visuals"][
+                "inline_math_source_renderings"
+            ]["candidates"][0]
+            candidate.update({"source_text": "x_i", "bbox": BBOX_BOTTOMLEFT_UNION})
+
+            result = evaluate_regions(root, document, metadata, status, write_sidecars=False)
+
+            inline = next(item for item in result["records"] if item["kind"] == "inline_math")
+            self.assertEqual("verified_semantic", inline["status"])
+            self.assertNotIn(
+                "inline_math_final_node_binding_missing_or_ambiguous",
+                inline["reasons"],
+            )
+            self.assertNotIn(
+                "inline_math_final_node_bbox_mismatch",
+                inline["reasons"],
+            )
+            self.assertTrue(result["ok"])
+
+    def test_inline_provenance_union_rejects_incoherent_boxes(self):
+        incoherent_cases = {
+            "mixed-origins": {
+                **BBOX_BOTTOMLEFT_B,
+                "coord_origin": "TOPLEFT",
+            },
+            "separate-columns": {
+                **BBOX_BOTTOMLEFT_B,
+                "l": 180,
+                "r": 320,
+            },
+        }
+        for name, second_bbox in incoherent_cases.items():
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                document, metadata, status = _fixture(root)
+                node = document["texts"][3]
+                node["self_ref"] = "#/texts/3"
+                node["prov"] = [
+                    {"page_no": 1, "bbox": BBOX_BOTTOMLEFT_A},
+                    {"page_no": 1, "bbox": second_bbox},
+                ]
+                region = status["quality_signals"]["primary_surface"][
+                    "inline_math_source_regions"
+                ][0]
+                region.update(
+                    {
+                        "collection_index": 3,
+                        "bbox": BBOX_BOTTOMLEFT_UNION,
+                        "source_text": "x_i",
+                        "unresolved": False,
+                    }
+                )
+                candidate = status["quality_signals"]["final_source_visuals"][
+                    "inline_math_source_renderings"
+                ]["candidates"][0]
+                candidate.update(
+                    {"source_text": "x_i", "bbox": BBOX_BOTTOMLEFT_UNION}
+                )
+
+                result = evaluate_regions(
+                    root, document, metadata, status, write_sidecars=False
+                )
+
+                inline = next(
+                    item
+                    for item in result["records"]
+                    if item["kind"] == "inline_math"
+                )
+                self.assertEqual("unresolved", inline["status"])
+                self.assertIn(
+                    "inline_math_final_node_binding_missing_or_ambiguous",
+                    inline["reasons"],
+                )
+                self.assertFalse(result["ok"])
+
+    def test_inline_provenance_union_does_not_bind_a_later_page(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            document, metadata, status = _fixture(root)
+            node = document["texts"][3]
+            node["self_ref"] = "#/texts/3"
+            node["prov"] = [
+                {"page_no": 1, "bbox": BBOX_BOTTOMLEFT_A},
+                {"page_no": 2, "bbox": BBOX_BOTTOMLEFT_B},
+            ]
+            region = status["quality_signals"]["primary_surface"][
+                "inline_math_source_regions"
+            ][0]
+            region.update(
+                {
+                    "collection_index": 3,
+                    "page_no": 2,
+                    "bbox": BBOX_BOTTOMLEFT_B,
+                    "source_text": "x_i",
+                    "unresolved": False,
+                }
+            )
+            candidate = status["quality_signals"]["final_source_visuals"][
+                "inline_math_source_renderings"
+            ]["candidates"][0]
+            candidate.update(
+                {
+                    "page_no": 2,
+                    "source_text": "x_i",
+                    "bbox": BBOX_BOTTOMLEFT_B,
+                }
+            )
+
+            result = evaluate_regions(
+                root, document, metadata, status, write_sidecars=False
+            )
+
+            inline = next(
+                item for item in result["records"] if item["kind"] == "inline_math"
+            )
+            self.assertEqual("unresolved", inline["status"])
+            self.assertIn(
+                "inline_math_final_node_binding_missing_or_ambiguous",
+                inline["reasons"],
+            )
+            self.assertFalse(result["ok"])
+
+    def test_inline_provenance_union_does_not_bind_inside_a_vertical_gap(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            document, metadata, status = _fixture(root)
+            node = document["texts"][3]
+            node["self_ref"] = "#/texts/3"
+            node["prov"] = [
+                {"page_no": 1, "bbox": BBOX_BOTTOMLEFT_A},
+                {
+                    "page_no": 1,
+                    "bbox": {
+                        **BBOX_BOTTOMLEFT_B,
+                        "t": 100,
+                        "b": 80,
+                    },
+                },
+            ]
+            gap_bbox = {
+                "l": 30,
+                "r": 160,
+                "t": 155,
+                "b": 125,
+                "coord_origin": "BOTTOMLEFT",
+            }
+            region = status["quality_signals"]["primary_surface"][
+                "inline_math_source_regions"
+            ][0]
+            region.update(
+                {
+                    "collection_index": 3,
+                    "bbox": gap_bbox,
+                    "source_text": "x_i",
+                    "unresolved": False,
+                }
+            )
+            candidate = status["quality_signals"]["final_source_visuals"][
+                "inline_math_source_renderings"
+            ]["candidates"][0]
+            candidate.update({"source_text": "x_i", "bbox": gap_bbox})
+
+            result = evaluate_regions(
+                root, document, metadata, status, write_sidecars=False
+            )
+
+            inline = next(
+                item for item in result["records"] if item["kind"] == "inline_math"
+            )
+            self.assertEqual("unresolved", inline["status"])
+            self.assertIn(
+                "inline_math_final_node_binding_missing_or_ambiguous",
+                inline["reasons"],
+            )
+            self.assertFalse(result["ok"])
+
     def test_inline_long_paragraph_binding_uses_full_text_not_preview(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -2189,7 +3303,9 @@ class RegionQualityGateTests(unittest.TestCase):
             self.assertIn("table_geometry_work_limit", table["reasons"])
             self.assertFalse(result["ok"])
 
-    def test_legal_uncertainty_and_range_cells_do_not_trigger_collapsed_rows(self):
+    def test_legal_uncertainty_and_range_cells_do_not_trigger_multiline_row_ambiguity(
+        self,
+    ):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             document, metadata, status = _fixture(root)
@@ -2212,7 +3328,7 @@ class RegionQualityGateTests(unittest.TestCase):
             )
             result = evaluate_regions(root, document, metadata, status, write_sidecars=False)
             table = next(record for record in result["records"] if record["kind"] == "table")
-            self.assertNotIn("table_row_likely_collapsed", table["reasons"])
+            self.assertNotIn("table_multiline_row_ambiguity", table["reasons"])
 
     def test_chunk_part_source_refs_are_deterministic_and_bounded(self):
         document = {
@@ -2272,7 +3388,7 @@ class RegionQualityGateTests(unittest.TestCase):
 
             self.assertIn("chunk:2:#/tables/0", diagnostics)
             self.assertIn(
-                "table_row_likely_collapsed",
+                "table_multiline_row_ambiguity",
                 diagnostics["chunk:2:#/tables/0"]["reasons"],
             )
 
@@ -2700,6 +3816,7 @@ class RegionQualityGateTests(unittest.TestCase):
                     item for item in result["records"] if item["kind"] == "table"
                 )
                 self.assertIn("table_cell_occupancy_incomplete", table["reasons"])
+                self.assertNotIn("table_multiline_row_ambiguity", table["reasons"])
                 self.assertFalse(result["ok"])
 
     def test_empty_table_requires_explicit_fallback_even_with_bad_dimensions(self):
@@ -2756,6 +3873,160 @@ class RegionQualityGateTests(unittest.TestCase):
             self.assertIn("quarantine_candidates_invalid", quarantine["reasons"])
             self.assertFalse(result["ok"])
 
+    def test_failed_state_publish_removes_stale_generation_and_advertisement(self):
+        for failed_name in ("metadata.json", "status.json"):
+            with (
+                self.subTest(failed_name=failed_name),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                root = Path(temporary)
+                document, metadata, status = _fixture(root)
+                advertised = ["regions.json", "quality_signals.json", failed_name]
+                metadata["generated_outputs"] = list(advertised)
+                status["generated_outputs"] = list(advertised)
+                status["outputs_written"] = list(advertised)
+                (root / "metadata.json").write_text(
+                    json.dumps({"stale": True}), encoding="utf-8"
+                )
+                (root / "status.json").write_text(
+                    json.dumps({"ok": True, "stale": True}), encoding="utf-8"
+                )
+                original_atomic_json = gate._atomic_json
+
+                def fail_selected_state(path, payload, **kwargs):
+                    if path.name == failed_name:
+                        return "injected_state_publish_failure"
+                    return original_atomic_json(path, payload, **kwargs)
+
+                gate._atomic_json = fail_selected_state
+                try:
+                    result = evaluate_regions(root, document, metadata, status)
+                finally:
+                    gate._atomic_json = original_atomic_json
+
+                self.assertFalse(result["ok"])
+                self.assertFalse((root / failed_name).exists())
+                self.assertTrue(
+                    any(
+                        reason
+                        == f"{failed_name}:injected_state_publish_failure"
+                        for reason in result["failure_reasons"]
+                    )
+                )
+                for state in (metadata, status):
+                    for key in ("generated_outputs", "outputs_written"):
+                        if isinstance(state.get(key), list):
+                            self.assertNotIn(failed_name, state[key])
+                surviving_name = (
+                    "status.json" if failed_name == "metadata.json" else "metadata.json"
+                )
+                surviving = json.loads(
+                    (root / surviving_name).read_text(encoding="utf-8")
+                )
+                if surviving_name == "status.json":
+                    self.assertFalse(surviving["ok"])
+                else:
+                    self.assertFalse(surviving["region_quality_gate"]["ok"])
+
+    def test_failed_failure_state_rewrite_unpublishes_written_sidecar(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            document, metadata, status = _fixture(root)
+            (root / "metadata.json").write_text(
+                json.dumps(metadata), encoding="utf-8"
+            )
+            (root / "status.json").write_text(json.dumps(status), encoding="utf-8")
+            original_atomic_json = gate._atomic_json
+            regions_writes = 0
+
+            def fail_companion_then_regions_rewrite(path, payload, **kwargs):
+                nonlocal regions_writes
+                if path.name == "quality_signals.json":
+                    return "injected_companion_failure"
+                if path.name == "regions.json":
+                    regions_writes += 1
+                    if regions_writes == 2:
+                        return "injected_failure_state_rewrite_failure"
+                return original_atomic_json(path, payload, **kwargs)
+
+            gate._atomic_json = fail_companion_then_regions_rewrite
+            try:
+                result = evaluate_regions(root, document, metadata, status)
+            finally:
+                gate._atomic_json = original_atomic_json
+
+            self.assertFalse(result["ok"])
+            self.assertFalse((root / "regions.json").exists())
+            self.assertFalse((root / "quality_signals.json").exists())
+            for state in (metadata, status):
+                for key in ("generated_outputs", "outputs_written"):
+                    if isinstance(state.get(key), list):
+                        self.assertNotIn("regions.json", state[key])
+                        self.assertNotIn("quality_signals.json", state[key])
+            persisted_metadata = json.loads(
+                (root / "metadata.json").read_text(encoding="utf-8")
+            )
+            persisted_status = json.loads(
+                (root / "status.json").read_text(encoding="utf-8")
+            )
+            self.assertNotIn(
+                "regions.json", persisted_metadata["generated_outputs"]
+            )
+            self.assertFalse(persisted_status["ok"])
+
+    def test_late_status_rewrite_failure_reconciles_persisted_metadata(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            document, metadata, status = _fixture(root)
+            advertised = [
+                "regions.json",
+                "quality_signals.json",
+                "metadata.json",
+                "status.json",
+            ]
+            metadata["generated_outputs"] = list(advertised)
+            status["generated_outputs"] = list(advertised)
+            status["outputs_written"] = list(advertised)
+            (root / "metadata.json").write_text(
+                json.dumps(metadata), encoding="utf-8"
+            )
+            (root / "status.json").write_text(json.dumps(status), encoding="utf-8")
+            original_atomic_json = gate._atomic_json
+            status_writes = 0
+
+            def fail_companion_and_late_status(path, payload, **kwargs):
+                nonlocal status_writes
+                if path.name == "quality_signals.json":
+                    return "injected_companion_failure"
+                if path.name == "status.json":
+                    status_writes += 1
+                    if status_writes == 2:
+                        return "injected_late_status_failure"
+                return original_atomic_json(path, payload, **kwargs)
+
+            gate._atomic_json = fail_companion_and_late_status
+            try:
+                result = evaluate_regions(root, document, metadata, status)
+            finally:
+                gate._atomic_json = original_atomic_json
+
+            self.assertFalse(result["ok"])
+            self.assertFalse((root / "quality_signals.json").exists())
+            self.assertFalse((root / "status.json").exists())
+            persisted_metadata = json.loads(
+                (root / "metadata.json").read_text(encoding="utf-8")
+            )
+            self.assertNotIn(
+                "quality_signals.json", persisted_metadata["generated_outputs"]
+            )
+            self.assertNotIn(
+                "status.json", persisted_metadata["generated_outputs"]
+            )
+            persisted_regions = json.loads(
+                (root / "regions.json").read_text(encoding="utf-8")
+            )
+            self.assertFalse(persisted_regions["ok"])
+
     def test_caller_state_is_persisted_after_sidecar_publish_failure(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -2766,10 +4037,10 @@ class RegionQualityGateTests(unittest.TestCase):
             (root / "status.json").write_text(json.dumps(status), encoding="utf-8")
             original_atomic_json = gate._atomic_json
 
-            def fail_quality_signals(path, payload):
+            def fail_quality_signals(path, payload, **kwargs):
                 if path.name == "quality_signals.json":
                     return "injected_publish_failure"
-                return original_atomic_json(path, payload)
+                return original_atomic_json(path, payload, **kwargs)
 
             gate._atomic_json = fail_quality_signals
             try:

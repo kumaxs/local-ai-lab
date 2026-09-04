@@ -33,6 +33,26 @@ def _coerce_iso(value: Any, *, default_now: bool = False) -> str | None:
     return None
 
 
+def _legacy_state_import_sort_key(path: Path) -> tuple[int, datetime, str]:
+    """Order legacy mirrors by submission time with a deterministic fallback."""
+
+    latest = datetime.max.replace(tzinfo=timezone.utc)
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        created_at = payload.get("created_at") if isinstance(payload, dict) else None
+        if not isinstance(created_at, str):
+            raise ValueError("legacy created_at is missing")
+        parsed = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return 0, parsed.astimezone(timezone.utc), path.name
+    except (OSError, UnicodeError, json.JSONDecodeError, ValueError, OverflowError):
+        # Invalid records are still handled by the existing import validator.
+        # Sort them after parseable submissions and by name so report order is
+        # stable without silently changing compatibility behavior.
+        return 1, latest, path.name
+
+
 def _to_cursor(payload: Mapping[str, Any]) -> str:
     raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode("utf-8")
     return base64.urlsafe_b64encode(raw).decode("ascii")
@@ -1477,7 +1497,10 @@ class SQLiteStore:
         skipped: list[dict[str, str]] = []
         now = _utc_now()
 
-        for path in sorted(jobs_dir.glob("*.json")):
+        for path in sorted(
+            jobs_dir.glob("*.json"),
+            key=_legacy_state_import_sort_key,
+        ):
             try:
                 raw = path.read_text(encoding="utf-8")
                 payload = json.loads(raw)

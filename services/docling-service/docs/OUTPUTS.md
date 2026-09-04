@@ -66,12 +66,17 @@ formula/table/algorithm/code counts. `metadata.json` and
 `status.json.quality_signals` may expose `pdf_structure_inventory`,
 `final_pdf_inventory`, `final_source_visuals`, `final_formula_surface`, and
 `final_structural_surface`. Current source builds also publish `regions.json`
-and `quality_signals.json`: the first is a deterministic, at-most-1,000-record
-inventory of region evidence and the second is its compact summary. Both are
-listed in `metadata.json.generated_outputs` only after they are written
-successfully. The high-confidence/ambiguous counters drive gate
+and `quality_signals.json`: the first is a deterministic, request-bounded
+inventory of region evidence with a 10,000-record hard cap and the second is its
+compact summary. Both are listed in `metadata.json.generated_outputs` only after
+they are written successfully; a failed replacement removes any older regular
+sidecar generation and its output-list entries. Producer-owned diagnostic lists
+are still traversed with a 1,001-item bound, and `regions.json` has a 128 MiB
+serialized-size limit. The high-confidence/ambiguous counters drive gate
 comparisons; persisted `records` arrays are bounded diagnostic samples and are
-not a second exact-count contract.
+not a second exact-count contract. Stand-alone validator callers must serialize
+sidecar-writing evaluations per output directory; the production path enforces
+this with its persistent job lock and fresh-output guard.
 
 Formula, table, algorithm, and code source visuals are occurrence-bound
 evidence, not generic decorations. Their manifests bind the submitted-PDF SHA,
@@ -82,9 +87,12 @@ but cannot override a conflicting source visual.
 
 Region outcomes are `verified_semantic`, `visual_only`, and `unresolved`.
 Unresolved picture-OCR, header/footer, table, algorithm, code, formula, or
-inline-math evidence is critical and forces `degraded_failure`; an ordinary
-picture may be noncritical `visual_only` only while its regular source crop is
-present. Structural records are rebound to a final node/body identity, source
+inline-math evidence is critical and forces `degraded_failure`. Every
+machine-binding-expected source picture must preserve its source ref,
+page/bbox, source-PDF digest, crop digest, and exactly one real image reference
+on each HTML and Markdown surface; missing or tampered bindings are critical.
+Tiny/decorative, furniture, quarantined, and formula-child pictures remain
+noncritical advisory evidence. Structural records are rebound to a final node/body identity, source
 PDF digest, page/bbox, and kind-specific source asset. Cross-page algorithms
 also require a real source asset for every covered page; until the producer can
 publish that set, they intentionally remain unresolved. Table regions

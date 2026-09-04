@@ -4362,6 +4362,220 @@ class SemanticReflowTests(unittest.TestCase):
                 "pictures/picture_1.png",
             )
 
+    def test_authoritative_picture_crop_wins_without_decoding_or_overwriting_embedded_data(self) -> None:
+        # The crop is produced by the source-PDF renderer and must remain
+        # byte-identical even when Docling also carries an embedded image.
+        document = {
+            "pictures": [
+                {
+                    "image": {"uri": "data:image/png;base64,not-valid-base64"},
+                    "prov": [{"page_no": 1, "bbox": {"l": 0, "r": 40, "t": 40, "b": 0}}],
+                }
+            ]
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            crop = output_dir / "pictures" / "picture_1.png"
+            crop.parent.mkdir()
+            crop.write_bytes(b"authoritative-source-crop")
+            before = crop.read_bytes()
+
+            result = semantic_reflow._materialize_picture_assets(
+                output_dir,
+                [document],
+            )
+
+            self.assertEqual({"written": 0, "skipped": 0}, result)
+            self.assertEqual(before, crop.read_bytes())
+            self.assertEqual(
+                "pictures/picture_1.png",
+                document["pictures"][0]["_semantic_picture_path"],
+            )
+
+    def test_captionless_picture_reuses_crop_and_renders_both_delivery_surfaces(self) -> None:
+        class Source:
+            def text(self, _prov, **_kwargs):
+                return ""
+
+            def lines(self, _prov, padding=0.0):
+                del padding
+                return []
+
+            def page_size(self, _page_no):
+                return 100.0, 100.0
+
+        picture = {
+            "label": "picture",
+            "self_ref": "#/pictures/0",
+            "image": None,
+            "prov": [{"page_no": 1, "bbox": {"l": 0, "r": 40, "t": 40, "b": 0}}],
+        }
+        document = {
+            "body": {"children": [{"$ref": "#/pictures/0"}]},
+            "pictures": [picture],
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            crop = output_dir / "pictures" / "picture_1.png"
+            crop.parent.mkdir()
+            crop.write_bytes(b"source-pdf-crop")
+            result = semantic_reflow._materialize_picture_assets(
+                output_dir,
+                [document],
+            )
+            items = semantic_reflow._collect_items(document, Source())
+            html_text, markdown_text, counts = semantic_reflow._render(
+                items,
+                document,
+                Source(),
+            )
+
+        self.assertEqual({"written": 0, "skipped": 0}, result)
+        self.assertEqual(1, len([item for item in items if item.kind == "picture"]))
+        self.assertEqual(1, counts["pictures"])
+        self.assertEqual(1, html_text.count('src="pictures/picture_1.png"'))
+        self.assertEqual(1, markdown_text.count("](pictures/picture_1.png)"))
+
+    def test_chunk_picture_assets_use_global_indices_without_part_local_collisions(self) -> None:
+        def picture(ref: str) -> dict[str, object]:
+            return {
+                "label": "picture",
+                "self_ref": ref,
+                "image": None,
+                "prov": [{"page_no": 1, "bbox": {"l": 0, "r": 40, "t": 40, "b": 0}}],
+            }
+
+        first = {"pictures": [picture("#/pictures/0")]}
+        second = {"pictures": [picture("#/pictures/0")]}
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            pictures_dir = output_dir / "pictures"
+            pictures_dir.mkdir()
+            (pictures_dir / "picture_1.png").write_bytes(b"first-crop")
+            (pictures_dir / "picture_2.png").write_bytes(b"second-crop")
+
+            result = semantic_reflow._materialize_picture_assets(
+                output_dir,
+                [first, second],
+            )
+
+        self.assertEqual({"written": 0, "skipped": 0}, result)
+        self.assertEqual(
+            "pictures/picture_1.png",
+            first["pictures"][0]["_semantic_picture_path"],
+        )
+        self.assertEqual(
+            "pictures/picture_2.png",
+            second["pictures"][0]["_semantic_picture_path"],
+        )
+
+    def test_picture_materialization_never_overwrites_unsafe_existing_target(self) -> None:
+        png = (
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR4nGNg"
+            "YAAAAAMAASsJTYQAAAAASUVORK5CYII="
+        )
+        document = {
+            "pictures": [
+                {
+                    "image": {"uri": f"data:image/png;base64,{png}"},
+                }
+            ]
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            pictures_dir = output_dir / "pictures"
+            pictures_dir.mkdir()
+            outside = output_dir / "outside.bin"
+            outside.write_bytes(b"must-not-change")
+            target = pictures_dir / "picture_1.png"
+            target.symlink_to(outside)
+
+            result = semantic_reflow._materialize_picture_assets(
+                output_dir,
+                [document],
+            )
+
+            self.assertEqual({"written": 0, "skipped": 1}, result)
+            self.assertTrue(target.is_symlink())
+            self.assertEqual(b"must-not-change", outside.read_bytes())
+            self.assertNotIn("_semantic_picture_path", document["pictures"][0])
+
+    def test_missing_picture_asset_does_not_render_a_broken_image(self) -> None:
+        class Source:
+            def text(self, _prov, **_kwargs):
+                return ""
+
+            def lines(self, _prov, padding=0.0):
+                del padding
+                return []
+
+            def page_size(self, _page_no):
+                return 100.0, 100.0
+
+        picture = {
+            "label": "picture",
+            "self_ref": "#/pictures/0",
+            "image": None,
+            "prov": [{"page_no": 1, "bbox": {"l": 0, "r": 40, "t": 40, "b": 0}}],
+        }
+        document = {
+            "body": {"children": [{"$ref": "#/pictures/0"}]},
+            "pictures": [picture],
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            result = semantic_reflow._materialize_picture_assets(
+                output_dir,
+                [document],
+            )
+            items = semantic_reflow._collect_items(document, Source())
+            html_text, markdown_text, counts = semantic_reflow._render(
+                items,
+                document,
+                Source(),
+            )
+
+        self.assertEqual({"written": 0, "skipped": 1}, result)
+        self.assertEqual(1, len([item for item in items if item.kind == "picture"]))
+        self.assertEqual(0, counts["pictures"])
+        self.assertNotIn("<img ", html_text)
+        self.assertNotIn("![", markdown_text)
+
+    def test_captionless_picture_flow_uses_source_bbox_minimum_visual_area(self) -> None:
+        class Source:
+            def text(self, _prov, **_kwargs):
+                return ""
+
+            def lines(self, _prov, padding=0.0):
+                del padding
+                return []
+
+            def page_size(self, _page_no):
+                return 100.0, 100.0
+
+        def picture(index: int, right: float, top: float) -> dict[str, object]:
+            return {
+                "label": "picture",
+                "self_ref": f"#/pictures/{index}",
+                "image": None,
+                "prov": [{"page_no": 1, "bbox": {"l": 0, "r": right, "t": top, "b": 0}}],
+            }
+
+        document = {
+            "body": {
+                "children": [
+                    {"$ref": "#/pictures/0"},
+                    {"$ref": "#/pictures/1"},
+                ]
+            },
+            "pictures": [picture(0, 40, 40), picture(1, 8, 8)],
+        }
+
+        items = semantic_reflow._collect_items(document, Source())
+
+        self.assertEqual(["picture"], [item.kind for item in items])
+        self.assertEqual("#/pictures/0", items[0].node["self_ref"])
+
     def test_pdf_symbol_glyphs_are_restored_semantically(self) -> None:
         # Font-private CIDs are not portable semantic symbols.  Unknown
         # values are removed from machine text and retained for source-visual
@@ -12880,6 +13094,942 @@ class SourceCropRecoveryAndDisclosureTests(unittest.TestCase):
         )
         self.assertEqual(12, diagnostics[0]["recovered_number"])
         self.assertTrue(diagnostics[0]["safe_to_recover"])
+
+
+class PictureSurfaceInventoryTests(unittest.TestCase):
+    def _picture(
+        self,
+        index: int,
+        *,
+        bbox: dict[str, object] | None = None,
+        caption: bool = False,
+        content_layer: str = "body",
+        parent_ref: str = "#/body",
+    ) -> dict[str, object]:
+        node: dict[str, object] = {
+            "self_ref": f"#/pictures/{index}",
+            "label": "picture",
+            "content_layer": content_layer,
+            "parent": {"$ref": parent_ref},
+            "prov": ([{"page_no": 1, "bbox": bbox}] if bbox is not None else []),
+        }
+        if caption:
+            node["captions"] = [{"$ref": "#/texts/0"}]
+        return node
+
+    def test_picture_classifier_is_conservative_but_caption_first(self) -> None:
+        large = {
+            "l": 0,
+            "r": 40,
+            "t": 40,
+            "b": 0,
+            "coord_origin": "TOPLEFT",
+        }
+        tiny = {
+            "l": 0,
+            "r": 8,
+            "t": 8,
+            "b": 0,
+            "coord_origin": "TOPLEFT",
+        }
+        expected, reason, failures = adapter._classify_source_picture(
+            self._picture(0, bbox=large, caption=True)
+        )
+        self.assertTrue(expected)
+        self.assertEqual("caption_present", reason)
+        self.assertEqual([], failures)
+        expected, reason, _ = adapter._classify_source_picture(
+            self._picture(1, bbox=tiny, caption=True)
+        )
+        self.assertTrue(expected)
+        self.assertEqual("caption_present", reason)
+        expected, reason, _ = adapter._classify_source_picture(
+            self._picture(2, bbox=tiny)
+        )
+        self.assertFalse(expected)
+        self.assertEqual("tiny_or_decorative_picture", reason)
+        self.assertFalse(
+            adapter._classify_source_picture(
+                self._picture(3, bbox=large, content_layer="furniture")
+            )[0]
+        )
+        self.assertFalse(
+            adapter._classify_source_picture(
+                self._picture(4, bbox=large, parent_ref="#/formulas/0")
+            )[0]
+        )
+
+    def test_html_picture_parser_suppresses_inert_fallback_containers(self) -> None:
+        asset = "pictures/picture_1.png"
+        containers = (
+            "template",
+            "textarea",
+            "title",
+            "noscript",
+            "iframe",
+            "object",
+            "xmp",
+            "noembed",
+            "noframes",
+            "script",
+            "style",
+        )
+        for container in containers:
+            closed = (
+                f"<{container}><img src=\"{asset}\"></{container}>"
+                f"<img src=\"{asset}\">"
+            )
+            self.assertEqual([asset], adapter._html_picture_image_sources(closed), container)
+            unclosed = f"<{container}><img src=\"{asset}\"><img src=\"{asset}\">"
+            self.assertEqual([], adapter._html_picture_image_sources(unclosed), container)
+
+        nested = (
+            f"<template><template><img src=\"{asset}\"></template>"
+            f"<img src=\"{asset}\"></template><img src=\"{asset}\">"
+        )
+        self.assertEqual([asset], adapter._html_picture_image_sources(nested))
+
+    def test_markdown_picture_scanner_suppresses_indented_and_raw_html_blocks(self) -> None:
+        asset = "pictures/picture_1.png"
+        containers = (
+            "script",
+            "pre",
+            "style",
+            "textarea",
+            "title",
+            "template",
+            "noscript",
+            "iframe",
+            "object",
+            "xmp",
+            "noembed",
+            "noframes",
+        )
+        for container in containers:
+            closed = (
+                f"<{container}>\n![hidden]({asset})\n</{container}>\n"
+                f"![visible]({asset})\n"
+            )
+            self.assertEqual(
+                [asset],
+                adapter._markdown_picture_image_destinations(closed),
+                container,
+            )
+            unclosed = f"<{container}>\n![hidden]({asset})\n![also hidden]({asset})"
+            self.assertEqual(
+                [],
+                adapter._markdown_picture_image_destinations(unclosed),
+                container,
+            )
+
+        for indented in (f"    ![hidden]({asset})", f"\t![hidden]({asset})"):
+            self.assertEqual([], adapter._markdown_picture_image_destinations(indented))
+        self.assertEqual(
+            [asset],
+            adapter._markdown_picture_image_destinations(
+                f"<div>\n![hidden]({asset})\n</div>\n![visible]({asset})\n"
+            ),
+        )
+        self.assertEqual(
+            [],
+            adapter._markdown_picture_image_destinations(
+                f"<div>\n![hidden]({asset})\n"
+            ),
+        )
+
+    def test_markdown_html_picture_sources_keep_rendered_blocks_and_drop_noise(self) -> None:
+        asset = "pictures/picture_1.png"
+        for container in ("p", "div", "figure", "table"):
+            rendered = (
+                f"<{container}>\n<img src=\"{asset}\">\n</{container}>"
+            )
+            self.assertEqual(
+                [asset],
+                adapter._markdown_picture_html_image_sources(rendered),
+                container,
+            )
+        inert = (
+            f"<template>\n<img src=\"{asset}\">\n</template>\n"
+            f"<img src=\"{asset}\">"
+        )
+        self.assertEqual([asset], adapter._markdown_picture_html_image_sources(inert))
+        for noise in (
+            f"`<img src=\"{asset}\">`",
+            f"```html\n<img src=\"{asset}\">\n```",
+            f"    <img src=\"{asset}\">",
+            f"\t<img src=\"{asset}\">",
+            f"<!-- <img src=\"{asset}\"> -->",
+        ):
+            self.assertEqual([], adapter._markdown_picture_html_image_sources(noise))
+        unclosed = f"<template>\n<img src=\"{asset}\">\n<img src=\"{asset}\">"
+        self.assertEqual([], adapter._markdown_picture_html_image_sources(unclosed))
+
+    def test_render_picture_inventory_preserves_global_asset_paths_on_crop_failure(self) -> None:
+        from types import SimpleNamespace
+        from PIL import Image
+
+        class FakePage:
+            def get_size(self) -> tuple[int, int]:
+                return (100, 100)
+
+            def render(self, *, scale: float) -> object:
+                class Bitmap:
+                    def to_pil(self) -> Image.Image:
+                        return Image.new("RGB", (int(100 * scale), int(100 * scale)), "white")
+
+                return Bitmap()
+
+        class FakePdfDocument:
+            def __init__(self, _path: str) -> None:
+                self.page = FakePage()
+
+            def __len__(self) -> int:
+                return 1
+
+            def __getitem__(self, _index: int) -> FakePage:
+                return self.page
+
+            def close(self) -> None:
+                return None
+
+        large = {"l": 0, "r": 40, "t": 40, "b": 0, "coord_origin": "TOPLEFT"}
+        missing = {"l": 0, "r": 40, "t": 40, "b": 0}
+        pictures = [
+            self._picture(0, bbox=large, caption=True),
+            self._picture(1, bbox=missing, caption=True),
+            self._picture(2, bbox=large, caption=True),
+        ]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / "source.pdf"
+            source.write_bytes(b"picture-source")
+            with patch.dict(
+                sys.modules,
+                {"pypdfium2": SimpleNamespace(PdfDocument=FakePdfDocument)},
+            ):
+                counts, warnings, _metrics, manifest = adapter.render_page_images_and_crops(
+                    source,
+                    root,
+                    [],
+                    [],
+                    pictures,
+                )
+            self.assertEqual([], warnings)
+            self.assertEqual(2, counts["picture_artifact_count"])
+            inventory = manifest["pictures"]
+            self.assertEqual(
+                [
+                    "pictures/picture_1.png",
+                    "pictures/picture_2.png",
+                    "pictures/picture_3.png",
+                ],
+                [record["source_asset"] for record in inventory],
+            )
+            self.assertTrue(inventory[0]["asset_present"])
+            self.assertFalse(inventory[1]["asset_present"])
+            self.assertTrue(inventory[2]["asset_present"])
+            self.assertTrue((root / "pictures/picture_3.png").is_file())
+            self.assertFalse((root / "pictures/picture_2.png").exists())
+
+    def test_picture_surface_validator_fails_closed_on_asset_surface_or_identity_tamper(self) -> None:
+        from PIL import Image
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "pictures").mkdir()
+            source = root / "source.pdf"
+            source.write_bytes(b"picture-source")
+            source_sha = adapter.file_sha256(source)
+            asset = root / "pictures/picture_1.png"
+            Image.new("RGB", (40, 40), "white").save(asset)
+            asset_sha = adapter.file_sha256(asset)
+            picture = self._picture(
+                0,
+                bbox={"l": 0, "r": 40, "t": 40, "b": 0, "coord_origin": "TOPLEFT"},
+                caption=True,
+            )
+            document = {
+                "pages": {"1": {"size": {"width": 100, "height": 100}}},
+                "pictures": [picture],
+            }
+            (root / "document.json").write_text(json.dumps(document), encoding="utf-8")
+            (root / "document.html").write_text(
+                '<img src="pictures/picture_1.png">', encoding="utf-8"
+            )
+            (root / "document.md").write_text(
+                "![Figure](pictures/picture_1.png)\n", encoding="utf-8"
+            )
+            record = {
+                "version": 1,
+                "index": 1,
+                "global_index": 1,
+                "self_ref": "#/pictures/0",
+                "source_ref": "#/pictures/0",
+                "part_index": None,
+                "page_no": 1,
+                "bbox": picture["prov"][0]["bbox"],
+                "source_asset": "pictures/picture_1.png",
+                "source_pdf_sha256": source_sha,
+                "asset_present": True,
+                "asset_sha256": asset_sha,
+                "machine_binding_expected": True,
+                "classification_reason": "caption_present",
+                "failure_reasons": [],
+            }
+            metadata: dict[str, object] = {
+                "visual_evidence_input_sha256": source_sha,
+                "structural_visual_provenance_manifest": {
+                    "version": 1,
+                    "visual_pdf_sha256": source_sha,
+                    "pictures": [record],
+                },
+            }
+            status: dict[str, object] = {"quality_signals": {}}
+            result = adapter.validate_final_picture_surfaces(root, metadata, status)
+            self.assertTrue(result["ok"])
+            self.assertEqual(1, result["bound_count"])
+            self.assertEqual("visual_only", result["records"][0]["status"])
+            self.assertFalse(result["records"][0]["critical"])
+            metadata["input_sha256"] = source_sha
+            region_result = adapter.evaluate_regions(
+                root,
+                document,
+                metadata,
+                status,
+                write_sidecars=False,
+            )
+            bound_picture = next(
+                item
+                for item in region_result["records"]
+                if item["kind"] == "picture"
+            )
+            self.assertTrue(region_result["ok"])
+            self.assertEqual("visual_only", bound_picture["status"])
+            self.assertFalse(bound_picture["critical"])
+            for mutate in ("asset", "html", "markdown", "sha", "bbox"):
+                if mutate == "asset":
+                    asset.write_bytes(b"tampered")
+                elif mutate == "html":
+                    (root / "document.html").write_text(
+                        '<img src="pictures/picture_1.png"><img src="pictures/picture_1.png">',
+                        encoding="utf-8",
+                    )
+                elif mutate == "markdown":
+                    (root / "document.md").write_text(
+                        "![Figure](pictures/picture_1.png)\n![Again](pictures/picture_1.png)\n",
+                        encoding="utf-8",
+                    )
+                elif mutate == "sha":
+                    metadata["visual_evidence_input_sha256"] = "b" * 64
+                else:
+                    record["bbox"] = dict(record["bbox"])
+                    record["bbox"]["r"] = 39
+                tampered = adapter.validate_final_picture_surfaces(root, metadata, status)
+                self.assertFalse(tampered["ok"], mutate)
+                # Restore the fixture for the next independent mutation.
+                asset.write_bytes(Image.new("RGB", (40, 40), "white").tobytes())
+                # Recreate a valid PNG and hashes after the asset mutation.
+                Image.new("RGB", (40, 40), "white").save(asset)
+                record["asset_sha256"] = adapter.file_sha256(asset)
+                metadata["visual_evidence_input_sha256"] = source_sha
+                record["bbox"] = picture["prov"][0]["bbox"]
+                (root / "document.html").write_text('<img src="pictures/picture_1.png">', encoding="utf-8")
+                (root / "document.md").write_text("![Figure](pictures/picture_1.png)\n", encoding="utf-8")
+
+    def _valid_picture_surface_fixture(
+        self,
+        root: Path,
+    ) -> tuple[dict[str, object], dict[str, object], dict[str, object], str]:
+        from PIL import Image
+
+        (root / "pictures").mkdir()
+        source = root / "source.pdf"
+        source.write_bytes(b"picture-source")
+        source_sha = adapter.file_sha256(source)
+        asset = root / "pictures/picture_1.png"
+        Image.new("RGB", (40, 40), "white").save(asset)
+        asset_sha = adapter.file_sha256(asset)
+        picture = self._picture(
+            0,
+            bbox={"l": 0, "r": 40, "t": 40, "b": 0, "coord_origin": "TOPLEFT"},
+            caption=True,
+        )
+        document = {
+            "pages": {"1": {"size": {"width": 100, "height": 100}}},
+            "pictures": [picture],
+        }
+        (root / "document.json").write_text(json.dumps(document), encoding="utf-8")
+        (root / "document.html").write_text(
+            '<img src="pictures/picture_1.png">', encoding="utf-8"
+        )
+        (root / "document.md").write_text(
+            "![Figure](pictures/picture_1.png)\n", encoding="utf-8"
+        )
+        record: dict[str, object] = {
+            "version": 1,
+            "index": 1,
+            "global_index": 1,
+            "self_ref": "#/pictures/0",
+            "source_ref": "#/pictures/0",
+            "part_index": None,
+            "page_no": 1,
+            "bbox": picture["prov"][0]["bbox"],
+            "source_asset": "pictures/picture_1.png",
+            "source_pdf_sha256": source_sha,
+            "asset_present": True,
+            "asset_sha256": asset_sha,
+            "machine_binding_expected": True,
+            "classification_reason": "caption_present",
+            "failure_reasons": [],
+        }
+        metadata: dict[str, object] = {
+            "visual_evidence_input_sha256": source_sha,
+            "structural_visual_provenance_manifest": {
+                "version": 1,
+                "visual_pdf_sha256": source_sha,
+                "pictures": [record],
+            },
+        }
+        status: dict[str, object] = {"quality_signals": {}}
+        return metadata, status, record, source_sha
+
+    def test_picture_surface_asset_present_requires_boolean(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            metadata, status, record, _source_sha = (
+                self._valid_picture_surface_fixture(root)
+            )
+            record["asset_present"] = "false"
+
+            result = adapter.validate_final_picture_surfaces(
+                root,
+                metadata,
+                status,
+            )
+
+            self.assertFalse(result["ok"])
+            self.assertTrue(result["records"][0]["critical"])
+            self.assertIn(
+                "picture_asset_present_invalid",
+                result["records"][0]["reasons"],
+            )
+
+    def test_picture_surface_counts_only_real_html_and_markdown_images(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            metadata, status, _record, _source_sha = self._valid_picture_surface_fixture(root)
+            (root / "document.html").write_text(
+                "pictures/picture_1.png\n"
+                '<!-- <img src="pictures/picture_1.png"> -->\n'
+                '<a href="pictures/picture_1.png">ordinary link</a>\n'
+                '<img src="./pictures/picture_1.png?cache=1#crop">\n',
+                encoding="utf-8",
+            )
+            (root / "document.md").write_text(
+                "pictures/picture_1.png\n"
+                "[ordinary link](pictures/picture_1.png)\n"
+                "`![inline](pictures/picture_1.png)`\n"
+                "```markdown\n![fenced](pictures/picture_1.png)\n```\n"
+                "<!-- ![comment](pictures/picture_1.png) -->\n"
+                "![Figure](<./pictures/picture_1.png?cache=1#crop>)\n",
+                encoding="utf-8",
+            )
+            result = adapter.validate_final_picture_surfaces(root, metadata, status)
+            self.assertTrue(result["ok"])
+            self.assertEqual(1, result["records"][0]["html_reference_count"])
+            self.assertEqual(1, result["records"][0]["markdown_reference_count"])
+            (root / "document.html").write_text(
+                "pictures/picture_1.png\n"
+                '<!-- <img src="pictures/picture_1.png"> -->\n'
+                '<a href="pictures/picture_1.png">ordinary link</a>\n',
+                encoding="utf-8",
+            )
+            (root / "document.md").write_text(
+                "pictures/picture_1.png\n"
+                "[ordinary link](pictures/picture_1.png)\n"
+                "`![inline](pictures/picture_1.png)`\n"
+                "```markdown\n![fenced](pictures/picture_1.png)\n```\n"
+                "<!-- ![comment](pictures/picture_1.png) -->\n",
+                encoding="utf-8",
+            )
+            noise_only = adapter.validate_final_picture_surfaces(root, metadata, status)
+            self.assertFalse(noise_only["ok"])
+            self.assertEqual(0, noise_only["records"][0]["html_reference_count"])
+            self.assertEqual(0, noise_only["records"][0]["markdown_reference_count"])
+
+    def test_picture_surface_manifest_and_derived_fields_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            metadata, status, _record, _source_sha = self._valid_picture_surface_fixture(root)
+            cases = (
+                ("manifest.version", lambda value: value["structural_visual_provenance_manifest"].__setitem__("version", 999)),
+                ("record.version", lambda value: value["structural_visual_provenance_manifest"]["pictures"][0].__setitem__("version", 999)),
+                ("record.global_index", lambda value: value["structural_visual_provenance_manifest"]["pictures"][0].__setitem__("global_index", 999)),
+                ("record.critical", lambda value: value["structural_visual_provenance_manifest"]["pictures"][0].__setitem__("critical", True)),
+                ("record.status", lambda value: value["structural_visual_provenance_manifest"]["pictures"][0].__setitem__("status", "unresolved")),
+                ("record.reasons", lambda value: value["structural_visual_provenance_manifest"]["pictures"][0].__setitem__("reasons", ["tampered"])),
+                ("record.html_reference_count", lambda value: value["structural_visual_provenance_manifest"]["pictures"][0].__setitem__("html_reference_count", 999)),
+                ("record.markdown_reference_count", lambda value: value["structural_visual_provenance_manifest"]["pictures"][0].__setitem__("markdown_reference_count", 999)),
+                ("record.html_reference_count_bool", lambda value: value["structural_visual_provenance_manifest"]["pictures"][0].__setitem__("html_reference_count", True)),
+                ("record.markdown_reference_count_bool", lambda value: value["structural_visual_provenance_manifest"]["pictures"][0].__setitem__("markdown_reference_count", True)),
+            )
+            for label, mutate in cases:
+                candidate = copy.deepcopy(metadata)
+                candidate_status: dict[str, object] = {"quality_signals": {}}
+                mutate(candidate)
+                result = adapter.validate_final_picture_surfaces(
+                    root, candidate, candidate_status
+                )
+                self.assertFalse(result["ok"], label)
+
+    def test_picture_surface_recomputes_machine_binding_and_classification_evidence(self) -> None:
+        """Raw manifest classification edits must fail before region projection."""
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            metadata, _status, _record, source_sha = self._valid_picture_surface_fixture(
+                root
+            )
+            baseline_document = json.loads(
+                (root / "document.json").read_text(encoding="utf-8")
+            )
+
+            def machine_binding_false(
+                candidate: dict[str, object], _document: dict[str, object]
+            ) -> None:
+                candidate["structural_visual_provenance_manifest"]["pictures"][0][
+                    "machine_binding_expected"
+                ] = False
+
+            def caption_removed_large_bbox(
+                _candidate: dict[str, object], document: dict[str, object]
+            ) -> None:
+                document["pictures"][0]["captions"] = []
+
+            def large_bbox_expected_false(
+                candidate: dict[str, object], document: dict[str, object]
+            ) -> None:
+                document["pictures"][0]["captions"] = []
+                record = candidate["structural_visual_provenance_manifest"]["pictures"][0]
+                record["machine_binding_expected"] = False
+                record["classification_reason"] = "tiny_or_decorative_picture"
+                record["failure_reasons"] = ["bbox_below_minimum_visual_area"]
+
+            def classification_reason_tampered(
+                candidate: dict[str, object], _document: dict[str, object]
+            ) -> None:
+                candidate["structural_visual_provenance_manifest"]["pictures"][0][
+                    "classification_reason"
+                ] = "tiny_or_decorative_picture"
+
+            def classification_failure_missing(
+                candidate: dict[str, object], document: dict[str, object]
+            ) -> None:
+                document["pictures"][0]["captions"] = []
+                document["pictures"][0]["prov"] = [{"page_no": 1}]
+                record = candidate["structural_visual_provenance_manifest"]["pictures"][0]
+                record["machine_binding_expected"] = False
+                record["classification_reason"] = "missing_or_invalid_bbox"
+                record["failure_reasons"] = []
+                record["bbox"] = None
+
+            def classification_failure_extra(
+                candidate: dict[str, object], document: dict[str, object]
+            ) -> None:
+                document["pictures"][0]["captions"] = []
+                document["pictures"][0]["prov"][0]["bbox"] = {
+                    "l": 0,
+                    "r": 8,
+                    "t": 8,
+                    "b": 0,
+                    "coord_origin": "TOPLEFT",
+                }
+                record = candidate["structural_visual_provenance_manifest"]["pictures"][0]
+                record["machine_binding_expected"] = False
+                record["classification_reason"] = "tiny_or_decorative_picture"
+                record["failure_reasons"] = [
+                    "bbox_below_minimum_visual_area",
+                    "tampered_classification_failure",
+                ]
+                record["bbox"] = document["pictures"][0]["prov"][0]["bbox"]
+
+            cases = (
+                ("machine_binding_expected_false", machine_binding_false),
+                ("caption_removed_large_bbox", caption_removed_large_bbox),
+                ("large_bbox_expected_false", large_bbox_expected_false),
+                ("classification_reason_tampered", classification_reason_tampered),
+                ("classification_failure_missing", classification_failure_missing),
+                ("classification_failure_extra", classification_failure_extra),
+            )
+            for label, mutate in cases:
+                candidate = copy.deepcopy(metadata)
+                candidate_document = copy.deepcopy(baseline_document)
+                mutate(candidate, candidate_document)
+                (root / "document.json").write_text(
+                    json.dumps(candidate_document), encoding="utf-8"
+                )
+                candidate_status: dict[str, object] = {"quality_signals": {}}
+                result = adapter.validate_final_picture_surfaces(
+                    root,
+                    candidate,
+                    candidate_status,
+                )
+                self.assertFalse(result["ok"], label)
+                self.assertTrue(
+                    any(
+                        reason.startswith("picture_")
+                        for reason in result["failure_reasons"]
+                    ),
+                    label,
+                )
+                candidate["input_sha256"] = source_sha
+                region_result = adapter.evaluate_regions(
+                    root,
+                    candidate_document,
+                    candidate,
+                    candidate_status,
+                    write_sidecars=False,
+                )
+                self.assertFalse(region_result["ok"], label)
+
+            # Renderer-owned crop failures are valid supplemental evidence and
+            # must not be mistaken for classifier-integrity edits.  The
+            # expected picture is still unresolved, so delivery fails for the
+            # crop reason itself.
+            crop_failure = copy.deepcopy(metadata)
+            crop_failure_record = crop_failure[
+                "structural_visual_provenance_manifest"
+            ]["pictures"][0]
+            crop_failure_record["failure_reasons"] = ["picture_crop_failed"]
+            crop_failure_result = adapter.validate_final_picture_surfaces(
+                root,
+                crop_failure,
+                {"quality_signals": {}},
+            )
+            self.assertFalse(crop_failure_result["ok"])
+            self.assertIn(
+                "picture_crop_failed",
+                crop_failure_result["records"][0]["reasons"],
+            )
+            self.assertNotIn(
+                "picture_classification_failure_reasons_unexpected",
+                crop_failure_result["records"][0]["reasons"],
+            )
+
+    def test_picture_surface_expected_inventory_is_bidirectional_and_fallback_safe(self) -> None:
+        """Final expected pictures cannot disappear behind advisory records."""
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            metadata, _status, _record, source_sha = self._valid_picture_surface_fixture(
+                root
+            )
+            baseline_document = json.loads(
+                (root / "document.json").read_text(encoding="utf-8")
+            )
+
+            # Attack: the final node is still captioned/large (therefore
+            # expected), but omits self_ref.  Its producer-compatible fallback
+            # source_ref is ``picture:0``; an advisory-only ``picture:1``
+            # manifest record must not make the inventory pass.
+            attack_metadata = copy.deepcopy(metadata)
+            attack_document = copy.deepcopy(baseline_document)
+            attack_document["pictures"][0].pop("self_ref")
+            attack_record = attack_metadata[
+                "structural_visual_provenance_manifest"
+            ]["pictures"][0]
+            attack_record["machine_binding_expected"] = False
+            attack_record["source_ref"] = "picture:1"
+            attack_record["self_ref"] = ""
+            (root / "document.json").write_text(
+                json.dumps(attack_document), encoding="utf-8"
+            )
+            attack_status: dict[str, object] = {"quality_signals": {}}
+            attack_result = adapter.validate_final_picture_surfaces(
+                root, attack_metadata, attack_status
+            )
+            self.assertFalse(attack_result["ok"])
+            self.assertIn(
+                "picture_expected_source_ref_inventory_mismatch",
+                attack_result["failure_reasons"],
+            )
+            attack_metadata["input_sha256"] = source_sha
+            attack_region = adapter.evaluate_regions(
+                root,
+                attack_document,
+                attack_metadata,
+                attack_status,
+                write_sidecars=False,
+            )
+            self.assertFalse(attack_region["ok"])
+
+            # Compatibility: when the final producer also omits self_ref, an
+            # expected record may carry the same empty raw self_ref while its
+            # deterministic fallback source_ref remains exact.
+            fallback_metadata = copy.deepcopy(metadata)
+            fallback_document = copy.deepcopy(baseline_document)
+            fallback_document["pictures"][0].pop("self_ref")
+            fallback_record = fallback_metadata[
+                "structural_visual_provenance_manifest"
+            ]["pictures"][0]
+            fallback_record["source_ref"] = "picture:0"
+            fallback_record["self_ref"] = ""
+            (root / "document.json").write_text(
+                json.dumps(fallback_document), encoding="utf-8"
+            )
+            fallback_status: dict[str, object] = {"quality_signals": {}}
+            fallback_result = adapter.validate_final_picture_surfaces(
+                root, fallback_metadata, fallback_status
+            )
+            self.assertTrue(fallback_result["ok"])
+
+            # Duplicate manifest entries are not an alternate way to satisfy
+            # one final expected source; both the raw duplicate checks and the
+            # expected-source multiset check must reject them.
+            duplicate_metadata = copy.deepcopy(metadata)
+            duplicate_record = copy.deepcopy(
+                duplicate_metadata["structural_visual_provenance_manifest"][
+                    "pictures"
+                ][0]
+            )
+            duplicate_record["index"] = 2
+            duplicate_record["global_index"] = 2
+            duplicate_record["source_asset"] = "pictures/picture_2.png"
+            duplicate_metadata["structural_visual_provenance_manifest"][
+                "pictures"
+            ].append(duplicate_record)
+            duplicate_result = adapter.validate_final_picture_surfaces(
+                root,
+                duplicate_metadata,
+                {"quality_signals": {}},
+            )
+            self.assertFalse(duplicate_result["ok"])
+
+    def test_picture_surface_requires_self_ref_and_part_index_integrity(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            metadata, _status, _record, _source_sha = self._valid_picture_surface_fixture(root)
+            cases = (
+                ("self_ref_missing", lambda value: value["structural_visual_provenance_manifest"]["pictures"][0].pop("self_ref")),
+                ("self_ref_tampered", lambda value: value["structural_visual_provenance_manifest"]["pictures"][0].__setitem__("self_ref", "#/pictures/9")),
+                ("self_ref_invalid", lambda value: value["structural_visual_provenance_manifest"]["pictures"][0].__setitem__("self_ref", 9)),
+                ("part_index_missing", lambda value: value["structural_visual_provenance_manifest"]["pictures"][0].pop("part_index")),
+                ("part_index_tampered", lambda value: value["structural_visual_provenance_manifest"]["pictures"][0].__setitem__("part_index", 2)),
+                ("part_index_invalid", lambda value: value["structural_visual_provenance_manifest"]["pictures"][0].__setitem__("part_index", True)),
+            )
+            for label, mutate in cases:
+                candidate = copy.deepcopy(metadata)
+                candidate_status: dict[str, object] = {"quality_signals": {}}
+                mutate(candidate)
+                result = adapter.validate_final_picture_surfaces(
+                    root, candidate, candidate_status
+                )
+                self.assertFalse(result["ok"], label)
+
+    def test_picture_surface_chunk_identity_and_nonexpected_empty_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            metadata, status, _record, _source_sha = self._valid_picture_surface_fixture(root)
+            document = json.loads((root / "document.json").read_text(encoding="utf-8"))
+            picture = document["pictures"][0]
+            picture["_local_ai_lab_chunk_part_index"] = 3
+            (root / "document.json").write_text(json.dumps(document), encoding="utf-8")
+            manifest_record = metadata["structural_visual_provenance_manifest"]["pictures"][0]
+            manifest_record["part_index"] = 3
+            manifest_record["source_ref"] = "chunk:3:#/pictures/0"
+            result = adapter.validate_final_picture_surfaces(root, metadata, status)
+            self.assertTrue(result["ok"])
+
+            tampered_self_ref = copy.deepcopy(metadata)
+            tampered_self_ref["structural_visual_provenance_manifest"]["pictures"][0]["self_ref"] = "#/pictures/9"
+            self.assertFalse(
+                adapter.validate_final_picture_surfaces(
+                    root, tampered_self_ref, {"quality_signals": {}}
+                )["ok"]
+            )
+            tampered_part_index = copy.deepcopy(metadata)
+            tampered_part_index["structural_visual_provenance_manifest"]["pictures"][0]["part_index"] = 4
+            self.assertFalse(
+                adapter.validate_final_picture_surfaces(
+                    root, tampered_part_index, {"quality_signals": {}}
+                )["ok"]
+            )
+
+            advisory = copy.deepcopy(metadata)
+            advisory_record = advisory["structural_visual_provenance_manifest"]["pictures"][0]
+            advisory_record["machine_binding_expected"] = False
+            advisory_record["self_ref"] = ""
+            advisory_record["part_index"] = None
+            advisory_record["classification_reason"] = "tiny_or_decorative_picture"
+            advisory_record["failure_reasons"] = [
+                "bbox_below_minimum_visual_area"
+            ]
+            advisory_bbox = {
+                "l": 0,
+                "r": 8,
+                "t": 8,
+                "b": 0,
+                "coord_origin": "TOPLEFT",
+            }
+            advisory_document = copy.deepcopy(document)
+            advisory_document["pictures"][0]["captions"] = []
+            advisory_document["pictures"][0]["prov"][0]["bbox"] = advisory_bbox
+            advisory_record["bbox"] = advisory_bbox
+            (root / "document.json").write_text(
+                json.dumps(advisory_document), encoding="utf-8"
+            )
+            advisory_result = adapter.validate_final_picture_surfaces(
+                root, advisory, {"quality_signals": {}}
+            )
+            self.assertTrue(advisory_result["ok"])
+
+    def test_picture_surface_validator_keeps_nonexpected_diagnostic_advisory(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / "source.pdf"
+            source.write_bytes(b"picture-source")
+            source_sha = adapter.file_sha256(source)
+            tiny_bbox = {
+                "l": 0,
+                "r": 8,
+                "t": 8,
+                "b": 0,
+                "coord_origin": "TOPLEFT",
+            }
+            picture = self._picture(0, bbox=tiny_bbox)
+            document = {
+                "pages": {"1": {"size": {"width": 100, "height": 100}}},
+                "pictures": [picture],
+            }
+            (root / "document.json").write_text(json.dumps(document), encoding="utf-8")
+            (root / "document.html").write_text("<p>Body</p>", encoding="utf-8")
+            (root / "document.md").write_text("Body\n", encoding="utf-8")
+            metadata: dict[str, object] = {
+                "visual_evidence_input_sha256": source_sha,
+                "structural_visual_provenance_manifest": {
+                    "version": 1,
+                    "visual_pdf_sha256": source_sha,
+                    "pictures": [
+                        {
+                            "version": 1,
+                            "index": 1,
+                            "global_index": 1,
+                            "self_ref": "#/pictures/0",
+                            "source_ref": "#/pictures/0",
+                            "part_index": None,
+                            "page_no": 1,
+                            "bbox": tiny_bbox,
+                            "source_asset": "pictures/picture_1.png",
+                            "source_pdf_sha256": source_sha,
+                            "asset_present": False,
+                            "asset_sha256": None,
+                            "machine_binding_expected": False,
+                            "classification_reason": "tiny_or_decorative_picture",
+                            "failure_reasons": ["bbox_below_minimum_visual_area"],
+                        }
+                    ],
+                },
+            }
+            status: dict[str, object] = {"quality_signals": {}}
+
+            result = adapter.validate_final_picture_surfaces(root, metadata, status)
+
+            self.assertTrue(result["ok"])
+            self.assertEqual(0, result["expected_count"])
+            self.assertEqual(0, result["bound_count"])
+            self.assertEqual("visual_only", result["records"][0]["status"])
+            self.assertFalse(result["records"][0]["critical"])
+            self.assertIn(
+                "bbox_below_minimum_visual_area",
+                result["records"][0]["reasons"],
+            )
+            metadata["input_sha256"] = source_sha
+            region_result = adapter.evaluate_regions(
+                root,
+                document,
+                metadata,
+                status,
+                write_sidecars=False,
+            )
+            advisory_picture = next(
+                item
+                for item in region_result["records"]
+                if item["kind"] == "picture"
+            )
+            self.assertTrue(region_result["ok"])
+            self.assertFalse(advisory_picture["critical"])
+
+    def test_semantic_crop_reuse_preserves_hash_and_passes_adapter_picture_gate(self) -> None:
+        """A source crop survives semantic materialization and final validation."""
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "pictures").mkdir()
+            source = root / "source.pdf"
+            source.write_bytes(b"picture-source")
+            source_sha = adapter.file_sha256(source)
+            asset = root / "pictures/picture_1.png"
+            asset.write_bytes(b"authoritative-crop-bytes")
+            before_sha = adapter.file_sha256(asset)
+
+            picture = self._picture(
+                0,
+                bbox={"l": 0, "r": 40, "t": 40, "b": 0, "coord_origin": "TOPLEFT"},
+                caption=True,
+            )
+            # Deliberately malformed embedded data proves the authoritative
+            # crop path is selected before URI decoding is attempted.
+            picture["image"] = {"uri": "data:image/png;base64:not-valid"}
+            document = {
+                "pages": {"1": {"size": {"width": 100, "height": 100}}},
+                "pictures": [picture],
+            }
+            materialized = semantic_reflow._materialize_picture_assets(
+                root,
+                [document],
+            )
+            self.assertEqual({"written": 0, "skipped": 0}, materialized)
+            self.assertEqual(before_sha, adapter.file_sha256(asset))
+
+            (root / "document.json").write_text(json.dumps(document), encoding="utf-8")
+            (root / "document.html").write_text(
+                '<figure><img src="pictures/picture_1.png"></figure>',
+                encoding="utf-8",
+            )
+            (root / "document.md").write_text(
+                "![Figure](pictures/picture_1.png)\n",
+                encoding="utf-8",
+            )
+            record = {
+                "version": 1,
+                "index": 1,
+                "global_index": 1,
+                "self_ref": "#/pictures/0",
+                "source_ref": "#/pictures/0",
+                "part_index": None,
+                "page_no": 1,
+                "bbox": picture["prov"][0]["bbox"],
+                "source_asset": "pictures/picture_1.png",
+                "source_pdf_sha256": source_sha,
+                "asset_present": True,
+                "asset_sha256": before_sha,
+                "machine_binding_expected": True,
+                "classification_reason": "caption_present",
+                "failure_reasons": [],
+            }
+            metadata: dict[str, object] = {
+                "input_sha256": source_sha,
+                "visual_evidence_input_sha256": source_sha,
+                "structural_visual_provenance_manifest": {
+                    "version": 1,
+                    "visual_pdf_sha256": source_sha,
+                    "pictures": [record],
+                },
+            }
+            status: dict[str, object] = {"quality_signals": {}}
+            gate = adapter.validate_final_picture_surfaces(root, metadata, status)
+            self.assertTrue(gate["ok"])
+            self.assertEqual(1, gate["bound_count"])
 
 
 if __name__ == "__main__":

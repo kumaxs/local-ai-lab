@@ -809,6 +809,160 @@ class SourceEvidenceIdentityTests(unittest.TestCase):
             self.assertEqual(1, markdown_text.count("docling-code-source-disclosure"))
             self.assertEqual(1, markdown_text.count("code_blocks/code_block_1.png"))
 
+    def test_algorithm_candidate_records_excludes_picture_child_code_nodes(self) -> None:
+        picture_parent = {"$ref": "#/pictures/0"}
+        records = adapter._algorithm_candidate_records(
+            {
+                "pages": {"1": {"size": {"width": 100, "height": 100}}},
+                "texts": [
+                    {
+                        "self_ref": "#/texts/body",
+                        "label": "code",
+                        "text": (
+                            "Algorithm 1: Input: x while x < y do "
+                            "update x return x"
+                        ),
+                        "prov": [
+                            {
+                                "page_no": 1,
+                                "bbox": {
+                                    "l": 5,
+                                    "r": 95,
+                                    "t": 95,
+                                    "b": 5,
+                                    "coord_origin": "BOTTOMLEFT",
+                                },
+                            }
+                        ],
+                    },
+                    {
+                        "self_ref": "#/texts/picture-1",
+                        "label": "code",
+                        "text": "for i in range(3): while True: print(i)",
+                        "parent": picture_parent,
+                        "prov": [
+                            {
+                                "page_no": 1,
+                                "bbox": {
+                                    "l": 5,
+                                    "r": 95,
+                                    "t": 95,
+                                    "b": 5,
+                                    "coord_origin": "BOTTOMLEFT",
+                                },
+                            }
+                        ],
+                    },
+                    {
+                        "self_ref": "#/texts/picture-2",
+                        "label": "code",
+                        "text": "while counter < max_steps: do update counter",
+                        "parent": picture_parent,
+                        "prov": [
+                            {
+                                "page_no": 1,
+                                "bbox": {
+                                    "l": 5,
+                                    "r": 95,
+                                    "t": 95,
+                                    "b": 5,
+                                    "coord_origin": "BOTTOMLEFT",
+                                },
+                            }
+                        ],
+                    },
+                ],
+            },
+            Path("missing.pdf"),
+        )
+
+        source_refs = {record["source_ref"] for record in records}
+        self.assertEqual({"#/texts/body"}, source_refs)
+
+    def test_append_code_source_renderings_skips_picture_child_code_nodes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            (output_dir / "pages").mkdir()
+            _visible_png(output_dir / "pages" / "page_1.png", (200, 200))
+            body_ref = "#/texts/0"
+            (output_dir / "document.html").write_text(
+                '<html><body><section class="code-listing">'
+                f'<pre data-source-ref="{body_ref}"><code>result = left + right</code></pre>'
+                "</section></body></html>",
+                encoding="utf-8",
+            )
+            (output_dir / "document.md").write_text(
+                f"<!-- source-code-ref:{body_ref} -->\n```python\nresult = left + right\n```\n",
+                encoding="utf-8",
+            )
+            document = {
+                "pages": {"1": {"size": {"width": 100, "height": 100}}},
+                "texts": [
+                    {
+                        "self_ref": body_ref,
+                        "label": "code",
+                        "text": "result = left + right",
+                        "prov": [
+                            {
+                                "page_no": 1,
+                                "bbox": {
+                                    "l": 5,
+                                    "r": 95,
+                                    "t": 95,
+                                    "b": 5,
+                                    "coord_origin": "BOTTOMLEFT",
+                                },
+                            }
+                        ],
+                    },
+                    {
+                        "self_ref": "#/texts/1",
+                        "label": "code",
+                        "text": "for i in range(8): while true: update(i)",
+                        "parent": {"$ref": "#/pictures/0"},
+                        "prov": [
+                            {
+                                "page_no": 1,
+                                "bbox": {
+                                    "l": 5,
+                                    "r": 95,
+                                    "t": 95,
+                                    "b": 5,
+                                    "coord_origin": "BOTTOMLEFT",
+                                },
+                            }
+                        ],
+                    },
+                    {
+                        "self_ref": "#/texts/2",
+                        "label": "code",
+                        "text": "while idx < N: for c in data: process(c)",
+                        "parent": {"$ref": "#/pictures/1"},
+                        "prov": [
+                            {
+                                "page_no": 1,
+                                "bbox": {
+                                    "l": 5,
+                                    "r": 95,
+                                    "t": 95,
+                                    "b": 5,
+                                    "coord_origin": "BOTTOMLEFT",
+                                },
+                            }
+                        ],
+                    },
+                ],
+            }
+
+            result = adapter.append_code_source_renderings(output_dir, document)
+
+            self.assertEqual(1, result["candidate_count"])
+            self.assertEqual([body_ref], result["candidate_source_refs"])
+            self.assertEqual([body_ref], result["html_bound_source_refs"])
+            self.assertEqual([body_ref], result["markdown_bound_source_refs"])
+            self.assertEqual([], result["html_unbound_source_refs"])
+            self.assertEqual([], result["markdown_unbound_source_refs"])
+
     def test_chunk_local_code_page_maps_to_global_source_crop(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             output_dir = Path(tmpdir)

@@ -2,10 +2,15 @@ from __future__ import annotations
 
 import base64
 import copy
+import hashlib
 import html
 import io
+import json
 import keyword
+import math
+import os
 import re
+import stat
 import token
 import tokenize
 from collections import defaultdict
@@ -211,11 +216,660 @@ def _inline_math_control_character(run: dict[str, Any]) -> bool:
         return True
     if "CMEX" not in font_name:
         return False
-    # CMEX control codes (for example U+0010/U+0011) are emitted for large
-    # delimiters.  A CID marker is equally opaque even when pdfplumber keeps
-    # it as printable text.  Do not classify ordinary CMMI/CMSY minus glyphs
-    # as controls here; fraction bars are detected from page line objects.
-    return any(ord(character) < 32 for character in text_value)
+    # CMEX control codes (for example U+0010/U+0011) and private-use glyphs
+    # are emitted for large, multi-part delimiters.  Their Unicode spelling
+    # does not establish semantics, so never accept them as the one-glyph
+    # operator wildcard used by the conservative fraction repair.  Do not
+    # classify ordinary CMMI/CMSY minus glyphs as controls here; fraction bars
+    # are detected from page line objects.
+    def opaque_cmex_codepoint(character: str) -> bool:
+        codepoint = ord(character)
+        return (
+            codepoint < 32
+            or 0xE000 <= codepoint <= 0xF8FF
+            or 0xF0000 <= codepoint <= 0xFFFFD
+            or 0x100000 <= codepoint <= 0x10FFFD
+        )
+
+    return any(
+        opaque_cmex_codepoint(character)
+        or (
+            not character.isspace()
+            and character not in _INLINE_CMEX_OPERATOR_ALIASES
+            and character not in _INLINE_CMEX_CANONICAL_OPERATORS
+        )
+        for character in text_value
+    )
+
+
+_INLINE_CMEX_OPERATOR_ALIASES = {
+    # Standard OMX/CMEX10 text-size and display-size slots.  PDF text
+    # extraction commonly exposes the raw slot as its ASCII character.
+    "F": "⨆",
+    "G": "⨆",
+    "H": "∮",
+    "I": "∮",
+    "J": "⨀",
+    "K": "⨀",
+    "L": "⨁",
+    "M": "⨁",
+    "N": "⨂",
+    "O": "⨂",
+    "P": "∑",
+    "Q": "∏",
+    "R": "∫",
+    "S": "⋃",
+    "T": "⋂",
+    "U": "⨄",
+    "V": "⋀",
+    "W": "⋁",
+    "X": "∑",
+    "Y": "∏",
+    "Z": "∫",
+    "[": "⋃",
+    "\\": "⋂",
+    "]": "⨄",
+    "^": "⋀",
+    "_": "⋁",
+    "`": "∐",
+    "a": "∐",
+}
+_INLINE_CMEX_CANONICAL_OPERATORS = frozenset(
+    _INLINE_CMEX_OPERATOR_ALIASES.values()
+)
+
+
+def _normalize_inline_math_run_text(run: dict[str, Any]) -> str:
+    """Decode only standard, semantically known OMX operator slots."""
+
+    value = _inline_geometry_preserve_private_text(str(run.get("text") or ""))
+    font_name = str(
+        run.get("fontname")
+        or run.get("font_name")
+        or run.get("font")
+        or ""
+    ).upper()
+    if "CMEX" not in font_name or _inline_math_control_character(
+        {**run, "text": value}
+    ):
+        return value
+    return "".join(
+        _INLINE_CMEX_OPERATOR_ALIASES.get(character, character)
+        for character in value
+    )
+
+
+def _repair_inline_solidus_glyph(
+    fallback: str,
+    runs: list[dict[str, Any]],
+) -> tuple[str, set[str]]:
+    """Restore an explicitly extracted math solidus when Docling drops it.
+
+    A slash is only inserted when the PDF text layer contains a literal ``/``
+    glyph in a known math font, with legal same-baseline operands on both
+    sides.  The source line's compact neighbourhood is aligned to the compact
+    fallback text and must identify exactly one whitespace-only insertion gap.
+    This is deliberately not a regular-expression replacement: repeated
+    operands, opaque CID/CMEX glyphs, punctuation gaps, and baseline mismatch
+    all remain unchanged.
+    """
+
+    if not fallback or not runs:
+        return fallback, set()
+
+    # Build a compact fallback stream while retaining a mapping to original
+    # character offsets so that the slash can be inserted without touching
+    # surrounding punctuation or normalising prose-wide whitespace.
+    fallback_compact, fallback_mapping = _inline_geometry_compact_chars(
+        [{"text": character} for character in fallback]
+    )
+    if not fallback_compact:
+        return fallback, set()
+
+    def finite_bbox(run: dict[str, Any]) -> dict[str, float] | None:
+        value = run.get("bbox")
+        if not isinstance(value, dict):
+            return None
+        try:
+            bbox = {
+                "l": float(value.get("l") or 0.0),
+                "r": float(value.get("r") or 0.0),
+                "t": float(value.get("t") or 0.0),
+                "b": float(value.get("b") or 0.0),
+            }
+        except (TypeError, ValueError):
+            return None
+        if not all(math.isfinite(number) for number in bbox.values()):
+            return None
+        return bbox
+
+    def known_math_font(run: dict[str, Any]) -> bool:
+        font_name = str(
+            run.get("fontname")
+            or run.get("font_name")
+            or run.get("font")
+            or ""
+        ).upper()
+        return bool(font_name) and any(
+            hint in font_name for hint in _INLINE_MATH_MATH_FONT_HINTS
+        )
+
+    def opaque_run(run: dict[str, Any]) -> bool:
+        text_value = str(run.get("text") or "")
+        return bool(
+            not text_value
+            or re.search(r"\(cid:\d+\)", text_value, flags=re.IGNORECASE)
+            or _inline_math_control_character(run)
+            or any(ord(character) < 32 for character in text_value)
+            or any(0xE000 <= ord(character) <= 0xF8FF for character in text_value)
+        )
+
+    def legal_operand(character: str) -> bool:
+        # Closing delimiters and a detached prime can terminate an operand;
+        # opening punctuation, commas, and ordinary prose separators cannot.
+        return bool(
+            character.isalnum()
+            or character in _MATH_SYMBOL_CHARS
+            or character in ")]}'′"
+        )
+
+    def safe_gap(
+        left_original: int,
+        right_original: int,
+    ) -> tuple[str, tuple[int, int]] | None:
+        if not (0 <= left_original < right_original <= len(fallback)):
+            return None
+        start = left_original + 1
+        gap = fallback[start:right_original]
+        if not gap:
+            return None
+        if gap.count("/") == 1 and all(
+            character == "/" or character.isspace() for character in gap
+        ):
+            # Existing source slash: report it as resolved but do not add a
+            # duplicate marker on a repeated pass.
+            return "existing", (start, right_original)
+        if gap.isspace():
+            return "insert", (start, right_original)
+        return None
+
+    repaired = fallback
+    repaired_names: set[str] = set()
+    pending_insertions: list[tuple[int, int, str]] = []
+
+    # A pypdfium run is normally one glyph, but retaining the character index
+    # makes this helper deterministic for synthetic fixtures and ligatures.
+    slash_indexes = [
+        index
+        for index, run in enumerate(runs)
+        if (
+            str(run.get("text") or "") == "/"
+            and known_math_font(run)
+            and not opaque_run(run)
+            and finite_bbox(run) is not None
+        )
+    ]
+    for slash_index in slash_indexes:
+        slash_run = runs[slash_index]
+        slash_bbox = finite_bbox(slash_run)
+        if slash_bbox is None:
+            continue
+        slash_center = _inline_geometry_char_center_y(slash_run)
+        slash_size = _inline_geometry_char_size(slash_run)
+        if not math.isfinite(slash_center):
+            continue
+
+        # Baseline evidence is intentionally tighter than the script detector:
+        # pypdfium's body glyph centres can differ by about one point, while a
+        # nearby superscript is usually displaced farther.  Include a little
+        # extra vertical room for line-ending punctuation (whose ink box is
+        # often shorter) in the source compact neighbourhood; operands below
+        # still use the stricter same-baseline gate.
+        baseline_tolerance = max(2.5, slash_size * 0.28) if slash_size > 0 else 2.5
+        line_runs: list[tuple[int, dict[str, Any], dict[str, float]]] = []
+        for index, run in enumerate(runs):
+            text_value = str(run.get("text") or "")
+            bbox = finite_bbox(run)
+            if not text_value or not text_value.strip() or bbox is None:
+                continue
+            center = _inline_geometry_char_center_y(run)
+            if abs(center - slash_center) > baseline_tolerance:
+                continue
+            line_runs.append((index, run, bbox))
+        if not line_runs:
+            continue
+        line_runs.sort(key=lambda value: (value[2]["l"], value[2]["r"], value[0]))
+
+        # Keep opaque markers in the local line so a CID/control between the
+        # operands cannot silently disappear from the uniqueness check.
+        line_chars: list[dict[str, Any]] = []
+        for index, run, bbox in line_runs:
+            text_value = str(run.get("text") or "")
+            if opaque_run(run):
+                for _character in text_value or "?":
+                    line_chars.append(
+                        {
+                            "char": None,
+                            "run_index": index,
+                            "bbox": bbox,
+                        }
+                    )
+                continue
+            clean = _inline_geometry_preserve_private_text(text_value)
+            for character in clean:
+                if character.isspace():
+                    continue
+                line_chars.append(
+                    {
+                        "char": character,
+                        "run_index": index,
+                        "bbox": bbox,
+                    }
+                )
+        slash_positions = [
+            position
+            for position, item in enumerate(line_chars)
+            if item["run_index"] == slash_index and item["char"] == "/"
+        ]
+        if len(slash_positions) != 1:
+            continue
+        slash_position = slash_positions[0]
+        if slash_position <= 0 or slash_position + 1 >= len(line_chars):
+            continue
+        left_item = line_chars[slash_position - 1]
+        right_item = line_chars[slash_position + 1]
+        if (
+            left_item["char"] is None
+            or right_item["char"] is None
+            or not legal_operand(str(left_item["char"]))
+            or not legal_operand(str(right_item["char"]))
+        ):
+            continue
+        operand_tolerance = max(1.5, slash_size * 0.18) if slash_size > 0 else 1.5
+        if any(
+            abs(
+                _inline_geometry_char_center_y(runs[int(item["run_index"])])
+                - slash_center
+            )
+            > operand_tolerance
+            for item in (left_item, right_item)
+        ):
+            continue
+        left_bbox = left_item["bbox"]
+        right_bbox = right_item["bbox"]
+        # The slash must lie between the operand boxes and not bridge a whole
+        # unrelated word/column.  A generous local gap still accommodates
+        # TeX's visible spaces around a binary operator.
+        if (
+            left_bbox["r"] > slash_bbox["l"] + 0.5
+            or right_bbox["l"] < slash_bbox["r"] - 0.5
+            or slash_bbox["l"] - left_bbox["r"] > max(6.0, slash_size * 1.2)
+            or right_bbox["l"] - slash_bbox["r"] > max(6.0, slash_size * 1.2)
+        ):
+            continue
+
+        source_left = [
+            item["char"] for item in line_chars[:slash_position]
+        ]
+        source_right = [
+            item["char"] for item in line_chars[slash_position + 1 :]
+        ]
+        if any(character is None for character in source_left[-1:] + source_right[:1]):
+            continue
+        max_radius = min(24, len(source_left), len(source_right))
+        if max_radius <= 0:
+            continue
+
+        name = (
+            "geometry_solidus-"
+            f"{re.sub(r'[^A-Za-z0-9]+', '-', str(left_item['char'])).strip('-') or 'left'}-"
+            f"{re.sub(r'[^A-Za-z0-9]+', '-', str(right_item['char'])).strip('-') or 'right'}-"
+            f"run{slash_index}"
+        )
+        candidate_gaps: list[tuple[str, tuple[int, int]]] = []
+        for radius in range(1, max_radius + 1):
+            left_context = source_left[-radius:]
+            right_context = source_right[:radius]
+            if any(
+                character is None for character in left_context + right_context
+            ):
+                break
+            pattern = "".join(left_context + right_context)
+            if not pattern:
+                continue
+            matches: list[tuple[int, int]] = [
+                (start, len(left_context))
+                for start in range(0, len(fallback_compact) - len(pattern) + 1)
+                if fallback_compact.startswith(pattern, start)
+            ]
+            # A prior pass (or the original fallback) may already retain the
+            # source slash.  Treat that spelling as an idempotent alignment,
+            # but still require the same unique surrounding context.
+            slash_pattern = "".join(left_context) + "/" + "".join(right_context)
+            matches.extend(
+                (start, len(left_context) + 1)
+                for start in range(
+                    0,
+                    len(fallback_compact) - len(slash_pattern) + 1,
+                )
+                if fallback_compact.startswith(slash_pattern, start)
+            )
+            if len(matches) != 1:
+                continue
+            start, right_offset = matches[0]
+            left_compact = start + len(left_context) - 1
+            right_compact = start + right_offset
+            if not (0 <= right_compact < len(fallback_mapping)):
+                continue
+            gap = safe_gap(
+                fallback_mapping[left_compact],
+                fallback_mapping[right_compact],
+            )
+            if gap is not None:
+                candidate_gaps.append(gap)
+                break
+        if len(candidate_gaps) != 1:
+            continue
+        mode, (replace_start, replace_end) = candidate_gaps[0]
+        repaired_names.add(name)
+        if mode == "insert":
+            pending_insertions.append((replace_start, replace_end, name))
+
+    # Apply only pairwise-disjoint insertion gaps.  Repeated solidus contexts
+    # are never selected by the uniqueness gate; this final guard also keeps
+    # two independently proven source runs from editing one fallback gap.
+    accepted: list[tuple[int, int, str]] = []
+    for candidate in sorted(pending_insertions, key=lambda value: value[0]):
+        if any(
+            candidate[0] < existing[1] and existing[0] < candidate[1]
+            or candidate[0] == existing[0]
+            for existing in accepted
+        ):
+            repaired_names.discard(candidate[2])
+            continue
+        accepted.append(candidate)
+    for start, end, _name in sorted(accepted, key=lambda value: value[0], reverse=True):
+        repaired = repaired[:start] + "/" + repaired[end:]
+    return repaired, repaired_names
+
+
+def _repair_inline_fraction_rule(
+    fallback: str,
+    runs: list[dict[str, Any]],
+    spans: list[dict[str, Any]],
+) -> tuple[str, set[str]]:
+    """Insert one source-proven division boundary into a flattened fallback.
+
+    The PDF rule establishes only the numerator/denominator boundary; this
+    helper never guesses a glyph.  It accepts one fraction occurrence only,
+    requires unique compact fallback alignment for both geometric layers, and
+    otherwise returns the original text unchanged.
+    """
+
+    fraction_spans = [
+        span for span in spans if str(span.get("reason") or "") == "fraction_rule"
+    ]
+    if not fraction_spans or len(spans) != len(fraction_spans):
+        return fallback, set()
+    if len(fraction_spans) > 1:
+        # A short rule can turn one previously visible fraction span into
+        # several spans in the same paragraph.  Re-run the single-span proof
+        # independently, but only when the visual repair boxes are disjoint;
+        # each recursive call still requires a unique fallback alignment and a
+        # whitespace-only replacement gap.  This preserves a proven det-ratio
+        # repair without pairing repeated ``1 2`` occurrences by count.
+        for left_index, left_span in enumerate(fraction_spans):
+            left_box = left_span.get("repair_bbox") or left_span.get("bbox")
+            if not isinstance(left_box, dict):
+                return fallback, set()
+            for right_span in fraction_spans[left_index + 1 :]:
+                right_box = right_span.get("repair_bbox") or right_span.get("bbox")
+                if not isinstance(right_box, dict):
+                    return fallback, set()
+                if _inline_geometry_bbox_intersects(left_box, right_box):
+                    return fallback, set()
+        proposals: list[tuple[int, int, str, str]] = []
+        resolved_names: set[str] = set()
+        for candidate_span in fraction_spans:
+            candidate_text, candidate_names = _repair_inline_fraction_rule(
+                fallback,
+                runs,
+                [candidate_span],
+            )
+            resolved_names.update(candidate_names)
+            if candidate_text == fallback:
+                continue
+            # The single-span helper only inserts one slash.  Recover that
+            # insertion interval explicitly so independently proven edits can
+            # be checked for overlap before applying them together.
+            matcher = SequenceMatcher(None, fallback, candidate_text, autojunk=False)
+            inserts = [
+                (a_start, a_end, candidate_text[b_start:b_end])
+                for tag, a_start, a_end, b_start, b_end in matcher.get_opcodes()
+                if candidate_text[b_start:b_end] == "/"
+                and (
+                    tag == "insert"
+                    or (tag == "replace" and fallback[a_start:a_end].isspace())
+                )
+            ]
+            if len(inserts) != 1:
+                # A future change that edits more than the division gap must
+                # not silently enter the multi-span path.
+                resolved_names.difference_update(candidate_names)
+                continue
+            start, end, _replacement = inserts[0]
+            name = next(iter(candidate_names), "")
+            proposals.append((start, end, name, candidate_text))
+        accepted: list[tuple[int, int, str, str]] = []
+        rejected_names: set[str] = set()
+        for proposal in sorted(proposals, key=lambda value: (value[0], value[1])):
+            if any(
+                proposal[0] < existing[1]
+                and existing[0] < proposal[1]
+                or proposal[0] == existing[0]
+                for existing in accepted
+            ):
+                rejected_names.add(proposal[2])
+                continue
+            accepted.append(proposal)
+        for start, end, _name, _candidate_text in sorted(
+            accepted,
+            key=lambda value: value[0],
+            reverse=True,
+        ):
+            fallback = fallback[:start] + "/" + fallback[end:]
+        resolved_names.difference_update(rejected_names)
+        return fallback, resolved_names
+    span = fraction_spans[0]
+    repair_bbox = span.get("repair_bbox")
+    try:
+        rule_y = float(span["rule_y"])
+    except (KeyError, TypeError, ValueError):
+        return fallback, set()
+    if not math.isfinite(rule_y) or not isinstance(repair_bbox, dict):
+        return fallback, set()
+    try:
+        repair_left = min(float(repair_bbox["l"]), float(repair_bbox["r"]))
+        repair_right = max(float(repair_bbox["l"]), float(repair_bbox["r"]))
+        repair_bottom = min(float(repair_bbox["b"]), float(repair_bbox["t"]))
+        repair_top = max(float(repair_bbox["b"]), float(repair_bbox["t"]))
+    except (KeyError, TypeError, ValueError):
+        return fallback, set()
+    if not all(
+        math.isfinite(value)
+        for value in (repair_left, repair_right, repair_bottom, repair_top)
+    ):
+        return fallback, set()
+
+    selected: list[dict[str, Any]] = []
+    for run in runs:
+        text_value = str(run.get("text") or "")
+        bbox = run.get("bbox")
+        if not text_value.strip() or not isinstance(bbox, dict):
+            continue
+        try:
+            center_x = (
+                float(bbox.get("l") or 0.0) + float(bbox.get("r") or 0.0)
+            ) / 2.0
+            center_y = _inline_geometry_char_center_y(run)
+        except (TypeError, ValueError):
+            return fallback, set()
+        # A glyph from an adjacent physical line can have an anti-aliased box
+        # that barely overlaps the fraction repair box.  Accept only glyphs
+        # whose center is inside the source-proven repair region; all glyphs
+        # used to construct that region satisfy this stronger condition.
+        if (
+            repair_left <= center_x <= repair_right
+            and repair_bottom <= center_y <= repair_top
+        ):
+            selected.append(run)
+    if not (2 <= len(selected) <= 64):
+        return fallback, set()
+    if any(
+        _inline_math_control_character(run)
+        or re.search(r"\(cid:\d+\)", str(run.get("text") or ""), re.I)
+        for run in selected
+    ):
+        return fallback, set()
+
+    positive_sizes = [
+        _inline_geometry_char_size(run)
+        for run in selected
+        if _inline_geometry_char_size(run) > 0.0
+    ]
+    layer_margin = max(0.5, (median(positive_sizes) if positive_sizes else 6.0) * 0.06)
+    numerator: list[dict[str, Any]] = []
+    denominator: list[dict[str, Any]] = []
+    for run in selected:
+        center = _inline_geometry_char_center_y(run)
+        if center > rule_y + layer_margin:
+            numerator.append(run)
+        elif center < rule_y - layer_margin:
+            denominator.append(run)
+        else:
+            return fallback, set()
+    if not numerator or not denominator:
+        return fallback, set()
+
+    def horizontal_bounds(values: list[dict[str, Any]]) -> tuple[float, float] | None:
+        boxes = [run.get("bbox") for run in values]
+        if not all(isinstance(box, dict) for box in boxes):
+            return None
+        return (
+            min(float(box.get("l") or 0.0) for box in boxes),
+            max(float(box.get("r") or 0.0) for box in boxes),
+        )
+
+    numerator_bounds = horizontal_bounds(numerator)
+    denominator_bounds = horizontal_bounds(denominator)
+    if numerator_bounds is None or denominator_bounds is None:
+        return fallback, set()
+    if min(numerator_bounds[1], denominator_bounds[1]) <= max(
+        numerator_bounds[0], denominator_bounds[0]
+    ):
+        return fallback, set()
+
+    def side_pattern(values: list[dict[str, Any]]) -> tuple[str, int] | None:
+        ordered = sorted(
+            values,
+            key=lambda run: (
+                float((run.get("bbox") or {}).get("l") or 0.0),
+                -_inline_geometry_char_center_y(run),
+            ),
+        )
+        sizes = [
+            _inline_geometry_char_size(run)
+            for run in ordered
+            if _inline_geometry_char_size(run) > 0.0
+        ]
+        gap_limit = max(3.0, (median(sizes) if sizes else 6.0) * 0.65)
+        previous_right: float | None = None
+        pattern: list[str] = []
+        width = 0
+        for run in ordered:
+            bbox = run.get("bbox") or {}
+            left = float(bbox.get("l") or 0.0)
+            right = float(bbox.get("r") or 0.0)
+            if previous_right is not None and left - previous_right > gap_limit:
+                return None
+            previous_right = max(previous_right or right, right)
+            text_value = _inline_geometry_preserve_private_text(
+                str(run.get("text") or "")
+            )
+            font_name = str(
+                run.get("fontname") or run.get("font_name") or run.get("font") or ""
+            ).upper()
+            for character in text_value:
+                if character.isspace():
+                    continue
+                character = {"−": "-", "—": "-", "–": "-"}.get(
+                    character, character
+                )
+                if "CMEX" in font_name:
+                    # A printable CMEX operator can have a different Unicode
+                    # spelling in the fallback (for example raw OMX slot P is
+                    # a sum operator).  Require the exact standard slot map;
+                    # unknown CMEX glyphs remain unresolved.
+                    canonical_operator = _INLINE_CMEX_OPERATOR_ALIASES.get(character)
+                    if canonical_operator is None:
+                        if character not in _INLINE_CMEX_CANONICAL_OPERATORS:
+                            return None
+                        canonical_operator = character
+                    pattern.append(re.escape(canonical_operator))
+                else:
+                    pattern.append(re.escape(character))
+                width += 1
+        if width == 0:
+            return None
+        return "".join(pattern), width
+
+    numerator_pattern = side_pattern(numerator)
+    denominator_pattern = side_pattern(denominator)
+    if numerator_pattern is None or denominator_pattern is None:
+        return fallback, set()
+    numerator_re, numerator_width = numerator_pattern
+    denominator_re, _denominator_width = denominator_pattern
+    fallback_compact, fallback_mapping = _inline_geometry_compact_chars(
+        [{"text": character} for character in fallback]
+    )
+    fallback_compact = fallback_compact.replace("−", "-").replace("—", "-").replace("–", "-")
+    try:
+        alignment_pattern = re.compile(
+            numerator_re + r"(?P<division>/?)" + denominator_re
+        )
+    except re.error:
+        return fallback, set()
+    match = alignment_pattern.search(fallback_compact)
+    if match is None or alignment_pattern.search(fallback_compact, match.start() + 1):
+        return fallback, set()
+    first_original = fallback_mapping[match.start()]
+    last_original = fallback_mapping[match.end() - 1]
+
+    def word_character(value: str) -> bool:
+        return bool(value) and (value.isalnum() or value == "_")
+
+    if (
+        word_character(fallback[first_original])
+        and first_original > 0
+        and word_character(fallback[first_original - 1])
+    ) or (
+        word_character(fallback[last_original])
+        and last_original + 1 < len(fallback)
+        and word_character(fallback[last_original + 1])
+    ):
+        return fallback, set()
+    name = str(span.get("name") or "geometry_math_span-fraction_rule")
+    if match.group("division") == "/":
+        return fallback, {name}
+    boundary = match.start() + numerator_width
+    if boundary <= 0 or boundary >= len(fallback_mapping):
+        return fallback, set()
+    replace_start = fallback_mapping[boundary - 1] + 1
+    replace_end = fallback_mapping[boundary]
+    gap = fallback[replace_start:replace_end]
+    if not gap or not gap.isspace():
+        return fallback, set()
+    return fallback[:replace_start] + "/" + fallback[replace_end:], {name}
 
 
 def _inline_geometry_preserve_private_text(value: str) -> str:
@@ -1703,7 +2357,11 @@ class SourceReader:
                 continue
             left, right = sorted((x0, x1))
             top, bottom = sorted((y0, y1))
-            if right - left < max(6.0, typical_size * 0.65):
+            # TeX's compact numerator/denominator bars can be only a few
+            # points wide (the lattice holdout uses a 4.234pt rule).  Keep a
+            # small absolute floor, while the two-sided reduced-glyph checks
+            # below continue to reject short overbars and underlines.
+            if right - left < max(3.0, typical_size * 0.35):
                 continue
             # A fraction bar is horizontal.  ``page.lines`` normally has
             # identical top/bottom; allow a small stroke thickness for PDFs
@@ -1933,6 +2591,7 @@ class SourceReader:
                 {
                     "reason": "fraction_rule",
                     "index": line_index,
+                    "rule_y": line_y_bottom_left,
                     "bbox": span_box,
                     "repair_bbox": repair_box,
                     "source_text": "".join(
@@ -2228,7 +2887,7 @@ class SourceReader:
         runs = [
             {
                 **run,
-                "text": _inline_geometry_preserve_private_text(str(run.get("text") or "")),
+                "text": _normalize_inline_math_run_text(run),
             }
             for run in runs
             if str(run.get("text") or "") != ""
@@ -2294,11 +2953,6 @@ class SourceReader:
             for span in span_evidence
             if isinstance(span.get("bbox"), dict)
         ]
-        blocked_bboxes = [
-            item.get("repair_bbox") or item["bbox"]
-            for item in span_diagnostics
-            if isinstance(item.get("repair_bbox") or item.get("bbox"), dict)
-        ]
         fallback_normalized = _normalize_formula_similarity_text(fallback)
         if fallback_normalized:
             if SequenceMatcher(
@@ -2317,20 +2971,52 @@ class SourceReader:
                         "anchor": True,
                     }
                 return fallback
+        fraction_repaired, fraction_names = _repair_inline_fraction_rule(
+            fallback,
+            runs,
+            span_evidence,
+        )
+        for item in span_diagnostics:
+            if str(item.get("name") or "") in fraction_names:
+                item["resolved"] = True
+                item["resolution"] = "source_geometry_division_boundary"
+        solidus_repaired, solidus_names = _repair_inline_solidus_glyph(
+            fraction_repaired,
+            runs,
+        )
+        solidus_diagnostics = [
+            {
+                "name": name,
+                "reason": "solidus_glyph",
+                "resolved": True,
+                "resolution": "source_glyph_solidus",
+            }
+            for name in sorted(solidus_names)
+        ]
+        blocked_bboxes = [
+            item.get("repair_bbox") or item["bbox"]
+            for item in span_diagnostics
+            if not item.get("resolved")
+            and isinstance(item.get("repair_bbox") or item.get("bbox"), dict)
+        ]
         cluster_diagnostics: list[dict[str, Any]] = []
         repaired, repaired_names, unresolved_names = _inline_geometry_repair(
-            fallback,
+            solidus_repaired,
             runs,
             math_font_evidence=self._math_font_evidence,
             cluster_diagnostics=cluster_diagnostics,
             blocked_bboxes=blocked_bboxes,
             allow_text_script_base=allow_text_script_base,
         )
+        repaired_names.update(fraction_names)
+        repaired_names.update(solidus_names)
         repaired = _repair_source_comparison_operators(repaired, candidate)
         if span_diagnostics:
             cluster_diagnostics.extend(span_diagnostics)
             unresolved_names.update(
-                str(item["name"]) for item in span_diagnostics
+                str(item["name"])
+                for item in span_diagnostics
+                if not item.get("resolved")
             )
         # Isolated italic S in a comma-delimited notation list is a known
         # low-confidence overbar case.  We deliberately do not invent the bar;
@@ -2353,6 +3039,7 @@ class SourceReader:
                 and item.get("bbox")
             ],
             "math_span_regions": span_diagnostics,
+            "solidus_regions": solidus_diagnostics,
             "anchor": bool(repaired_names or unresolved_names),
         }
         self._math_aware_diagnostics[self._math_diagnostic_key(prov)] = diagnostic
@@ -2561,38 +3248,175 @@ class SourceReader:
         return self.text(prov, layout=False)
 
     def equation_number(self, prov: dict[str, Any]) -> int | str | None:
-        page_no = int(prov.get("page_no") or 0)
+        try:
+            page_no = int(prov.get("page_no") or 0)
+        except (TypeError, ValueError):
+            return None
         bbox = prov.get("bbox")
         if not page_no or not isinstance(bbox, dict):
             return None
-        width, _height = self.page_size(page_no)
-        expanded = dict(bbox)
-        expanded["r"] = width - 45.0
-        matches: list[str] = []
-        for line in self.lines({"page_no": page_no, "bbox": expanded}, padding=0.0):
-            right_chars = [
-                char
-                for char in line.get("chars") or []
-                if isinstance(char, dict)
-                and float(char.get("x0") or 0.0) >= width * 0.84
-            ]
-            right_chars.sort(
-                key=lambda char: (
-                    float(char.get("x0") or 0.0),
-                    float(char.get("top") or 0.0),
+        try:
+            width, _height = self.page_size(page_no)
+            formula_left = float(bbox.get("l") or 0.0)
+            formula_right = float(bbox.get("r") or formula_left)
+            formula_bottom = float(bbox.get("b") or 0.0)
+            formula_top = float(bbox.get("t") or formula_bottom)
+        except (IndexError, TypeError, ValueError):
+            return None
+        if (
+            not all(
+                math.isfinite(value)
+                for value in (
+                    width,
+                    formula_left,
+                    formula_right,
+                    formula_bottom,
+                    formula_top,
                 )
             )
-            right_text = "".join(
-                _clean_glyph_text(str(char.get("text") or ""))
-                for char in right_chars
+            or width <= 0.0
+            or formula_right <= formula_left
+            or formula_top == formula_bottom
+        ):
+            return None
+        formula_width = max(abs(formula_right - formula_left), 1.0)
+        origin = str(bbox.get("coord_origin") or "BOTTOMLEFT").upper()
+        try:
+            page = self._pdf.pages[page_no - 1]
+            page_height = float(page.height or 0.0)
+        except Exception:
+            page_height = 0.0
+        # pdfplumber text-line coordinates are TOPLEFT.  Compare against one
+        # and only one interpretation of the source bbox: accepting both the
+        # raw and mirrored interval can bind a label from the page-height
+        # reflection of the real formula.
+        if origin == "TOPLEFT":
+            formula_line_low = min(formula_bottom, formula_top)
+            formula_line_high = max(formula_bottom, formula_top)
+        else:
+            if page_height <= 0.0 or not math.isfinite(page_height):
+                return None
+            formula_line_low = min(
+                page_height - formula_top,
+                page_height - formula_bottom,
             )
-            label_match = re.fullmatch(
-                r"\s*\(\s*((?:\d\s*)+(?:\.\s*(?:\d\s*)+)?)\)\s*",
-                right_text,
+            formula_line_high = max(
+                page_height - formula_top,
+                page_height - formula_bottom,
             )
-            if label_match:
-                matches.append(label_match.group(1))
-        if not matches:
+        probe_half = max(12.0, min(50.0, formula_width * 0.50))
+        search_left = max(0.0, formula_right - probe_half)
+        search = dict(bbox)
+        search["l"] = search_left
+        search["r"] = (width - 0.5) if width > 0 else (formula_right + 60.0)
+
+        def _interval_overlap(min_a: float, max_a: float, min_b: float, max_b: float) -> float:
+            return min(max_a, max_b) - max(min_a, min_b)
+
+        def _char_x_bounds(
+            value: dict[str, Any],
+        ) -> tuple[float, float] | None:
+            try:
+                candidate = value.get("bbox")
+                if isinstance(candidate, dict):
+                    left = float(candidate.get("l") or 0.0)
+                    right = float(candidate.get("r") or left)
+                else:
+                    left = float(value.get("x0") or value.get("l") or 0.0)
+                    right = float(value.get("x1") or value.get("r") or left)
+            except (TypeError, ValueError):
+                return None
+            if not math.isfinite(left) or not math.isfinite(right):
+                return None
+            if right < left:
+                left, right = right, left
+            return left, right
+
+        pattern = re.compile(r"\(\s*((?:\d\s*)+(?:\.\s*(?:\d\s*)+)?)\)")
+        matches: list[str] = []
+        for line in self.lines({"page_no": page_no, "bbox": search}, padding=0.0):
+            line_top = float(line.get("top") or 0.0)
+            line_bottom = float(line.get("bottom") or 0.0)
+            line_min = min(line_top, line_bottom)
+            line_max = max(line_top, line_bottom)
+            overlap = _interval_overlap(
+                line_min,
+                line_max,
+                formula_line_low,
+                formula_line_high,
+            )
+            if overlap <= 0.0:
+                continue
+            char_items = [
+                (char, bounds)
+                for char in (line.get("chars") or [])
+                if isinstance(char, dict)
+                for bounds in [_char_x_bounds(char)]
+                if bounds is not None
+            ]
+            if not char_items:
+                continue
+            char_items.sort(key=lambda item: item[1])
+            chars = [item[0] for item in char_items]
+            char_bounds = [item[1] for item in char_items]
+            compact, compact_mapping = _inline_geometry_compact_chars(
+                {
+                    "text": _clean_glyph_text(str(char.get("text") or ""))
+                }
+                for char in chars
+            )
+            if not compact:
+                continue
+            for match in pattern.finditer(compact):
+                positions = sorted(
+                    {
+                        compact_mapping[index]
+                        for index in range(match.start(), match.end())
+                        if compact_mapping[index] is not None
+                    }
+                )
+                if not positions:
+                    continue
+                label_left = 1e9
+                label_right = 0.0
+                for index in positions:
+                    left, right = char_bounds[index]
+                    label_left = min(label_left, left)
+                    label_right = max(label_right, right)
+                if label_left == 1e9 or label_right <= label_left:
+                    continue
+                label_text = match.group(1)
+                if not label_text:
+                    continue
+                # Docling bboxes commonly include the equation label exactly
+                # at their right edge.  Some producers exclude it by a small
+                # margin instead.  Accept those two local geometries only;
+                # never bind a same-row label from the opposite column.
+                right_edge_label = abs(label_right - formula_right) <= 2.0
+                outside_gap = label_left - formula_right
+                just_outside = (
+                    -1.0 <= outside_gap <= 24.0
+                    and label_right <= formula_right + 36.0
+                )
+                if not (right_edge_label or just_outside):
+                    continue
+                if label_left < search_left:
+                    continue
+                previous_positions = [
+                    index
+                    for index in range(min(positions) - 1, -1, -1)
+                    if _clean_glyph_text(str(chars[index].get("text") or "")).strip()
+                ]
+                if previous_positions:
+                    previous_right = char_bounds[previous_positions[0]][1]
+                    # A source label is visually separated from the equation
+                    # body.  This prevents a terminal function argument such
+                    # as ``y(0)`` from being promoted to an equation number.
+                    if label_left - previous_right < 8.0:
+                        continue
+                matches.append(label_text)
+
+        if len(matches) != 1:
             return None
         normalized = re.sub(r"\s+", "", matches[-1])
         return normalized if "." in normalized else int(normalized)
@@ -2786,6 +3610,46 @@ def _picture_boxes(document: dict[str, Any]) -> dict[int, list[dict[str, float]]
         if box and page_no:
             result.setdefault(page_no, []).append(box)
     return result
+
+
+def _picture_has_caption_binding(node: dict[str, Any]) -> bool:
+    """Return whether a picture carries a non-empty caption binding.
+
+    Caption values in Docling payloads vary between references, direct text,
+    and legacy ``caption``/``caption_text`` fields.  Treat only non-empty
+    values as a caption so an empty placeholder does not make a tiny picture
+    enter the main flow.
+    """
+
+    captions = node.get("captions")
+    if isinstance(captions, (list, tuple, set)):
+        for item in captions:
+            if isinstance(item, str) and item.strip():
+                return True
+            if isinstance(item, dict) and (
+                str(item.get("$ref") or "").strip()
+                or str(item.get("text") or "").strip()
+            ):
+                return True
+            if not isinstance(item, (str, dict)) and item not in (None, ""):
+                return True
+    elif isinstance(captions, str) and captions.strip():
+        return True
+    elif isinstance(captions, dict) and (
+        str(captions.get("$ref") or "").strip()
+        or str(captions.get("text") or "").strip()
+    ):
+        return True
+    for key in ("caption", "caption_text"):
+        value = node.get(key)
+        if isinstance(value, str) and value.strip():
+            return True
+        if isinstance(value, dict) and (
+            str(value.get("$ref") or "").strip()
+            or str(value.get("text") or "").strip()
+        ):
+            return True
+    return False
 
 
 def _label_node_ordinals(value: Any, label: str) -> dict[int, int]:
@@ -3457,13 +4321,25 @@ def _group_text_node_paragraph_items(
         merged_bbox = _union_flowitem_bbox(ordered_group)
         if not merged_bbox:
             continue
+        unresolved_members = [
+            grouped_item
+            for grouped_item in ordered_group
+            if grouped_item.inline_math_source_unresolved
+        ]
         evidence_member = next(
             (
                 grouped_item
                 for grouped_item in ordered_group
-                if grouped_item.inline_math_source_scope
+                if grouped_item.inline_math_source_unresolved
             ),
-            ordered_group[0],
+            next(
+                (
+                    grouped_item
+                    for grouped_item in ordered_group
+                    if grouped_item.inline_math_source_scope
+                ),
+                ordered_group[0],
+            ),
         )
         has_inline_math = any(
             grouped_item.inline_math_source_scope for grouped_item in ordered_group
@@ -3477,7 +4353,7 @@ def _group_text_node_paragraph_items(
         merged_source_text = _merged_source_text_from_group(ordered_group)[0]
         merged_regions = [
             region
-            for grouped_item in ordered_group
+            for grouped_item in (unresolved_members or ordered_group)
             for region in grouped_item.inline_math_unresolved_regions
             if isinstance(region, dict)
         ]
@@ -3507,10 +4383,7 @@ def _group_text_node_paragraph_items(
             inline_math_source_anchor=evidence_member.inline_math_source_anchor,
             inline_math_source_scope=evidence_member.inline_math_source_scope,
             inline_math_source_reason=evidence_member.inline_math_source_reason,
-            inline_math_source_unresolved=any(
-                grouped_item.inline_math_source_unresolved
-                for grouped_item in ordered_group
-            ),
+            inline_math_source_unresolved=bool(unresolved_members),
             inline_math_unresolved_regions=merged_regions,
             inline_math_source_clip_bounds=merged_clip_bounds,
             source_readability_diagnostic=(
@@ -3594,22 +4467,35 @@ def _collect_items(
                 if str((candidate or {}).get("label") or "").lower() == "formula":
                     formula_child = candidate
                     break
-            image_size = (
-                ((node.get("image") or {}).get("size") or {})
-                if isinstance(node.get("image"), dict)
-                else {}
-            )
-            if (
-                formula_child is None
-                and not node.get("captions")
-                and float(image_size.get("width") or 0.0) <= 64.0
-                and float(image_size.get("height") or 0.0) <= 64.0
-            ):
-                continue
             effective = formula_child or node
             prov = _first_prov(effective) or _first_prov(node)
             box = _bbox(prov)
             if not box or not prov:
+                continue
+
+            # Source geometry, rather than the optional embedded image size,
+            # is the authoritative signal for captionless pictures.  Docling
+            # frequently emits ``image=None`` for a picture whose crop was
+            # materialized by the adapter.  The same conservative thresholds
+            # used by the adapter's picture inventory keep tiny rules and
+            # decorative fragments out of the semantic flow while allowing a
+            # real captionless figure to be rendered from its source crop.
+            source_width = abs(float(box.get("r") or 0.0) - float(box.get("l") or 0.0))
+            source_height = abs(float(box.get("t") or 0.0) - float(box.get("b") or 0.0))
+            source_area = source_width * source_height
+            source_bbox_is_significant = (
+                math.isfinite(source_width)
+                and math.isfinite(source_height)
+                and math.isfinite(source_area)
+                and source_width >= 32.0
+                and source_height >= 32.0
+                and source_area >= 1500.0
+            )
+            if (
+                formula_child is None
+                and not _picture_has_caption_binding(node)
+                and not source_bbox_is_significant
+            ):
                 continue
             items.append(
                 FlowItem(
@@ -4531,6 +5417,532 @@ def _table_cell_span(
     return row, col, row_end, col_end, row_end - row, col_end - col
 
 
+_TABLE_HOLE_NUMERIC_RE = re.compile(r"^[0-9][0-9\s.,:+\-()%/]*$")
+_TABLE_HOLE_MAX_AUDIT_RECORDS = 32
+_TABLE_HOLE_MAX_TEXT = 160
+_TABLE_HOLE_MAX_CELLS = 65536
+_TABLE_HOLE_MAX_SOURCE_BYTES = 4 * 1024 * 1024 * 1024
+
+
+def _table_hole_hash(value: Any) -> str:
+    try:
+        raw = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str).encode()
+    except Exception:
+        raw = repr(value).encode("utf-8", errors="replace")
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _table_hole_source_hash(path: Path | str | None) -> str | None:
+    if path is None:
+        return None
+    descriptor: int | None = None
+    try:
+        source_path = Path(path)
+        path_stat = source_path.lstat()
+        if not stat.S_ISREG(path_stat.st_mode):
+            return None
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+        descriptor = os.open(source_path, flags)
+        opened_stat = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened_stat.st_mode)
+            or opened_stat.st_size > _TABLE_HOLE_MAX_SOURCE_BYTES
+        ):
+            return None
+        digest = hashlib.sha256()
+        total = 0
+        with os.fdopen(descriptor, "rb", closefd=True) as handle:
+            descriptor = None
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                total += len(chunk)
+                if total > _TABLE_HOLE_MAX_SOURCE_BYTES:
+                    return None
+                digest.update(chunk)
+        return digest.hexdigest()
+    except Exception:
+        return None
+    finally:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+
+
+def _table_hole_int(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = int(value.strip())
+    except ValueError:
+        return None
+    return parsed if value.strip() == str(parsed) else None
+
+
+def _table_hole_bbox(value: Any) -> dict[str, float] | None:
+    if not isinstance(value, dict) or str(value.get("coord_origin") or "").upper() != "TOPLEFT":
+        return None
+    try:
+        result = {key: float(value[key]) for key in ("l", "r", "t", "b")}
+    except (KeyError, TypeError, ValueError):
+        return None
+    if not all(math.isfinite(item) for item in result.values()) or result["r"] <= result["l"] or result["t"] == result["b"]:
+        return None
+    return {**result, "coord_origin": "TOPLEFT"}
+
+
+def _table_hole_lines(source: Any, page_no: int, bbox: dict[str, float]) -> tuple[list[dict[str, Any]], str | None]:
+    try:
+        raw_lines = source.lines({"page_no": page_no, "bbox": bbox}, padding=0.0)
+    except Exception:
+        return [], "source_lines_unavailable"
+    if not isinstance(raw_lines, list):
+        return [], "source_lines_invalid"
+    low, high = min(bbox["t"], bbox["b"]), max(bbox["t"], bbox["b"])
+    lines: list[dict[str, Any]] = []
+    for raw in raw_lines:
+        if not isinstance(raw, dict):
+            return [], "source_line_invalid"
+        text = str(raw.get("text") or "").strip()
+        if not text:
+            continue
+        raw_bbox = raw.get("bbox") if isinstance(raw.get("bbox"), dict) else {}
+        try:
+            top = float(raw.get("top", raw_bbox.get("t")))
+            bottom = float(raw.get("bottom", raw_bbox.get("b")))
+            left = float(raw.get("x0", raw_bbox.get("l")))
+            right = float(raw.get("x1", raw_bbox.get("r")))
+        except (KeyError, TypeError, ValueError):
+            return [], "source_line_geometry_invalid"
+        if (
+            not all(math.isfinite(item) for item in (top, bottom, left, right))
+            or top == bottom or right <= left
+        ):
+            return [], "source_line_geometry_invalid"
+        y_low, y_high = min(top, bottom), max(top, bottom)
+        if y_high < low - 1.0 or y_low > high + 1.0:
+            continue
+        if (
+            left < bbox["l"] - 1.0
+            or right > bbox["r"] + 1.0
+            or y_low < low - 1.0
+            or y_high > high + 1.0
+        ):
+            return [], "source_line_bbox_outside_cell"
+        if not _TABLE_HOLE_NUMERIC_RE.fullmatch(text):
+            return [], "source_line_numeric_whitelist_failed"
+        lines.append({
+            "text": text, "top": top, "bottom": bottom,
+            "center": (top + bottom) / 2.0,
+            "bbox": {"l": left, "r": right, "t": top, "b": bottom, "coord_origin": "TOPLEFT"},
+        })
+    if len(lines) != 2:
+        return lines, "source_line_count_not_two"
+    lines.sort(key=lambda item: min(item["top"], item["bottom"]))
+    if max(lines[0]["top"], lines[0]["bottom"]) > min(lines[1]["top"], lines[1]["bottom"]):
+        return lines, "source_line_y_bands_overlap"
+    if abs(lines[0]["center"] - lines[1]["center"]) <= 1e-6:
+        return lines, "source_line_y_bands_not_unique"
+    return lines, None
+
+
+def _table_hole_tables(value: Any) -> Iterable[dict[str, Any]]:
+    if isinstance(value, dict):
+        if str(value.get("label") or "").casefold() == "table":
+            yield value
+        for child in value.values():
+            yield from _table_hole_tables(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from _table_hole_tables(child)
+
+
+def _table_hole_diag(
+    reason: str, *,
+    source_sha256: str | None,
+    raw_sha256: str | None,
+    attempted: int = 0,
+    accepted: int = 0,
+    repairs: list[dict[str, Any]] | None = None,
+    rejected: list[dict[str, Any]] | None = None,
+    chunked: bool = False,
+) -> dict[str, Any]:
+    return {
+        "ok": reason in {"no_tables", "no_eligible_candidate", "applied", "chunked_document_skipped"},
+        "applied": reason == "applied" and accepted > 0,
+        "reason": reason,
+        "chunked": bool(chunked),
+        "attempted_count": min(max(int(attempted), 0), _TABLE_HOLE_MAX_CELLS),
+        "accepted_count": min(max(int(accepted), 0), _TABLE_HOLE_MAX_AUDIT_RECORDS),
+        "source_pdf_sha256": source_sha256,
+        "raw_document_sha256": raw_sha256,
+        "repairs": list(repairs or [])[:_TABLE_HOLE_MAX_AUDIT_RECORDS],
+        "rejected": list(rejected or [])[:_TABLE_HOLE_MAX_AUDIT_RECORDS],
+    }
+
+
+
+def repair_table_cross_row_holes(
+    document: dict[str, Any],
+    source_pdf_path: Path | str | None,
+    *,
+    metadata: dict[str, Any] | None = None,
+    status: dict[str, Any] | None = None,
+    source_reader: Any | None = None,
+) -> dict[str, Any]:
+    source_sha256, raw_sha256 = _table_hole_source_hash(source_pdf_path), _table_hole_hash(document)
+
+    def publish(diag: dict[str, Any]) -> dict[str, Any]:
+        if isinstance(metadata, dict):
+            metadata["table_cross_row_hole_repair"] = diag
+        if isinstance(status, dict):
+            quality_signals = status.get("quality_signals")
+            if not isinstance(quality_signals, dict):
+                quality_signals = {}
+                status["quality_signals"] = quality_signals
+            quality_signals["table_cross_row_hole_repair"] = diag
+        return diag
+
+    if not isinstance(document, dict):
+        return publish(_table_hole_diag("invalid_document", source_sha256=source_sha256, raw_sha256=None))
+    if source_pdf_path is not None and source_reader is None and source_sha256 is None:
+        return publish(_table_hole_diag("source_pdf_unavailable", source_sha256=None, raw_sha256=raw_sha256))
+    schema = str(document.get("schema_name") or "").casefold()
+    if (isinstance(document.get("chunks"), list) and document["chunks"]) or "chunked" in schema:
+        return publish(_table_hole_diag("chunked_document_skipped", source_sha256=source_sha256, raw_sha256=raw_sha256, chunked=True))
+    tables = list(_table_hole_tables(document))
+    if not tables:
+        return publish(_table_hole_diag("no_tables", source_sha256=source_sha256, raw_sha256=raw_sha256))
+
+    owns_reader = source_reader is None
+    if source_reader is None and source_pdf_path is not None:
+        try:
+            source_reader = SourceReader(Path(source_pdf_path))
+        except Exception:
+            source_reader = None
+    if source_reader is None:
+        return publish(_table_hole_diag("source_reader_unavailable", source_sha256=source_sha256, raw_sha256=raw_sha256))
+
+    rejected: list[dict[str, Any]] = []
+    candidates: list[dict[str, Any]] = []
+
+    def reject(table_index: int, row: int, col: int, reason: str) -> None:
+        rejected.append({"table_index": table_index, "row": row, "col": col, "reason": reason})
+
+    try:
+        for table_index, table in enumerate(tables):
+            data = table.get("data")
+            if not isinstance(data, dict):
+                continue
+            rows, cols = _table_hole_int(data.get("num_rows")), _table_hole_int(data.get("num_cols"))
+            cells = data.get("table_cells")
+            if (
+                rows is None or cols is None or rows < 2 or cols < 4
+                or rows > 256 or cols > 256 or not isinstance(cells, list)
+                or len(cells) > _TABLE_HOLE_MAX_CELLS or rows * cols > _TABLE_HOLE_MAX_CELLS
+            ):
+                continue
+            grid = data.get("grid")
+            if grid is not None and (
+                not isinstance(grid, list) or len(grid) < rows
+                or any(not isinstance(grid[r], list) or len(grid[r]) < cols for r in range(rows))
+            ):
+                continue
+
+            records: list[dict[str, Any]] = []
+            slots: dict[tuple[int, int], dict[str, Any]] = {}
+            work = 0
+            malformed = False
+            for index, cell in enumerate(cells):
+                keys = ("start_row_offset_idx", "end_row_offset_idx", "start_col_offset_idx", "end_col_offset_idx")
+                if not isinstance(cell, dict) or not all(key in cell for key in keys):
+                    malformed = True
+                    break
+                start_row, end_row = _table_hole_int(cell[keys[0]]), _table_hole_int(cell[keys[1]])
+                start_col, end_col = _table_hole_int(cell[keys[2]]), _table_hole_int(cell[keys[3]])
+                if None in (start_row, end_row, start_col, end_col):
+                    malformed = True
+                    break
+                assert start_row is not None and end_row is not None and start_col is not None and end_col is not None
+                if start_row < 0 or start_col < 0 or end_row <= start_row or end_col <= start_col or end_row > rows or end_col > cols:
+                    malformed = True
+                    break
+                declared_row_span = _table_hole_int(cell.get("row_span"))
+                declared_col_span = _table_hole_int(cell.get("col_span"))
+                if (
+                    "row_span" in cell
+                    and (
+                        declared_row_span is None
+                        or declared_row_span != end_row - start_row
+                    )
+                ) or (
+                    "col_span" in cell
+                    and (
+                        declared_col_span is None
+                        or declared_col_span != end_col - start_col
+                    )
+                ):
+                    malformed = True
+                    break
+                work += (end_row - start_row) * (end_col - start_col)
+                if work > _TABLE_HOLE_MAX_CELLS:
+                    malformed = True
+                    break
+                record = {
+                    "index": index, "cell": cell, "row": start_row, "col": start_col,
+                    "rowspan": end_row - start_row, "colspan": end_col - start_col,
+                }
+                records.append(record)
+                for slot in (
+                    (r, c) for r in range(start_row, end_row) for c in range(start_col, end_col)
+                ):
+                    if slot in slots:
+                        malformed = True
+                        break
+                    slots[slot] = record
+                if malformed:
+                    break
+            if malformed:
+                continue
+
+            def grid_value(row: int, col: int) -> tuple[Any, bool]:
+                if grid is None:
+                    return None, False
+                value = grid[row][col]
+                if isinstance(value, dict):
+                    bad = any(
+                        key in value and _table_hole_int(value.get(key)) != 1
+                        for key in ("row_span", "rowspan", "col_span", "colspan")
+                    )
+                    for key, expected in (
+                        ("start_row_offset_idx", row),
+                        ("end_row_offset_idx", row + 1),
+                        ("start_col_offset_idx", col),
+                        ("end_col_offset_idx", col + 1),
+                    ):
+                        if key in value and _table_hole_int(value.get(key)) != expected:
+                            bad = True
+                    return value.get("text"), bad
+                return value, False
+
+            for record in records:
+                if record["rowspan"] != 1 or record["colspan"] != 1:
+                    continue
+                cell, row, col = record["cell"], record["row"], record["col"]
+                text = str(cell.get("text") or "")
+                if not text.strip() or not _TABLE_HOLE_NUMERIC_RE.fullmatch(text.strip()):
+                    continue
+                target_row = row + 1
+                if target_row >= rows:
+                    continue
+                target = slots.get((target_row, col))
+                if target and (
+                    target["rowspan"] != 1 or target["colspan"] != 1
+                    or str(target["cell"].get("text") or "").strip()
+                ):
+                    reject(table_index, row, col, "target_occupied_or_merged")
+                    continue
+                current_grid, current_bad = grid_value(row, col)
+                target_grid, target_bad = grid_value(target_row, col)
+                if target_bad or (target_grid is not None and str(target_grid or "").strip()):
+                    reject(table_index, row, col, "target_grid_occupied_or_merged")
+                    continue
+                if current_bad or (
+                    current_grid is not None
+                    and re.sub(r"\s+", "", str(current_grid)) != re.sub(r"\s+", "", text)
+                ):
+                    reject(table_index, row, col, "candidate_grid_mismatch")
+                    continue
+                bbox = _table_hole_bbox(cell.get("bbox"))
+                if bbox is None:
+                    reject(table_index, row, col, "candidate_bbox_not_topleft")
+                    continue
+                provs = table.get("prov")
+                page_value = cell.get("page_no")
+                if page_value is None and isinstance(provs, list) and provs and isinstance(provs[0], dict):
+                    page_value = provs[0].get("page_no")
+                page_no = _table_hole_int(page_value)
+                if page_no is None or page_no <= 0:
+                    reject(table_index, row, col, "candidate_page_missing")
+                    continue
+                lines, reason = _table_hole_lines(source_reader, page_no, bbox)
+                if reason:
+                    reject(table_index, row, col, reason)
+                    continue
+
+                peers: list[dict[str, Any]] = []
+                for peer_col in range(cols):
+                    if peer_col == col:
+                        continue
+                    first, second = slots.get((row, peer_col)), slots.get((target_row, peer_col))
+                    if (
+                        first is None or second is None
+                        or first["rowspan"] != 1 or first["colspan"] != 1
+                        or second["rowspan"] != 1 or second["colspan"] != 1
+                    ):
+                        continue
+                    first_text, second_text = str(first["cell"].get("text") or "").strip(), str(second["cell"].get("text") or "").strip()
+                    if not first_text or not second_text:
+                        continue
+                    first_bbox, second_bbox = _table_hole_bbox(first["cell"].get("bbox")), _table_hole_bbox(second["cell"].get("bbox"))
+                    if first_bbox is None or second_bbox is None:
+                        continue
+                    peers.append({
+                        "col": peer_col, "first_text": first_text, "second_text": second_text,
+                        "first_center": (first_bbox["t"] + first_bbox["b"]) / 2.0,
+                        "second_center": (second_bbox["t"] + second_bbox["b"]) / 2.0,
+                        "height": (abs(first_bbox["b"] - first_bbox["t"]) + abs(second_bbox["b"] - second_bbox["t"])) / 2.0,
+                    })
+                if len(peers) < 3:
+                    reject(table_index, row, col, "peer_columns_fewer_than_three")
+                    continue
+                first_center, second_center = median(p["first_center"] for p in peers), median(p["second_center"] for p in peers)
+                height = median(p["height"] for p in peers)
+                tolerance = max(1.0, min(3.0, height * 0.20))
+                if (
+                    max(abs(p["first_center"] - first_center) for p in peers) > tolerance
+                    or max(abs(p["second_center"] - second_center) for p in peers) > tolerance
+                ):
+                    reject(table_index, row, col, "peer_row_centers_inconsistent")
+                    continue
+                if not any(p["first_text"] != p["second_text"] for p in peers):
+                    reject(table_index, row, col, "peer_row_texts_not_distinct")
+                    continue
+                if abs(second_center - first_center) < max(4.0, min(8.0, height * 0.50)):
+                    reject(table_index, row, col, "peer_row_centers_not_separate")
+                    continue
+                hits: list[str] = []
+                for line in lines:
+                    matching = [
+                        name for name, center in (("current", first_center), ("next", second_center))
+                        if abs(line["center"] - center) <= max(1.5, min(4.0, height * 0.35))
+                    ]
+                    if len(matching) != 1:
+                        hits = []
+                        break
+                    hits.append(matching[0])
+                if hits != ["current", "next"]:
+                    reject(table_index, row, col, "source_lines_row_center_ambiguous")
+                    continue
+                if "".join(re.sub(r"\s+", "", line["text"]) for line in lines) != re.sub(r"\s+", "", text):
+                    reject(table_index, row, col, "source_text_not_lossless")
+                    continue
+                candidates.append({
+                    "table_index": table_index, "data": data, "cell_index": record["index"],
+                    "target_index": target["index"] if target else None,
+                    "row": row, "col": col, "target_row": target_row, "page_no": page_no,
+                    "lines": lines, "peers": [p["col"] for p in peers],
+                })
+    except Exception as exc:
+        return publish(_table_hole_diag(
+            f"repair_discovery_failed:{type(exc).__name__}",
+            source_sha256=source_sha256, raw_sha256=raw_sha256,
+            attempted=len(rejected), rejected=rejected,
+        ))
+    finally:
+        if owns_reader:
+            close = getattr(source_reader, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    pass
+
+    if not candidates:
+        return publish(_table_hole_diag(
+            "no_eligible_candidate", source_sha256=source_sha256, raw_sha256=raw_sha256,
+            attempted=len(rejected), rejected=rejected,
+        ))
+    selected: list[dict[str, Any]] = []
+    seen: set[tuple[int, int, int]] = set()
+    for candidate in candidates:
+        key = (candidate["table_index"], candidate["target_row"], candidate["col"])
+        if key not in seen:
+            seen.add(key)
+            selected.append(candidate)
+        else:
+            rejected.append({
+                "table_index": candidate["table_index"], "row": candidate["row"],
+                "col": candidate["col"], "reason": "repair_candidate_ambiguous",
+            })
+
+    working, repairs = copy.deepcopy(document), []
+    try:
+        for candidate in selected:
+            table = list(_table_hole_tables(working))[candidate["table_index"]]
+            data, cells = table["data"], table["data"]["table_cells"]
+            current_line, next_line = candidate["lines"]
+            current = cells[candidate["cell_index"]]
+            current["text"], current["bbox"] = str(current_line["text"]).strip(), dict(current_line["bbox"])
+            target_index = candidate["target_index"]
+            if target_index is None:
+                target = copy.deepcopy(current)
+                for key in ("self_ref", "$ref", "id"):
+                    target.pop(key, None)
+                target.update({
+                    "start_row_offset_idx": candidate["target_row"], "end_row_offset_idx": candidate["target_row"] + 1,
+                    "start_col_offset_idx": candidate["col"], "end_col_offset_idx": candidate["col"] + 1,
+                })
+                cells.append(target)
+            else:
+                target = cells[target_index]
+            target["text"], target["bbox"] = str(next_line["text"]).strip(), dict(next_line["bbox"])
+            grid = data.get("grid")
+            if grid is not None:
+                for grid_row, line in ((candidate["row"], current_line), (candidate["target_row"], next_line)):
+                    value = grid[grid_row][candidate["col"]]
+                    if isinstance(value, dict):
+                        was_empty = not str(value.get("text") or "").strip()
+                        value["text"], value["bbox"] = str(line["text"]).strip(), dict(line["bbox"])
+                        for key, expected in (
+                            ("start_row_offset_idx", grid_row), ("end_row_offset_idx", grid_row + 1),
+                            ("start_col_offset_idx", candidate["col"]), ("end_col_offset_idx", candidate["col"] + 1),
+                        ):
+                            if key in value or was_empty:
+                                value[key] = expected
+                    else:
+                        grid[grid_row][candidate["col"]] = str(line["text"]).strip()
+            repairs.append({
+                "table_index": int(candidate["table_index"]),
+                "table_ref": (
+                    str(table.get("self_ref"))
+                    if re.fullmatch(r"#/tables/\d+", str(table.get("self_ref") or ""))
+                    else f"#/tables/{candidate['table_index']}"
+                ),
+                "source_page_no": int(candidate["page_no"]),
+                "row": int(candidate["row"]), "col": int(candidate["col"]),
+                "target_row": int(candidate["target_row"]),
+                "peer_columns": [int(value) for value in candidate["peers"][:16]],
+                "line_texts": [str(current_line["text"])[:_TABLE_HOLE_MAX_TEXT], str(next_line["text"])[:_TABLE_HOLE_MAX_TEXT]],
+                "line_centers": [round(float(current_line["center"]), 3), round(float(next_line["center"]), 3)],
+                "raw_table_data_sha256": _table_hole_hash(candidate["data"]),
+            })
+    except Exception as exc:
+        return publish(_table_hole_diag(
+            f"repair_apply_failed:{type(exc).__name__}",
+            source_sha256=source_sha256, raw_sha256=raw_sha256,
+            attempted=len(candidates) + len(rejected), rejected=rejected,
+        ))
+    working_tables = list(_table_hole_tables(working))
+    for repair in repairs:
+        repair["repaired_table_data_sha256"] = _table_hole_hash(
+            working_tables[repair["table_index"]].get("data") or {}
+        )
+    document.clear()
+    document.update(working)
+    diagnostic = _table_hole_diag(
+        "applied", source_sha256=source_sha256, raw_sha256=raw_sha256,
+        attempted=len(candidates) + len(rejected), accepted=len(repairs),
+        repairs=repairs, rejected=rejected,
+    )
+    diagnostic["repaired_document_sha256"] = _table_hole_hash(working)
+    return publish(diagnostic)
+
 def _table_cell_layout(
     source: SourceReader,
     item: FlowItem,
@@ -4908,23 +6320,102 @@ def _materialize_picture_assets(
     output_dir: Path,
     documents: list[dict[str, Any]],
 ) -> dict[str, int]:
+    """Bind every picture to one globally numbered, safe local asset.
+
+    The review-artifact layer creates ``pictures/picture_N.png`` crops before
+    semantic reflow runs.  Those files are authoritative: when a regular
+    non-symlink crop already exists, reuse it byte-for-byte and never decode or
+    overwrite a conflicting embedded data URI.  Embedded data is only a
+    fallback for a missing crop, and is written with exclusive creation so an
+    existing file (including a symlink or non-regular target) is never
+    followed or replaced.
+    """
+
     pictures_dir = output_dir / "pictures"
     written = 0
     skipped = 0
-    counter = 0
+    global_index = 0
     extensions = {
         "image/png": "png",
         "image/jpeg": "jpg",
         "image/webp": "webp",
         "image/gif": "gif",
     }
+
+    def safe_regular_file(path: Path) -> bool:
+        try:
+            info = path.lstat()
+        except (FileNotFoundError, OSError):
+            return False
+        return stat.S_ISREG(info.st_mode) and not stat.S_ISLNK(info.st_mode)
+
+    def path_exists_or_unsafe(path: Path) -> bool:
+        try:
+            path.lstat()
+        except FileNotFoundError:
+            return False
+        except OSError:
+            # Treat an uninspectable path as occupied.  Never risk following
+            # or replacing it on behalf of an embedded payload.
+            return True
+        return True
+
+    def picture_dir_is_safe_if_present() -> bool:
+        """Reject a picture-root symlink before inspecting child assets."""
+
+        try:
+            info = pictures_dir.lstat()
+        except FileNotFoundError:
+            return True
+        except OSError:
+            return False
+        return stat.S_ISDIR(info.st_mode) and not stat.S_ISLNK(info.st_mode)
+
+    def ensure_safe_picture_dir() -> bool:
+        try:
+            if pictures_dir.is_symlink():
+                return False
+            if pictures_dir.exists():
+                info = pictures_dir.lstat()
+                return stat.S_ISDIR(info.st_mode) and not stat.S_ISLNK(info.st_mode)
+            pictures_dir.mkdir(parents=True, exist_ok=True)
+            info = pictures_dir.lstat()
+            return stat.S_ISDIR(info.st_mode) and not stat.S_ISLNK(info.st_mode)
+        except OSError:
+            return False
+
     for document in documents:
         for node in document.get("pictures") or []:
             if not isinstance(node, dict):
                 continue
-            counter += 1
+            global_index += 1
+
+            # A caller may retry against the same in-memory document.  Do not
+            # let a stale or caller-provided path produce a broken image when
+            # no safe asset can be established on this pass.
+            node.pop("_semantic_picture_path", None)
+
+            authoritative_relative_path = f"pictures/picture_{global_index}.png"
+            authoritative_path = output_dir / authoritative_relative_path
+            if not picture_dir_is_safe_if_present():
+                skipped += 1
+                continue
+            if safe_regular_file(authoritative_path):
+                node["_semantic_picture_path"] = authoritative_relative_path
+                continue
+            # A reserved crop path that is already a symlink, directory, or
+            # other non-regular node is an unsafe binding.  Do not switch to a
+            # different embedded extension and leave that collision hidden.
+            if path_exists_or_unsafe(authoritative_path):
+                skipped += 1
+                continue
+
             image = node.get("image")
-            uri = str((image or {}).get("uri") or "") if isinstance(image, dict) else ""
+            uri = (
+                str((image or {}).get("uri") or "")
+                if isinstance(image, dict)
+                else ""
+            )
             match = re.match(
                 r"^data:(image/(?:png|jpeg|webp|gif));base64,(.+)$",
                 uri,
@@ -4941,12 +6432,43 @@ def _materialize_picture_assets(
             if not payload:
                 skipped += 1
                 continue
+
             extension = extensions[match.group(1)]
-            relative_path = f"pictures/picture_{counter}.{extension}"
-            pictures_dir.mkdir(parents=True, exist_ok=True)
-            (output_dir / relative_path).write_bytes(payload)
-            node["_semantic_picture_path"] = relative_path
-            written += 1
+            relative_path = f"pictures/picture_{global_index}.{extension}"
+            destination = output_dir / relative_path
+            if safe_regular_file(destination):
+                node["_semantic_picture_path"] = relative_path
+                continue
+            if path_exists_or_unsafe(destination) or not ensure_safe_picture_dir():
+                skipped += 1
+                continue
+
+            try:
+                # Exclusive creation makes the fallback race-safe: a target
+                # appearing between the lstat above and open is never
+                # overwritten or followed.
+                with destination.open("xb") as handle:
+                    handle.write(payload)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+            except FileExistsError:
+                # A concurrent producer may have completed the same asset.
+                # Reuse it only if it is now a safe regular file; otherwise
+                # leave the target untouched and fail this binding closed.
+                if safe_regular_file(destination):
+                    node["_semantic_picture_path"] = relative_path
+                else:
+                    skipped += 1
+                continue
+            except OSError:
+                skipped += 1
+                continue
+
+            if safe_regular_file(destination):
+                node["_semantic_picture_path"] = relative_path
+                written += 1
+            else:
+                skipped += 1
     return {"written": written, "skipped": skipped}
 
 
@@ -6567,11 +8089,6 @@ def _render(
         "pictures": 0,
         "inline_math_repairs": 0,
     }
-    picture_counter = {
-        id(node): index
-        for index, node in enumerate(document.get("pictures") or [], start=1)
-        if isinstance(node, dict)
-    }
     for item in items:
         node = item.node
         if item.kind == "title":
@@ -7075,10 +8592,7 @@ def _render(
             )
             counts["tables"] += 1
         elif item.kind == "picture":
-            picture_index = picture_counter.get(id(node))
             image_path = str(node.get("_semantic_picture_path") or "")
-            if not image_path and picture_index is not None:
-                image_path = f"pictures/picture_{picture_index}.png"
             caption = _caption_text(document, node)
             if not re.match(r"(?i)^Figure\s+\d+\s*:", caption):
                 caption = _source_caption(source, item, kind="picture") or caption

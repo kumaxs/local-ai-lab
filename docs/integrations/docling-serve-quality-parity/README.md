@@ -190,13 +190,23 @@ label, blank image, or unbound occurrence is diagnostic evidence and cannot
 satisfy exact coverage.
 
 The final region gate runs after those hard gates and before surface-status
-reconciliation. It emits at most 1,000 deterministic records across picture
-OCR, header/footer, pictures, tables, algorithms, code, display formulas, and
-inline math. Each record is `verified_semantic`, `visual_only`, or
+reconciliation. It emits a request-bounded deterministic inventory with a
+10,000-record hard cap across picture OCR, header/footer, pictures, tables,
+algorithms, code, display formulas, and inline math. Producer-owned diagnostic
+lists retain their separate 1,001-item traversal bound, and `regions.json` is
+limited to 128 MiB. Each record is `verified_semantic`, `visual_only`, or
 `unresolved`; structural, formula, inline-math, picture-OCR, and header/footer
-records are critical, while a bare picture may remain noncritical visual-only
-evidence. Any unresolved critical record, truncated inventory, unsafe/missing
-evidence path, or sidecar publication failure forces `degraded_failure`.
+records are critical. Source pictures are classified before delivery: every
+machine-binding-expected picture must retain the same source ref, page/bbox,
+source-PDF digest, crop digest, and exactly one real image reference on each
+HTML and Markdown surface. Missing or tampered expected pictures are critical;
+tiny/decorative, furniture, quarantined, and formula-child pictures remain
+bounded advisory evidence. Any unresolved critical record, truncated inventory, unsafe/missing
+evidence path, or sidecar publication failure forces `degraded_failure` and
+withdraws the failed output's older regular generation and output-list entry.
+Sidecar-writing stand-alone evaluations must be serialized per output
+directory; the production path enforces this with its job lock and fresh-output
+guard.
 
 Structural promotion is bound again at the gate to the final document node,
 normalized body identity, source-PDF digest, page/bbox, and a kind-constrained
@@ -419,7 +429,36 @@ failure; it is an operational failure and should be retried or escalated.
 
 `batch_full_dir_review.py` is a manual review helper. It is not a production n8n
 integration. It calls `quality_parity_adapter.py` once per PDF, continues after
-failures, and writes `run_summary.json` plus `run_summary.md`.
+conversion failures, and writes `run_summary.json` (a compatibility-preserved
+list), `run_summary.md`, and manual-review links. The input directory must
+contain at least one direct-child, regular, non-symlink PDF; `.pdf` matching is
+case-insensitive. Every `.pdf`-named entry must be a direct-child regular
+non-symlink file; invalid, disappearing, added, or removed members fail closed.
+Before conversion, every input is fingerprinted with `input_size_bytes` and
+`input_sha256`; duplicate content is rejected. Use `--expected-count N`
+(a positive integer) when a fixed corpus size is required.
+The output root may be absent (it is created) or an existing empty real
+directory; symlinks, non-directories, and non-empty roots are rejected and
+never deleted. A second fingerprint immediately before each adapter call
+prevents conversion after an input changes.
+The helper takes an exclusive output-root run lock, forwards each preflight
+SHA-256 to the adapter as `--expected-input-sha256`, and rechecks the
+locked roster before every job and after the batch. Summary files are replaced
+atomically through unique same-directory temporary files.
+Job ids are sanitized to one path component and pre-scanned case-insensitively;
+ids that collide with another input or with the helper's own summary/capture
+components are rejected.
+
+Exit codes are part of the helper contract:
+
+- `0`: every PDF ran and each `status.json.ok` is the JSON boolean `true`.
+- `1`: preflight passed, but one or more PDFs timed out, failed, changed after
+  preflight, or produced a non-`true` status.
+- `2`: preflight failed (missing/empty corpus, count mismatch, duplicate
+  content, job-id collision, or unsafe output root).
+Invalid numeric options (`--timeout-seconds > 0`, `--http-retries >= 0`,
+`--cn-ocr-chunk-size > 0`, and `--expected-count > 0` when supplied) also return
+`2`.
 
 Example:
 
@@ -429,8 +468,12 @@ python3 docs/integrations/docling-serve-quality-parity/batch_full_dir_review.py 
   --output-root /Users/zeyuan/Projects/local-ai-lab/.runtime/review/docling-serve-full-dir-review-2026-06-01 \
   --serve-url http://127.0.0.1:5001 \
   --adapter /Users/zeyuan/Projects/local-ai-lab/docs/integrations/docling-serve-quality-parity/quality_parity_adapter.py \
+  --formula-second-pass-policy off \
   --timeout-seconds 1800
 ```
+
+For the planned one-plus-sixteen acceptance corpus, add
+`--expected-count 17`.
 
 Use an ignored output root under `.runtime/review/`. Generated review corpora
 must not be committed.

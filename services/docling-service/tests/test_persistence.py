@@ -447,6 +447,38 @@ class SQLiteStoreTests(unittest.TestCase):
                 terminal["tombstone_expires_at"],
             )
 
+    def test_import_legacy_queued_jobs_preserves_created_at_fifo(self) -> None:
+        root = Path(_tmp_db_root())
+        input_root = root / "input"
+        output_root = root / "output"
+        jobs_dir = root / "state" / "jobs"
+        input_root.mkdir()
+        output_root.mkdir()
+        jobs_dir.mkdir(parents=True)
+        older = "ffffffff-ffff-4fff-9fff-ffffffffffff"
+        newer = "00000000-0000-4000-8000-000000000000"
+
+        def write_legacy(filename: str, job_id: str, created_at: str) -> None:
+            (jobs_dir / filename).write_text(
+                f'''{{"job_id":"{job_id}","state":"queued","original_name":"{job_id}.pdf","input_path":"{input_root / (job_id + '.pdf')}","output_dir":"{output_root / job_id}","created_at":"{created_at}","started_at":null,"finished_at":null,"exit_code":null,"error":null}}''',
+                encoding="utf-8",
+            )
+
+        # Lexical filename order is deliberately the reverse of submission
+        # order.  Legacy recovery must infer FIFO from persisted created_at.
+        write_legacy("z-older.json", older, "2020-01-01T00:00:00+00:00")
+        write_legacy("a-newer.json", newer, "2020-01-02T00:00:00+00:00")
+
+        with SQLiteStore(
+            root / "docling.sqlite",
+            input_root=input_root,
+            output_root=output_root,
+        ) as store:
+            result = store.import_legacy_state_jobs(root / "state")
+            self.assertEqual([older, newer], result["imported"])
+            self.assertEqual(1, store.get_job(older)["queue_position"])
+            self.assertEqual(2, store.get_job(newer)["queue_position"])
+
     def test_expired_output_cannot_acquire_download_lease(self) -> None:
         root = _tmp_db_root()
         with self._new_store(root) as store:

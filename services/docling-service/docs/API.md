@@ -163,6 +163,13 @@ States are exactly `queued`, `running`, `succeeded`, `failed`, and
 `status.json.ok` pass verification and the staged output directory is published
 atomically.
 
+After an API process restart, a job that was still `queued` is dispatched again
+only after the conversion dependencies are healthy and only when its exact
+managed `source.pdf` still matches the persisted digest and both per-job output
+paths are absent. A previously `running` job, an invalid input, or any partial or
+ambiguous output state becomes `interrupted`; the service does not blindly
+replay a conversion that may already have reached the backend.
+
 | Method and path | Purpose |
 | --- | --- |
 | `GET /v1/jobs?state=&client_reference=&cursor=&limit=` | Cursor-paginated task list; limit 1–100 |
@@ -194,12 +201,18 @@ For jobs produced by the current quality adapter, the output list and archive
 also include `regions.json` and `quality_signals.json` after successful sidecar
 publication. `regions.json` contains bounded per-region evidence and the
 `verified_semantic` / `visual_only` / `unresolved` outcome; the compact companion
-contains counts and failure reasons. Consumers must still read `status.json.ok`
-first: any unresolved critical region makes the job a `degraded_failure`.
+contains counts and failure reasons. Its default and hard inventory limit is
+10,000 records, producer-owned diagnostic lists are traversed with a 1,001-item
+bound, and the serialized sidecar is limited to 128 MiB. A failed replacement
+removes any older regular sidecar generation and its output-list entries.
+Consumers must still read `status.json.ok` first: any unresolved critical region
+makes the job a `degraded_failure`.
 Structural success also requires final-node/body, source-PDF, page/bbox, and
 kind-specific visual identity. A detected multi-page algorithm remains
 unresolved unless every covered page has real evidence and both HTML and
-Markdown are bound. Algorithm contributor lists must agree across the manifest
+Markdown are bound. Machine-binding-expected pictures likewise require their
+exact source crop and one real image reference on each surface; diagnostic
+tiny/decorative or quarantined pictures remain advisory. Algorithm contributor lists must agree across the manifest
 and semantic sidecar; tables require complete declared-grid occupancy unless
 the explicit empty-table fallback applies, and inline-math bindings preserve
 operators and Unicode math symbols.

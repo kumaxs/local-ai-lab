@@ -21,6 +21,7 @@ import io
 import json
 import math
 import os
+import posixpath
 import re
 import secrets
 import shutil
@@ -30,6 +31,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, Iterable
 from pdf_structure_inventory import KIND_HEALTHY, KIND_ORDER, KIND_UNKNOWN, pdf_structure_inventory
@@ -46,10 +48,15 @@ from semantic_reflow import (
     _formula_mathml,
     _formula_source_text,
     _numbered_code_lines,
+    repair_table_cross_row_holes,
     rebuild_semantic_surfaces,
     source_algorithm_block,
 )
-from region_quality_gate import REGION_STATUSES, evaluate_regions
+from region_quality_gate import (
+    DEFAULT_MAX_RECORDS,
+    REGION_STATUSES,
+    evaluate_regions,
+)
 
 GXX_RE = re.compile(r"/G[0-9A-Fa-f]{2}")
 DATA_IMAGE_RE = re.compile(r"data:image/[^\"')\s]+")
@@ -1709,6 +1716,56 @@ def _atomic_write_output_text(
     )
 
 
+def apply_table_cross_row_hole_repair(
+    response: dict[str, Any],
+    source_pdf_path: Path,
+    metadata: dict[str, Any],
+    status: dict[str, Any],
+) -> dict[str, Any]:
+    """Apply the bounded table repair before any contract artifact is written."""
+
+    quality_signals = status.get("quality_signals")
+    if not isinstance(quality_signals, dict):
+        quality_signals = {}
+        status["quality_signals"] = quality_signals
+
+    document = response.get("document") if isinstance(response, dict) else None
+    document_json = document.get("json_content") if isinstance(document, dict) else None
+    if not isinstance(document_json, dict):
+        diagnostic = {
+            "ok": True,
+            "applied": False,
+            "reason": "document_json_missing",
+            "attempted_count": 0,
+            "accepted_count": 0,
+            "repairs": [],
+            "rejected": [],
+        }
+        metadata["table_cross_row_hole_repair"] = diagnostic
+        quality_signals["table_cross_row_hole_repair"] = diagnostic
+        return diagnostic
+    try:
+        return repair_table_cross_row_holes(
+            document_json,
+            source_pdf_path,
+            metadata=metadata,
+            status=status,
+        )
+    except Exception as exc:  # fail closed without mutating the response
+        diagnostic = {
+            "ok": False,
+            "applied": False,
+            "reason": f"repair_exception:{type(exc).__name__}",
+            "attempted_count": 0,
+            "accepted_count": 0,
+            "repairs": [],
+            "rejected": [],
+        }
+        metadata["table_cross_row_hole_repair"] = diagnostic
+        quality_signals["table_cross_row_hole_repair"] = diagnostic
+        return diagnostic
+
+
 def write_contract_outputs(
     output_dir: Path,
     response: dict[str, Any],
@@ -2342,6 +2399,7 @@ def render_page_images_and_crops(
         "visual_pdf_sha256": None,
         "pages": {},
         "tables": [],
+        "pictures": [],
         "code": [],
         "algorithms": [],
     }
@@ -2353,10 +2411,60 @@ def render_page_images_and_crops(
         "formula_evidence_count": 0,
         "picture_artifact_count": 0,
     }
+
+    # Keep a source-picture inventory even when PDFium cannot open the input or
+    # an individual crop fails.  The final gate consumes this inventory rather
+    # than inferring asset paths from the number of successful crops.
+    try:
+        source_pdf_sha256 = file_sha256(input_file)
+    except OSError:
+        source_pdf_sha256 = None
+    structural_manifest["visual_pdf_sha256"] = source_pdf_sha256
+    for global_index, picture in enumerate(pictures, start=1):
+        part_index = _structural_node_part_index(picture)
+        source_ref = _structural_node_source_ref(
+            picture,
+            kind="picture",
+            fallback_index=global_index - 1,
+            part_index=part_index,
+        )
+        prov = first_prov(picture) or {}
+        bbox = _picture_source_bbox_snapshot(prov.get("bbox"))
+        page_no = _positive_page_number(prov.get("page_no"))
+        expected, classification_reason, classification_failures = (
+            _classify_source_picture(
+                picture,
+                document_json=document_json,
+            )
+        )
+        structural_manifest["pictures"].append(
+            {
+                "version": STRUCTURAL_VISUAL_PROVENANCE_VERSION,
+                "index": global_index,
+                "global_index": global_index,
+                "source_ref": source_ref,
+                "self_ref": str(picture.get("self_ref") or ""),
+                "part_index": part_index,
+                "page_no": page_no,
+                "bbox": bbox,
+                "source_asset": f"pictures/picture_{global_index}.png",
+                "source_pdf_sha256": source_pdf_sha256,
+                "asset_present": False,
+                "asset_sha256": None,
+                "machine_binding_expected": expected,
+                "classification_reason": classification_reason,
+                "failure_reasons": list(classification_failures),
+            }
+        )
     try:
         import pypdfium2 as pdfium
     except ImportError as exc:
         warnings.append(f"review_artifact_pdf_renderer_missing:{exc}")
+        for record in structural_manifest["pictures"]:
+            record["failure_reasons"] = sorted(
+                set(record.get("failure_reasons") or [])
+                | {"picture_crop_renderer_unavailable"}
+            )
         return counts, warnings, crop_metrics, structural_manifest
 
     pages_dir = output_dir / "pages"
@@ -2370,13 +2478,13 @@ def render_page_images_and_crops(
         pdf = pdfium.PdfDocument(str(input_file))
     except Exception as exc:
         warnings.append(f"review_artifact_pdf_open_failed:{exc}")
+        for record in structural_manifest["pictures"]:
+            record["failure_reasons"] = sorted(
+                set(record.get("failure_reasons") or [])
+                | {"picture_crop_pdf_open_failed"}
+            )
         return counts, warnings, crop_metrics, structural_manifest
 
-    try:
-        source_pdf_sha256 = file_sha256(input_file)
-    except OSError:
-        source_pdf_sha256 = None
-    structural_manifest["visual_pdf_sha256"] = source_pdf_sha256
     semantic_page_inventory = (
         _document_page_size_inventory(document_json)
         if isinstance(document_json, dict)
@@ -2430,10 +2538,13 @@ def render_page_images_and_crops(
             if image is None or page_size is None:
                 return False, None
             bbox = prov["bbox"]
-            left = float(bbox.get("l") or 0.0)
-            right = float(bbox.get("r") or 0.0)
-            top = float(bbox.get("t") or 0.0)
-            bottom = float(bbox.get("b") or 0.0)
+            try:
+                left = float(bbox.get("l") or 0.0)
+                right = float(bbox.get("r") or 0.0)
+                top = float(bbox.get("t") or 0.0)
+                bottom = float(bbox.get("b") or 0.0)
+            except (TypeError, ValueError):
+                return False, None
             origin = _bbox_explicit_coord_origin(bbox)
             if origin is None:
                 return False, None
@@ -2650,9 +2761,67 @@ def render_page_images_and_crops(
             if wrote_context:
                 counts["formula_context_asset_count"] += 1
         for index, picture in enumerate(pictures, start=1):
-            wrote_picture, _ = crop_node(picture, pictures_dir / f"picture_{index}.png", padding)
+            source_asset = f"pictures/picture_{index}.png"
+            wrote_picture, picture_metric = crop_node(
+                picture,
+                output_dir / source_asset,
+                padding,
+            )
+            picture_records = structural_manifest.get("pictures") or []
+            picture_record = next(
+                (
+                    item
+                    for item in picture_records
+                    if isinstance(item, dict) and item.get("index") == index
+                ),
+                None,
+            )
+            if not isinstance(picture_record, dict):
+                # The inventory was initialized above, but retain a bounded
+                # defensive fallback if a caller supplies a non-list picture
+                # collection or a future renderer changes enumeration.
+                picture_record = {
+                    "version": STRUCTURAL_VISUAL_PROVENANCE_VERSION,
+                    "index": index,
+                    "global_index": index,
+                    "source_ref": _structural_node_source_ref(
+                        picture,
+                        kind="picture",
+                        fallback_index=index - 1,
+                        part_index=_structural_node_part_index(picture),
+                    ),
+                    "self_ref": str(picture.get("self_ref") or ""),
+                    "part_index": _structural_node_part_index(picture),
+                    "page_no": _positive_page_number(
+                        (first_prov(picture) or {}).get("page_no")
+                    ),
+                    "bbox": _picture_source_bbox_snapshot(
+                        (first_prov(picture) or {}).get("bbox")
+                    ),
+                    "source_asset": source_asset,
+                    "source_pdf_sha256": source_pdf_sha256,
+                    "asset_present": False,
+                    "asset_sha256": None,
+                    "machine_binding_expected": False,
+                    "classification_reason": "inventory_fallback",
+                    "failure_reasons": [],
+                }
+                structural_manifest.setdefault("pictures", []).append(
+                    picture_record
+                )
+            picture_record["source_asset"] = source_asset
             if wrote_picture:
                 counts["picture_artifact_count"] += 1
+                picture_record["asset_present"] = True
+                picture_record["asset_sha256"] = (
+                    str((picture_metric or {}).get("asset_sha256") or "").lower()
+                    or None
+                )
+            else:
+                picture_record["failure_reasons"] = sorted(
+                    set(picture_record.get("failure_reasons") or [])
+                    | {"picture_crop_failed"}
+                )
     finally:
         pdf.close()
     counts["formula_evidence_count"] = max(
@@ -4505,6 +4674,167 @@ def _structural_node_source_ref(
 def _structural_node_part_index(node: dict[str, Any]) -> int | None:
     value = node.get("_local_ai_lab_chunk_part_index")
     return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _picture_has_caption(node: dict[str, Any], document_json: Any = None) -> bool:
+    """Return whether a picture carries an explicit caption binding.
+
+    Docling normally stores captions as ``{"$ref": "#/texts/N"}`` entries,
+    but fixtures and older responses may use a string or a direct caption
+    value.  Presence of a binding is intentionally enough for the conservative
+    classifier: an unresolved caption must still be treated as expected and
+    fail closed when its source geometry/asset is unavailable.
+    """
+
+    captions = node.get("captions")
+    if isinstance(captions, (list, tuple, set)):
+        if any(
+            (
+                isinstance(item, str)
+                and bool(item.strip())
+            )
+            or (
+                isinstance(item, dict)
+                and bool(
+                    str(item.get("$ref") or "").strip()
+                    or str(item.get("text") or "").strip()
+                )
+            )
+            or (
+                not isinstance(item, (str, dict))
+                and item not in (None, "")
+            )
+            for item in captions
+        ):
+            return True
+    elif isinstance(captions, str) and captions.strip():
+        return True
+    elif isinstance(captions, dict) and (
+        str(captions.get("$ref") or "").strip()
+        or str(captions.get("text") or "").strip()
+    ):
+        return True
+    for key in ("caption", "caption_text"):
+        value = node.get(key)
+        if isinstance(value, str) and value.strip():
+            return True
+        if isinstance(value, dict) and (
+            str(value.get("$ref") or "").strip()
+            or str(value.get("text") or "").strip()
+        ):
+            return True
+    return False
+
+
+def _picture_is_formula_child(node: dict[str, Any]) -> bool:
+    parent = node.get("parent")
+    parent_ref = (
+        parent.get("$ref")
+        if isinstance(parent, dict)
+        else parent
+    )
+    if str(parent_ref or "").strip().startswith("#/formulas/"):
+        return True
+    # A few Docling payloads use a parent ``self_ref`` rather than ``$ref``.
+    parent_self_ref = parent.get("self_ref") if isinstance(parent, dict) else None
+    return str(parent_self_ref or "").strip().startswith("#/formulas/")
+
+
+def _picture_is_quarantined_or_furniture(node: dict[str, Any]) -> bool:
+    label = str(node.get("label") or "").casefold()
+    if label.startswith("quarantined_"):
+        return True
+    if str(node.get("content_layer") or "").casefold() == "furniture":
+        return True
+    qc = node.get("local_ai_lab_qc")
+    if isinstance(qc, dict):
+        for key in ("structural_quarantine", "structural_fragment_quarantine"):
+            value = qc.get(key)
+            if isinstance(value, dict):
+                action = str(value.get("action") or "").casefold()
+                if action == "quarantine_from_main_text_flow" or value:
+                    return True
+            elif value:
+                return True
+    return False
+
+
+def _picture_source_bbox_snapshot(value: Any) -> dict[str, Any] | None:
+    """Normalize picture geometry while allowing legacy implicit origins."""
+
+    snapshot = _structural_bbox_snapshot(value)
+    if snapshot is not None:
+        return snapshot
+    if not isinstance(value, dict):
+        return None
+    try:
+        values = {key: float(value[key]) for key in ("l", "r", "t", "b")}
+    except (KeyError, TypeError, ValueError):
+        return None
+    if (
+        not all(math.isfinite(item) for item in values.values())
+        or values["r"] <= values["l"]
+        or values["t"] == values["b"]
+    ):
+        return None
+    origin = _bbox_coord_origin(value)
+    if origin is None:
+        return None
+    values["coord_origin"] = origin
+    return values
+
+
+def _classify_source_picture(
+    node: dict[str, Any],
+    *,
+    document_json: Any = None,
+) -> tuple[bool, str, list[str]]:
+    """Classify one picture for conservative final-surface binding.
+
+    Formula children, furniture and quarantined nodes are diagnostic-only.  A
+    caption makes a picture expected regardless of geometry; otherwise a
+    finite positive bbox must clear the minimum visual area before becoming a
+    required body binding.
+    """
+
+    if _picture_is_quarantined_or_furniture(node):
+        return False, "furniture_or_quarantined_picture", []
+    if _picture_is_formula_child(node):
+        return False, "formula_child_picture", []
+    has_caption = _picture_has_caption(node, document_json)
+    prov = first_prov(node) or {}
+    bbox = prov.get("bbox") if isinstance(prov, dict) else None
+    snapshot = _picture_source_bbox_snapshot(bbox)
+    if has_caption:
+        failures = [] if snapshot is not None else ["missing_source_bbox"]
+        return True, "caption_present", failures
+    if snapshot is None:
+        return False, "missing_or_invalid_bbox", ["missing_source_bbox"]
+    width = abs(float(snapshot["r"]) - float(snapshot["l"]))
+    height = abs(float(snapshot["t"]) - float(snapshot["b"]))
+    area = width * height
+    if width >= 32.0 and height >= 32.0 and area >= 1500.0:
+        return True, "bbox_meets_minimum_visual_area", []
+    return (
+        False,
+        "tiny_or_decorative_picture",
+        ["bbox_below_minimum_visual_area"],
+    )
+
+
+# These failures are appended by the renderer after classification.  They are
+# deliberately kept separate from classifier evidence: a crop can fail even
+# when the source picture's expected/nonexpected disposition is valid.  Only
+# these producer-owned values may be present in the raw manifest in addition
+# to the classifier's failure list; arbitrary extras would otherwise provide a
+# way to hide or rewrite the classifier evidence.
+_PICTURE_RENDER_FAILURE_REASONS = frozenset(
+    {
+        "picture_crop_failed",
+        "picture_crop_pdf_open_failed",
+        "picture_crop_renderer_unavailable",
+    }
+)
 
 
 def _structural_nodes_by_part_ref(
@@ -8324,6 +8654,7 @@ def append_code_source_renderings(
             if (
                 isinstance(node, dict)
                 and str(node.get("label") or "").casefold() == "code"
+                and not _code_node_is_direct_picture_child(node)
                 and first_prov(node)
                 # Keep this classification identical to
                 # semantic_reflow._collect_items: a code-labelled node headed
@@ -12882,6 +13213,16 @@ def _code_node_has_algorithm_structure(value: str) -> bool:
     return has_input and has_output
 
 
+def _code_node_is_direct_picture_child(node: dict[str, Any]) -> bool:
+    """Return True when the code node is directly under a picture node."""
+
+    parent = node.get("parent")
+    if not isinstance(parent, dict):
+        return False
+    parent_ref = parent.get("$ref")
+    return isinstance(parent_ref, str) and parent_ref.startswith("#/pictures/")
+
+
 def _algorithm_source_node_binding(
     node: dict[str, Any],
     *,
@@ -13023,6 +13364,7 @@ def _algorithm_candidate_records(document_json: Any, pdf_path: Path) -> list[dic
             formula_no = formula_index
         algorithm_like = (
             label == "code"
+            and not _code_node_is_direct_picture_child(node)
             and _code_node_has_algorithm_structure(node_text)
         ) or (
             label == "formula"
@@ -21106,6 +21448,18 @@ def restore_review_artifact_layer(
     )
     metadata["review_artifact_warnings"] = review_warnings
     metadata["unresolved_v1_parity_warnings"] = UNRESOLVED_V1_PARITY_WARNINGS
+    picture_manifest_records = (
+        structural_visual_provenance_manifest.get("pictures") or []
+        if isinstance(structural_visual_provenance_manifest, dict)
+        else []
+    )
+    picture_generated_outputs = [
+        str(record.get("source_asset"))
+        for record in picture_manifest_records
+        if isinstance(record, dict)
+        and bool(record.get("asset_present"))
+        and str(record.get("source_asset") or "")
+    ]
     metadata.setdefault("generated_outputs", []).extend(
         [
             "review_index.html",
@@ -21119,10 +21473,7 @@ def restore_review_artifact_layer(
                 f"formulas/formula_{index}_context.png"
                 for index in range(1, crop_counts["formula_context_asset_count"] + 1)
             ],
-            *[
-                f"pictures/picture_{index}.png"
-                for index in range(1, crop_counts["picture_artifact_count"] + 1)
-            ],
+            *picture_generated_outputs,
         ]
     )
     status["warnings"].extend(review_warnings)
@@ -27093,6 +27444,1011 @@ def validate_final_structural_surfaces(
     return result
 
 
+class _PictureHTMLImageSourceParser(HTMLParser):
+    """Collect actual ``<img src>`` attributes from one HTML surface.
+
+    ``HTMLParser`` deliberately ignores markup inside comments and raw-text
+    elements such as ``script``/``style``.  This keeps the picture gate from
+    treating a literal example in prose or an HTML comment as a delivered
+    image reference.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.sources: list[str] = []
+        # These elements are inert/raw/fallback containers from the delivery
+        # perspective.  An ``<img>`` nested inside one is not a rendered
+        # picture reference; keep suppressing until the matching close tag.
+        # The stack also makes nested templates and an unclosed outer element
+        # fail closed instead of leaking a later literal image through.
+        self._suppression_stack: list[str] = []
+
+    _SUPPRESSED_CONTAINERS = frozenset(
+        {
+            "template",
+            "textarea",
+            "title",
+            "noscript",
+            "iframe",
+            "object",
+            "xmp",
+            "noembed",
+            "noframes",
+            "script",
+            "style",
+        }
+    )
+
+    def _is_suppressed(self) -> bool:
+        return bool(self._suppression_stack)
+
+    def _record_img(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if str(tag).lower() != "img":
+            return
+        for name, value in attrs:
+            if str(name).lower() == "src" and value is not None:
+                self.sources.append(str(value))
+
+    def handle_starttag(
+        self,
+        tag: str,
+        attrs: list[tuple[str, str | None]],
+    ) -> None:
+        normalized_tag = str(tag).lower()
+        if self._is_suppressed():
+            if normalized_tag in self._SUPPRESSED_CONTAINERS:
+                self._suppression_stack.append(normalized_tag)
+            return
+        if normalized_tag in self._SUPPRESSED_CONTAINERS:
+            self._suppression_stack.append(normalized_tag)
+            return
+        self._record_img(normalized_tag, attrs)
+
+    def handle_startendtag(
+        self,
+        tag: str,
+        attrs: list[tuple[str, str | None]],
+    ) -> None:
+        # These elements are not HTML void elements.  A self-closing spelling
+        # is therefore malformed/unterminated in an HTML surface; retain a
+        # suppression scope to EOF (or an eventual explicit close) rather
+        # than allowing a later literal image to leak through.
+        normalized_tag = str(tag).lower()
+        if normalized_tag in self._SUPPRESSED_CONTAINERS:
+            self._suppression_stack.append(normalized_tag)
+            return
+        if not self._is_suppressed():
+            self._record_img(normalized_tag, attrs)
+
+    def handle_endtag(self, tag: str) -> None:
+        normalized_tag = str(tag).lower()
+        if not self._suppression_stack:
+            return
+        # Only the matching top element closes the suppression scope.  A
+        # mismatched close tag must not accidentally release an unclosed outer
+        # container and expose a later literal ``<img>``.
+        if self._suppression_stack[-1] == normalized_tag:
+            self._suppression_stack.pop()
+
+
+def _html_picture_image_sources(document_html: str) -> list[str]:
+    parser = _PictureHTMLImageSourceParser()
+    try:
+        parser.feed(str(document_html))
+        parser.close()
+    except Exception:
+        # A malformed final surface must never make the quality gate crash.
+        # Returning the references parsed before the malformed fragment lets
+        # the exact-one binding check fail closed when appropriate.
+        pass
+    return parser.sources
+
+
+_PICTURE_HTML_COMMENT_RE = re.compile(r"<!--.*?(?:-->|\Z)", flags=re.S)
+
+
+def _mask_picture_html_comments(value: str) -> str:
+    """Mask HTML comments without changing offsets used by Markdown ranges."""
+
+    def replace(match: re.Match[str]) -> str:
+        return "".join(
+            "\n" if char == "\n" else "\r" if char == "\r" else " "
+            for char in match.group(0)
+        )
+
+    return _PICTURE_HTML_COMMENT_RE.sub(replace, str(value))
+
+
+def _picture_markdown_matching_bracket(text: str, start: int) -> int | None:
+    """Find the closing bracket for a Markdown image alt span."""
+
+    depth = 0
+    position = start
+    while position < len(text):
+        char = text[position]
+        if char == "\\":
+            position += 2
+            continue
+        if char == "[":
+            depth += 1
+        elif char == "]":
+            if depth == 0:
+                return position
+            depth -= 1
+        position += 1
+    return None
+
+
+def _picture_markdown_unescaped_backslash(text: str, position: int) -> bool:
+    count = 0
+    position -= 1
+    while position >= 0 and text[position] == "\\":
+        count += 1
+        position -= 1
+    return bool(count % 2)
+
+
+def _picture_markdown_image_destination(
+    text: str,
+    opening_paren: int,
+) -> tuple[str, int] | None:
+    """Parse one inline Markdown image destination and its closing position."""
+
+    if opening_paren >= len(text) or text[opening_paren] != "(":
+        return None
+    position = opening_paren + 1
+    while position < len(text) and text[position].isspace():
+        position += 1
+    if position >= len(text):
+        return None
+
+    if text[position] == "<":
+        destination_start = position + 1
+        position = destination_start
+        while position < len(text):
+            char = text[position]
+            if char == "\\":
+                position += 2
+                continue
+            if char == ">":
+                break
+            if char in "\r\n":
+                return None
+            position += 1
+        if position >= len(text) or text[position] != ">":
+            return None
+        destination = text[destination_start:position]
+        position += 1
+    else:
+        destination_start = position
+        nested_parentheses = 0
+        while position < len(text):
+            char = text[position]
+            if char == "\\":
+                position += 2
+                continue
+            if char == "(":
+                nested_parentheses += 1
+            elif char == ")":
+                if nested_parentheses == 0:
+                    destination = text[destination_start:position]
+                    if not destination:
+                        return None
+                    return destination, position + 1
+                nested_parentheses -= 1
+            elif char.isspace() and nested_parentheses == 0:
+                break
+            position += 1
+        else:
+            return None
+        destination = text[destination_start:position]
+
+    if not destination:
+        return None
+    while position < len(text) and text[position].isspace():
+        position += 1
+    if position < len(text) and text[position] == ")":
+        return destination, position + 1
+
+    # CommonMark permits a quoted or parenthesized optional title.  Parse it
+    # strictly so ordinary prose after an image is not mistaken for a valid
+    # image destination.
+    if position >= len(text) or text[position] not in "\"'(":
+        return None
+    opener = text[position]
+    closer = ")" if opener == "(" else opener
+    nested_title_parentheses = 0
+    position += 1
+    while position < len(text):
+        char = text[position]
+        if char == "\\":
+            position += 2
+            continue
+        if opener == "(" and char == "(":
+            nested_title_parentheses += 1
+        elif char == closer:
+            if opener == "(" and nested_title_parentheses:
+                nested_title_parentheses -= 1
+            else:
+                position += 1
+                break
+        position += 1
+    else:
+        return None
+    while position < len(text) and text[position].isspace():
+        position += 1
+    if position >= len(text) or text[position] != ")":
+        return None
+    return destination, position + 1
+
+
+_PICTURE_MARKDOWN_RAW_HTML_BLOCK_TAGS = frozenset(
+    {
+        "address",
+        "article",
+        "aside",
+        "base",
+        "basefont",
+        "blockquote",
+        "body",
+        "caption",
+        "center",
+        "col",
+        "colgroup",
+        "dd",
+        "details",
+        "dialog",
+        "dir",
+        "div",
+        "dl",
+        "dt",
+        "fieldset",
+        "figcaption",
+        "figure",
+        "footer",
+        "form",
+        "h1",
+        "h2",
+        "h3",
+        "h4",
+        "h5",
+        "h6",
+        "head",
+        "header",
+        "hr",
+        "html",
+        "iframe",
+        "legend",
+        "li",
+        "link",
+        "main",
+        "menu",
+        "menuitem",
+        "nav",
+        "noframes",
+        "ol",
+        "object",
+        "p",
+        "pre",
+        "script",
+        "section",
+        "summary",
+        "table",
+        "tbody",
+        "td",
+        "tfoot",
+        "th",
+        "thead",
+        "title",
+        "tr",
+        "track",
+        "ul",
+        "style",
+        "textarea",
+        "template",
+        "noscript",
+        "xmp",
+        "noembed",
+    }
+)
+_PICTURE_MARKDOWN_VOID_HTML_TAGS = frozenset(
+    {
+        "area",
+        "base",
+        "br",
+        "col",
+        "embed",
+        "hr",
+        "img",
+        "input",
+        "link",
+        "meta",
+        "param",
+        "source",
+        "track",
+        "wbr",
+    }
+)
+_PICTURE_MARKDOWN_HTML_TAG_RE = re.compile(
+    r"<(?P<closing>/?)\s*(?P<tag>[A-Za-z][A-Za-z0-9:-]*)(?P<attrs>[^<>]*?)>",
+    flags=re.S,
+)
+
+
+def _merge_picture_ranges(
+    ranges: Iterable[tuple[int, int]],
+    length: int,
+) -> list[tuple[int, int]]:
+    merged: list[tuple[int, int]] = []
+    for start, end in sorted(
+        (max(0, int(start)), min(length, int(end)))
+        for start, end in ranges
+        if int(start) < int(end)
+    ):
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    return merged
+
+
+def _markdown_picture_indented_code_ranges(
+    markdown: str,
+) -> list[tuple[int, int]]:
+    ranges: list[tuple[int, int]] = []
+    offset = 0
+    for line in str(markdown).splitlines(keepends=True):
+        candidate = _markdown_strip_container_prefix(line)
+        if re.match(r"^(?: {4,}|\t)", candidate):
+            ranges.append((offset, offset + len(line)))
+        offset += len(line)
+    return ranges
+
+
+def _markdown_picture_raw_html_ranges(
+    markdown: str,
+) -> list[tuple[int, int]]:
+    original = str(markdown)
+    # Fenced and inline code, plus comments, must not contribute HTML tags to
+    # this scanner.  All masking preserves offsets for the intervals below.
+    masked = _mask_picture_html_comments(_markdown_mask_code(original))
+    stack: list[tuple[str, int]] = []
+    ranges: list[tuple[int, int]] = []
+    for match in _PICTURE_MARKDOWN_HTML_TAG_RE.finditer(masked):
+        tag = match.group("tag").lower()
+        if tag not in _PICTURE_MARKDOWN_RAW_HTML_BLOCK_TAGS:
+            continue
+        if match.group("closing"):
+            if stack and stack[-1][0] == tag:
+                _tag, start = stack.pop()
+                ranges.append((start, match.end()))
+            continue
+        if tag in _PICTURE_MARKDOWN_VOID_HTML_TAGS or match.group("attrs").rstrip().endswith("/"):
+            continue
+        stack.append((tag, match.start()))
+    ranges.extend((start, len(original)) for _tag, start in stack)
+    return _merge_picture_ranges(ranges, len(original))
+
+
+def _markdown_picture_non_code_ranges(
+    markdown: str,
+) -> list[tuple[int, int]]:
+    """Return Markdown prose ranges safe for picture-image recognition.
+
+    In addition to the normal fenced/inline-code ranges, suppress indented
+    code and raw HTML blocks.  Markdown image syntax inside these regions is
+    literal text, and an unmatched HTML block remains suppressed to EOF.
+    """
+
+    original = str(markdown)
+    suppressed = [
+        *_markdown_code_ranges(original),
+        *_markdown_picture_indented_code_ranges(original),
+        *_markdown_picture_raw_html_ranges(original),
+    ]
+    merged = _merge_picture_ranges(suppressed, len(original))
+    ranges: list[tuple[int, int]] = []
+    cursor = 0
+    for start, end in merged:
+        if cursor < start:
+            ranges.append((cursor, start))
+        cursor = max(cursor, end)
+    if cursor < len(original):
+        ranges.append((cursor, len(original)))
+    return ranges
+
+
+def _markdown_picture_image_destinations(markdown: str) -> list[str]:
+    """Return only real inline Markdown image destinations.
+
+    Fenced/inline code is excluded using the existing CommonMark-aware range
+    scanner.  HTML comments are masked before scanning so an illustrative
+    ``<!-- ![...](...) -->`` cannot satisfy the delivery gate.
+    """
+
+    original = str(markdown)
+    masked_comments = _mask_picture_html_comments(original)
+    destinations: list[str] = []
+    for start, end in _markdown_picture_non_code_ranges(original):
+        segment = masked_comments[start:end]
+        position = 0
+        while position < len(segment):
+            marker = segment.find("![", position)
+            if marker < 0:
+                break
+            if not _picture_markdown_unescaped_backslash(segment, marker):
+                alt_end = _picture_markdown_matching_bracket(segment, marker + 2)
+                if alt_end is not None:
+                    parsed = _picture_markdown_image_destination(segment, alt_end + 1)
+                    if parsed is not None:
+                        destination, consumed = parsed
+                        destinations.append(destination)
+                        position = consumed
+                        continue
+            position = marker + 2
+    return destinations
+
+
+def _markdown_picture_html_image_sources(markdown: str) -> list[str]:
+    """Collect inline HTML ``<img src>`` tags from Markdown prose only.
+
+    Raw HTML *block* ranges are excluded from Markdown ``![...]`` parsing, but
+    an actual HTML ``<img>`` inside a rendered ``<div>/<figure>/<table>`` is a
+    legitimate Markdown-surface image.  Mask only fenced/inline/indented code
+    here, then feed one contiguous surface to the HTML suppression parser so
+    inert containers remain suppressed across masked regions and to EOF.
+    """
+
+    original = str(markdown)
+    masked = _mask_picture_html_comments(original)
+    code_ranges = _merge_picture_ranges(
+        [
+            *_markdown_code_ranges(original),
+            *_markdown_picture_indented_code_ranges(original),
+        ],
+        len(original),
+    )
+    pieces: list[str] = []
+    cursor = 0
+    for start, end in code_ranges:
+        pieces.append(masked[cursor:start])
+        pieces.append(
+            "".join(
+                "\n" if char == "\n" else "\r" if char == "\r" else " "
+                for char in masked[start:end]
+            )
+        )
+        cursor = end
+    pieces.append(masked[cursor:])
+    return _html_picture_image_sources("".join(pieces))
+
+
+def _normalize_picture_local_asset_reference(value: Any) -> str | None:
+    """Canonicalize a local surface reference for exact asset comparison."""
+
+    if value is None:
+        return None
+    text = html.unescape(str(value)).strip()
+    if text.startswith("<") and text.endswith(">"):
+        text = text[1:-1].strip()
+    if not text or "\x00" in text:
+        return None
+    parsed = urllib.parse.urlsplit(text)
+    if parsed.scheme or parsed.netloc:
+        return None
+    path = urllib.parse.unquote(parsed.path)
+    if not path or path.startswith(("/", "\\")):
+        return None
+    normalized = posixpath.normpath(path)
+    if normalized in {"", ".", ".."} or normalized.startswith("../"):
+        return None
+    return normalized
+
+
+def validate_final_picture_surfaces(
+    output_dir: Path,
+    metadata: dict[str, Any],
+    status: dict[str, Any],
+) -> dict[str, Any]:
+    """Validate source-cropped picture bindings on both delivery surfaces.
+
+    Pictures intentionally use a separate inventory from tables/formulas.  A
+    source picture that is tiny, furniture, quarantined, or a formula child is
+    diagnostic-only; every other picture is a critical visual binding and must
+    retain one HTML and one Markdown reference to its exact source crop.
+    """
+
+    quality_signals = status.setdefault("quality_signals", {})
+    manifest = metadata.get("structural_visual_provenance_manifest")
+    manifest_records = manifest.get("pictures") if isinstance(manifest, dict) else None
+    records = list(manifest_records) if isinstance(manifest_records, list) else []
+    top_reasons: set[str] = set()
+    if isinstance(manifest, dict):
+        manifest_version = manifest.get("version")
+        if (
+            not isinstance(manifest_version, int)
+            or isinstance(manifest_version, bool)
+            or manifest_version != STRUCTURAL_VISUAL_PROVENANCE_VERSION
+        ):
+            top_reasons.add("picture_manifest_version_invalid")
+        if "pictures" in manifest and not isinstance(manifest_records, list):
+            top_reasons.add("picture_manifest_records_invalid")
+    elif manifest is not None:
+        top_reasons.add("picture_manifest_invalid")
+    html_text = (
+        (output_dir / "document.html").read_text(encoding="utf-8")
+        if (output_dir / "document.html").is_file()
+        else ""
+    )
+    markdown_text = (
+        (output_dir / "document.md").read_text(encoding="utf-8")
+        if (output_dir / "document.md").is_file()
+        else ""
+    )
+
+    expected_source_sha = str(
+        _structural_expected_visual_pdf_sha256(metadata)
+        or _normalize_sha256(metadata.get("source_pdf_sha256"))
+        or ""
+    ).lower()
+    manifest_source_sha = str(
+        (manifest or {}).get("visual_pdf_sha256") if isinstance(manifest, dict) else ""
+    ).lower()
+    has_expected_records = any(
+        isinstance(record, dict) and bool(record.get("machine_binding_expected"))
+        for record in records
+    )
+    if has_expected_records:
+        if not re.fullmatch(r"[0-9a-f]{64}", expected_source_sha):
+            top_reasons.add("missing_expected_source_pdf_sha256")
+        if not re.fullmatch(r"[0-9a-f]{64}", manifest_source_sha):
+            top_reasons.add("missing_manifest_source_pdf_sha256")
+        elif expected_source_sha and manifest_source_sha != expected_source_sha:
+            top_reasons.add("manifest_source_pdf_sha256_mismatch")
+
+    # Recompute source identities from the final document JSON.  This catches a
+    # manifest bbox/ref edit even when the asset bytes and surface references
+    # themselves were left untouched.
+    document = _load_json_file(output_dir / "document.json")
+    current_by_ref: dict[str, list[dict[str, Any]]] = {}
+    if isinstance(document, dict):
+        normalized = _document_with_resolved_page_provenance(document)
+        for index, picture in enumerate(
+            extract_label_nodes(normalized, "picture"), start=1
+        ):
+            raw_self_ref = picture.get("self_ref")
+            (
+                classified_expected,
+                classified_reason,
+                classified_failures,
+            ) = _classify_source_picture(
+                picture,
+                document_json=normalized,
+            )
+            source_ref = _structural_node_source_ref(
+                picture,
+                kind="picture",
+                fallback_index=index - 1,
+                part_index=_structural_node_part_index(picture),
+            )
+            current_by_ref.setdefault(source_ref, []).append(
+                {
+                    "index": index,
+                    "source_ref": source_ref,
+                    "self_ref": raw_self_ref,
+                    "part_index": _structural_node_part_index(picture),
+                    "page_no": _positive_page_number(
+                        (first_prov(picture) or {}).get("page_no")
+                    ),
+                    "bbox": _picture_source_bbox_snapshot(
+                        (first_prov(picture) or {}).get("bbox")
+                    ),
+                    # Classification is recomputed from the final document,
+                    # rather than trusted from the raw manifest.  Keep the
+                    # exact evidence in the snapshot so the record can be
+                    # compared after its source_ref resolves uniquely.
+                    "machine_binding_expected": classified_expected,
+                    "classification_reason": classified_reason,
+                    "classification_failures": list(classified_failures),
+                }
+            )
+    elif has_expected_records:
+        top_reasons.add("final_picture_document_json_missing")
+
+    # Count only semantic image destinations.  Raw string counts are unsafe:
+    # they also match prose, comments, ordinary links, and Markdown code.
+    html_surface_assets = [
+        normalized
+        for raw_reference in _html_picture_image_sources(html_text)
+        if (normalized := _normalize_picture_local_asset_reference(raw_reference))
+        is not None
+    ]
+    markdown_surface_assets = [
+        normalized
+        for raw_reference in [
+            *_markdown_picture_image_destinations(markdown_text),
+            *_markdown_picture_html_image_sources(markdown_text),
+        ]
+        if (normalized := _normalize_picture_local_asset_reference(raw_reference))
+        is not None
+    ]
+
+    seen_indexes: set[int] = set()
+    seen_refs: set[str] = set()
+    enriched_records: list[dict[str, Any]] = []
+    expected_count = 0
+    bound_count = 0
+    for raw_record in records:
+        record = dict(raw_record) if isinstance(raw_record, dict) else {}
+        integrity_failure = not isinstance(raw_record, dict)
+        if not isinstance(raw_record, dict):
+            top_reasons.add("picture_manifest_record_invalid")
+        raw_failure_reasons = record.get("failure_reasons")
+        if raw_failure_reasons is not None and not isinstance(raw_failure_reasons, list):
+            integrity_failure = True
+        if isinstance(raw_failure_reasons, list) and any(
+            not isinstance(reason, str) for reason in raw_failure_reasons
+        ):
+            integrity_failure = True
+        raw_failure_reason_items = (
+            raw_failure_reasons if isinstance(raw_failure_reasons, list) else []
+        )
+        reasons: set[str] = {
+            str(reason)
+            for reason in raw_failure_reason_items
+            if str(reason)
+        }
+        raw_failure_reason_values = {
+            reason
+            for reason in raw_failure_reason_items
+            if isinstance(reason, str) and reason
+        }
+        if raw_failure_reasons is not None and not isinstance(raw_failure_reasons, list):
+            reasons.add("picture_manifest_failure_reasons_invalid")
+        elif isinstance(raw_failure_reasons, list) and any(
+            not isinstance(reason, str) for reason in raw_failure_reasons
+        ):
+            reasons.add("picture_manifest_failure_reasons_invalid")
+        record_version = record.get("version")
+        if (
+            not isinstance(record_version, int)
+            or isinstance(record_version, bool)
+            or record_version != STRUCTURAL_VISUAL_PROVENANCE_VERSION
+        ):
+            reasons.add("picture_manifest_record_version_invalid")
+            integrity_failure = True
+        expected_value = record.get("machine_binding_expected")
+        if not isinstance(expected_value, bool):
+            reasons.add("picture_machine_binding_expected_invalid")
+            integrity_failure = True
+        expected = bool(expected_value)
+        if expected:
+            expected_count += 1
+        index = record.get("index")
+        if not isinstance(index, int) or isinstance(index, bool) or index <= 0:
+            reasons.add("picture_manifest_index_invalid")
+            integrity_failure = True
+            index = None
+        elif index in seen_indexes:
+            reasons.add("picture_manifest_duplicate_index")
+            integrity_failure = True
+        else:
+            seen_indexes.add(index)
+        global_index = record.get("global_index")
+        if (
+            not isinstance(global_index, int)
+            or isinstance(global_index, bool)
+            or global_index <= 0
+        ):
+            reasons.add("picture_manifest_global_index_invalid")
+            integrity_failure = True
+        elif index is None or global_index != index:
+            reasons.add("picture_manifest_global_index_mismatch")
+            integrity_failure = True
+        raw_self_ref_present = "self_ref" in record
+        raw_self_ref = record.get("self_ref")
+        if not raw_self_ref_present:
+            reasons.add("picture_manifest_self_ref_missing")
+            integrity_failure = True
+        elif not isinstance(raw_self_ref, str):
+            reasons.add("picture_manifest_self_ref_invalid")
+            integrity_failure = True
+        # A source node may legitimately omit ``self_ref``.  In that case the
+        # producer and validator both use the deterministic ``picture:N``
+        # source_ref fallback below.  Defer the expected-record empty-string
+        # decision until the unique final node is available so this compatible
+        # fallback is accepted while a present final self_ref still has to
+        # match exactly.
+        raw_part_index_present = "part_index" in record
+        raw_part_index = record.get("part_index")
+        if not raw_part_index_present:
+            reasons.add("picture_manifest_part_index_missing")
+            integrity_failure = True
+        elif raw_part_index is not None and (
+            isinstance(raw_part_index, bool)
+            or not isinstance(raw_part_index, int)
+            or raw_part_index < 0
+        ):
+            reasons.add("picture_manifest_part_index_invalid")
+            integrity_failure = True
+        source_ref = str(record.get("source_ref") or "").strip()
+        if not source_ref:
+            reasons.add("picture_manifest_source_ref_missing")
+            integrity_failure = True
+        elif source_ref in seen_refs:
+            reasons.add("picture_manifest_duplicate_source_ref")
+            integrity_failure = True
+        else:
+            seen_refs.add(source_ref)
+        expected_asset = (
+            f"pictures/picture_{index}.png" if isinstance(index, int) else ""
+        )
+        source_asset = str(record.get("source_asset") or "")
+        if not expected_asset or source_asset != expected_asset:
+            reasons.add("picture_source_asset_path_mismatch")
+            integrity_failure = True
+        record_sha = str(record.get("source_pdf_sha256") or "").lower()
+        if not re.fullmatch(r"[0-9a-f]{64}", record_sha):
+            reasons.add("picture_source_pdf_sha256_missing")
+        elif manifest_source_sha and record_sha != manifest_source_sha:
+            reasons.add("picture_source_pdf_sha256_mismatch")
+        elif expected_source_sha and record_sha != expected_source_sha:
+            reasons.add("picture_source_pdf_sha256_mismatch")
+
+        current_matches = current_by_ref.get(source_ref, []) if source_ref else []
+        current = current_matches[0] if len(current_matches) == 1 else None
+        if source_ref and len(current_matches) == 0:
+            reasons.add("picture_source_ref_missing_from_final_document")
+        elif len(current_matches) > 1:
+            reasons.add("picture_source_ref_ambiguous_in_final_document")
+        if current is not None:
+            # The final document is authoritative for the machine-binding
+            # disposition.  A manifest producer must not be able to turn a
+            # required picture into an advisory one (or vice versa) by
+            # editing ``machine_binding_expected`` after rendering.
+            current_expected = current.get("machine_binding_expected")
+            if (
+                not isinstance(current_expected, bool)
+                or expected != current_expected
+            ):
+                reasons.add("picture_machine_binding_expected_mismatch")
+                integrity_failure = True
+            current_reason = current.get("classification_reason")
+            if "classification_reason" not in record:
+                reasons.add("picture_classification_reason_missing")
+                integrity_failure = True
+            elif record.get("classification_reason") != current_reason:
+                reasons.add("picture_classification_reason_mismatch")
+                integrity_failure = True
+            current_failures = {
+                reason
+                for reason in (current.get("classification_failures") or [])
+                if isinstance(reason, str) and reason
+            }
+            missing_classification_failures = (
+                current_failures - raw_failure_reason_values
+            )
+            if missing_classification_failures:
+                reasons.add("picture_classification_failure_reasons_missing")
+                integrity_failure = True
+            unexpected_failure_reasons = (
+                raw_failure_reason_values
+                - current_failures
+                - _PICTURE_RENDER_FAILURE_REASONS
+            )
+            if unexpected_failure_reasons:
+                reasons.add("picture_classification_failure_reasons_unexpected")
+                integrity_failure = True
+            current_self_ref = current.get("self_ref")
+            if not isinstance(raw_self_ref, str):
+                # The schema/type failure above is authoritative; do not try
+                # to coerce an invalid raw self_ref for identity comparison.
+                pass
+            elif not expected and not raw_self_ref:
+                # Advisory/nonexpected records intentionally do not require a
+                # source identity; an explicit empty string is valid even
+                # when the final node happens to carry a self_ref.
+                pass
+            elif isinstance(current_self_ref, str):
+                if raw_self_ref != current_self_ref:
+                    reasons.add("picture_self_ref_mismatch")
+            elif current_self_ref is not None or raw_self_ref:
+                # ``None`` is the only compatible missing-final-self_ref
+                # value.  Other final types are malformed, and a nonempty raw
+                # value cannot match an absent final identity.
+                reasons.add("picture_self_ref_mismatch")
+            if index is not None and current.get("index") != index:
+                # Index is a global asset ordinal.  Chunk-qualified refs remain
+                # unique, but reordering still risks binding the wrong crop.
+                reasons.add("picture_global_index_mismatch")
+            if (
+                (
+                    raw_part_index is None
+                    or (
+                        isinstance(raw_part_index, int)
+                        and not isinstance(raw_part_index, bool)
+                        and raw_part_index >= 0
+                    )
+                )
+                and (expected or raw_part_index is not None)
+                and raw_part_index != current.get("part_index")
+            ):
+                reasons.add("picture_part_index_mismatch")
+            page_no = _positive_page_number(record.get("page_no"))
+            if page_no is None or page_no != current.get("page_no"):
+                reasons.add("picture_page_no_mismatch")
+            record_bbox = _picture_source_bbox_snapshot(
+                record.get("bbox") or record.get("node_bbox")
+            )
+            if record_bbox is None:
+                reasons.add("picture_bbox_missing_or_invalid")
+            elif record_bbox != current.get("bbox"):
+                reasons.add("picture_bbox_mismatch")
+        elif expected:
+            # Keep an explicit completeness reason for records whose final JSON
+            # cannot be compared at all.
+            reasons.add("picture_source_identity_unverified")
+
+        raw_asset_present = record.get("asset_present")
+        if not isinstance(raw_asset_present, bool):
+            reasons.add("picture_asset_present_invalid")
+            integrity_failure = True
+        asset_present = raw_asset_present is True
+        asset_path = _strict_output_asset_path(output_dir, source_asset)
+        record_asset_sha = str(record.get("asset_sha256") or "").lower()
+        if expected:
+            if not asset_present:
+                reasons.add("picture_asset_not_present_in_manifest")
+            if asset_path is None:
+                reasons.add("picture_asset_missing_or_unsafe")
+            if not re.fullmatch(r"[0-9a-f]{64}", record_asset_sha):
+                reasons.add("picture_asset_sha256_missing")
+            elif asset_path is not None:
+                try:
+                    if file_sha256(asset_path) != record_asset_sha:
+                        reasons.add("picture_asset_sha256_mismatch")
+                except OSError:
+                    reasons.add("picture_asset_hash_failed")
+        normalized_source_asset = _normalize_picture_local_asset_reference(
+            source_asset
+        )
+        html_reference_count = (
+            sum(
+                1
+                for reference in html_surface_assets
+                if normalized_source_asset is not None
+                and reference == normalized_source_asset
+            )
+            if normalized_source_asset is not None
+            else 0
+        )
+        markdown_reference_count = (
+            sum(
+                1
+                for reference in markdown_surface_assets
+                if normalized_source_asset is not None
+                and reference == normalized_source_asset
+            )
+            if normalized_source_asset is not None
+            else 0
+        )
+        raw_html_reference_count_present = "html_reference_count" in record
+        raw_html_reference_count = record.get("html_reference_count")
+        raw_markdown_reference_count_present = "markdown_reference_count" in record
+        raw_markdown_reference_count = record.get("markdown_reference_count")
+        record["html_reference_count"] = html_reference_count
+        record["markdown_reference_count"] = markdown_reference_count
+        if expected:
+            if html_reference_count != 1:
+                reasons.add("picture_html_reference_count_mismatch")
+            if markdown_reference_count != 1:
+                reasons.add("picture_markdown_reference_count_mismatch")
+        # Derived fields are output-only.  If a caller feeds a previously
+        # enriched/tampered record back into this validator, compare the raw
+        # values before replacing them instead of silently normalizing them.
+        # Any integrity failure is critical even for an otherwise advisory
+        # picture.  This keeps the region-side projection from downgrading a
+        # tampered nonexpected classification to a healthy visual-only record.
+        derived_status = (
+            "unresolved"
+            if integrity_failure or (expected and reasons)
+            else "visual_only"
+        )
+        derived_critical = bool(integrity_failure or (expected and reasons))
+        derived_reasons = sorted(reasons)
+        if "status" in record and record.get("status") != derived_status:
+            reasons.add("picture_status_derived_field_tampered")
+            integrity_failure = True
+        if "critical" in record:
+            raw_critical = record.get("critical")
+            if (
+                not isinstance(raw_critical, bool)
+                or raw_critical != derived_critical
+            ):
+                reasons.add("picture_critical_derived_field_tampered")
+                integrity_failure = True
+        if "reasons" in record and record.get("reasons") != derived_reasons:
+            reasons.add("picture_reasons_derived_field_tampered")
+            integrity_failure = True
+        if (
+            raw_html_reference_count_present
+            and (
+                isinstance(raw_html_reference_count, bool)
+                or not isinstance(raw_html_reference_count, int)
+                or raw_html_reference_count != html_reference_count
+            )
+        ):
+            reasons.add("picture_html_reference_count_derived_field_tampered")
+            integrity_failure = True
+        if (
+            raw_markdown_reference_count_present
+            and (
+                isinstance(raw_markdown_reference_count, bool)
+                or not isinstance(raw_markdown_reference_count, int)
+                or raw_markdown_reference_count != markdown_reference_count
+            )
+        ):
+            reasons.add("picture_markdown_reference_count_derived_field_tampered")
+            integrity_failure = True
+        record["status"] = (
+            "unresolved"
+            if integrity_failure or (expected and reasons)
+            else "visual_only"
+        )
+        # ``machine_binding_expected`` describes whether the picture belongs
+        # on the delivery surface.  It is not itself a failure severity.  A
+        # completely bound source crop is visual-only and noncritical; an
+        # expected picture with a missing/tampered identity or binding, or any
+        # manifest integrity failure, is a critical unresolved record.
+        record["critical"] = bool(integrity_failure or (expected and reasons))
+        record["reasons"] = sorted(reasons)
+        if expected and not reasons:
+            bound_count += 1
+        if reasons and expected:
+            top_reasons.update(reasons)
+        if integrity_failure:
+            top_reasons.update(reasons)
+        enriched_records.append(record)
+
+    if not records:
+        if current_by_ref:
+            top_reasons.add("missing_picture_provenance_inventory")
+    else:
+        # The final document is authoritative for which pictures are required
+        # to be delivered.  Compare the complete expected source_ref
+        # *multisets* in both directions: a manifest cannot drop a required
+        # final picture by marking its record nonexpected, and it cannot add a
+        # second expected record without a matching final node.  Sorting keeps
+        # duplicate source_refs observable without importing a mutable counter.
+        final_expected_refs = sorted(
+            source_ref
+            for source_ref, current_matches in current_by_ref.items()
+            for current in current_matches
+            if current.get("machine_binding_expected") is True
+        )
+        manifest_expected_refs = sorted(
+            str(record.get("source_ref") or "").strip()
+            for record in records
+            if isinstance(record, dict)
+            and record.get("machine_binding_expected") is True
+            and str(record.get("source_ref") or "").strip()
+        )
+        if final_expected_refs != manifest_expected_refs:
+            top_reasons.add("picture_expected_source_ref_inventory_mismatch")
+
+    result = {
+        "version": STRUCTURAL_VISUAL_PROVENANCE_VERSION,
+        "ok": not top_reasons and bound_count == expected_count,
+        "expected_count": expected_count,
+        "bound_count": bound_count,
+        "records": enriched_records,
+        "failure_reasons": sorted(top_reasons),
+    }
+    metadata["picture_surface_inventory"] = result
+    quality_signals["picture_surface_inventory"] = result
+    return result
+
+
 def validate_final_formula_surfaces(
     output_dir: Path,
     metadata: dict[str, Any],
@@ -28148,8 +29504,46 @@ def _finalize_delivery_surfaces(
             visual_pdf_path=visual_pdf_path,
             trusted_formula_authority=trusted_formula_authority,
         )
+    # Picture coverage is independent of table/formula structural coverage and
+    # must run before the generic region gate.  It is deliberately fail-closed:
+    # a missing/tampered expected picture invalidates the final structural
+    # surface even when other structural inventories pass.
+    picture = validate_final_picture_surfaces(output_dir, metadata, status)
+    if not picture.get("ok"):
+        picture_reasons = [
+            str(reason)
+            for reason in picture.get("failure_reasons") or []
+            if str(reason)
+        ]
+        status["ok"] = False
+        status["success_class"] = "degraded_failure"
+        warning = "final_picture_surface_failed:" + ",".join(
+            picture_reasons or ["unknown"]
+        )
+        if warning not in status.setdefault("warnings", []):
+            status["warnings"].append(warning)
     formula = validate_final_formula_surfaces(output_dir, metadata, status)
     structural = validate_final_structural_surfaces(output_dir, metadata, status)
+    if not picture.get("ok"):
+        structural = dict(structural)
+        picture_reasons = [
+            str(reason)
+            for reason in picture.get("failure_reasons") or []
+            if str(reason)
+        ]
+        structural_failure_reasons = list(structural.get("failure_reasons") or [])
+        for reason in picture_reasons:
+            if reason not in structural_failure_reasons:
+                structural_failure_reasons.append(reason)
+        structural["failure_reasons"] = structural_failure_reasons
+        structural["ok"] = False
+        metadata["final_structural_surface"] = structural
+        status.setdefault("quality_signals", {})["final_structural_surface"] = structural
+        structural_warning = "final_structural_surface_failed:" + ",".join(
+            structural_failure_reasons or ["picture_surface"]
+        )
+        if structural_warning not in status.setdefault("warnings", []):
+            status["warnings"].append(structural_warning)
     if pdf_inventory is None:
         expected_source_pdf_sha256 = _normalize_sha256(
             metadata.get("visual_evidence_input_sha256")
@@ -28245,7 +29639,7 @@ def _finalize_delivery_surfaces(
             metadata=metadata,
             status=status,
             pdf_inventory=inventory,
-            max_records=1000,
+            max_records=DEFAULT_MAX_RECORDS,
         )
     except Exception as exc:  # fail closed if a malformed diagnostic escapes
         regions = {
@@ -28270,6 +29664,7 @@ def _finalize_delivery_surfaces(
     reconciliation = reconcile_final_surface_status(output_dir, metadata, status)
     return {
         "visuals": visuals,
+        "picture": picture,
         "formula": formula,
         "structural": structural,
         "regions": regions,
@@ -28551,6 +29946,17 @@ def _run_snapshot_job(
     )
     metadata["image_table_semantic_recovery"] = image_table_recovery
     status.setdefault("quality_signals", {})["image_table_semantic_recovery"] = image_table_recovery
+
+    # Repair only a source-proven, cross-row numeric hole before contract
+    # outputs and review artifacts are materialized.  The persisted source PDF
+    # is the validated snapshot used by every later evidence phase.
+    apply_table_cross_row_hole_repair(
+        response,
+        source_pdf_path,
+        metadata,
+        status,
+    )
+    checkpoint(verify_tree=True)
 
     visual_args = conversion_args
     write_contract_outputs(
