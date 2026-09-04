@@ -472,8 +472,10 @@ python3 docs/integrations/docling-serve-quality-parity/batch_full_dir_review.py 
   --timeout-seconds 1800
 ```
 
-For the planned one-plus-sixteen acceptance corpus, add
-`--expected-count 17`.
+For a one-plus-sixteen acceptance run, use `--expected-count 16` for the
+sixteen-PDF direct Route A corpus. Run the one representative API smoke job
+separately through `POST /v1/jobs`; it is a conversion job, not a seventeenth
+PDF in this helper's input directory.
 
 Use an ignored output root under `.runtime/review/`. Generated review corpora
 must not be committed.
